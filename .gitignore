@@ -27,3 +27,7 @@ neural.cache
 
 # Logs
 *.log
+
+#CLAUDE
+.claude/
+CLAUDE.md
