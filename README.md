@@ -1,7 +1,7 @@
 # Talos-XII（终末地抽卡模拟器）
 
 **项目开发者**：zayoka  
-**开源协议**：GPLv3
+**开源协议**：GPL-3.0 license
 
 
 
@@ -194,3 +194,5 @@ git push -u origin feature/new-algorithm
 
 
 **Copyright 2025 zayoka. All rights reserved.**
+
+**本项目基于 GPL-3.0 协议开源，您可以在遵守协议的前提下自由使用、修改和分发本项目的代码。**
