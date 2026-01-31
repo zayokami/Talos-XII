@@ -1,0 +1,15 @@
+[package]
+name = "talos_xii"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rayon = "1.10"
+rand = "0.8"
+rand_core = "0.6"
+
+[profile.release]
+lto = true        # Link Time Optimization (smaller binary, faster code)
+codegen-units = 1 # Maximize optimization units (slower compile, faster code)
+panic = 'unwind'  # Keep unwind for robustness (we want to catch panics)
+strip = true      # Strip symbols to reduce size

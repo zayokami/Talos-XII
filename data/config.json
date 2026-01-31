@@ -1,0 +1,23 @@
+{
+  "pool_name": "熔火灼痕",
+  "up_six": ["莱万汀"],
+  "prob_6_base": 0.008,
+  "prob_5_base": 0.08,
+  "prob_4_base": 0.912,
+  "soft_pity_start": 65,
+  "small_pity_guarantee": 80,
+  "big_pity_cumulative": 120,
+  "six_stars": [
+    "管理员", "黎风", "余烬", "洁尔佩塔", 
+    "艾尔黛拉", "骏卫", "莱万汀", "伊冯", "别礼"
+  ],
+  "five_stars": [
+    "昼雪", "赛希", "狼卫", "佩丽卡", 
+    "弧光", "阿列什", "艾维文娜", "大潘", "埃特拉"
+  ],
+  "four_stars": [
+    "卡契尔", "安塔尔", "萤石", "秋栗"
+  ],
+  "luck_mode": "probability",
+  "fast_init": true
+}

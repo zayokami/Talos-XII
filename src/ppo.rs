@@ -1,0 +1,724 @@
+use crate::autograd::Tensor;
+use crate::neural::DIM;
+use crate::{PullState, dbn_env, prob_6, build_features};
+use crate::config::Config;
+use crate::dbn::Dbn;
+use crate::rng::Rng;
+use crate::transformer::{LuckTransformer, Linear};
+use std::collections::VecDeque;
+
+// --- PPO Components ---
+
+const ACTION_SPACE: usize = 5;
+pub const ACTIONS: [f64; ACTION_SPACE] = [0.0, 0.005, 0.015, -0.005, -0.015];
+const CLIP_EPSILON: f64 = 0.2;
+const GAMMA: f64 = 0.99;
+const GAE_LAMBDA: f64 = 0.95;
+const VALUE_COEF: f64 = 0.5;
+const ENTROPY_COEF: f64 = 0.01;
+
+#[inline(always)]
+fn sum_f64(values: &[f64]) -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            unsafe {
+                return sum_f64_avx2(values);
+            }
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            return sum_f64_neon(values);
+        }
+    }
+    let mut sum = 0.0;
+    for &v in values {
+        sum += v;
+    }
+    sum
+}
+
+#[inline(always)]
+fn sum_sq_diff(values: &[f64], mean: f64) -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            unsafe {
+                return sum_sq_diff_avx2(values, mean);
+            }
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            return sum_sq_diff_neon(values, mean);
+        }
+    }
+    let mut sum = 0.0;
+    for &v in values {
+        let d = v - mean;
+        sum += d * d;
+    }
+    sum
+}
+
+#[inline(always)]
+fn normalize_slice(values: &[f64], mean: f64, std: f64) -> Vec<f64> {
+    let len = values.len();
+    let mut out = vec![0.0; len];
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            unsafe {
+                normalize_slice_avx2(values, &mut out, mean, std);
+            }
+            return out;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            normalize_slice_neon(values, &mut out, mean, std);
+        }
+        return out;
+    }
+    for i in 0..len {
+        out[i] = (values[i] - mean) / std;
+    }
+    out
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sum_f64_avx2(values: &[f64]) -> f64 {
+    use core::arch::x86_64::*;
+    let mut i = 0;
+    let len = values.len();
+    let mut acc = _mm256_setzero_pd();
+    while i + 4 <= len {
+        let v = _mm256_loadu_pd(values.as_ptr().add(i));
+        acc = _mm256_add_pd(acc, v);
+        i += 4;
+    }
+    let mut tmp = [0.0; 4];
+    _mm256_storeu_pd(tmp.as_mut_ptr(), acc);
+    let mut sum = tmp[0] + tmp[1] + tmp[2] + tmp[3];
+    while i < len {
+        sum += *values.get_unchecked(i);
+        i += 1;
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sum_sq_diff_avx2(values: &[f64], mean: f64) -> f64 {
+    use core::arch::x86_64::*;
+    let mut i = 0;
+    let len = values.len();
+    let mut acc = _mm256_setzero_pd();
+    let mean_vec = _mm256_set1_pd(mean);
+    while i + 4 <= len {
+        let v = _mm256_loadu_pd(values.as_ptr().add(i));
+        let d = _mm256_sub_pd(v, mean_vec);
+        let prod = _mm256_mul_pd(d, d);
+        acc = _mm256_add_pd(acc, prod);
+        i += 4;
+    }
+    let mut tmp = [0.0; 4];
+    _mm256_storeu_pd(tmp.as_mut_ptr(), acc);
+    let mut sum = tmp[0] + tmp[1] + tmp[2] + tmp[3];
+    while i < len {
+        let d = *values.get_unchecked(i) - mean;
+        sum += d * d;
+        i += 1;
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn normalize_slice_avx2(values: &[f64], out: &mut [f64], mean: f64, std: f64) {
+    use core::arch::x86_64::*;
+    let mut i = 0;
+    let len = values.len();
+    let mean_vec = _mm256_set1_pd(mean);
+    let std_vec = _mm256_set1_pd(std);
+    while i + 4 <= len {
+        let v = _mm256_loadu_pd(values.as_ptr().add(i));
+        let d = _mm256_sub_pd(v, mean_vec);
+        let n = _mm256_div_pd(d, std_vec);
+        _mm256_storeu_pd(out.as_mut_ptr().add(i), n);
+        i += 4;
+    }
+    while i < len {
+        *out.get_unchecked_mut(i) = (*values.get_unchecked(i) - mean) / std;
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn sum_f64_neon(values: &[f64]) -> f64 {
+    use core::arch::aarch64::*;
+    let mut i = 0;
+    let len = values.len();
+    let mut acc = vdupq_n_f64(0.0);
+    while i + 2 <= len {
+        let v = vld1q_f64(values.as_ptr().add(i));
+        acc = vaddq_f64(acc, v);
+        i += 2;
+    }
+    let mut tmp = [0.0; 2];
+    vst1q_f64(tmp.as_mut_ptr(), acc);
+    let mut sum = tmp[0] + tmp[1];
+    while i < len {
+        sum += *values.get_unchecked(i);
+        i += 1;
+    }
+    sum
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn sum_sq_diff_neon(values: &[f64], mean: f64) -> f64 {
+    use core::arch::aarch64::*;
+    let mut i = 0;
+    let len = values.len();
+    let mut acc = vdupq_n_f64(0.0);
+    let mean_vec = vdupq_n_f64(mean);
+    while i + 2 <= len {
+        let v = vld1q_f64(values.as_ptr().add(i));
+        let d = vsubq_f64(v, mean_vec);
+        let prod = vmulq_f64(d, d);
+        acc = vaddq_f64(acc, prod);
+        i += 2;
+    }
+    let mut tmp = [0.0; 2];
+    vst1q_f64(tmp.as_mut_ptr(), acc);
+    let mut sum = tmp[0] + tmp[1];
+    while i < len {
+        let d = *values.get_unchecked(i) - mean;
+        sum += d * d;
+        i += 1;
+    }
+    sum
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn normalize_slice_neon(values: &[f64], out: &mut [f64], mean: f64, std: f64) {
+    use core::arch::aarch64::*;
+    let mut i = 0;
+    let len = values.len();
+    let mean_vec = vdupq_n_f64(mean);
+    let std_vec = vdupq_n_f64(std);
+    while i + 2 <= len {
+        let v = vld1q_f64(values.as_ptr().add(i));
+        let d = vsubq_f64(v, mean_vec);
+        let n = vdivq_f64(d, std_vec);
+        vst1q_f64(out.as_mut_ptr().add(i), n);
+        i += 2;
+    }
+    while i < len {
+        *out.get_unchecked_mut(i) = (*values.get_unchecked(i) - mean) / std;
+        i += 1;
+    }
+}
+
+#[derive(Clone)]
+pub struct ActorCritic {
+    pub backbone: LuckTransformer,
+    pub actor_head: Linear,
+    pub critic_head: Linear,
+}
+
+impl ActorCritic {
+    pub fn new(seed: u64) -> Self {
+        let backbone = LuckTransformer::new(DIM, 64);
+        let actor_head = Linear::new(64, ACTION_SPACE, seed.wrapping_add(100));
+        let critic_head = Linear::new(64, 1, seed.wrapping_add(200));
+        
+        ActorCritic { backbone, actor_head, critic_head }
+    }
+
+    pub fn forward_actor(&self, state: &Tensor, pity: &[usize]) -> Tensor {
+        let x = if state.shape.len() == 1 {
+             state.reshape(vec![1, state.shape[0]])
+        } else {
+             state.clone()
+        };
+        let seq = self.backbone.forward(&x, pity);
+        let last = self.backbone.last_token(&seq);
+        let logits = self.actor_head.forward(&last);
+        if logits.shape.len() == 2 && logits.shape[0] == 1 {
+            logits.reshape(vec![logits.shape[1]])
+        } else {
+            logits
+        }
+    }
+
+    pub fn forward_critic(&self, state: &Tensor, pity: &[usize]) -> Tensor {
+        let x = if state.shape.len() == 1 {
+             state.reshape(vec![1, state.shape[0]])
+        } else {
+             state.clone()
+        };
+        let seq = self.backbone.forward(&x, pity);
+        let last = self.backbone.last_token(&seq);
+        let value = self.critic_head.forward(&last);
+        if value.shape.len() == 2 && value.shape[0] == 1 {
+            value.reshape(vec![value.shape[1]])
+        } else {
+            value
+        }
+    }
+    
+    pub fn parameters(&self) -> Vec<Tensor> {
+        let mut p = self.backbone.parameters();
+        p.extend(self.actor_head.parameters());
+        p.extend(self.critic_head.parameters());
+        p
+    }
+
+    // Returns (action_idx, log_prob, value)
+    pub fn step(&self, state: &Tensor, pity: &[usize]) -> (usize, f64, f64) {
+        let logits = self.forward_actor(state, pity);
+        let value = self.forward_critic(state, pity);
+        
+        // Softmax
+        let logits_data = logits.data.read().unwrap();
+        let mut max_l = -1e9;
+        for &v in logits_data.iter() { if v > max_l { max_l = v; } }
+        let mut sum_exp = 0.0;
+        let mut probs = vec![0.0; ACTION_SPACE];
+        for i in 0..ACTION_SPACE {
+            probs[i] = (logits_data[i] - max_l).exp();
+            sum_exp += probs[i];
+        }
+        for i in 0..ACTION_SPACE { probs[i] /= sum_exp; }
+        
+        // Sample
+        let mut r = rand::random::<f64>();
+        let mut action_idx = 0;
+        for i in 0..ACTION_SPACE {
+            if r < probs[i] {
+                action_idx = i;
+                break;
+            }
+            r -= probs[i];
+        }
+        if action_idx == ACTION_SPACE { action_idx = ACTION_SPACE - 1; }
+        
+        let log_prob = probs[action_idx].ln();
+        let val = value.data.read().unwrap()[0];
+        
+        (action_idx, log_prob, val)
+    }
+}
+
+// --- Optimizer (Adam) ---
+
+struct Adam {
+    params: Vec<Tensor>,
+    m: Vec<Vec<f64>>,
+    v: Vec<Vec<f64>>,
+    t: usize,
+    lr: f64,
+    beta1: f64,
+    beta2: f64,
+    eps: f64,
+}
+
+impl Adam {
+    fn new(params: Vec<Tensor>, lr: f64) -> Self {
+        let m = params.iter().map(|p| vec![0.0; p.data.read().unwrap().len()]).collect();
+        let v = params.iter().map(|p| vec![0.0; p.data.read().unwrap().len()]).collect();
+        Adam {
+            params, m, v, t: 0, lr, beta1: 0.9, beta2: 0.999, eps: 1e-8,
+        }
+    }
+
+    fn step(&mut self) {
+        self.t += 1;
+        for (i, param) in self.params.iter_mut().enumerate() {
+            let grad = param.grad.read().unwrap();
+            let mut data = param.data.write().unwrap();
+            for j in 0..data.len() {
+                let g = grad[j];
+                self.m[i][j] = self.beta1 * self.m[i][j] + (1.0 - self.beta1) * g;
+                self.v[i][j] = self.beta2 * self.v[i][j] + (1.0 - self.beta2) * g * g;
+                let m_hat = self.m[i][j] / (1.0 - self.beta1.powi(self.t as i32));
+                let v_hat = self.v[i][j] / (1.0 - self.beta2.powi(self.t as i32));
+                data[j] -= self.lr * m_hat / (v_hat.sqrt() + self.eps);
+            }
+        }
+    }
+    
+    fn zero_grad(&self) {
+        for p in &self.params {
+            p.zero_grad();
+        }
+    }
+}
+
+// --- PPO Trainer ---
+
+struct Memory {
+    states: Vec<Tensor>,
+    pities: Vec<Vec<usize>>,
+    actions: Vec<usize>,
+    log_probs: Vec<f64>,
+    rewards: Vec<f64>,
+    is_terminals: Vec<bool>,
+    values: Vec<f64>,
+}
+
+pub struct PPO {
+    pub policy: ActorCritic,
+    optimizer: Adam,
+    memory: Memory,
+    k_epochs: usize,
+    batch_size: usize,
+}
+
+impl PPO {
+    pub fn new(seed: u64, k_epochs: usize, batch_size: usize) -> Self {
+        let policy = ActorCritic::new(seed);
+        let optimizer = Adam::new(policy.parameters(), 0.0003);
+        PPO {
+            policy,
+            optimizer,
+            memory: Memory {
+                states: vec![],
+                pities: vec![],
+                actions: vec![],
+                log_probs: vec![],
+                rewards: vec![],
+                is_terminals: vec![],
+                values: vec![],
+            },
+            k_epochs,
+            batch_size,
+        }
+    }
+    
+    pub fn store(&mut self, state: Tensor, pity: Vec<usize>, action: usize, log_prob: f64, reward: f64, done: bool, value: f64) {
+        self.memory.states.push(state);
+        self.memory.pities.push(pity);
+        self.memory.actions.push(action);
+        self.memory.log_probs.push(log_prob);
+        self.memory.rewards.push(reward);
+        self.memory.is_terminals.push(done);
+        self.memory.values.push(value);
+    }
+    
+    pub fn update(&mut self) {
+        if self.memory.states.is_empty() { return; }
+        
+        let len = self.memory.states.len();
+        let mut advantages = vec![0.0; len];
+        let mut returns = vec![0.0; len];
+        
+        let mut last_gae_lam = 0.0;
+        
+        for t in (0..len).rev() {
+            let non_terminal = if self.memory.is_terminals[t] { 0.0 } else { 1.0 };
+            let val_t = self.memory.values[t];
+            let val_next = if t < len - 1 { self.memory.values[t+1] } else { 0.0 }; 
+            
+            let delta = self.memory.rewards[t] + GAMMA * val_next * non_terminal - val_t;
+            let gae = delta + GAMMA * GAE_LAMBDA * non_terminal * last_gae_lam;
+            
+            advantages[t] = gae;
+            returns[t] = gae + val_t;
+            
+            last_gae_lam = gae;
+        }
+        
+        let adv_mean: f64 = sum_f64(&advantages) / len as f64;
+        let adv_std: f64 = (sum_sq_diff(&advantages, adv_mean) / len as f64).sqrt() + 1e-8;
+        let norm_advantages: Vec<f64> = normalize_slice(&advantages, adv_mean, adv_std);
+        
+        for _ in 0..self.k_epochs {
+            let indices: Vec<usize> = (0..len).collect();
+            for chunk in indices.chunks(self.batch_size) {
+                self.optimizer.zero_grad();
+                
+                let mut loss_accum = Tensor::zeros(vec![1]);
+                let batch_len = chunk.len();
+                
+                for &i in chunk {
+                    let state = &self.memory.states[i];
+                    let pity = &self.memory.pities[i];
+                    let action_idx = self.memory.actions[i];
+                    let old_log_prob = self.memory.log_probs[i];
+                    let advantage = norm_advantages[i];
+                    let return_val = returns[i];
+                    
+                    let logits = self.policy.forward_actor(state, pity);
+                    let value = self.policy.forward_critic(state, pity);
+                    
+                    let max_logit = logits.data.read().unwrap().iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+                    let exp_logits = (logits.clone() + Tensor::new(vec![-max_logit; ACTION_SPACE], vec![ACTION_SPACE])).exp();
+                    let sum_exp = exp_logits.sum();
+                    let log_sum_exp = sum_exp.log() + Tensor::new(vec![max_logit], vec![1]);
+                    
+                    let mut mask_vec = vec![0.0; ACTION_SPACE];
+                    mask_vec[action_idx] = 1.0;
+                    let mask = Tensor::new(mask_vec, vec![ACTION_SPACE]);
+                    
+                    let log_probs = logits.clone() - log_sum_exp.broadcast(vec![ACTION_SPACE]);
+                    
+                    let log_prob = (log_probs.clone() * mask).sum(); 
+                    
+                    let old_log_prob_tensor = Tensor::new(vec![old_log_prob], vec![1]);
+                    let ratio = (log_prob.clone() - old_log_prob_tensor).exp();
+                    
+                    let adv_tensor = Tensor::new(vec![advantage], vec![1]);
+                    let surr1 = ratio.clone() * adv_tensor.clone();
+                    let ratio_clipped = ratio.clip(1.0 - CLIP_EPSILON, 1.0 + CLIP_EPSILON);
+                    let surr2 = ratio_clipped * adv_tensor;
+                    
+                    let s1_val = surr1.data.read().unwrap()[0];
+                    let s2_val = surr2.data.read().unwrap()[0];
+                    let policy_loss = if s1_val < s2_val { surr1 } else { surr2 };
+                    
+                    let ret_tensor = Tensor::new(vec![return_val], vec![1]);
+                    let v_loss = (value - ret_tensor).mse_loss(&Tensor::zeros(vec![1])); 
+                    
+                    let p = log_probs.exp();
+                    let entropy = -(p * log_probs).sum();
+                    
+                    let loss = -policy_loss + v_loss * Tensor::new(vec![VALUE_COEF], vec![1]) - entropy * Tensor::new(vec![ENTROPY_COEF], vec![1]);
+                    
+                    loss_accum = loss_accum + loss;
+                }
+                
+                let batch_size_tensor = Tensor::new(vec![batch_len as f64], vec![1]);
+                let final_loss = loss_accum / batch_size_tensor;
+                
+                final_loss.backward();
+                self.optimizer.step();
+            }
+        }
+        
+        self.memory.states.clear();
+        self.memory.pities.clear();
+        self.memory.actions.clear();
+        self.memory.log_probs.clear();
+        self.memory.rewards.clear();
+        self.memory.is_terminals.clear();
+        self.memory.values.clear();
+    }
+}
+
+pub fn train_ppo(
+    rng: &mut Rng,
+    dbn: &Dbn,
+    config: &Config,
+) -> ActorCritic {
+    println!("\n[PPO] Initializing PPO Training (Actor-Critic)...");
+    let fast_mode = config.fast_init || config.ppo_mode == "fast";
+    let total_steps = if config.ppo_total_steps > 0 {
+        config.ppo_total_steps
+    } else if fast_mode {
+        4_000
+    } else {
+        20_000
+    };
+    let steps_per_update = if config.ppo_steps_per_update > 0 {
+        config.ppo_steps_per_update
+    } else if fast_mode {
+        256
+    } else {
+        1_024
+    };
+    let k_epochs = if config.ppo_k_epochs > 0 {
+        config.ppo_k_epochs
+    } else if fast_mode {
+        2
+    } else {
+        3
+    };
+    let batch_size = if config.ppo_batch_size > 0 {
+        config.ppo_batch_size
+    } else {
+        128
+    };
+    let context_len = if config.ppo_context_len > 0 {
+        config.ppo_context_len
+    } else if fast_mode {
+        6
+    } else {
+        8
+    };
+    let mut ppo = PPO::new(rng.next_u64(), k_epochs, batch_size);
+    let mut steps_done = 0;
+    
+    let mut state_struct = PullState {
+        pity_6: 0,
+        total_pulls_in_pool: 0,
+        has_obtained_up: false,
+        streak_4_star: 0,
+        loss_streak: 0,
+    };
+    let (mut env_noise, mut env_bias) = dbn_env(dbn, rng);
+    let mut pulls_done = 0; 
+    
+    let mut history_buffer: VecDeque<Vec<f64>> = VecDeque::with_capacity(context_len);
+    let mut pity_buffer: VecDeque<usize> = VecDeque::with_capacity(context_len);
+    let mut flat_data: Vec<f64> = Vec::with_capacity(context_len * DIM);
+    let mut pity_vec: Vec<usize> = Vec::with_capacity(context_len);
+    
+    let mut recent_rewards: VecDeque<f64> = VecDeque::with_capacity(50);
+    let mut _episode_count = 0;
+
+    while steps_done < total_steps {
+        let mut episode_reward = 0.0;
+        
+        for _ in 0..steps_per_update {
+            let current_state_raw = build_features(
+                state_struct.pity_6,
+                pulls_done,
+                env_noise,
+                state_struct.streak_4_star,
+                env_bias,
+                state_struct.loss_streak,
+                config
+            ).to_vec();
+            
+            let current_pity = state_struct.pity_6 as usize;
+            
+            history_buffer.push_back(current_state_raw);
+            pity_buffer.push_back(current_pity);
+            if history_buffer.len() > context_len {
+                history_buffer.pop_front();
+                pity_buffer.pop_front();
+            }
+            
+            let seq_len = history_buffer.len();
+            flat_data.clear();
+            for s in history_buffer.iter() {
+                flat_data.extend_from_slice(s);
+            }
+            let current_state_tensor = Tensor::new(flat_data.clone(), vec![seq_len, DIM]);
+            
+            pity_vec.clear();
+            pity_vec.extend(pity_buffer.iter().copied());
+            let (action_idx, log_prob, val) = ppo.policy.step(&current_state_tensor, &pity_vec);
+            
+            let luck_modifier = ACTIONS[action_idx];
+            let base_prob_6 = prob_6(state_struct.pity_6, config);
+            let final_prob_6 = (base_prob_6 + luck_modifier).clamp(0.0, 1.0);
+            
+            let r = rng.next_f64();
+            let mut is_six = false;
+            let mut is_up = false;
+            
+            state_struct.pity_6 += 1;
+            state_struct.total_pulls_in_pool += 1;
+            
+            if state_struct.total_pulls_in_pool == config.big_pity_cumulative && !state_struct.has_obtained_up {
+                 is_six = true;
+                 is_up = true;
+                 state_struct.pity_6 = 0;
+                 state_struct.streak_4_star = 0;
+                 state_struct.loss_streak = 0;
+                 state_struct.has_obtained_up = true;
+            } else if r < final_prob_6 {
+                 is_six = true;
+                 state_struct.pity_6 = 0;
+                 state_struct.streak_4_star = 0;
+                 if rng.next_f64() < 0.5 {
+                     is_up = true;
+                     state_struct.loss_streak = 0;
+                     state_struct.has_obtained_up = true;
+                 } else {
+                     state_struct.loss_streak += 1;
+                 }
+            } else {
+                 if state_struct.streak_4_star >= 9 || r < final_prob_6 + config.prob_5_base {
+                     state_struct.streak_4_star = 0;
+                 } else {
+                     state_struct.streak_4_star += 1;
+                 }
+            }
+            pulls_done += 1;
+            
+            let mut reward = -0.1;
+            if is_six {
+                if is_up { reward += 10.0; } else { reward += 2.0; }
+            }
+            if state_struct.loss_streak >= 2 {
+                reward -= (state_struct.loss_streak as f64) * 0.5;
+            }
+            episode_reward += reward;
+            
+            let done = is_up || pulls_done >= 300;
+            
+            ppo.store(current_state_tensor, pity_vec.clone(), action_idx, log_prob, reward, done, val);
+            
+            if done {
+                history_buffer.clear();
+                pity_buffer.clear();
+                _episode_count += 1;
+                recent_rewards.push_back(episode_reward);
+                if recent_rewards.len() > 50 { recent_rewards.pop_front(); }
+
+                state_struct = PullState {
+                    pity_6: 0,
+                    total_pulls_in_pool: 0,
+                    has_obtained_up: false,
+                    streak_4_star: 0,
+                    loss_streak: 0,
+                };
+                let new_env = dbn_env(dbn, rng);
+                env_noise = new_env.0;
+                env_bias = new_env.1;
+                pulls_done = 0;
+                episode_reward = 0.0;
+            }
+        }
+        
+        ppo.update();
+        steps_done += steps_per_update;
+        
+        let avg_r = if recent_rewards.is_empty() { 0.0 } else { recent_rewards.iter().sum::<f64>() / recent_rewards.len() as f64 };
+        print!("\r[PPO] Steps: {}/{} | Avg Reward: {:.2}", steps_done, total_steps, avg_r);
+        use std::io::Write;
+        std::io::stdout().flush().unwrap();
+    }
+    println!("\n[PPO] Training Complete.");
+        ppo.policy
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sum_f64_matches_scalar() {
+        let values = vec![1.0, -2.5, 3.25, 4.0, -5.0, 6.5, 7.75, -8.0, 9.0];
+        let mut expected = 0.0;
+        for v in &values {
+            expected += v;
+        }
+        let got = sum_f64(&values);
+        assert!((got - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn normalize_slice_zero_mean_unit_std() {
+        let values = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let mean = sum_f64(&values) / values.len() as f64;
+        let std = (sum_sq_diff(&values, mean) / values.len() as f64).sqrt() + 1e-8;
+        let norm = normalize_slice(&values, mean, std);
+        let norm_mean = sum_f64(&norm) / norm.len() as f64;
+        let norm_std = (sum_sq_diff(&norm, 0.0) / norm.len() as f64).sqrt();
+        assert!(norm_mean.abs() < 1e-9);
+        assert!((norm_std - 1.0).abs() < 1e-6);
+    }
+}
