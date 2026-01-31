@@ -32,6 +32,51 @@ Talos-XII是一款使用了深度学习技术的《明日方舟：终末地》�
 
 
 
+## 开发与部署
+
+### 环境要求
+*   **操作系统**：Windows 10/11 (x86_64) 或 Linux (x86_64/aarch64)
+*   **编译器**：Rust 1.75.0 或更高版本 (支持 `portable_simd` 特性)
+*   **内存**：建议 16GB RAM 或以上 (大规模模拟需要较大内存)
+*   **处理器**：支持 AVX2 (Intel/AMD) 或 NEON (ARM) 指令集的 CPU 推荐
+
+### 构建指南
+1.  **克隆仓库**
+    ```bash
+    git clone https://github.com/zayoka/Endfield-Simulator.git
+    cd Endfield-Simulator
+    ```
+
+2.  **编译项目**
+    *   **开发模式** (调试构建，速度较慢，含调试符号):
+        ```bash
+        cargo build
+        ```
+    *   **生产模式** (高性能优化，推荐):
+        ```bash
+        cargo build --release
+        ```
+    *   *注：构建脚本会自动检测 CPU 架构并启用相应的 SIMD 优化 (AVX2/NEON)。*
+
+3.  **运行程序**
+    ```bash
+    cargo run --release
+    ```
+    或直接运行生成的可执行文件：
+    ```bash
+    ./target/release/talos_xii
+    ```
+
+### 部署配置
+项目包含一个默认配置文件 `data/config.json`，您可以根据需求修改以下参数：
+
+*   `pool_name`: 卡池名称
+*   `up_six`: 当期 UP 六星干员列表
+*   `prob_6_base`: 六星基础概率 (默认 0.008)
+*   `fast_init`: 是否启用快速初始化模式 (true/false) - 设为 `true` 可显著加快启动速度，适合开发调试
+*   `ppo_mode`: PPO 训练模式 ("auto" / "fast" / "balanced")
+*   `worker_max_threads`: 线程池最大线程数 (0 为自动)
+
 ## 技术栈
 *   **编程语言**：Rust
 *   **并行计算**：Rayon (线程池与任务调度)
