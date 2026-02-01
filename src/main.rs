@@ -393,7 +393,7 @@ fn train_linear_regression(
     base.set_linear_params([0.0; DIM], 0.0);
     
     let sim_count = if config.fast_init {
-        if cfg!(debug_assertions) { 20 } else { 80 }
+        if cfg!(debug_assertions) { 10 } else { 40 }
     } else if cfg!(debug_assertions) { 50 } else { 200 };
     // This will generate ~10k to 40k data points (50 * 200 = 10000)
     let data = simulate_for_data_collection(sim_count, rng, &base, dbn, config);
@@ -401,7 +401,7 @@ fn train_linear_regression(
     println!("[Linear] Collected {} samples from realistic simulation trajectories.", data.len());
 
     let epochs = if config.fast_init {
-        if cfg!(debug_assertions) { 2 } else { 6 }
+        if cfg!(debug_assertions) { 1 } else { 3 }
     } else if cfg!(debug_assertions) { 4 } else { 12 };
     let mut weights = [0.0; DIM];
     let mut bias = 0.0;
@@ -426,18 +426,14 @@ fn train_linear_regression(
     (weights, bias)
 }
 
-fn evaluate_linear_reward(
-    weights: [f64; DIM],
-    bias: f64,
-    base: &NeuralLuckOptimizer,
+fn evaluate_manifold_reward(
+    model: &NeuralLuckOptimizer,
     rng: &mut Rng,
     dbn: &Dbn,
     config: &Config,
 ) -> f64 {
-    let mut model = base.clone();
-    model.set_linear_params(weights, bias);
     let sims = if cfg!(debug_assertions) { 2000 } else { 6000 };
-    let res = simulate_fast(sims, rng, 0, &model, None, None, dbn, config);
+    let res = simulate_fast(sims, rng, 0, model, None, None, dbn, config);
     let expected_pulls = expected_pulls_per_six(config);
     let target_rate = if expected_pulls > 0.0 {
         1.0 / expected_pulls
@@ -456,71 +452,87 @@ fn train_manifold_rl(
     rng: &mut Rng,
     dbn: &Dbn,
     config: &Config,
-    init_weights: [f64; DIM],
-    init_bias: f64,
     worker: &GoodJobWorker,
-) -> ([f64; DIM], f64) {
+) -> NeuralLuckOptimizer {
     let iterations = if config.fast_init {
-        if cfg!(debug_assertions) { 4 } else { 12 }
+        if cfg!(debug_assertions) { 2 } else { 6 }
     } else if cfg!(debug_assertions) { 8 } else { 30 };
     let population = if config.fast_init {
-        if cfg!(debug_assertions) { 8 } else { 24 }
+        if cfg!(debug_assertions) { 4 } else { 12 }
     } else if cfg!(debug_assertions) { 16 } else { 64 };
-    let sigma = if config.fast_init {
-        if cfg!(debug_assertions) { 0.2 } else { 0.15 }
-    } else if cfg!(debug_assertions) { 0.15 } else { 0.1 };
-    let lr = if config.fast_init {
-        if cfg!(debug_assertions) { 0.4 } else { 0.15 }
-    } else if cfg!(debug_assertions) { 0.3 } else { 0.1 };
-    let _momentum = 0.85;
-
-    let mut weights = init_weights;
-    let mut bias = init_bias;
     
-    // Adam optimizer state for mHC
-    let mut m_weights = [0.0; DIM];
-    let mut v_weights_sq = [0.0; DIM];
-    let mut m_bias = 0.0;
-    let mut v_bias_sq = 0.0;
+    // Multi-Manifold Topology Mapping Hyperparameters
+    let mut sigma_analysis = 0.02; // Stiffer manifold for feature extraction
+    let mut sigma_decision = 0.15; // More flexible manifold for decision making
+    let l1_lambda = 0.005; // L1 Regularization strength for sparsity
+
+    let lr = if config.fast_init {
+        if cfg!(debug_assertions) { 0.1 } else { 0.05 }
+    } else if cfg!(debug_assertions) { 0.08 } else { 0.04 };
+    
+    let mut current_opt = base.clone();
+    let mut params = current_opt.get_params();
+    let n_params = params.len();
+    let n_analysis = NeuralLuckOptimizer::count_params_analysis();
+    
+    // Adam optimizer state
+    let mut m = vec![0.0; n_params];
+    let mut v_sq = vec![0.0; n_params];
     let beta1 = 0.9;
     let beta2 = 0.999;
     let epsilon = 1e-8;
 
-    println!("[RL] Manifold Optimization: Pop={}, Iter={}, Adam-ES", population, iterations);
+    println!("[RL] Manifold Optimization (MMTM): Pop={}, Iter={}, AnalysisParams={}, DecisionParams={}", 
+             population, iterations, n_analysis, n_params - n_analysis);
 
     for iter in 0..iterations {
-        // ... (Perturbation generation and evaluation remains same)
         let mut noise_seeds: Vec<u64> = Vec::with_capacity(population);
         for _ in 0..population {
             noise_seeds.push(rng.next_u64());
         }
 
+        // Parallel Evaluation
         let results = worker.execute(|| {
             noise_seeds.into_par_iter().map(|seed| {
                 let mut local_rng = Rng::from_seed(seed);
                 
-                let mut eps = [0.0; DIM];
-                for val in eps.iter_mut().take(DIM) {
-                    *val = local_rng.next_f64_normal();
+                // Generate perturbation vector
+                let mut eps = vec![0.0; n_params];
+                for (i, val) in eps.iter_mut().enumerate() {
+                    let noise = local_rng.next_f64_normal();
+                    // Apply manifold-specific scaling
+                    let sigma = if i < n_analysis { sigma_analysis } else { sigma_decision };
+                    *val = noise * sigma;
                 }
-                let eps_b = local_rng.next_f64_normal();
 
-                let mut w_pos = weights;
-                let mut w_neg = weights;
-                for i in 0..DIM {
-                    w_pos[i] += sigma * eps[i];
-                    w_neg[i] -= sigma * eps[i];
+                // Create Positive and Negative variants
+                let mut params_pos = params.clone();
+                let mut params_neg = params.clone();
+                
+                for i in 0..n_params {
+                    params_pos[i] += eps[i];
+                    params_neg[i] -= eps[i];
                 }
-                let b_pos = bias + sigma * eps_b;
-                let b_neg = bias - sigma * eps_b;
+                
+                let mut opt_pos = current_opt.clone();
+                opt_pos.set_params(&params_pos);
+                
+                let mut opt_neg = current_opt.clone();
+                opt_neg.set_params(&params_neg);
 
                 let mut sim_rng_pos = Rng::from_seed(local_rng.next_u64());
                 let mut sim_rng_neg = Rng::from_seed(local_rng.next_u64());
 
-                let r_pos = evaluate_linear_reward(w_pos, b_pos, base, &mut sim_rng_pos, dbn, config);
-                let r_neg = evaluate_linear_reward(w_neg, b_neg, base, &mut sim_rng_neg, dbn, config);
+                let mut r_pos = evaluate_manifold_reward(&opt_pos, &mut sim_rng_pos, dbn, config);
+                let mut r_neg = evaluate_manifold_reward(&opt_neg, &mut sim_rng_neg, dbn, config);
                 
-                (eps, eps_b, r_pos, r_neg)
+                // Add L1 Penalty for Sparsity
+                let l1_pos: f64 = params_pos.iter().map(|x| x.abs()).sum();
+                let l1_neg: f64 = params_neg.iter().map(|x| x.abs()).sum();
+                r_pos -= l1_pos * l1_lambda;
+                r_neg -= l1_neg * l1_lambda;
+
+                (eps, r_pos, r_neg)
             }).collect::<Vec<_>>()
         });
 
@@ -533,15 +545,19 @@ fn train_manifold_rl(
         };
 
         // Aggregate gradients
-        let mut grad = [0.0; DIM];
-        let mut grad_b = 0.0;
+        let mut grad = vec![0.0; n_params];
         let mut avg_reward = 0.0;
 
-        for (eps, eps_b, r_pos, r_neg) in results {
+        for (eps, r_pos, r_neg) in results {
             let diff = r_pos - r_neg;
             avg_reward += (r_pos + r_neg) / 2.0;
+            
+            // Standard ES gradient approximation:
+            // g ~ (1 / (pop * sigma^2)) * sum(reward_diff * noise * sigma)
+            // Here eps is already (noise * sigma).
+            // So we just accumulate (diff * eps). 
+            
             add_scaled_row(&mut grad, &eps, diff);
-            grad_b += diff * eps_b;
         }
         avg_reward /= population as f64;
 
@@ -551,34 +567,87 @@ fn train_manifold_rl(
         }
 
         // Apply Adam Update
-        // Note: The gradient here is actually sum(diff * eps), which is ~ proportional to true gradient * population * sigma.
-        // Standard ES gradient estimate is g ~ 1/(pop*sigma) * sum(diff * eps).
-        // Let's normalize it properly.
-        let grad_scale = 1.0 / (population as f64 * sigma);
+        // We need to normalize grad by population.
+        // And effectively divide by sigma^2 for correct gradient scale?
+        // Or just let Adam handle the scaling.
+        // But since sigma_analysis << sigma_decision, the `eps` values for analysis are small.
+        // So `grad` for analysis will be small.
+        // But the sensitivity might be high.
+        // Let's normalize by population first.
+        let scale = 1.0 / population as f64;
         
-        for i in 0..DIM {
-            let g = grad[i] * grad_scale;
-            // Adam update for weights[i]
-            // Note: We are maximizing reward, so this is Gradient Ascent.
-            m_weights[i] = beta1 * m_weights[i] + (1.0 - beta1) * g;
-            v_weights_sq[i] = beta2 * v_weights_sq[i] + (1.0 - beta2) * g * g;
+        for i in 0..n_params {
+            let g = grad[i] * scale;
             
-            let m_hat = m_weights[i] / (1.0 - beta1.powi((iter + 1) as i32));
-            let v_hat = v_weights_sq[i] / (1.0 - beta2.powi((iter + 1) as i32));
+            // Adam
+            m[i] = beta1 * m[i] + (1.0 - beta1) * g;
+            v_sq[i] = beta2 * v_sq[i] + (1.0 - beta2) * g * g;
             
-            weights[i] += lr * m_hat / (v_hat.sqrt() + epsilon);
+            let m_hat = m[i] / (1.0 - beta1.powi((iter + 1) as i32));
+            let v_hat = v_sq[i] / (1.0 - beta2.powi((iter + 1) as i32));
+            
+            // For MMTM, we might want to scale the update step by sigma again?
+            // Or just rely on LR.
+            // With small sigma, the gradient estimate is noisy but also small.
+            // Adam's adaptive moment might boost it if consistent.
+            
+            params[i] += lr * m_hat / (v_hat.sqrt() + epsilon);
         }
         
-        // Adam update for bias
-        let gb = grad_b * grad_scale;
-        m_bias = beta1 * m_bias + (1.0 - beta1) * gb;
-        v_bias_sq = beta2 * v_bias_sq + (1.0 - beta2) * gb * gb;
-        let mb_hat = m_bias / (1.0 - beta1.powi((iter + 1) as i32));
-        let vb_hat = v_bias_sq / (1.0 - beta2.powi((iter + 1) as i32));
-        bias += lr * mb_hat / (vb_hat.sqrt() + epsilon);
+        // === Dynamic Curvature Adaptation ===
+        // We use the Adam second moment estimate (v_sq) to infer the local curvature (gradient magnitude).
+        // High v_sq -> Steep gradients -> High curvature -> We need smaller exploration noise (trust region).
+        // Low v_sq -> Flat gradients -> Low curvature -> We can explore more.
+        
+        // Calculate average v_hat for analysis and decision blocks
+        let mut v_sum_analysis = 0.0;
+        let mut v_sum_decision = 0.0;
+        
+        for i in 0..n_params {
+            let v_hat = v_sq[i] / (1.0 - beta2.powi((iter + 1) as i32));
+            if i < n_analysis {
+                v_sum_analysis += v_hat;
+            } else {
+                v_sum_decision += v_hat;
+            }
+        }
+        
+        let v_avg_analysis = v_sum_analysis / n_analysis as f64;
+        let v_avg_decision = v_sum_decision / (n_params - n_analysis) as f64;
+        
+        // Adapt sigmas: sigma ~ Base / (1 + Scale * sqrt(v_avg))
+        // This is a heuristic to inversely scale noise with gradient magnitude.
+        
+        let curvature_scale = 10.0; // Tuning parameter
+        sigma_analysis = 0.02 / (1.0 + curvature_scale * v_avg_analysis.sqrt());
+        sigma_decision = 0.15 / (1.0 + curvature_scale * v_avg_decision.sqrt());
+        
+        // Clamp to safe ranges
+        sigma_analysis = sigma_analysis.clamp(0.001, 0.05);
+        sigma_decision = sigma_decision.clamp(0.01, 0.3);
+
+        if iter % 5 == 0 {
+             // Print curvature stats
+             print!(" [Sigma: A={:.4}, D={:.4}]", sigma_analysis, sigma_decision);
+             io::stdout().flush().unwrap();
+        }
+
+        current_opt.set_params(&params);
     }
-    println!(); // Newline after progress bar
-    (weights, bias)
+    
+    // Apply Pruning (Sparse Hyper-Connections)
+    println!(); // Newline
+    println!("[RL] Applying Sparse Hyper-Connections (Pruning)...");
+    let initial_active = current_opt.count_active_params();
+    current_opt.prune(0.01); // Prune weights < 0.01
+    let final_active = current_opt.count_active_params();
+    let total_params = NeuralLuckOptimizer::param_count();
+    let sparsity = 1.0 - (final_active as f64 / total_params as f64);
+    
+    println!("[RL] Pruning Complete: {} -> {} active params (Sparsity: {:.1}%)", 
+             initial_active, final_active, sparsity * 100.0);
+             
+    current_opt
 }
 
 fn prompt_yes_no(prompt: &str, default_yes: bool) -> bool {
@@ -1051,7 +1120,7 @@ fn main() {
 
     let mut dbn = Dbn::new(&[8, 16, 8], &mut rng);
     let (dbn_data_count, dbn_epochs) = if config.fast_init {
-        if cfg!(debug_assertions) { (128, 3) } else { (512, 8) }
+        if cfg!(debug_assertions) { (64, 2) } else { (256, 4) }
     } else if cfg!(debug_assertions) {
         (256, 5)
     } else {
@@ -1082,10 +1151,12 @@ fn main() {
     trained_neural_opt.set_linear_params(lin_w, lin_b);
     println!("[Linear] Regression complete.");
     println!("[RL] Manifold Optimization (Parallel)...");
-    let (rl_w, rl_b) = train_manifold_rl(&trained_neural_opt, &mut rng, &dbn, &config, lin_w, lin_b, &worker);
-    trained_neural_opt.set_linear_params(rl_w, rl_b);
+    trained_neural_opt = train_manifold_rl(&trained_neural_opt, &mut rng, &dbn, &config, &worker);
     println!("[RL] Fine-tuning complete.");
     
+    let rl_w = trained_neural_opt.linear_weights;
+    let rl_b = trained_neural_opt.linear_bias;
+
     // === EXPLAINABILITY REPORT ===
     println!("\n[Model Insight] Linear Manifold Analysis:");
     let feature_names = [

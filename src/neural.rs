@@ -139,12 +139,28 @@ impl DenseLayer {
         output
     }
 
-    fn write_params(&self, out: &mut Vec<f64>) {
+    pub fn get_params(&self) -> Vec<f64> {
+        let mut params = Vec::new();
+        self.write_params(&mut params);
+        params
+    }
+
+    pub fn set_params(&mut self, params: &[f64]) -> bool {
+        let mut idx = 0;
+        if let Some(new_layer) = Self::read_params(params, &mut idx) {
+            *self = new_layer;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn write_params(&self, out: &mut Vec<f64>) {
         out.extend_from_slice(&self.weights);
         out.extend_from_slice(&self.bias);
     }
 
-    fn read_params(data: &[f64], idx: &mut usize) -> Option<Self> {
+    pub fn read_params(data: &[f64], idx: &mut usize) -> Option<Self> {
         let total = DIM * DIM + DIM;
         if *idx + total > data.len() {
             return None;
@@ -156,6 +172,26 @@ impl DenseLayer {
         bias.copy_from_slice(&data[*idx..*idx + DIM]);
         *idx += DIM;
         Some(DenseLayer { weights, bias })
+    }
+
+    pub fn prune(&mut self, threshold: f64) {
+        for w in self.weights.iter_mut() {
+            if w.abs() < threshold {
+                *w = 0.0;
+            }
+        }
+    }
+
+    pub fn count_active_params(&self) -> usize {
+        let mut count = 0;
+        for w in self.weights.iter() {
+            if w.abs() > 1e-9 {
+                count += 1;
+            }
+        }
+        // Bias is usually not pruned, but let's count it if we want full sparsity
+        // Usually we only prune weights.
+        count
     }
 }
 
@@ -208,12 +244,28 @@ impl LayerNorm {
         output
     }
 
-    fn write_params(&self, out: &mut Vec<f64>) {
+    pub fn get_params(&self) -> Vec<f64> {
+        let mut params = Vec::new();
+        self.write_params(&mut params);
+        params
+    }
+
+    pub fn set_params(&mut self, params: &[f64]) -> bool {
+        let mut idx = 0;
+        if let Some(new_layer) = Self::read_params(params, &mut idx) {
+            *self = new_layer;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn write_params(&self, out: &mut Vec<f64>) {
         out.extend_from_slice(&self.gamma);
         out.extend_from_slice(&self.beta);
     }
 
-    fn read_params(data: &[f64], idx: &mut usize) -> Option<Self> {
+    pub fn read_params(data: &[f64], idx: &mut usize) -> Option<Self> {
         let total = DIM + DIM;
         if *idx + total > data.len() {
             return None;
@@ -267,19 +319,44 @@ impl ResidualBlock {
         tensor_add(x, &h2_act)
     }
 
-    fn write_params(&self, out: &mut Vec<f64>) {
+    pub fn get_params(&self) -> Vec<f64> {
+        let mut params = Vec::new();
+        self.write_params(&mut params);
+        params
+    }
+
+    pub fn set_params(&mut self, params: &[f64]) -> bool {
+        let mut idx = 0;
+        if let Some(new_block) = Self::read_params(params, &mut idx) {
+            *self = new_block;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn write_params(&self, out: &mut Vec<f64>) {
         self.d1.write_params(out);
         self.ln1.write_params(out);
         self.d2.write_params(out);
         self.ln2.write_params(out);
     }
 
-    fn read_params(data: &[f64], idx: &mut usize) -> Option<Self> {
+    pub fn read_params(data: &[f64], idx: &mut usize) -> Option<Self> {
         let d1 = DenseLayer::read_params(data, idx)?;
         let ln1 = LayerNorm::read_params(data, idx)?;
         let d2 = DenseLayer::read_params(data, idx)?;
         let ln2 = LayerNorm::read_params(data, idx)?;
         Some(ResidualBlock { d1, ln1, d2, ln2 })
+    }
+
+    pub fn prune(&mut self, threshold: f64) {
+        self.d1.prune(threshold);
+        self.d2.prune(threshold);
+    }
+
+    pub fn count_active_params(&self) -> usize {
+        self.d1.count_active_params() + self.d2.count_active_params()
     }
 }
 
@@ -316,6 +393,76 @@ impl NeuralLuckOptimizer {
     pub fn set_linear_params(&mut self, weights: [f64; DIM], bias: f64) {
         self.linear_weights = weights;
         self.linear_bias = bias;
+    }
+
+    pub fn get_params(&self) -> Vec<f64> {
+        let mut params = Vec::new();
+        self.write_params(&mut params);
+        params
+    }
+
+    pub fn set_params(&mut self, params: &[f64]) -> bool {
+        let mut idx = 0;
+        if let Some(new_opt) = Self::read_params(params, &mut idx) {
+            *self = new_opt;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn count_params_analysis() -> usize {
+        // ResidualBlock: 2 * (DenseLayer + LayerNorm)
+        // DenseLayer: DIM*DIM + DIM
+        // LayerNorm: DIM + DIM
+        2 * (DIM * DIM + DIM + 2 * DIM)
+    }
+
+    pub fn count_params_decision() -> usize {
+        DIM + 1
+    }
+
+    pub fn write_params(&self, out: &mut Vec<f64>) {
+        self.res_block.write_params(out);
+        out.extend_from_slice(&self.linear_weights);
+        out.push(self.linear_bias);
+    }
+
+    pub fn read_params(data: &[f64], idx: &mut usize) -> Option<Self> {
+        let res_block = ResidualBlock::read_params(data, idx)?;
+        if *idx + DIM + 1 > data.len() {
+            return None;
+        }
+        let mut linear_weights = [0.0; DIM];
+        linear_weights.copy_from_slice(&data[*idx..*idx + DIM]);
+        *idx += DIM;
+        let linear_bias = data[*idx];
+        *idx += 1;
+        Some(NeuralLuckOptimizer {
+            res_block,
+            linear_weights,
+            linear_bias,
+        })
+    }
+
+    pub fn prune(&mut self, threshold: f64) {
+        self.res_block.prune(threshold);
+        // Linear weights are part of the decision manifold, can also be pruned
+        for w in self.linear_weights.iter_mut() {
+            if w.abs() < threshold {
+                *w = 0.0;
+            }
+        }
+    }
+
+    pub fn count_active_params(&self) -> usize {
+        let mut count = self.res_block.count_active_params();
+        for w in self.linear_weights.iter() {
+            if w.abs() > 1e-9 {
+                count += 1;
+            }
+        }
+        count
     }
 
     fn param_count_v1() -> usize {
