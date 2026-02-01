@@ -7,6 +7,8 @@ use crate::rng::Rng;
 use crate::transformer::{LuckTransformer, Linear};
 use std::collections::VecDeque;
 
+use serde::{Serialize, Deserialize};
+
 // --- PPO Components ---
 
 const ACTION_SPACE: usize = 5;
@@ -228,7 +230,7 @@ unsafe fn normalize_slice_neon(values: &[f64], out: &mut [f64], mean: f64, std: 
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ActorCritic {
     pub backbone: LuckTransformer,
     pub actor_head: Linear,
@@ -237,16 +239,18 @@ pub struct ActorCritic {
 
 impl ActorCritic {
     pub fn new(seed: u64) -> Self {
-        let backbone = LuckTransformer::new(DIM, 64);
-        let actor_head = Linear::new(64, ACTION_SPACE, seed.wrapping_add(100));
-        let critic_head = Linear::new(64, 1, seed.wrapping_add(200));
+        let backbone = LuckTransformer::new(DIM, 64, true, seed);
+        let actor_head = Linear::new(64, ACTION_SPACE, true, seed.wrapping_add(100));
+        let critic_head = Linear::new(64, 1, true, seed.wrapping_add(200));
         
         ActorCritic { backbone, actor_head, critic_head }
     }
 
     pub fn forward_actor(&self, state: &Tensor, pity: &[usize]) -> Tensor {
         let x = if state.shape.len() == 1 {
-             state.reshape(vec![1, state.shape[0]])
+             state.reshape(vec![1, 1, state.shape[0]])
+        } else if state.shape.len() == 2 {
+             state.reshape(vec![1, state.shape[0], state.shape[1]])
         } else {
              state.clone()
         };
@@ -262,7 +266,9 @@ impl ActorCritic {
 
     pub fn forward_critic(&self, state: &Tensor, pity: &[usize]) -> Tensor {
         let x = if state.shape.len() == 1 {
-             state.reshape(vec![1, state.shape[0]])
+             state.reshape(vec![1, 1, state.shape[0]])
+        } else if state.shape.len() == 2 {
+             state.reshape(vec![1, state.shape[0], state.shape[1]])
         } else {
              state.clone()
         };
@@ -321,6 +327,46 @@ impl ActorCritic {
 
 // --- Optimizer (Adam) ---
 
+// --- Reward Normalization ---
+
+struct RunningMeanStd {
+    count: f64,
+    mean: f64,
+    var: f64,
+}
+
+impl RunningMeanStd {
+    fn new() -> Self {
+        RunningMeanStd {
+            count: 1e-4, // Avoid division by zero
+            mean: 0.0,
+            var: 1.0,
+        }
+    }
+
+    fn update(&mut self, x: f64) {
+        let batch_mean = x;
+        let batch_var = 0.0; // Single sample update for simplicity in this loop
+        let batch_count = 1.0;
+
+        let delta = batch_mean - self.mean;
+        let tot_count = self.count + batch_count;
+
+        let new_mean = self.mean + delta * batch_count / tot_count;
+        let m_a = self.var * self.count;
+        let m_b = batch_var * batch_count;
+        let m_2 = m_a + m_b + delta.powi(2) * self.count * batch_count / tot_count;
+        
+        self.mean = new_mean;
+        self.var = m_2 / tot_count;
+        self.count = tot_count;
+    }
+    
+    fn normalize(&self, x: f64) -> f64 {
+        (x - self.mean) / (self.var.sqrt() + 1e-8)
+    }
+}
+
 struct Adam {
     params: Vec<Tensor>,
     m: Vec<Vec<f64>>,
@@ -339,6 +385,10 @@ impl Adam {
         Adam {
             params, m, v, t: 0, lr, beta1: 0.9, beta2: 0.999, eps: 1e-8,
         }
+    }
+
+    fn set_lr(&mut self, lr: f64) {
+        self.lr = lr;
     }
 
     fn step(&mut self) {
@@ -382,6 +432,7 @@ pub struct PPO {
     memory: Memory,
     k_epochs: usize,
     batch_size: usize,
+    reward_normalizer: RunningMeanStd,
 }
 
 impl PPO {
@@ -402,10 +453,14 @@ impl PPO {
             },
             k_epochs,
             batch_size,
+            reward_normalizer: RunningMeanStd::new(),
         }
     }
     
     pub fn store(&mut self, state: Tensor, pity: Vec<usize>, action: usize, log_prob: f64, reward: f64, done: bool, value: f64) {
+        // Update reward normalizer
+        self.reward_normalizer.update(reward);
+        
         self.memory.states.push(state);
         self.memory.pities.push(pity);
         self.memory.actions.push(action);
@@ -415,8 +470,11 @@ impl PPO {
         self.memory.values.push(value);
     }
     
-    pub fn update(&mut self) {
+    pub fn update(&mut self, current_lr: f64) {
         if self.memory.states.is_empty() { return; }
+        
+        // Update Learning Rate
+        self.optimizer.set_lr(current_lr);
         
         let len = self.memory.states.len();
         let mut advantages = vec![0.0; len];
@@ -424,12 +482,18 @@ impl PPO {
         
         let mut last_gae_lam = 0.0;
         
+        // Normalize rewards for GAE calculation
+        let norm_rewards: Vec<f64> = self.memory.rewards.iter()
+            .map(|&r| self.reward_normalizer.normalize(r).max(-10.0).min(10.0)) // Clip for stability
+            .collect();
+        
         for t in (0..len).rev() {
             let non_terminal = if self.memory.is_terminals[t] { 0.0 } else { 1.0 };
             let val_t = self.memory.values[t];
             let val_next = if t < len - 1 { self.memory.values[t+1] } else { 0.0 }; 
             
-            let delta = self.memory.rewards[t] + GAMMA * val_next * non_terminal - val_t;
+            // Use normalized rewards for training signal
+            let delta = norm_rewards[t] + GAMMA * val_next * non_terminal - val_t;
             let gae = delta + GAMMA * GAE_LAMBDA * non_terminal * last_gae_lam;
             
             advantages[t] = gae;
@@ -442,8 +506,14 @@ impl PPO {
         let adv_std: f64 = (sum_sq_diff(&advantages, adv_mean) / len as f64).sqrt() + 1e-8;
         let norm_advantages: Vec<f64> = normalize_slice(&advantages, adv_mean, adv_std);
         
+        // Target KL Divergence for Early Stopping
+        let target_kl = 0.015;
+        
         for _ in 0..self.k_epochs {
             let indices: Vec<usize> = (0..len).collect();
+            let mut approx_kl = 0.0;
+            let mut batch_count = 0.0;
+            
             for chunk in indices.chunks(self.batch_size) {
                 self.optimizer.zero_grad();
                 
@@ -475,7 +545,15 @@ impl PPO {
                     let log_prob = (log_probs.clone() * mask).sum(); 
                     
                     let old_log_prob_tensor = Tensor::new(vec![old_log_prob], vec![1]);
-                    let ratio = (log_prob.clone() - old_log_prob_tensor).exp();
+                    // Use references to avoid moving, cleaner than explicit clones
+                    let log_ratio = &log_prob - &old_log_prob_tensor;
+                    let ratio = log_ratio.clone().exp();
+                    
+                    // Calculate KL Divergence
+                    // kl = (ratio - 1) - log_ratio
+                    let kl = (ratio.clone() - Tensor::new(vec![1.0], vec![1])) - log_ratio.clone();
+                    approx_kl += kl.data.read().unwrap()[0];
+                    batch_count += 1.0;
                     
                     let adv_tensor = Tensor::new(vec![advantage], vec![1]);
                     let surr1 = ratio.clone() * adv_tensor.clone();
@@ -502,6 +580,15 @@ impl PPO {
                 
                 final_loss.backward();
                 self.optimizer.step();
+            }
+            
+            // Early Stopping check
+            if batch_count > 0.0 {
+                approx_kl /= batch_count;
+                if approx_kl > target_kl * 1.5 {
+                    // println!("  [PPO] Early stopping at epoch {} due to KL {:.4}", _, approx_kl);
+                    break;
+                }
             }
         }
         
@@ -575,9 +662,16 @@ pub fn train_ppo(
     
     let mut recent_rewards: VecDeque<f64> = VecDeque::with_capacity(50);
     let mut _episode_count = 0;
+    
+    // Linear LR decay
+    let initial_lr = 0.0003;
 
     while steps_done < total_steps {
         let mut episode_reward = 0.0;
+        
+        // Calculate LR
+        let progress = steps_done as f64 / total_steps as f64;
+        let current_lr = initial_lr * (1.0 - progress).max(0.1); // Decay to 10%
         
         for _ in 0..steps_per_update {
             let current_state_raw = build_features(
@@ -650,10 +744,19 @@ pub fn train_ppo(
             
             let mut reward = -0.1;
             if is_six {
-                if is_up { reward += 10.0; } else { reward += 2.0; }
+                // Massive reward for getting UP, especially early
+                if is_up { 
+                    reward += 10.0; 
+                    // Bonus for efficiency: early pulls get more reward
+                    if pulls_done < 80 { reward += 5.0; }
+                    if pulls_done < 50 { reward += 5.0; }
+                } else { 
+                    // Small reward for non-up 6* to encourage hitting 6* at least
+                    reward += 2.0; 
+                }
             }
             if state_struct.loss_streak >= 2 {
-                reward -= (state_struct.loss_streak as f64) * 0.5;
+                reward -= (state_struct.loss_streak as f64) * 2.0; // Heavily penalize consecutive losses
             }
             episode_reward += reward;
             
@@ -683,11 +786,11 @@ pub fn train_ppo(
             }
         }
         
-        ppo.update();
+        ppo.update(current_lr);
         steps_done += steps_per_update;
         
         let avg_r = if recent_rewards.is_empty() { 0.0 } else { recent_rewards.iter().sum::<f64>() / recent_rewards.len() as f64 };
-        print!("\r[PPO] Steps: {}/{} | Avg Reward: {:.2}", steps_done, total_steps, avg_r);
+        print!("\r[PPO] Steps: {}/{} | Avg Reward: {:.2} | LR: {:.6}", steps_done, total_steps, avg_r, current_lr);
         use std::io::Write;
         std::io::stdout().flush().unwrap();
     }
@@ -720,5 +823,27 @@ mod tests {
         let norm_std = (sum_sq_diff(&norm, 0.0) / norm.len() as f64).sqrt();
         assert!(norm_mean.abs() < 1e-9);
         assert!((norm_std - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_actor_critic_shapes() {
+        let policy = ActorCritic::new(42);
+        
+        // Case 1: 1D input [DIM] (e.g. [8])
+        let state_1d = Tensor::new(vec![0.5; DIM], vec![DIM]);
+        let pity = vec![0];
+        let _ = policy.forward_actor(&state_1d, &pity);
+        let _ = policy.forward_critic(&state_1d, &pity);
+        
+        // Case 2: 2D input [Seq, DIM] (e.g. [5, 8])
+        let seq_len = 5;
+        let state_2d = Tensor::new(vec![0.5; seq_len * DIM], vec![seq_len, DIM]);
+        let _ = policy.forward_actor(&state_2d, &pity);
+        let _ = policy.forward_critic(&state_2d, &pity);
+        
+        // Case 3: 3D input [1, Seq, DIM]
+        let state_3d = Tensor::new(vec![0.5; seq_len * DIM], vec![1, seq_len, DIM]);
+        let _ = policy.forward_actor(&state_3d, &pity);
+        let _ = policy.forward_critic(&state_3d, &pity);
     }
 }

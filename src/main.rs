@@ -904,7 +904,8 @@ fn simulate_f2p_clearing(num_sims: usize, seed: u64, neural_opt: &NeuralLuckOpti
                 let control = SimControl {
                     max_pulls: None,
                     stop_on_up: true,
-                    stop_after_total_pulls: Some(config.big_pity_cumulative),
+                    // Fix: Ensure we use all available free pulls, covering the big pity if enough
+                    stop_after_total_pulls: Some(FREE_PULLS_WELFARE.max(config.big_pity_cumulative as u32) as usize),
                     nn_total_pulls_one_based: true,
                     collect_details: false,
                     big_pity_requires_not_up: false,
@@ -966,7 +967,8 @@ fn calculate_f2p_success_rate(num_sims: usize, seed: u64, neural_opt: &NeuralLuc
                 let control = SimControl {
                     max_pulls: None,
                     stop_on_up: true,
-                    stop_after_total_pulls: Some(config.big_pity_cumulative),
+                    // Fix: Ensure we use all available free pulls, covering the big pity if enough
+                    stop_after_total_pulls: Some(FREE_PULLS_WELFARE.max(config.big_pity_cumulative as u32) as usize),
                     nn_total_pulls_one_based: true,
                     collect_details: false,
                     big_pity_requires_not_up: false,
@@ -1109,6 +1111,76 @@ fn benchmark_simulation(rng: &mut Rng, neural_opt: &NeuralLuckOptimizer, dqn_pol
     );
 }
 
+fn save_ppo_model(model: &ActorCritic, path: &str) {
+    // Try saving as binary (bincode) first for speed
+    let bin_path = format!("{}.bin", path);
+    if let Ok(file) = std::fs::File::create(&bin_path) {
+        let writer = std::io::BufWriter::new(file);
+        if bincode::serialize_into(writer, model).is_ok() {
+            println!("[PPO] Model saved to {} (Binary)", bin_path);
+        }
+    }
+
+    // Also save as JSON for compatibility/debugging
+    if let Ok(file) = std::fs::File::create(path) {
+        let writer = std::io::BufWriter::new(file);
+        if serde_json::to_writer(writer, model).is_ok() {
+            println!("[PPO] Model saved to {} (JSON)", path);
+        } else {
+            println!("[PPO] Failed to serialize model (JSON)");
+        }
+    } else {
+        println!("[PPO] Failed to create file {}", path);
+    }
+}
+
+fn load_ppo_model(path: &str) -> Option<ActorCritic> {
+    // Try binary first
+    let bin_path = format!("{}.bin", path);
+    if let Ok(file) = std::fs::File::open(&bin_path) {
+        let reader = std::io::BufReader::new(file);
+        if let Ok(model) = bincode::deserialize_from(reader) {
+            println!("[PPO] Loaded model from {} (Binary)", bin_path);
+            return Some(model);
+        }
+    }
+
+    // Fallback to JSON
+    if let Ok(file) = std::fs::File::open(path) {
+        let reader = std::io::BufReader::new(file);
+        if let Ok(model) = serde_json::from_reader(reader) {
+            println!("[PPO] Loaded model from {} (JSON)", path);
+            return Some(model);
+        }
+    }
+    None
+}
+
+// Demo of "Crazy" Mmap loading
+fn demo_mmap_tensor() {
+    println!("\n[System] Demonstrating High-Performance Tensor I/O (Mmap)...");
+    let shape = vec![1000, 1000]; // 1M elements, ~8MB
+    let t = AutoTensor::rand(shape.clone(), 0.0, 1.0, 12345);
+    let path = "temp_tensor.bin";
+    
+    let start = Instant::now();
+    if t.save_binary(path).is_ok() {
+        println!("Saved tensor (1M floats) in {:.2?}", start.elapsed());
+        
+        let start_load = Instant::now();
+        match AutoTensor::from_mmap(path, shape) {
+            Ok(t_loaded) => {
+                println!("Loaded tensor via Mmap in {:.2?}", start_load.elapsed());
+                println!("Verification: Shape={:?}", t_loaded.shape);
+            },
+            Err(e) => println!("Mmap failed: {}", e),
+        }
+    }
+    // Cleanup
+    let _ = std::fs::remove_file(path);
+}
+
+
 fn main() {
     // Load Configuration
     let config = Config::load("data/config.json");
@@ -1180,7 +1252,28 @@ fn main() {
     let dqn_policy = train_dqn(&trained_neural_opt, &mut rng, &dbn, &config);
     
     // === PPO Training ===
-    let ppo_policy = train_ppo(&mut rng, &dbn, &config);
+    let ppo_policy = if let Some(cached) = load_ppo_model("ppo.cache") {
+        println!("[PPO] Cache detected.");
+        let use_cache = if config.fast_init {
+             true
+        } else {
+             prompt_yes_no("[PPO] Load cached PPO model? (y/n, default y): ", true)
+        };
+        if use_cache {
+            println!("[PPO] Cached model loaded.");
+            cached
+        } else {
+            println!("[PPO] Training new model...");
+            let p = train_ppo(&mut rng, &dbn, &config);
+            save_ppo_model(&p, "ppo.cache");
+            p
+        }
+    } else {
+        println!("[PPO] Training new model...");
+        let p = train_ppo(&mut rng, &dbn, &config);
+        save_ppo_model(&p, "ppo.cache");
+        p
+    };
     
     // We replace the trained_neural_opt with the DQN-optimized one (base part)
     // Note: The DQN might have shifted the Q-values, but we only use the base features + linear head for probability adjustment.
@@ -1205,6 +1298,10 @@ fn main() {
     }
 
 
+    // === Ask User for Interaction Mode ===
+    let use_ppo = prompt_yes_no("[System] Use PPO (Transformer) Brain for simulation? (y/n): ", true);
+    let active_ppo = if use_ppo { Some(&ppo_policy) } else { None };
+
     println!("=== Talos-XII Wish Simulator (Neural-Evolutionary) ===");
     println!("Pool Name: {}", config.pool_name);
     println!("UP Operator(s): {}", config.up_six.join(", "));
@@ -1218,6 +1315,7 @@ fn main() {
     if cfg!(debug_assertions) && !config.fast_init {
         println!("\n[System] Benchmarking simulation throughput...");
         benchmark_simulation(&mut rng, &trained_neural_opt, Some(&dqn_policy), Some(&ppo_policy), &dbn, &config);
+        demo_mmap_tensor();
     }
 
     // F2P Analysis
@@ -1232,7 +1330,8 @@ fn main() {
     println!("[System] Running {} simulations...", sim_count);
     
     let start_time = Instant::now();
-    let stats = simulate_stats(0, sim_count, rng.next_u64(), &trained_neural_opt, Some(&dqn_policy), Some(&ppo_policy), &dbn, &config, &worker);
+    // Fix: Pass FREE_PULLS_WELFARE as num_pulls instead of 0, otherwise simulation exits immediately!
+    let stats = simulate_stats(FREE_PULLS_WELFARE as usize, sim_count, rng.next_u64(), &trained_neural_opt, Some(&dqn_policy), Some(&ppo_policy), &dbn, &config, &worker);
     let elapsed = start_time.elapsed();
     let prob_line = format_f2p_probability_line(sim_count, stats.1);
     println!("{}", prob_line);
@@ -1308,7 +1407,7 @@ fn main() {
         };
 
         if sims_n > 1 {
-            let (s_total, u_total, _) = simulate_stats(n, sims_n, rng.next_u64(), &trained_neural_opt, Some(&dqn_policy), Some(&ppo_policy), &dbn, &config, &worker);
+            let (s_total, u_total, _) = simulate_stats(n, sims_n, rng.next_u64(), &trained_neural_opt, Some(&dqn_policy), active_ppo, &dbn, &config, &worker);
             let s_avg = s_total as f64 / sims_n as f64;
             let u_avg = u_total as f64 / sims_n as f64;
             println!(
@@ -1318,7 +1417,7 @@ fn main() {
         } else {
             let start_time = Instant::now();
             
-            let res = simulate_one(n, &mut rng, free_pulls, &trained_neural_opt, Some(&dqn_policy), Some(&ppo_policy), &dbn, &config);
+            let res = simulate_one(n, &mut rng, free_pulls, &trained_neural_opt, Some(&dqn_policy), active_ppo, &dbn, &config);
             let elapsed = start_time.elapsed();
             println!("\nSingle {}-pull result (Time: {:.2?}):", n, elapsed);
             println!("6-Star: {} | UP: {}", res.six_count, res.up_count);
@@ -1398,7 +1497,8 @@ mod tests {
         let control = SimControl {
             max_pulls: None,
             stop_on_up: true,
-            stop_after_total_pulls: Some(config.big_pity_cumulative),
+            // Ensure test uses max range to guarantee hit
+            stop_after_total_pulls: Some(FREE_PULLS_WELFARE.max(config.big_pity_cumulative as u32) as usize),
             nn_total_pulls_one_based: true,
             collect_details: false,
             big_pity_requires_not_up: false,

@@ -19,5 +19,5 @@
     "卡契尔", "安塔尔", "萤石", "秋栗"
   ],
   "luck_mode": "probability",
-  "fast_init": true
+  "fast_init": false
 }

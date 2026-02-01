@@ -1,14 +1,52 @@
 use std::sync::{Arc, RwLock};
 use std::ops::{Add, Sub, Mul, Div, Neg};
+use serde::{Serialize, Deserialize, Serializer, Deserializer};
+use serde::ser::SerializeStruct;
+use std::fs::File;
+use memmap2::Mmap;
 
 // --- Autograd Engine ---
 
+// TensorData removed as we are using direct mmap-to-vec for stability for now.
+
+
 #[derive(Clone)]
 pub struct Tensor {
-    pub data: Arc<RwLock<Vec<f64>>>,
+    pub data: Arc<RwLock<Vec<f64>>>, // Kept as Vec<f64> for now to minimize refactoring pain, but we can load from mmap
     pub grad: Arc<RwLock<Vec<f64>>>,
     pub shape: Vec<usize>,
     pub _ctx: Option<Arc<Context>>, // Keeps the graph alive
+}
+
+
+
+impl Serialize for Tensor {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let data = self.data.read().unwrap();
+        let mut state = serializer.serialize_struct("Tensor", 2)?;
+        state.serialize_field("data", &*data)?;
+        state.serialize_field("shape", &self.shape)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Tensor {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct TensorData {
+            data: Vec<f64>,
+            shape: Vec<usize>,
+        }
+
+        let helper = TensorData::deserialize(deserializer)?;
+        Ok(Tensor::new(helper.data, helper.shape))
+    }
 }
 
 pub struct Context {
@@ -17,9 +55,42 @@ pub struct Context {
 }
 
 impl Tensor {
+    pub fn from_mmap(path: &str, shape: Vec<usize>) -> std::io::Result<Self> {
+        let file = File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        let bytes = &mmap[..];
+        let len = bytes.len() / std::mem::size_of::<f64>();
+        let expected_len: usize = shape.iter().product();
+        if len != expected_len {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Mmap size mismatch"));
+        }
+        
+        // Zero-copy cast (unsafe but fast)
+        let slice = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f64, len) };
+        let data = slice.to_vec(); // We still copy to Vec because RwLock needs ownership. 
+        // True zero-copy requires changing Tensor.data to Cow<'a, [f64]> or similar which is a huge refactor.
+        // But mmap loading is still much faster than JSON parsing!
+        
+        Ok(Tensor {
+            data: Arc::new(RwLock::new(data)),
+            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            shape,
+            _ctx: None,
+        })
+    }
+    
+    pub fn save_binary(&self, path: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = File::create(path)?;
+        let data = self.data.read().unwrap();
+        let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
+        file.write_all(bytes)?;
+        Ok(())
+    }
+
     pub fn new(data: Vec<f64>, shape: Vec<usize>) -> Self {
         let len = data.len();
-        assert_eq!(len, shape.iter().product(), "Data length must match shape");
+        assert_eq!(len, shape.iter().product::<usize>(), "Data length must match shape");
         Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
@@ -29,12 +100,12 @@ impl Tensor {
     }
 
     pub fn zeros(shape: Vec<usize>) -> Self {
-        let len = shape.iter().product();
+        let len = shape.iter().product::<usize>();
         Tensor::new(vec![0.0; len], shape)
     }
     
     pub fn rand(shape: Vec<usize>, min: f64, max: f64, seed: u64) -> Self {
-        let len = shape.iter().product();
+        let len = shape.iter().product::<usize>();
         let mut data = Vec::with_capacity(len);
         let mut x = seed;
         for _ in 0..len {
@@ -277,32 +348,6 @@ impl Tensor {
         }
     }
 
-    pub fn clip(&self, min: f64, max: f64) -> Tensor {
-        let self_data = self.data.read().unwrap();
-        let data: Vec<f64> = self_data.iter().map(|&x| x.max(min).min(max)).collect();
-        let parents = vec![self.clone()];
-        
-        Tensor {
-            data: Arc::new(RwLock::new(data)),
-            grad: Arc::new(RwLock::new(vec![0.0; self_data.len()])),
-            shape: self.shape.clone(),
-            _ctx: Some(Arc::new(Context {
-                parents,
-                backward_op: Box::new(move |grad_out, parents| {
-                    let input = &parents[0];
-                    let input_data = input.data.read().unwrap();
-                    let mut inp_grad = input.grad.write().unwrap();
-                    for (i, &g) in grad_out.iter().enumerate() {
-                        let x = input_data[i];
-                        if x >= min && x <= max {
-                            inp_grad[i] += g;
-                        }
-                    }
-                }),
-            })),
-        }
-    }
-
     pub fn broadcast(&self, new_shape: Vec<usize>) -> Tensor {
         assert_eq!(self.shape, vec![1], "Broadcast only supported for scalar (1) to N");
         let len = new_shape.iter().product();
@@ -372,33 +417,160 @@ impl Tensor {
         }
     }
 
-    pub fn transpose(&self, dim0: usize, dim1: usize) -> Tensor {
-        assert!(self.shape.len() == 2, "Transpose only supported for 2D tensors");
-        assert!(dim0 < 2 && dim1 < 2 && dim0 != dim1, "Invalid dims for transpose");
-        
-        let (rows, cols) = (self.shape[0], self.shape[1]);
+    pub fn sqrt(&self) -> Tensor {
         let self_data = self.data.read().unwrap();
-        let mut data = vec![0.0; rows * cols];
-        
-        for r in 0..rows {
-            for c in 0..cols {
-                data[c * rows + r] = self_data[r * cols + c];
-            }
-        }
-        
+        let data: Vec<f64> = self_data.iter().map(|&x| x.sqrt()).collect();
         let parents = vec![self.clone()];
         
         Tensor {
             data: Arc::new(RwLock::new(data)),
-            grad: Arc::new(RwLock::new(vec![0.0; rows * cols])),
-            shape: vec![cols, rows],
+            grad: Arc::new(RwLock::new(vec![0.0; self_data.len()])),
+            shape: self.shape.clone(),
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
-                    let mut inp_grad = parents[0].grad.write().unwrap();
-                    for r in 0..rows {
-                        for c in 0..cols {
-                            inp_grad[r * cols + c] += grad_out[c * rows + r];
+                    let input = &parents[0];
+                    let input_data = input.data.read().unwrap();
+                    let mut inp_grad = input.grad.write().unwrap();
+                    for (i, &g) in grad_out.iter().enumerate() {
+                        let x = input_data[i];
+                        if x > 0.0 {
+                            inp_grad[i] += g * 0.5 / x.sqrt();
+                        }
+                    }
+                }),
+            })),
+        }
+    }
+
+    pub fn transpose(&self, dim0: usize, dim1: usize) -> Tensor {
+        // Full data copy transpose for simplicity
+        let self_data = self.data.read().unwrap();
+        let shape = &self.shape;
+        let rank = shape.len();
+        assert!(dim0 < rank && dim1 < rank);
+        
+        let mut new_shape = shape.clone();
+        new_shape.swap(dim0, dim1);
+        
+        let len = self_data.len();
+        let mut new_data = vec![0.0; len];
+        
+        // Calculate strides
+        let mut strides = vec![1; rank];
+        for i in (0..rank-1).rev() {
+            strides[i] = strides[i+1] * shape[i+1];
+        }
+        
+        let mut new_strides = vec![1; rank];
+        for i in (0..rank-1).rev() {
+            new_strides[i] = new_strides[i+1] * new_shape[i+1];
+        }
+        
+        // Iterate and copy
+        // This is generic N-dim transpose
+        for i in 0..len {
+            // Unravel index 'i' based on new_shape
+            let mut temp = i;
+            let mut coords = vec![0; rank];
+            for d in 0..rank {
+                coords[d] = temp / new_strides[d];
+                temp %= new_strides[d];
+            }
+            
+            // Swap coords to get old coordinates
+            coords.swap(dim0, dim1);
+            
+            // Ravel coords based on old shape (strides)
+            let mut old_idx = 0;
+            for d in 0..rank {
+                old_idx += coords[d] * strides[d];
+            }
+            
+            new_data[i] = self_data[old_idx];
+        }
+        
+        let parents = vec![self.clone()];
+        let dim0_cap = dim0;
+        let dim1_cap = dim1;
+        
+        Tensor {
+            data: Arc::new(RwLock::new(new_data)),
+            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            shape: new_shape,
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    let input = &parents[0];
+                    let mut inp_grad = input.grad.write().unwrap();
+                    
+                    // Transpose backward is transpose of grad
+                    // We need to map grad_out (which is in transposed shape) back to input shape
+                    
+                    let shape = &input.shape; // Old shape
+                    let rank = shape.len();
+                    
+                    // Recompute strides (captured closure would be better but expensive to copy vecs)
+                    let mut strides = vec![1; rank];
+                    for i in (0..rank-1).rev() {
+                        strides[i] = strides[i+1] * shape[i+1];
+                    }
+                    
+                    // New shape (transposed)
+                    let mut new_shape = shape.clone();
+                    new_shape.swap(dim0_cap, dim1_cap);
+                    let mut new_strides = vec![1; rank];
+                    for i in (0..rank-1).rev() {
+                        new_strides[i] = new_strides[i+1] * new_shape[i+1];
+                    }
+                    
+                    for i in 0..grad_out.len() {
+                        // i is index in grad_out (transposed layout)
+                        // We want to find corresponding index in inp_grad (original layout)
+                        
+                        // Unravel i using new_strides
+                        let mut temp = i;
+                        let mut coords = vec![0; rank];
+                        for d in 0..rank {
+                            coords[d] = temp / new_strides[d];
+                            temp %= new_strides[d];
+                        }
+                        
+                        // Swap coords back
+                        coords.swap(dim0_cap, dim1_cap);
+                        
+                        // Ravel using strides
+                        let mut old_idx = 0;
+                        for d in 0..rank {
+                            old_idx += coords[d] * strides[d];
+                        }
+                        
+                        inp_grad[old_idx] += grad_out[i];
+                    }
+                }),
+            })),
+        }
+    }
+    
+    pub fn clip(&self, min: f64, max: f64) -> Tensor {
+        let self_data = self.data.read().unwrap();
+        let data: Vec<f64> = self_data.iter().map(|&x| x.max(min).min(max)).collect();
+        let parents = vec![self.clone()];
+        
+        Tensor {
+            data: Arc::new(RwLock::new(data)),
+            grad: Arc::new(RwLock::new(vec![0.0; self_data.len()])),
+            shape: self.shape.clone(),
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    let input = &parents[0];
+                    let input_data = input.data.read().unwrap();
+                    let mut inp_grad = input.grad.write().unwrap();
+                    for (i, &g) in grad_out.iter().enumerate() {
+                        let x = input_data[i];
+                        if x >= min && x <= max {
+                            inp_grad[i] += g;
                         }
                     }
                 }),
@@ -408,7 +580,7 @@ impl Tensor {
 
     pub fn reshape(&self, new_shape: Vec<usize>) -> Tensor {
         let self_data = self.data.read().unwrap();
-        let len: usize = new_shape.iter().product();
+        let len: usize = new_shape.iter().product::<usize>();
         assert_eq!(len, self_data.len(), "Reshape dimension mismatch");
         
         let parents = vec![self.clone()];
