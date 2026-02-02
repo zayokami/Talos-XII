@@ -1,6 +1,6 @@
 [package]
 name = "talos_xii"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
@@ -18,3 +18,9 @@ lto = true        # Link Time Optimization (smaller binary, faster code)
 codegen-units = 1 # Maximize optimization units (slower compile, faster code)
 panic = 'unwind'  # Keep unwind for robustness (we want to catch panics)
 strip = true      # Strip symbols to reduce size
+
+# Add optimization for dev profile to speed up debug builds (critical for neural network training)
+[profile.dev]
+opt-level = 3     # Enable full optimizations even in debug mode
+debug-assertions = true # Keep assertions for safety
+overflow-checks = false # Disable overflow checks for speed (math intensive)

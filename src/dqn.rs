@@ -40,7 +40,13 @@ impl Linear {
     fn forward(&self, input: &Tensor) -> Tensor {
         // input: (Batch, In)
         let out = input.matmul(&self.weights);
-        out + self.bias.clone()
+        if out.shape.len() == 2 && out.shape[0] > 1 {
+            let batch_size = out.shape[0];
+            let bias_b = self.bias.broadcast_to_batch(batch_size);
+            out + bias_b
+        } else {
+            out + self.bias.clone()
+        }
     }
     
     fn parameters(&self) -> Vec<Tensor> {
@@ -70,27 +76,44 @@ impl DuelingQNetwork {
     }
 
     pub fn forward(&self, state: &Tensor) -> Tensor {
-        // state: (8)
+        // state: (Batch, 8) or (8)
         let x = self.l1.forward(state).relu();
         let x = self.l2.forward(&x).relu();
         
-        let val = self.val_head.forward(&x); // (1)
-        let adv = self.adv_head.forward(&x); // (5)
+        let val = self.val_head.forward(&x); // (Batch, 1) or (1)
+        let adv = self.adv_head.forward(&x); // (Batch, 5) or (5)
         
         // Q(s, a) = V(s) + (A(s, a) - mean(A(s, a')))
-        // Calculate mean of Advantage
-        let mean_adv_scalar = adv.mean(); // (1)
-        let mean_adv = mean_adv_scalar.broadcast(vec![ACTION_SPACE]); // (5)
         
-        // Expand Value to (5)
-        let val_expanded = val.broadcast(vec![ACTION_SPACE]); // (5)
-        
-        // Q = V + A - Mean(A)
-        // Note: We need negation. Tensor doesn't have neg() yet, use 0 - mean_adv
-        let zero = Tensor::zeros(vec![ACTION_SPACE]);
-        let neg_mean_adv = zero - mean_adv;
-        
-        val_expanded + adv + neg_mean_adv
+        if state.shape.len() == 2 && state.shape[0] > 1 {
+            // Batch Mode
+            
+            // val is (B, 1). Expand to (B, 5).
+            // Multiply by ones(1, 5) -> (B, 5)
+            // MatMul: (B, 1) x (1, 5) -> (B, 5)
+            let ones_1_5 = Tensor::new(vec![1.0; 5], vec![1, 5]);
+            let val_expanded = val.matmul(&ones_1_5);
+            
+            // Mean Adv: (B, 5) -> (B, 1)
+            // Multiply by ones(5, 1) / 5.0
+            let ones_5_1 = Tensor::new(vec![0.2; 5], vec![5, 1]); // 1/5 = 0.2
+            let mean_adv = adv.matmul(&ones_5_1); // (B, 1)
+            let mean_adv_expanded = mean_adv.matmul(&ones_1_5); // (B, 5)
+            
+            // Result: val + adv - mean
+            val_expanded + adv - mean_adv_expanded
+        } else {
+            // Single Mode
+            let mean_adv_scalar = adv.mean(); // (1)
+            let mean_adv = mean_adv_scalar.broadcast(vec![ACTION_SPACE]); // (5)
+            
+            let val_expanded = val.broadcast(vec![ACTION_SPACE]); // (5)
+            
+            let zero = Tensor::zeros(vec![ACTION_SPACE]);
+            let neg_mean_adv = zero - mean_adv;
+            
+            val_expanded + adv + neg_mean_adv
+        }
     }
     
     pub fn parameters(&self) -> Vec<Tensor> {
@@ -395,53 +418,89 @@ pub fn train_dqn(
         
         // 4. Train
         if replay_buffer.len() > BATCH_SIZE && step % TRAIN_FREQ == 0 {
+            let start_train = std::time::Instant::now();
             let batch = replay_buffer.sample(rng, BATCH_SIZE);
+            let sample_time = start_train.elapsed();
+            
+            let start_forward = std::time::Instant::now();
             optimizer.zero_grad();
             
-            let mut total_loss = Tensor::new(vec![0.0], vec![1]);
+            // --- Batched Processing ---
             
-            // Process batch
-            for exp in batch {
-                let s = Tensor::new(exp.state, vec![DIM]);
-                let ns = Tensor::new(exp.next_state, vec![DIM]);
+            // 1. Prepare Batch Tensors
+            let mut states_vec = Vec::with_capacity(BATCH_SIZE * DIM);
+            let mut next_states_vec = Vec::with_capacity(BATCH_SIZE * DIM);
+            let mut actions_vec = Vec::with_capacity(BATCH_SIZE * ACTION_SPACE); // For mask
+            let mut rewards_vec = Vec::with_capacity(BATCH_SIZE);
+            let mut dones_vec = Vec::with_capacity(BATCH_SIZE);
+            
+            for exp in &batch {
+                states_vec.extend_from_slice(&exp.state);
+                next_states_vec.extend_from_slice(&exp.next_state);
                 
-                let q_s = policy_net.forward(&s);
-                let mut mask_vec = vec![0.0; ACTION_SPACE];
-                mask_vec[exp.action] = 1.0;
-                let mask = Tensor::new(mask_vec, vec![ACTION_SPACE]);
-                let q_a = (q_s * mask).sum();
+                let mut mask = vec![0.0; ACTION_SPACE];
+                mask[exp.action] = 1.0;
+                actions_vec.extend_from_slice(&mask);
                 
-                let q_ns_policy = policy_net.forward(&ns); 
-                let mut max_val = f64::NEG_INFINITY;
-                let mut best_a = 0;
-                {
-                    let q_data = q_ns_policy.data.read().unwrap();
-                    for (i, &val) in q_data.iter().enumerate() {
-                        if val > max_val {
-                            max_val = val;
-                            best_a = i;
-                        }
-                    }
-                }
-                
-                let q_ns_target = target_net.forward(&ns);
-                let target_val = if exp.done {
-                    exp.reward
-                } else {
-                    exp.reward + GAMMA * q_ns_target.data.read().unwrap()[best_a]
-                };
-                
-                let target_tensor = Tensor::new(vec![target_val], vec![1]);
-                
-                let loss = q_a.mse_loss(&target_tensor);
-                total_loss = total_loss + loss;
+                rewards_vec.push(exp.reward);
+                dones_vec.push(if exp.done { 1.0 } else { 0.0 });
             }
             
-            total_loss.backward();
+            let batch_state = Tensor::new(states_vec, vec![BATCH_SIZE, DIM]);
+            let batch_next_state = Tensor::new(next_states_vec, vec![BATCH_SIZE, DIM]);
+            let batch_mask = Tensor::new(actions_vec, vec![BATCH_SIZE, ACTION_SPACE]);
+            
+            // 2. Policy Forward
+            let q_values = policy_net.forward(&batch_state); // (B, 5)
+            
+            // Select Action Q-Values: (B, 5) * (B, 5) -> (B, 5) [one non-zero per row]
+            // Sum across dim 1 to get (B, 1)
+            // MatMul by ones(5, 1) -> (B, 1)
+            let ones_5_1 = Tensor::new(vec![1.0; 5], vec![5, 1]);
+            let q_actions = (q_values * batch_mask).matmul(&ones_5_1); // (B, 1)
+            
+            // 3. Compute Targets (No Grad)
+            let q_next_values = target_net.forward(&batch_next_state); // (B, 5)
+            
+            // Extract max q_next for each row manually
+            let q_next_data = q_next_values.data.read().unwrap();
+            let mut target_vals = Vec::with_capacity(BATCH_SIZE);
+            
+            for i in 0..BATCH_SIZE {
+                let start = i * ACTION_SPACE;
+                let end = start + ACTION_SPACE;
+                let row = &q_next_data[start..end];
+                let max_q = row.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+                
+                let r = rewards_vec[i];
+                let d = dones_vec[i];
+                // if done (d=1.0), target = r. else r + gamma * max_q
+                let target = r + GAMMA * max_q * (1.0 - d);
+                target_vals.push(target);
+            }
+            
+            let target_tensor = Tensor::new(target_vals, vec![BATCH_SIZE, 1]);
+            
+            // 4. Loss
+            let loss = q_actions.mse_loss(&target_tensor);
+            
+            let forward_time = start_forward.elapsed();
+            
+            let start_backward = std::time::Instant::now();
+            loss.backward();
+            let backward_time = start_backward.elapsed();
+            
+            let start_opt = std::time::Instant::now();
             optimizer.step();
+            let opt_time = start_opt.elapsed();
             
             // Soft Update Target Network
             target_net.soft_update(&policy_net, 0.005);
+            
+            if step % LOG_FREQ == 0 {
+                 println!("[Perf] Step {}: Sample={:?} Fwd={:?} Bwd={:?} Opt={:?}", 
+                     step, sample_time, forward_time, backward_time, opt_time);
+            }
         }
         
         // Removed hard update logic (step % TARGET_UPDATE_FREQ == 0)

@@ -172,15 +172,36 @@ impl Tensor {
             let lhs_data = self.data.read().unwrap();
             let rhs_data = other.data.read().unwrap();
             
-            out_data.par_chunks_mut(n).enumerate().for_each(|(r, out_row)| {
-                for c in 0..n {
-                    let mut sum = 0.0;
+            // Heuristic for parallelization overhead
+            // A simple matmul has M*N*K ops.
+            // Rayon overhead is small but significant for tiny matrices.
+            let ops = m * n * k;
+            
+            if ops < 32768 { // Serial path for small matrices (e.g. 64x64x5)
+                for r in 0..m {
+                    let out_row_start = r * n;
                     for i in 0..k {
-                        sum += lhs_data[r * k + i] * rhs_data[i * n + c];
+                        let scale = lhs_data[r * k + i];
+                        let rhs_row_start = i * n;
+                        for c in 0..n {
+                            out_data[out_row_start + c] += scale * rhs_data[rhs_row_start + c];
+                        }
                     }
-                    out_row[c] = sum;
                 }
-            });
+            } else { // Parallel path
+                out_data.par_chunks_mut(n).enumerate().for_each(|(r, out_row)| {
+                    // Optimized Row-Accumulation (Cache Friendly)
+                    // C[r, :] += A[r, i] * B[i, :]
+                    for i in 0..k {
+                        let scale = lhs_data[r * k + i];
+                        let rhs_row_start = i * n;
+                        // Inner loop: sequential access on B and C -> SIMD friendly
+                        for c in 0..n {
+                            out_row[c] += scale * rhs_data[rhs_row_start + c];
+                        }
+                    }
+                });
+            }
         }
         
         let out_shape = if self.shape.len() == 1 { vec![n] } else { vec![m, n] };
@@ -203,29 +224,63 @@ impl Tensor {
                     // dL/dLHS = grad_out * RHS^T
                     {
                         let mut lhs_grad = lhs.grad.write().unwrap();
-                        lhs_grad.par_chunks_mut(k).enumerate().for_each(|(r, lhs_row)| {
-                            for i in 0..k {
-                                let mut sum = 0.0;
-                                for c in 0..n {
-                                    sum += grad_out[r * n + c] * rhs_data[i * n + c];
+                        let ops = m * k * n;
+                        if ops < 32768 {
+                             // Serial
+                             for r in 0..m {
+                                 let grad_out_row_start = r * n;
+                                 let lhs_grad_row_start = r * k;
+                                 for i in 0..k {
+                                     let mut sum = 0.0;
+                                     let rhs_row_start = i * n;
+                                     for c in 0..n {
+                                         sum += grad_out[grad_out_row_start + c] * rhs_data[rhs_row_start + c];
+                                     }
+                                     lhs_grad[lhs_grad_row_start + i] += sum;
+                                 }
+                             }
+                        } else {
+                            lhs_grad.par_chunks_mut(k).enumerate().for_each(|(r, lhs_row)| {
+                                for i in 0..k {
+                                    let mut sum = 0.0;
+                                    let rhs_row_start = i * n;
+                                    let grad_out_row_start = r * n;
+                                    for c in 0..n {
+                                        sum += grad_out[grad_out_row_start + c] * rhs_data[rhs_row_start + c];
+                                    }
+                                    lhs_row[i] += sum;
                                 }
-                                lhs_row[i] += sum;
-                            }
-                        });
+                            });
+                        }
                     }
                     
                     // dL/dRHS = LHS^T * grad_out
                     {
                         let mut rhs_grad = rhs.grad.write().unwrap();
-                        rhs_grad.par_chunks_mut(n).enumerate().for_each(|(i, rhs_row)| {
-                            for c in 0..n {
-                                let mut sum = 0.0;
-                                for r in 0..m {
-                                    sum += lhs_data[r * k + i] * grad_out[r * n + c];
+                         let ops = k * n * m;
+                         if ops < 32768 {
+                             // Serial
+                             for i in 0..k {
+                                 let rhs_grad_row_start = i * n;
+                                 for c in 0..n {
+                                     let mut sum = 0.0;
+                                     for r in 0..m {
+                                         sum += lhs_data[r * k + i] * grad_out[r * n + c];
+                                     }
+                                     rhs_grad[rhs_grad_row_start + c] += sum;
+                                 }
+                             }
+                         } else {
+                            rhs_grad.par_chunks_mut(n).enumerate().for_each(|(i, rhs_row)| {
+                                for c in 0..n {
+                                    let mut sum = 0.0;
+                                    for r in 0..m {
+                                        sum += lhs_data[r * k + i] * grad_out[r * n + c];
+                                    }
+                                    rhs_row[c] += sum;
                                 }
-                                rhs_row[c] += sum;
-                            }
-                        });
+                            });
+                         }
                     }
                 }),
             })),
@@ -363,6 +418,44 @@ impl Tensor {
                     let mut inp_grad = parents[0].grad.write().unwrap();
                     let sum_grad: f64 = grad_out.par_iter().sum();
                     inp_grad[0] += sum_grad;
+                }),
+            })),
+        }
+    }
+
+    pub fn broadcast_to_batch(&self, batch_size: usize) -> Tensor {
+        let self_data = self.data.read().unwrap();
+        let len = self_data.len();
+        let mut new_data = Vec::with_capacity(len * batch_size);
+        for _ in 0..batch_size {
+            new_data.extend_from_slice(&self_data);
+        }
+        
+        let mut new_shape = vec![batch_size];
+        new_shape.extend_from_slice(&self.shape);
+        
+        let parents = vec![self.clone()];
+        
+        Tensor {
+            data: Arc::new(RwLock::new(new_data)),
+            grad: Arc::new(RwLock::new(vec![0.0; len * batch_size])),
+            shape: new_shape,
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    let mut inp_grad = parents[0].grad.write().unwrap();
+                    // Sum gradients across batch dimension
+                    // grad_out is (Batch, D...)
+                    // inp_grad is (D...)
+                    let chunk_size = inp_grad.len();
+                    
+                    // Parallel accumulation could be tricky without extra buffer, 
+                    // but simple serial sum over batch chunks is likely fast enough compared to matmul
+                    for chunk in grad_out.chunks(chunk_size) {
+                        for (i, &g) in chunk.iter().enumerate() {
+                            inp_grad[i] += g;
+                        }
+                    }
                 }),
             })),
         }
