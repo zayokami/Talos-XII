@@ -857,13 +857,13 @@ fn simulate_one(num_pulls: usize, rng: &mut Rng, available_free_pulls: u32, neur
     }
 }
 
-fn simulate_stats(num_pulls: usize, num_sims: usize, seed: u64, neural_opt: &NeuralLuckOptimizer, dqn_policy: Option<&DuelingQNetwork>, ppo_policy: Option<&ActorCritic>, dbn: &Dbn, config: &Config, worker: &GoodJobWorker) -> (usize, usize, usize) {
+fn simulate_stats(num_pulls: usize, num_sims: usize, seed: u64, neural_opt: &NeuralLuckOptimizer, dqn_policy: Option<&DuelingQNetwork>, ppo_policy: Option<&ActorCritic>, dbn: &Dbn, config: &Config, worker: &GoodJobWorker) -> (usize, usize, usize, usize) {
     let mut master_rng = Rng::from_seed(seed);
     let base_seed = master_rng.next_u64();
 
     let chunk_size = 64usize;
     let chunk_count = (num_sims + chunk_size - 1) / chunk_size;
-    let (total_six, total_up, total_big_pity) = worker.execute(|| {
+    let (total_six, total_up, total_big_pity, total_with_up) = worker.execute(|| {
         (0..chunk_count).into_par_iter()
             .map(|chunk_idx| {
                 let start = chunk_idx * chunk_size;
@@ -872,21 +872,23 @@ fn simulate_stats(num_pulls: usize, num_sims: usize, seed: u64, neural_opt: &Neu
                 let mut total_six = 0usize;
                 let mut total_up = 0usize;
                 let mut total_big_pity = 0usize;
+                let mut total_with_up = 0usize;
                 for _ in start..end {
                     let res = simulate_fast(num_pulls, &mut local_rng, 0, neural_opt, dqn_policy, ppo_policy, dbn, config);
                     total_six += res.six_count;
                     total_up += res.up_count;
                     if res.big_pity_used { total_big_pity += 1; }
+                    if res.up_count > 0 { total_with_up += 1; }
                 }
-                (total_six, total_up, total_big_pity)
+                (total_six, total_up, total_big_pity, total_with_up)
             })
-            .reduce(|| (0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
+            .reduce(|| (0, 0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3))
     }).unwrap_or_else(|e| {
         println!("[Error] Simulation failed: {}", e);
-        (0, 0, 0)
+        (0, 0, 0, 0)
     });
 
-    (total_six, total_up, total_big_pity)
+    (total_six, total_up, total_big_pity, total_with_up)
 }
 
 fn simulate_f2p_clearing(num_sims: usize, seed: u64, neural_opt: &NeuralLuckOptimizer, dqn_policy: Option<&DuelingQNetwork>, ppo_policy: Option<&ActorCritic>, dbn: &Dbn, config: &Config, worker: &GoodJobWorker) -> (Option<f64>, usize) {
@@ -1316,10 +1318,11 @@ fn main() {
     
     let start_time = Instant::now();
     // Fix: Pass FREE_PULLS_WELFARE as num_pulls instead of 0, otherwise simulation exits immediately!
-    let stats = simulate_stats(FREE_PULLS_WELFARE as usize, sim_count, rng.next_u64(), &trained_neural_opt, Some(&dqn_policy), Some(&ppo_policy), &dbn, &config, &worker);
+    let (_, total_up, _, total_with_up) = simulate_stats(FREE_PULLS_WELFARE as usize, sim_count, rng.next_u64(), &trained_neural_opt, Some(&dqn_policy), Some(&ppo_policy), &dbn, &config, &worker);
     let elapsed = start_time.elapsed();
-    let prob_line = format_f2p_probability_line(sim_count, stats.1);
+    let prob_line = format_f2p_probability_line(sim_count, total_with_up);
     println!("{}", prob_line);
+    println!("Expected UP Count: {:.2}", total_up as f64 / sim_count as f64);
     println!("Time taken: {:.2?}", elapsed);
     println!("Throughput: {:.0} sims/sec", sim_count as f64 / elapsed.as_secs_f64());
     
@@ -1392,7 +1395,7 @@ fn main() {
         };
 
         if sims_n > 1 {
-            let (s_total, u_total, _) = simulate_stats(n, sims_n, rng.next_u64(), &trained_neural_opt, Some(&dqn_policy), active_ppo, &dbn, &config, &worker);
+            let (s_total, u_total, _, _) = simulate_stats(n, sims_n, rng.next_u64(), &trained_neural_opt, Some(&dqn_policy), active_ppo, &dbn, &config, &worker);
             let s_avg = s_total as f64 / sims_n as f64;
             let u_avg = u_total as f64 / sims_n as f64;
             println!(
