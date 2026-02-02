@@ -47,6 +47,12 @@ fn sum_f64(values: &[f64]) -> f64 {
             return sum_sq_diff_neon(values, mean);
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            return sum_sq_diff_neon(values, mean);
+        }
+    }
     let mut sum = 0.0;
     for &v in values {
         sum += v;

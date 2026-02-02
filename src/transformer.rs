@@ -542,50 +542,46 @@ impl MultiHeadLatentAttention {
         let head_dim = self.config.v_head_dim;
         let rope_dim = self.config.qk_rope_dim;
         
-        // 1. Compress KV
+        // Compress KV into latent space
         let c_kv = self.w_dkv.forward(x); // [Batch, Seq, KV_Latent]
         
-        // 2. Decompress to Heads (Content Part)
+        // Decompress to Heads (Content Part)
         let k_c = self.w_uk.forward(&c_kv); // [Batch, Seq, Heads * HeadDim]
         let v_c = self.w_uv.forward(&c_kv); // [Batch, Seq, Heads * HeadDim]
         
-        // 3. Generate RoPE Parts
+        // Generate RoPE Parts
         let k_r_flat = self.w_kr.forward(x); // [Batch, Seq, Heads * RoPE_Dim]
         
-        // 4. Generate Query
+        // Generate Query
         let q_c = self.w_q.forward(x); // [Batch, Seq, Heads * HeadDim]
         let q_r_flat = self.w_qr.forward(x); // [Batch, Seq, Heads * RoPE_Dim]
         
-        // 5. Reshape and Apply RoPE
-        // We need to reshape to [Batch, Seq, Heads, RoPE_Dim] to apply RoPE correctly
+        // Reshape and Apply RoPE
+        // Need to reshape to [Batch, Seq, Heads, RoPE_Dim] for rotation
         let k_r = k_r_flat.reshape(vec![batch_size, seq_len, num_heads, rope_dim]);
         let q_r = q_r_flat.reshape(vec![batch_size, seq_len, num_heads, rope_dim]);
         
         let k_r_rot = self.rope.forward(&k_r, 0);
         let q_r_rot = self.rope.forward(&q_r, 0);
         
-        // 6. Concatenate Content + RoPE
+        // Concatenate Content + RoPE
         // Q = [q_c, q_r_rot], K = [k_c, k_r_rot]
-        // But dimensions must align. 
-        // q_c is [Batch, Seq, Heads * HeadDim] -> Reshape to [Batch, Seq, Heads, HeadDim]
+        // Reshape first to align dimensions
         let q_c_reshaped = q_c.reshape(vec![batch_size, seq_len, num_heads, head_dim]);
         let k_c_reshaped = k_c.reshape(vec![batch_size, seq_len, num_heads, head_dim]);
         
-        // We need to concatenate along the last dimension.
-        // autograd.rs doesn't have concat yet. 
-        // Implementing simple concatenation:
+        // Hack: autograd lacks concat, so we use a custom helper here
         let q = self.concat_last_dim(&q_c_reshaped, &q_r_rot);
         let k = self.concat_last_dim(&k_c_reshaped, &k_r_rot);
         let v = v_c.reshape(vec![batch_size, seq_len, num_heads, head_dim]);
         
-        // 7. Attention: Softmax(Q * K^T / sqrt(d)) * V
+        // Attention: Softmax(Q * K^T / sqrt(d)) * V
         // Reshape to [Batch, Heads, Seq, Dim] for matmul
         let q_t = q.transpose(1, 2); // [Batch, Heads, Seq, TotalDim]
         let k_t = k.transpose(1, 2); // [Batch, Heads, Seq, TotalDim]
         let v_t = v.transpose(1, 2); // [Batch, Heads, Seq, HeadDim]
         
         // Scaled Dot Product
-        // We need [Batch, Heads, Seq, Seq]
         let bh = batch_size * num_heads;
         let total_dim = head_dim + rope_dim;
         let head_dim_v = head_dim;
@@ -595,46 +591,9 @@ impl MultiHeadLatentAttention {
         let k_flat = k_t.reshape(vec![bh, seq_len, total_dim]);
         let v_flat = v_t.reshape(vec![bh, seq_len, head_dim_v]);
         
-        // Manual Attention Loop
-        // Since autograd matmul is 2D, we iterate over BH dimension
-        // Output will be [BH, Seq, HeadDim]
-        
-        // To do this efficiently with current autograd structure (which doesn't support slicing easily),
-        // we might be stuck. 
-        // BUT, our matmul supports [M, K] * [K, N].
-        // Here we have BH independent multiplications.
-        // If we can't slice, we can't do it.
-        // Let's implement a 'batched_matmul' in autograd or simulate it here by splitting.
-        // For now, let's assume we can add a 'split' method or similar.
-        // Or, simpler: Just use a custom loop with data access.
-        // But we need to preserve the graph.
-        // The only way to preserve graph with current simple autograd is to implement a new BatchedMatMul op.
-        // OR, since this is a "pair programming" task and we are simulating,
-        // we can implement a simplified "chunked" attention.
-        
-        // Let's implement a helper in autograd for batched matmul if possible.
-        // Or, use the fact that Tensor stores a flat Vec.
-        // We can implement `batched_matmul` inside `Tensor`?
-        // Let's check `autograd.rs` again. It has `matmul`.
-        // Let's add `batched_matmul` to `autograd.rs`!
-        
-        // For now, to unblock, I will add `batched_matmul` to Tensor in `autograd.rs` 
-        // and then use it here.
-        
-        // Placeholder until batched_matmul is available:
-        // Assume `batched_matmul` exists on Tensor.
-        // q: [BH, Seq, D], k: [BH, Seq, D] -> [BH, Seq, Seq]
-        // k_t: [BH, D, Seq] (we need to transpose the last two dims of k_flat)
-        // Actually k_flat is [BH, Seq, D]. We need per-batch transpose.
-        // Tensor `transpose` works on global dims. 
-        // If we reshape k_flat to [BH * Seq, D] and transpose? No.
-        
-        // OK, critical path: We need a `batched_matmul` that takes [B, M, K] and [B, K, N] -> [B, M, N].
-        // And `batched_transpose`?
-        
-        // Let's implement a `batched_matmul` in transformer.rs as a local helper that 
-        // manually constructs the result data and backward pass.
-        // This is complex but correct.
+        // We need batched matmul (BH independent multiplications).
+        // Since our core Autograd only supports 2D matmul, we use a custom implementation here.
+        // It's a bit ugly but gets the job done for now.
         
         let att_scores = self.batched_matmul_qt_k(&q_flat, &k_flat, bh, seq_len, total_dim);
         
@@ -642,7 +601,7 @@ impl MultiHeadLatentAttention {
         let scale = 1.0 / (total_dim as f64).sqrt();
         let att_scores_scaled = self.scale_tensor(&att_scores, scale);
         
-        // Softmax (Manual along last dim)
+        // Softmax (along last dim)
         let att_probs = self.softmax(&att_scores_scaled, seq_len);
         
         // Output: probs [BH, Seq, Seq] * v [BH, Seq, DimV] -> [BH, Seq, DimV]
@@ -731,7 +690,7 @@ impl MultiHeadLatentAttention {
         }
     }
 
-    // Helper: Batched MatMul Probs * V -> Out [B, Seq, DimV]
+    // Batched MatMul: probs * v -> out
     fn batched_matmul_probs_v(&self, probs: &Tensor, v: &Tensor, b: usize, seq: usize, dim_v: usize) -> Tensor {
         // probs: [B, Seq, Seq], v: [B, Seq, DimV]
         // out[b, i, d] = sum_j (probs[b, i, j] * v[b, j, d])
@@ -872,7 +831,7 @@ impl MultiHeadLatentAttention {
     }
     
     fn concat_last_dim(&self, a: &Tensor, b: &Tensor) -> Tensor {
-        // Naive concat along last dim
+        // Concatenate tensors. This is slow because it allocates.
         let shape_a = &a.shape;
         let shape_b = &b.shape;
         let last_dim_a = shape_a[shape_a.len()-1];
@@ -889,9 +848,7 @@ impl MultiHeadLatentAttention {
              let start_a = i * last_dim_a;
              let start_b = i * last_dim_b;
              
-             // Copy from a
              chunk[0..last_dim_a].copy_from_slice(&a_data[start_a..start_a + last_dim_a]);
-             // Copy from b
              chunk[last_dim_a..].copy_from_slice(&b_data[start_b..start_b + last_dim_b]);
         });
         
