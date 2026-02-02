@@ -1,5 +1,6 @@
 use crate::autograd::{Tensor, Context};
 use std::sync::{Arc, RwLock};
+use rayon::prelude::*;
 use serde::{Serialize, Deserialize};
 
 // --- Configuration ---
@@ -60,27 +61,18 @@ impl Linear {
         
         if let Some(b) = &self.b {
             // Manual broadcast for bias
-            // Simply construct a new tensor that adds bias to every last dim
-            // For now, let's assume autograd supports simple broadcasting or we do it manually
-            // Given autograd.rs limitations, we'll do a simple add loop in a custom op if needed
-            // But let's assume we can just add a reshaped bias?
-            // Tensor addition usually requires matching shapes.
-            // Let's rely on a custom add helper for now or just skip bias if complex.
-            // But bias is important.
-            // Let's implement a simple broadcast_add logic here:
-            
             let b_data = b.data.read().unwrap();
             let out_data_len = batch_dim * self.out_dim;
-            let mut new_data = Vec::with_capacity(out_data_len);
+            let mut new_data = vec![0.0; out_data_len];
             
-            // Scope to drop the read lock on out
             {
                 let out_read = out.data.read().unwrap();
-                for i in 0..batch_dim {
+                new_data.par_chunks_mut(self.out_dim).enumerate().for_each(|(i, chunk)| {
+                    let offset = i * self.out_dim;
                     for j in 0..self.out_dim {
-                        new_data.push(out_read[i * self.out_dim + j] + b_data[j]);
+                        chunk[j] = out_read[offset + j] + b_data[j];
                     }
-                }
+                });
             }
             
             // Re-wrap in Tensor with backward pass
@@ -101,21 +93,19 @@ impl Linear {
                         let mut b_grad = b_tensor.grad.write().unwrap();
                         
                         // dL/dout_tensor = grad_out (identity)
-                        for i in 0..grad_out.len() {
-                            out_grad[i] += grad_out[i];
-                        }
+                        out_grad.par_iter_mut().zip(grad_out.par_iter()).for_each(|(og, &g)| *og += g);
                         
                         // dL/db = sum(grad_out) over batch
-                        // grad_out is [Batch, OutDim]
-                        // b is [OutDim]
                         let total_elements = grad_out.len();
                         let batch_size = total_elements / out_dim;
                         
-                        for i in 0..batch_size {
-                            for j in 0..out_dim {
-                                b_grad[j] += grad_out[i * out_dim + j];
+                        b_grad.par_iter_mut().enumerate().for_each(|(j, bg)| {
+                            let mut sum = 0.0;
+                            for i in 0..batch_size {
+                                sum += grad_out[i * out_dim + j];
                             }
-                        }
+                            *bg += sum;
+                        });
                     }),
                 })),
             };
@@ -165,35 +155,35 @@ impl RMSNorm {
         let num_elements = x_data.len();
         let num_rows = num_elements / self.dim;
         
-        let mut out_data = Vec::with_capacity(num_elements);
-        let mut rms_cache = Vec::with_capacity(num_rows); // Cache rms for backward
-        let mut x_hat_cache = Vec::with_capacity(num_elements); // Cache x_hat for backward
+        let mut out_data = vec![0.0; num_elements];
+        let mut rms_cache = vec![0.0; num_rows];
+        let mut x_hat_cache = vec![0.0; num_elements];
         
-        for r in 0..num_rows {
-            let base = r * self.dim;
-            let mut sum_sq = 0.0;
-            for i in 0..self.dim {
-                let val = x_data[base + i];
-                sum_sq += val * val;
-            }
-            let rms = (sum_sq / self.dim as f64 + self.eps).sqrt();
-            rms_cache.push(rms);
-            
-            for i in 0..self.dim {
-                let val = x_data[base + i];
-                let x_hat = val / rms;
-                x_hat_cache.push(x_hat);
-                out_data.push(x_hat * w_data[i]);
-            }
-        }
+        out_data.par_chunks_mut(self.dim)
+            .zip(x_hat_cache.par_chunks_mut(self.dim))
+            .zip(rms_cache.par_iter_mut())
+            .enumerate()
+            .for_each(|(r, ((out_row, x_hat_row), rms_ref))| {
+                let base = r * self.dim;
+                let mut sum_sq = 0.0;
+                for i in 0..self.dim {
+                    let val = x_data[base + i];
+                    sum_sq += val * val;
+                }
+                let rms = (sum_sq / self.dim as f64 + self.eps).sqrt();
+                *rms_ref = rms;
+                
+                for i in 0..self.dim {
+                    let val = x_data[base + i];
+                    let x_hat = val / rms;
+                    x_hat_row[i] = x_hat;
+                    out_row[i] = x_hat * w_data[i];
+                }
+            });
         
         let parents = vec![x.clone(), self.weight.clone()];
         let dim = self.dim;
-        let _eps = self.eps; // Capture eps if needed (not needed for grad formula derived above)
         
-        // We need to capture cache.
-        // Since we can't easily modify the Tensor struct to store arbitrary cache,
-        // we capture it in the closure.
         let rms_cache = Arc::new(rms_cache);
         let x_hat_cache = Arc::new(x_hat_cache);
         
@@ -211,47 +201,43 @@ impl RMSNorm {
                     let mut w_grad = w_in.grad.write().unwrap();
                     let w_data = w_in.data.read().unwrap();
                     
-                    // x_hat_cache and rms_cache are available here
-                    
-                    for r in 0..num_rows {
-                        let base = r * dim;
-                        let rms = rms_cache[r];
-                        let inv_rms = 1.0 / rms;
-                        
-                        // 1. Calculate dL/dx_hat
-                        // dL/dx_hat_i = grad_out_i * w_i
-                        
-                        // 2. Calculate dot product sum(dL/dx_hat * x_hat)
-                        let mut dot_sum = 0.0;
-                        for i in 0..dim {
-                            let g = grad_out[base + i];
-                            let w = w_data[i];
-                            let dl_dxhat = g * w;
-                            dot_sum += dl_dxhat * x_hat_cache[base + i];
+                    // 1. Calculate dL/dx parallel over rows
+                    x_grad.par_chunks_mut(dim)
+                        .zip(grad_out.par_chunks(dim))
+                        .enumerate()
+                        .for_each(|(r, (x_g_row, g_out_row))| {
+                            let base = r * dim;
+                            let rms = rms_cache[r];
+                            let inv_rms = 1.0 / rms;
                             
-                            // Accumulate weight gradient
-                            // dL/dw_i = sum_over_batch(grad_out * x_hat)
-                            // We can do this atomically or accumulate locally then write?
-                            // RwLock write is exclusive. We are inside write lock.
-                            // But we iterate rows. w_grad is shared across rows.
-                            w_grad[i] += g * x_hat_cache[base + i];
-                        }
-                        
-                        let mean_dot = dot_sum / dim as f64;
-                        
-                        // 3. Calculate dL/dx
-                        for i in 0..dim {
-                            let g = grad_out[base + i];
-                            let w = w_data[i];
-                            let dl_dxhat = g * w;
-                            let x_hat = x_hat_cache[base + i];
+                            let mut dot_sum = 0.0;
+                            for i in 0..dim {
+                                let g = g_out_row[i];
+                                let w = w_data[i];
+                                let dl_dxhat = g * w;
+                                dot_sum += dl_dxhat * x_hat_cache[base + i];
+                            }
                             
-                            // dL/dx = (1/rms) * (dL/dx_hat - x_hat * mean_dot)
-                            x_grad[base + i] += inv_rms * (dl_dxhat - x_hat * mean_dot); // Wait, formula check
-                            // Formula: dL/dx = (1/rms) * (dL/dx_hat - x_hat * (1/d) * sum(dL/dx_hat * x_hat))
-                            // Yes, matches.
+                            let mean_dot = dot_sum / dim as f64;
+                            
+                            for i in 0..dim {
+                                let g = g_out_row[i];
+                                let w = w_data[i];
+                                let dl_dxhat = g * w;
+                                let x_hat = x_hat_cache[base + i];
+                                x_g_row[i] += inv_rms * (dl_dxhat - x_hat * mean_dot);
+                            }
+                        });
+
+                    // 2. Accumulate weight gradient (reduction over batch)
+                    w_grad.par_iter_mut().enumerate().for_each(|(i, wg)| {
+                        let mut sum = 0.0;
+                        for r in 0..num_rows {
+                            let base = r * dim;
+                            sum += grad_out[base + i] * x_hat_cache[base + i];
                         }
-                    }
+                        *wg += sum;
+                    });
                 }),
             })),
         }
@@ -679,11 +665,11 @@ impl MultiHeadLatentAttention {
         
         let q_data = q.data.read().unwrap();
         let k_data = k.data.read().unwrap();
-        let mut out_data = Vec::with_capacity(b * seq * seq);
         
-        for batch_idx in 0..b {
+        let out_data: Vec<f64> = (0..b).into_par_iter().flat_map_iter(|batch_idx| {
             let base_q = batch_idx * seq * dim;
             let base_k = batch_idx * seq * dim;
+            let mut batch_out = Vec::with_capacity(seq * seq);
             
             for i in 0..seq {
                 for j in 0..seq {
@@ -691,10 +677,11 @@ impl MultiHeadLatentAttention {
                     for d in 0..dim {
                         sum += q_data[base_q + i * dim + d] * k_data[base_k + j * dim + d];
                     }
-                    out_data.push(sum);
+                    batch_out.push(sum);
                 }
             }
-        }
+            batch_out
+        }).collect();
         
         // Backward pass implementation
         let parents = vec![q.clone(), k.clone()];
@@ -714,27 +701,31 @@ impl MultiHeadLatentAttention {
                     let mut q_grad = q_in.grad.write().unwrap();
                     let mut k_grad = k_in.grad.write().unwrap();
                     
-                    for batch_idx in 0..b {
-                        let base_q = batch_idx * seq * dim;
-                        let base_k = batch_idx * seq * dim;
-                        let base_grad = batch_idx * seq * seq;
-                        
-                        // dL/dQ = grad_out * K
-                        // dL/dK = grad_out^T * Q (careful with indices)
-                        
-                        for i in 0..seq {
-                            for j in 0..seq {
-                                let g = grad_out[base_grad + i * seq + j];
-                                for d in 0..dim {
-                                    // dL/dQ[b, i, d] += g * K[b, j, d]
-                                    q_grad[base_q + i * dim + d] += g * k_data[base_k + j * dim + d];
-                                    
-                                    // dL/dK[b, j, d] += g * Q[b, i, d]
-                                    k_grad[base_k + j * dim + d] += g * q_data[base_q + i * dim + d];
+                    let chunk_size_grad = seq * dim;
+                    let chunk_size_out = seq * seq;
+                    
+                    q_grad.par_chunks_mut(chunk_size_grad)
+                          .zip(k_grad.par_chunks_mut(chunk_size_grad))
+                          .zip(grad_out.par_chunks(chunk_size_out))
+                          .enumerate()
+                          .for_each(|(batch_idx, ((q_g_chunk, k_g_chunk), g_out_chunk))| {
+                                let base_data = batch_idx * seq * dim;
+                                let q_slice = &q_data[base_data..base_data + chunk_size_grad];
+                                let k_slice = &k_data[base_data..base_data + chunk_size_grad];
+                                
+                                for i in 0..seq {
+                                    for j in 0..seq {
+                                        let g = g_out_chunk[i * seq + j];
+                                        for d in 0..dim {
+                                            // dL/dQ[b, i, d] += g * K[b, j, d]
+                                            q_g_chunk[i * dim + d] += g * k_slice[j * dim + d];
+                                            
+                                            // dL/dK[b, j, d] += g * Q[b, i, d]
+                                            k_g_chunk[j * dim + d] += g * q_slice[i * dim + d];
+                                        }
+                                    }
                                 }
-                            }
-                        }
-                    }
+                          });
                 }),
             })),
         }
@@ -747,11 +738,11 @@ impl MultiHeadLatentAttention {
         
         let p_data = probs.data.read().unwrap();
         let v_data = v.data.read().unwrap();
-        let mut out_data = Vec::with_capacity(b * seq * dim_v);
         
-        for batch_idx in 0..b {
+        let out_data: Vec<f64> = (0..b).into_par_iter().flat_map_iter(|batch_idx| {
             let base_p = batch_idx * seq * seq;
             let base_v = batch_idx * seq * dim_v;
+            let mut batch_out = Vec::with_capacity(seq * dim_v);
             
             for i in 0..seq {
                 for d in 0..dim_v {
@@ -759,10 +750,11 @@ impl MultiHeadLatentAttention {
                     for j in 0..seq {
                         sum += p_data[base_p + i * seq + j] * v_data[base_v + j * dim_v + d];
                     }
-                    out_data.push(sum);
+                    batch_out.push(sum);
                 }
             }
-        }
+            batch_out
+        }).collect();
         
         // Backward pass implementation
         let parents = vec![probs.clone(), v.clone()];
@@ -782,24 +774,33 @@ impl MultiHeadLatentAttention {
                     let mut p_grad = p_in.grad.write().unwrap();
                     let mut v_grad = v_in.grad.write().unwrap();
                     
-                    for batch_idx in 0..b {
-                        let base_p = batch_idx * seq * seq;
-                        let base_v = batch_idx * seq * dim_v;
-                        let base_grad = batch_idx * seq * dim_v;
-                        
-                        for i in 0..seq {
-                            for d in 0..dim_v {
-                                let g = grad_out[base_grad + i * dim_v + d];
-                                for j in 0..seq {
-                                    // dL/dP[b, i, j] += g * V[b, j, d]
-                                    p_grad[base_p + i * seq + j] += g * v_data[base_v + j * dim_v + d];
-                                    
-                                    // dL/dV[b, j, d] += g * P[b, i, j]
-                                    v_grad[base_v + j * dim_v + d] += g * p_data[base_p + i * seq + j];
+                    let chunk_size_p = seq * seq;
+                    let chunk_size_v = seq * dim_v;
+                    let chunk_size_grad = seq * dim_v;
+                    
+                    p_grad.par_chunks_mut(chunk_size_p)
+                          .zip(v_grad.par_chunks_mut(chunk_size_v))
+                          .zip(grad_out.par_chunks(chunk_size_grad))
+                          .enumerate()
+                          .for_each(|(batch_idx, ((p_g_chunk, v_g_chunk), g_out_chunk))| {
+                                let base_p = batch_idx * seq * seq;
+                                let base_v = batch_idx * seq * dim_v;
+                                let p_slice = &p_data[base_p..base_p + chunk_size_p];
+                                let v_slice = &v_data[base_v..base_v + chunk_size_v];
+                                
+                                for i in 0..seq {
+                                    for d in 0..dim_v {
+                                        let g = g_out_chunk[i * dim_v + d];
+                                        for j in 0..seq {
+                                            // dL/dP[b, i, j] += g * V[b, j, d]
+                                            p_g_chunk[i * seq + j] += g * v_slice[j * dim_v + d];
+                                            
+                                            // dL/dV[b, j, d] += g * P[b, i, j]
+                                            v_g_chunk[j * dim_v + d] += g * p_slice[i * seq + j];
+                                        }
+                                    }
                                 }
-                            }
-                        }
-                    }
+                          });
                 }),
             })),
         }
@@ -808,7 +809,7 @@ impl MultiHeadLatentAttention {
     
     fn scale_tensor(&self, t: &Tensor, scale: f64) -> Tensor {
         let data = t.data.read().unwrap();
-        let new_data: Vec<f64> = data.iter().map(|&x| x * scale).collect();
+        let new_data: Vec<f64> = data.par_iter().map(|&x| x * scale).collect();
         
         let parents = vec![t.clone()];
         Tensor {
@@ -819,9 +820,7 @@ impl MultiHeadLatentAttention {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
                     let mut inp_grad = parents[0].grad.write().unwrap();
-                    for (i, &g) in grad_out.iter().enumerate() {
-                        inp_grad[i] += g * scale;
-                    }
+                    inp_grad.par_iter_mut().zip(grad_out.par_iter()).for_each(|(ig, &g)| *ig += g * scale);
                 }),
             })),
         }
@@ -831,28 +830,13 @@ impl MultiHeadLatentAttention {
         // t: [B, Seq, Seq]
         // Softmax along last dimension
         let data = t.data.read().unwrap();
-        let mut new_data = Vec::with_capacity(data.len());
-        let total_rows = data.len() / seq_len;
         
-        for r in 0..total_rows {
-            let start = r * seq_len;
-            let end = start + seq_len;
-            let row = &data[start..end];
-            
+        let new_data: Vec<f64> = data.par_chunks(seq_len).flat_map_iter(|row| {
             let max_val = row.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-            let mut sum_exp = 0.0;
-            let mut exps = Vec::with_capacity(seq_len);
-            
-            for &x in row {
-                let e = (x - max_val).exp();
-                exps.push(e);
-                sum_exp += e;
-            }
-            
-            for e in exps {
-                new_data.push(e / sum_exp);
-            }
-        }
+            let exps: Vec<f64> = row.iter().map(|&x| (x - max_val).exp()).collect();
+            let sum_exp: f64 = exps.iter().sum();
+            exps.into_iter().map(move |e| e / sum_exp)
+        }).collect();
         
         let parents = vec![t.clone()];
         let out_data_clone = new_data.clone();
@@ -867,21 +851,21 @@ impl MultiHeadLatentAttention {
                     let mut inp_grad = parents[0].grad.write().unwrap();
                     let out_data = &out_data_clone;
                     
-                    for r in 0..total_rows {
-                        let start = r * seq_len;
-                        let end = start + seq_len;
-                        
-                        let mut sum_gy = 0.0;
-                        for i in start..end {
-                            sum_gy += grad_out[i] * out_data[i];
-                        }
-                        
-                        for i in start..end {
-                            let yi = out_data[i];
-                            let gi = grad_out[i];
-                            inp_grad[i] += yi * (gi - sum_gy);
-                        }
-                    }
+                    inp_grad.par_chunks_mut(seq_len)
+                        .zip(grad_out.par_chunks(seq_len))
+                        .zip(out_data.par_chunks(seq_len))
+                        .for_each(|((ig_row, g_row), out_row)| {
+                            let mut sum_gy = 0.0;
+                            for i in 0..seq_len {
+                                sum_gy += g_row[i] * out_row[i];
+                            }
+                            
+                            for i in 0..seq_len {
+                                let yi = out_row[i];
+                                let gi = g_row[i];
+                                ig_row[i] += yi * (gi - sum_gy);
+                            }
+                        });
                 }),
             })),
         }
@@ -899,14 +883,17 @@ impl MultiHeadLatentAttention {
         let b_data = b.data.read().unwrap();
         
         let total_elements = batch_dims.iter().product::<usize>();
-        let mut new_data = Vec::with_capacity(total_elements * (last_dim_a + last_dim_b));
+        let mut new_data = vec![0.0; total_elements * (last_dim_a + last_dim_b)];
         
-        for i in 0..total_elements {
-            let start_a = i * last_dim_a;
-            let start_b = i * last_dim_b;
-            new_data.extend_from_slice(&a_data[start_a..start_a + last_dim_a]);
-            new_data.extend_from_slice(&b_data[start_b..start_b + last_dim_b]);
-        }
+        new_data.par_chunks_mut(last_dim_a + last_dim_b).enumerate().for_each(|(i, chunk)| {
+             let start_a = i * last_dim_a;
+             let start_b = i * last_dim_b;
+             
+             // Copy from a
+             chunk[0..last_dim_a].copy_from_slice(&a_data[start_a..start_a + last_dim_a]);
+             // Copy from b
+             chunk[last_dim_a..].copy_from_slice(&b_data[start_b..start_b + last_dim_b]);
+        });
         
         let mut new_shape = batch_dims.to_vec();
         new_shape.push(last_dim_a + last_dim_b);
@@ -925,18 +912,17 @@ impl MultiHeadLatentAttention {
                     
                     let stride = last_dim_a + last_dim_b;
                     
-                    for i in 0..total_elements {
-                        let base_out = i * stride;
-                        let base_a = i * last_dim_a;
-                        let base_b = i * last_dim_b;
-                        
-                        for k in 0..last_dim_a {
-                            a_grad[base_a + k] += grad_out[base_out + k];
-                        }
-                        for k in 0..last_dim_b {
-                            b_grad[base_b + k] += grad_out[base_out + last_dim_a + k];
-                        }
-                    }
+                    a_grad.par_chunks_mut(last_dim_a)
+                          .zip(b_grad.par_chunks_mut(last_dim_b))
+                          .zip(grad_out.par_chunks(stride))
+                          .for_each(|((ag_row, bg_row), g_row)| {
+                               for k in 0..last_dim_a {
+                                   ag_row[k] += g_row[k];
+                               }
+                               for k in 0..last_dim_b {
+                                   bg_row[k] += g_row[last_dim_a + k];
+                               }
+                          });
                 }),
             })),
         }

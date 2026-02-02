@@ -1275,21 +1275,6 @@ fn main() {
         p
     };
     
-    // We replace the trained_neural_opt with the DQN-optimized one (base part)
-    // Note: The DQN might have shifted the Q-values, but we only use the base features + linear head for probability adjustment.
-    // Actually, Q-Network output is Q-Values, not probability adjustments directly.
-    // But our DQN implementation modified the 'base' weights inside the QNetwork during backprop (if we allowed it).
-    // In our implementation, we only trained the Q-Head.
-    // So the 'base' inside dqn_policy is unchanged.
-    // IF we want to use the DQN policy for inference, we need to map Q-values to Actions.
-    // But `simulate_core` expects a `NeuralLuckOptimizer` that outputs a float scalar.
-    // So we can't easily swap `trained_neural_opt` with `dqn_policy` directly for the existing simulator
-    // unless we adapt the simulator to use Q-Network selection logic.
-    
-    // For now, let's just save the DQN model or demonstrate it trained.
-    // If we want to use the DQN result, we should probably update the linear weights of trained_neural_opt
-    // based on the "best action" preference, but that's complex.
-    // Let's just acknowledge DQN training completed.
     
     if save_neural_cache(NEURAL_CACHE_PATH, &trained_neural_opt) {
         println!("[Neural Core] Cache saved.");

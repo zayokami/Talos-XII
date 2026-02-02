@@ -1,5 +1,6 @@
 use std::sync::{Arc, RwLock};
 use std::ops::{Add, Sub, Mul, Div, Neg};
+use rayon::prelude::*;
 use serde::{Serialize, Deserialize, Serializer, Deserializer};
 use serde::ser::SerializeStruct;
 use std::fs::File;
@@ -171,15 +172,15 @@ impl Tensor {
             let lhs_data = self.data.read().unwrap();
             let rhs_data = other.data.read().unwrap();
             
-            for r in 0..m {
+            out_data.par_chunks_mut(n).enumerate().for_each(|(r, out_row)| {
                 for c in 0..n {
                     let mut sum = 0.0;
                     for i in 0..k {
                         sum += lhs_data[r * k + i] * rhs_data[i * n + c];
                     }
-                    out_data[r * n + c] = sum;
+                    out_row[c] = sum;
                 }
-            }
+            });
         }
         
         let out_shape = if self.shape.len() == 1 { vec![n] } else { vec![m, n] };
@@ -202,29 +203,29 @@ impl Tensor {
                     // dL/dLHS = grad_out * RHS^T
                     {
                         let mut lhs_grad = lhs.grad.write().unwrap();
-                        for r in 0..m {
+                        lhs_grad.par_chunks_mut(k).enumerate().for_each(|(r, lhs_row)| {
                             for i in 0..k {
                                 let mut sum = 0.0;
                                 for c in 0..n {
                                     sum += grad_out[r * n + c] * rhs_data[i * n + c];
                                 }
-                                lhs_grad[r * k + i] += sum;
+                                lhs_row[i] += sum;
                             }
-                        }
+                        });
                     }
                     
                     // dL/dRHS = LHS^T * grad_out
                     {
                         let mut rhs_grad = rhs.grad.write().unwrap();
-                        for i in 0..k {
+                        rhs_grad.par_chunks_mut(n).enumerate().for_each(|(i, rhs_row)| {
                             for c in 0..n {
                                 let mut sum = 0.0;
                                 for r in 0..m {
                                     sum += lhs_data[r * k + i] * grad_out[r * n + c];
                                 }
-                                rhs_grad[i * n + c] += sum;
+                                rhs_row[c] += sum;
                             }
-                        }
+                        });
                     }
                 }),
             })),
@@ -233,7 +234,7 @@ impl Tensor {
     
     pub fn relu(&self) -> Tensor {
         let self_data = self.data.read().unwrap();
-        let data: Vec<f64> = self_data.iter().map(|&x| if x > 0.0 { x } else { 0.0 }).collect();
+        let data: Vec<f64> = self_data.par_iter().map(|&x| if x > 0.0 { x } else { 0.0 }).collect();
         let parents = vec![self.clone()];
         
         Tensor {
@@ -246,11 +247,11 @@ impl Tensor {
                     let input = &parents[0];
                     let input_data = input.data.read().unwrap();
                     let mut inp_grad = input.grad.write().unwrap();
-                    for (i, &g) in grad_out.iter().enumerate() {
-                        if input_data[i] > 0.0 {
-                            inp_grad[i] += g;
+                    inp_grad.par_iter_mut().zip(grad_out.par_iter()).zip(input_data.par_iter()).for_each(|((ig, &go), &val)| {
+                        if val > 0.0 {
+                            *ig += go;
                         }
-                    }
+                    });
                 }),
             })),
         }
@@ -258,7 +259,7 @@ impl Tensor {
 
     pub fn log(&self) -> Tensor {
         let self_data = self.data.read().unwrap();
-        let data: Vec<f64> = self_data.iter().map(|&x| x.ln()).collect();
+        let data: Vec<f64> = self_data.par_iter().map(|&x| x.ln()).collect();
         let parents = vec![self.clone()];
         
         Tensor {
@@ -271,9 +272,9 @@ impl Tensor {
                     let input = &parents[0];
                     let input_data = input.data.read().unwrap();
                     let mut inp_grad = input.grad.write().unwrap();
-                    for (i, &g) in grad_out.iter().enumerate() {
-                        inp_grad[i] += g / input_data[i];
-                    }
+                    inp_grad.par_iter_mut().zip(grad_out.par_iter()).zip(input_data.par_iter()).for_each(|((ig, &g), &id)| {
+                        *ig += g / id;
+                    });
                 }),
             })),
         }
@@ -281,7 +282,7 @@ impl Tensor {
 
     pub fn exp(&self) -> Tensor {
         let self_data = self.data.read().unwrap();
-        let data: Vec<f64> = self_data.iter().map(|&x| x.exp()).collect();
+        let data: Vec<f64> = self_data.par_iter().map(|&x| x.exp()).collect();
         let parents = vec![self.clone()];
         
         Tensor {
@@ -295,9 +296,9 @@ impl Tensor {
                     let input = &parents[0];
                     let input_data = input.data.read().unwrap();
                     let mut inp_grad = input.grad.write().unwrap();
-                    for (i, &g) in grad_out.iter().enumerate() {
-                        inp_grad[i] += g * input_data[i].exp();
-                    }
+                    inp_grad.par_iter_mut().zip(grad_out.par_iter()).zip(input_data.par_iter()).for_each(|((ig, &g), &id)| {
+                        *ig += g * id.exp();
+                    });
                 }),
             })),
         }
@@ -305,7 +306,7 @@ impl Tensor {
 
     pub fn sum(&self) -> Tensor {
         let self_data = self.data.read().unwrap();
-        let sum_val: f64 = self_data.iter().sum();
+        let sum_val: f64 = self_data.par_iter().sum();
         let parents = vec![self.clone()];
         
         Tensor {
@@ -317,9 +318,7 @@ impl Tensor {
                 backward_op: Box::new(move |grad_out, parents| {
                     let mut inp_grad = parents[0].grad.write().unwrap();
                     let g = grad_out[0];
-                    for v in inp_grad.iter_mut() {
-                        *v += g;
-                    }
+                    inp_grad.par_iter_mut().for_each(|v| *v += g);
                 }),
             })),
         }
@@ -328,7 +327,7 @@ impl Tensor {
     pub fn mean(&self) -> Tensor {
         let self_data = self.data.read().unwrap();
         let len = self_data.len();
-        let sum_val: f64 = self_data.iter().sum();
+        let sum_val: f64 = self_data.par_iter().sum();
         let parents = vec![self.clone()];
         
         Tensor {
@@ -340,9 +339,7 @@ impl Tensor {
                 backward_op: Box::new(move |grad_out, parents| {
                     let mut inp_grad = parents[0].grad.write().unwrap();
                     let g = grad_out[0] / len as f64;
-                    for v in inp_grad.iter_mut() {
-                        *v += g;
-                    }
+                    inp_grad.par_iter_mut().for_each(|v| *v += g);
                 }),
             })),
         }
@@ -364,7 +361,7 @@ impl Tensor {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
                     let mut inp_grad = parents[0].grad.write().unwrap();
-                    let sum_grad: f64 = grad_out.iter().sum();
+                    let sum_grad: f64 = grad_out.par_iter().sum();
                     inp_grad[0] += sum_grad;
                 }),
             })),
@@ -373,7 +370,7 @@ impl Tensor {
 
     pub fn sin(&self) -> Tensor {
         let self_data = self.data.read().unwrap();
-        let data: Vec<f64> = self_data.iter().map(|&x| x.sin()).collect();
+        let data: Vec<f64> = self_data.par_iter().map(|&x| x.sin()).collect();
         let parents = vec![self.clone()];
         
         Tensor {
@@ -386,9 +383,9 @@ impl Tensor {
                     let input = &parents[0];
                     let input_data = input.data.read().unwrap();
                     let mut inp_grad = input.grad.write().unwrap();
-                    for (i, &g) in grad_out.iter().enumerate() {
-                        inp_grad[i] += g * input_data[i].cos();
-                    }
+                    inp_grad.par_iter_mut().zip(grad_out.par_iter()).zip(input_data.par_iter()).for_each(|((ig, &g), &id)| {
+                        *ig += g * id.cos();
+                    });
                 }),
             })),
         }
@@ -396,7 +393,7 @@ impl Tensor {
 
     pub fn cos(&self) -> Tensor {
         let self_data = self.data.read().unwrap();
-        let data: Vec<f64> = self_data.iter().map(|&x| x.cos()).collect();
+        let data: Vec<f64> = self_data.par_iter().map(|&x| x.cos()).collect();
         let parents = vec![self.clone()];
         
         Tensor {
@@ -409,9 +406,9 @@ impl Tensor {
                     let input = &parents[0];
                     let input_data = input.data.read().unwrap();
                     let mut inp_grad = input.grad.write().unwrap();
-                    for (i, &g) in grad_out.iter().enumerate() {
-                        inp_grad[i] -= g * input_data[i].sin();
-                    }
+                    inp_grad.par_iter_mut().zip(grad_out.par_iter()).zip(input_data.par_iter()).for_each(|((ig, &g), &id)| {
+                        *ig -= g * id.sin();
+                    });
                 }),
             })),
         }
@@ -419,7 +416,7 @@ impl Tensor {
 
     pub fn sqrt(&self) -> Tensor {
         let self_data = self.data.read().unwrap();
-        let data: Vec<f64> = self_data.iter().map(|&x| x.sqrt()).collect();
+        let data: Vec<f64> = self_data.par_iter().map(|&x| x.sqrt()).collect();
         let parents = vec![self.clone()];
         
         Tensor {
@@ -432,12 +429,11 @@ impl Tensor {
                     let input = &parents[0];
                     let input_data = input.data.read().unwrap();
                     let mut inp_grad = input.grad.write().unwrap();
-                    for (i, &g) in grad_out.iter().enumerate() {
-                        let x = input_data[i];
-                        if x > 0.0 {
-                            inp_grad[i] += g * 0.5 / x.sqrt();
+                    inp_grad.par_iter_mut().zip(grad_out.par_iter()).zip(input_data.par_iter()).for_each(|((ig, &g), &id)| {
+                        if id > 0.0 {
+                            *ig += g * 0.5 / id.sqrt();
                         }
-                    }
+                    });
                 }),
             })),
         }
@@ -554,7 +550,7 @@ impl Tensor {
     
     pub fn clip(&self, min: f64, max: f64) -> Tensor {
         let self_data = self.data.read().unwrap();
-        let data: Vec<f64> = self_data.iter().map(|&x| x.max(min).min(max)).collect();
+        let data: Vec<f64> = self_data.par_iter().map(|&x| x.max(min).min(max)).collect();
         let parents = vec![self.clone()];
         
         Tensor {
@@ -567,12 +563,11 @@ impl Tensor {
                     let input = &parents[0];
                     let input_data = input.data.read().unwrap();
                     let mut inp_grad = input.grad.write().unwrap();
-                    for (i, &g) in grad_out.iter().enumerate() {
-                        let x = input_data[i];
-                        if x >= min && x <= max {
-                            inp_grad[i] += g;
+                    inp_grad.par_iter_mut().zip(grad_out.par_iter()).zip(input_data.par_iter()).for_each(|((ig, &g), &id)| {
+                        if id >= min && id <= max {
+                            *ig += g;
                         }
-                    }
+                    });
                 }),
             })),
         }
@@ -593,14 +588,325 @@ impl Tensor {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
                     let mut inp_grad = parents[0].grad.write().unwrap();
-                    for (i, &g) in grad_out.iter().enumerate() {
-                        inp_grad[i] += g;
-                    }
+                    inp_grad.par_iter_mut().zip(grad_out.par_iter()).for_each(|(ig, &g)| *ig += g);
                 }),
             })),
         }
     }
     
+    pub fn conv2d(&self, weight: &Tensor, stride: usize, padding: usize) -> Tensor {
+        assert_eq!(self.shape.len(), 4, "Input must be 4D (NCHW)");
+        assert_eq!(weight.shape.len(), 4, "Weight must be 4D (OIHW)");
+        
+        let (n, c_in, h_in, w_in) = (self.shape[0], self.shape[1], self.shape[2], self.shape[3]);
+        let (c_out, c_in_k, k_h, k_w) = (weight.shape[0], weight.shape[1], weight.shape[2], weight.shape[3]);
+        
+        assert_eq!(c_in, c_in_k, "Input channels must match weight input channels");
+        
+        let h_out = (h_in + 2 * padding - k_h) / stride + 1;
+        let w_out = (w_in + 2 * padding - k_w) / stride + 1;
+        
+        let out_shape = vec![n, c_out, h_out, w_out];
+        let out_len: usize = out_shape.iter().product();
+        let mut out_data = vec![0.0; out_len];
+        
+        let k_len = c_in * k_h * k_w;
+        let out_plane_len = h_out * w_out;
+
+        {
+            let input_data = self.data.read().unwrap();
+            let weight_data = weight.data.read().unwrap();
+            
+            // Optimization: Im2Col + GEMM
+            // Parallelize over Batch
+            out_data.par_chunks_mut(c_out * out_plane_len).enumerate().for_each(|(b, out_batch)| {
+                 // 1. Im2Col: Input (C_in, H, W) -> Cols (K_len, Out_len)
+                 let mut cols = vec![0.0; k_len * out_plane_len];
+                 
+                 // Parallelize filling cols (by kernel rows)
+                 cols.par_chunks_mut(out_plane_len).enumerate().for_each(|(k_idx, col_row)| {
+                     let c = k_idx / (k_h * k_w);
+                     let rem = k_idx % (k_h * k_w);
+                     let kh = rem / k_w;
+                     let kw = rem % k_w;
+                     
+                     for oh in 0..h_out {
+                         for ow in 0..w_out {
+                             let h_in_idx = (oh * stride) as isize - padding as isize + kh as isize;
+                             let w_in_idx = (ow * stride) as isize - padding as isize + kw as isize;
+                             
+                             if h_in_idx >= 0 && h_in_idx < h_in as isize && w_in_idx >= 0 && w_in_idx < w_in as isize {
+                                 col_row[oh * w_out + ow] = input_data[((b * c_in + c) * h_in + h_in_idx as usize) * w_in + w_in_idx as usize];
+                             }
+                         }
+                     }
+                 });
+
+                 // 2. GEMM: Weight (C_out, K_len) * Cols (K_len, Out_len) -> Out (C_out, Out_len)
+                 // out_batch is already slice of size C_out * Out_len
+                 
+                 // Iterate over output rows (C_out)
+                 out_batch.par_chunks_mut(out_plane_len).enumerate().for_each(|(out_c, out_row)| {
+                     // For each output channel, dot product weight row with all cols
+                     // weight row start: out_c * k_len
+                     let w_row_start = out_c * k_len;
+                     let w_row = &weight_data[w_row_start..w_row_start + k_len];
+                     
+                     for i in 0..out_plane_len {
+                         let mut sum = 0.0;
+                         // This inner loop is the hot path. 
+                         // Vectorization potential here.
+                         for k in 0..k_len {
+                             sum += w_row[k] * cols[k * out_plane_len + i];
+                         }
+                         out_row[i] = sum;
+                     }
+                 });
+            });
+        }
+
+        let parents = vec![self.clone(), weight.clone()];
+        
+        Tensor {
+            data: Arc::new(RwLock::new(out_data)),
+            grad: Arc::new(RwLock::new(vec![0.0; out_len])),
+            shape: out_shape,
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    let input = &parents[0];
+                    let weight = &parents[1];
+                    let input_data = input.data.read().unwrap();
+                    let weight_data = weight.data.read().unwrap();
+                    
+                    // dL/dInput
+                    {
+                        let mut input_grad = input.grad.write().unwrap();
+                        // Parallel over Input (N, C_in)
+                         input_grad.par_chunks_mut(h_in * w_in).enumerate().for_each(|(idx, in_plane)| {
+                            let b = idx / c_in;
+                            let c = idx % c_in;
+                            
+                            // Optimized Col2Im (Transposed Conv)
+                            for ih in 0..h_in {
+                                // Pre-calculate bounds to avoid inner loop checks
+                                let oh_min = (ih + padding).saturating_sub(k_h - 1) / stride;
+                                let oh_max = ((ih + padding) / stride).min(h_out - 1); // clamp to h_out-1
+                                // Adjust oh_max: if (ih+padding)/stride >= h_out, loop shouldn't run
+                                // But simple min works if range is valid.
+                                
+                                for iw in 0..w_in {
+                                    let mut sum = 0.0;
+                                    let ow_min = (iw + padding).saturating_sub(k_w - 1) / stride;
+                                    let ow_max = ((iw + padding) / stride).min(w_out - 1);
+
+                                    // Check if range is valid (could be empty if padding is small/large)
+                                    // With loop range ..= it handles it but let's be safe
+                                    if oh_min <= oh_max && ow_min <= ow_max {
+                                        for oh in oh_min..=oh_max {
+                                            for ow in ow_min..=ow_max {
+                                                 // Calculate kh, kw given ih, iw, oh, ow
+                                                 // ih = oh*s - p + kh => kh = ih - oh*s + p
+                                                 let kh = ih as isize - (oh * stride) as isize + padding as isize;
+                                                 let kw = iw as isize - (ow * stride) as isize + padding as isize;
+                                                 
+                                                 if kh >= 0 && kh < k_h as isize && kw >= 0 && kw < k_w as isize {
+                                                     // Should always be true given bounds, but stride check needed?
+                                                     // If we iterate oh, ow, kh is determined.
+                                                     // kh must be integer. It is.
+                                                     
+                                                     // Wait, we need to sum over all output channels (c_out)
+                                                     // grad_out layout: N, C_out, H_out, W_out
+                                                     
+                                                     for k in 0..c_out {
+                                                         let g = grad_out[((b * c_out + k) * h_out + oh) * w_out + ow];
+                                                         let w = weight_data[((k * c_in + c) * k_h + kh as usize) * k_w + kw as usize];
+                                                         sum += g * w;
+                                                     }
+                                                 }
+                                            }
+                                        }
+                                    }
+                                    in_plane[ih * w_in + iw] += sum;
+                                }
+                            }
+                         });
+                    }
+                    
+                    // dL/dWeight
+                    {
+                        let mut weight_grad = weight.grad.write().unwrap();
+                        // dWeight = grad_out * Input_Cols^T
+                        // Implemented via manual accumulation over batch
+                        
+                        // We can reuse the Im2Col logic here, or just direct convolution loop (gradient of weight is convolution of input and grad_out)
+                        // Actually, reusing Im2Col per batch is cleaner if we had the cols. We don't save them.
+                        // So re-computing Im2Col or doing direct loop.
+                        // Direct loop is safer for memory.
+                        
+                        // Optimization: Parallel over Weight (C_out, C_in, KH, KW)
+                        weight_grad.par_chunks_mut(k_h * k_w).enumerate().for_each(|(idx, w_plane)| {
+                             let k = idx / c_in;
+                             let c = idx % c_in;
+                             
+                             for kh in 0..k_h {
+                                 for kw in 0..k_w {
+                                     let mut sum = 0.0;
+                                     for b in 0..n {
+                                         for oh in 0..h_out {
+                                             for ow in 0..w_out {
+                                                let h_in_idx = (oh * stride) as isize - padding as isize + kh as isize;
+                                                let w_in_idx = (ow * stride) as isize - padding as isize + kw as isize;
+                                                
+                                                if h_in_idx >= 0 && h_in_idx < h_in as isize && w_in_idx >= 0 && w_in_idx < w_in as isize {
+                                                    let val_in = input_data[((b * c_in + c) * h_in + h_in_idx as usize) * w_in + w_in_idx as usize];
+                                                    let g_val = grad_out[((b * c_out + k) * h_out + oh) * w_out + ow];
+                                                    sum += val_in * g_val;
+                                                }
+                                             }
+                                         }
+                                     }
+                                     w_plane[kh * k_w + kw] += sum;
+                                 }
+                             }
+                        });
+                    }
+                }),
+            })),
+        }
+    }
+
+    pub fn max_pool2d(&self, kernel_size: usize, stride: usize, padding: usize) -> Tensor {
+         assert_eq!(self.shape.len(), 4, "Input must be 4D (NCHW)");
+         let (n, c, h_in, w_in) = (self.shape[0], self.shape[1], self.shape[2], self.shape[3]);
+         
+         let h_out = (h_in + 2 * padding - kernel_size) / stride + 1;
+         let w_out = (w_in + 2 * padding - kernel_size) / stride + 1;
+         
+         let out_shape = vec![n, c, h_out, w_out];
+         let out_len: usize = out_shape.iter().product();
+         let mut out_data = vec![0.0; out_len];
+         
+         {
+             let input_data = self.data.read().unwrap();
+             // Parallelize over (N, C)
+             out_data.par_chunks_mut(h_out * w_out).enumerate().for_each(|(idx, out_plane)| {
+                 let b = idx / c;
+                 let ch = idx % c;
+                 
+                 for oh in 0..h_out {
+                     for ow in 0..w_out {
+                         let h_start = (oh * stride) as isize - padding as isize;
+                         let w_start = (ow * stride) as isize - padding as isize;
+                         
+                         let mut max_val = f64::NEG_INFINITY;
+                         
+                         // Optimization: Optimized bounds
+                         let kh_start = if h_start < 0 { (-h_start) as usize } else { 0 };
+                         let kw_start = if w_start < 0 { (-w_start) as usize } else { 0 };
+                         let kh_end = if h_start + kernel_size as isize > h_in as isize { (h_in as isize - h_start) as usize } else { kernel_size };
+                         let kw_end = if w_start + kernel_size as isize > w_in as isize { (w_in as isize - w_start) as usize } else { kernel_size };
+                         
+                         // Inner loops now guaranteed valid
+                         for kh in kh_start..kh_end {
+                             for kw in kw_start..kw_end {
+                                 let h_in_idx = (h_start + kh as isize) as usize;
+                                 let w_in_idx = (w_start + kw as isize) as usize;
+                                 let val = input_data[((b * c + ch) * h_in + h_in_idx) * w_in + w_in_idx];
+                                 if val > max_val {
+                                     max_val = val;
+                                 }
+                             }
+                         }
+                         out_plane[oh * w_out + ow] = max_val;
+                     }
+                 }
+             });
+         }
+         
+         let parents = vec![self.clone()];
+         
+         Tensor {
+            data: Arc::new(RwLock::new(out_data)),
+            grad: Arc::new(RwLock::new(vec![0.0; out_len])),
+            shape: out_shape,
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    let input = &parents[0];
+                    let input_data = input.data.read().unwrap();
+                    let mut input_grad = input.grad.write().unwrap();
+                    
+                    // Parallelize over Input (N, C)
+                    input_grad.par_chunks_mut(h_in * w_in).enumerate().for_each(|(idx, in_plane)| {
+                        let b = idx / c;
+                        let ch = idx % c;
+                        
+                        for ih in 0..h_in {
+                            for iw in 0..w_in {
+                                let mut grad_sum = 0.0;
+                                let val_in = input_data[((b * c + ch) * h_in + ih) * w_in + iw];
+
+                                // Determine possible output windows
+                                // ih = oh*s - p + kh  => oh*s = ih + p - kh
+                                // oh_min occurs when kh is max (k-1) -> oh*s = ih + p - (k-1)
+                                // oh_max occurs when kh is min (0)   -> oh*s = ih + p
+                                
+                                let oh_min = (ih + padding).saturating_sub(kernel_size - 1) / stride;
+                                let oh_max = ((ih + padding) / stride).min(h_out - 1);
+                                let ow_min = (iw + padding).saturating_sub(kernel_size - 1) / stride;
+                                let ow_max = ((iw + padding) / stride).min(w_out - 1);
+                                
+                                if oh_min <= oh_max && ow_min <= ow_max {
+                                    for oh in oh_min..=oh_max {
+                                        for ow in ow_min..=ow_max {
+                                            // Check stride alignment effectively handled by division/range but:
+                                            // We need to check if ih is actually in the window for this oh.
+                                            // The range calculation above is necessary but not sufficient if stride > 1?
+                                            // Actually integer division handles "floor".
+                                            // Let's verify: oh*s <= ih+p < oh*s + k
+                                            // oh*s - p <= ih < oh*s - p + k
+                                            
+                                            let h_start = (oh * stride) as isize - padding as isize;
+                                            let w_start = (ow * stride) as isize - padding as isize;
+                                            
+                                            if (ih as isize) >= h_start && (ih as isize) < h_start + kernel_size as isize &&
+                                               (iw as isize) >= w_start && (iw as isize) < w_start + kernel_size as isize {
+                                                
+                                                // Re-find max
+                                                let mut max_val = f64::NEG_INFINITY;
+                                                
+                                                // Optimized bounds for inner search
+                                                let kh_start = if h_start < 0 { (-h_start) as usize } else { 0 };
+                                                let kw_start = if w_start < 0 { (-w_start) as usize } else { 0 };
+                                                let kh_end = if h_start + kernel_size as isize > h_in as isize { (h_in as isize - h_start) as usize } else { kernel_size };
+                                                let kw_end = if w_start + kernel_size as isize > w_in as isize { (w_in as isize - w_start) as usize } else { kernel_size };
+                                                
+                                                for kh in kh_start..kh_end {
+                                                    for kw in kw_start..kw_end {
+                                                         let h_k = (h_start + kh as isize) as usize;
+                                                         let w_k = (w_start + kw as isize) as usize;
+                                                         let v = input_data[((b * c + ch) * h_in + h_k) * w_in + w_k];
+                                                         if v > max_val { max_val = v; }
+                                                    }
+                                                }
+                                                
+                                                if (val_in - max_val).abs() < 1e-6 {
+                                                    grad_sum += grad_out[((b * c + ch) * h_out + oh) * w_out + ow];
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                in_plane[ih * w_in + iw] += grad_sum;
+                            }
+                        }
+                    });
+                }),
+            })),
+         }
+    }
+
     pub fn mse_loss(&self, target: &Tensor) -> Tensor {
         let diff = self - target;
         let sq = &diff * &diff;
@@ -616,7 +922,7 @@ impl Add for Tensor {
         assert_eq!(self.shape, rhs.shape, "Add shape mismatch");
         let self_data = self.data.read().unwrap();
         let rhs_data = rhs.data.read().unwrap();
-        let data: Vec<f64> = self_data.iter().zip(rhs_data.iter()).map(|(a, b)| a + b).collect();
+        let data: Vec<f64> = self_data.par_iter().zip(rhs_data.par_iter()).map(|(a, b)| a + b).collect();
         let parents = vec![self.clone(), rhs.clone()];
         Tensor {
             data: Arc::new(RwLock::new(data)),
@@ -628,16 +934,12 @@ impl Add for Tensor {
                     // Scope 1: LHS
                     {
                         let mut lhs_grad = parents[0].grad.write().unwrap();
-                        for (i, &g) in grad_out.iter().enumerate() {
-                            lhs_grad[i] += g;
-                        }
+                        lhs_grad.par_iter_mut().zip(grad_out.par_iter()).for_each(|(lg, &g)| *lg += g);
                     }
                     // Scope 2: RHS
                     {
                         let mut rhs_grad = parents[1].grad.write().unwrap();
-                        for (i, &g) in grad_out.iter().enumerate() {
-                            rhs_grad[i] += g;
-                        }
+                        rhs_grad.par_iter_mut().zip(grad_out.par_iter()).for_each(|(rg, &g)| *rg += g);
                     }
                 }),
             })),
@@ -656,7 +958,7 @@ impl Sub for Tensor {
         assert_eq!(self.shape, rhs.shape, "Sub shape mismatch");
         let self_data = self.data.read().unwrap();
         let rhs_data = rhs.data.read().unwrap();
-        let data: Vec<f64> = self_data.iter().zip(rhs_data.iter()).map(|(a, b)| a - b).collect();
+        let data: Vec<f64> = self_data.par_iter().zip(rhs_data.par_iter()).map(|(a, b)| a - b).collect();
         let parents = vec![self.clone(), rhs.clone()];
         Tensor {
             data: Arc::new(RwLock::new(data)),
@@ -668,16 +970,12 @@ impl Sub for Tensor {
                     // Scope 1: LHS
                     {
                         let mut lhs_grad = parents[0].grad.write().unwrap();
-                        for (i, &g) in grad_out.iter().enumerate() {
-                            lhs_grad[i] += g;
-                        }
+                        lhs_grad.par_iter_mut().zip(grad_out.par_iter()).for_each(|(lg, &g)| *lg += g);
                     }
                     // Scope 2: RHS
                     {
                         let mut rhs_grad = parents[1].grad.write().unwrap();
-                        for (i, &g) in grad_out.iter().enumerate() {
-                            rhs_grad[i] -= g;
-                        }
+                        rhs_grad.par_iter_mut().zip(grad_out.par_iter()).for_each(|(rg, &g)| *rg -= g);
                     }
                 }),
             })),
@@ -698,7 +996,7 @@ impl Mul for Tensor {
         assert_eq!(self.shape, rhs.shape, "Mul shape mismatch");
         let self_data = self.data.read().unwrap();
         let rhs_data = rhs.data.read().unwrap();
-        let data: Vec<f64> = self_data.iter().zip(rhs_data.iter()).map(|(a, b)| a * b).collect();
+        let data: Vec<f64> = self_data.par_iter().zip(rhs_data.par_iter()).map(|(a, b)| a * b).collect();
         let parents = vec![self.clone(), rhs.clone()];
         Tensor {
             data: Arc::new(RwLock::new(data)),
@@ -709,25 +1007,24 @@ impl Mul for Tensor {
                 backward_op: Box::new(|grad_out, parents| {
                     let lhs = &parents[0];
                     let rhs = &parents[1];
-                    let lhs_data = lhs.data.read().unwrap().clone();
-                    let rhs_data = rhs.data.read().unwrap().clone();
+                    let lhs_data = lhs.data.read().unwrap();
+                    let rhs_data = rhs.data.read().unwrap();
                     if Arc::ptr_eq(&lhs.grad, &rhs.grad) {
                         let mut grad = lhs.grad.write().unwrap();
-                        for (i, &g) in grad_out.iter().enumerate() {
-                            grad[i] += g * (lhs_data[i] + rhs_data[i]);
-                        }
+                        grad.par_iter_mut().zip(grad_out.par_iter()).zip(lhs_data.par_iter()).zip(rhs_data.par_iter())
+                            .for_each(|(((g, &go), &l), &r)| {
+                                *g += go * (l + r);
+                            });
                     } else {
                         {
                             let mut lhs_grad = lhs.grad.write().unwrap();
-                            for (i, &g) in grad_out.iter().enumerate() {
-                                lhs_grad[i] += g * rhs_data[i];
-                            }
+                            lhs_grad.par_iter_mut().zip(grad_out.par_iter()).zip(rhs_data.par_iter())
+                                .for_each(|((lg, &g), &r)| *lg += g * r);
                         }
                         {
                             let mut rhs_grad = rhs.grad.write().unwrap();
-                            for (i, &g) in grad_out.iter().enumerate() {
-                                rhs_grad[i] += g * lhs_data[i];
-                            }
+                            rhs_grad.par_iter_mut().zip(grad_out.par_iter()).zip(lhs_data.par_iter())
+                                .for_each(|((rg, &g), &l)| *rg += g * l);
                         }
                     }
                 }),
@@ -747,7 +1044,7 @@ impl Div for Tensor {
         assert_eq!(self.shape, rhs.shape, "Div shape mismatch");
         let self_data = self.data.read().unwrap();
         let rhs_data = rhs.data.read().unwrap();
-        let data: Vec<f64> = self_data.iter().zip(rhs_data.iter()).map(|(a, b)| a / b).collect();
+        let data: Vec<f64> = self_data.par_iter().zip(rhs_data.par_iter()).map(|(a, b)| a / b).collect();
         let parents = vec![self.clone(), rhs.clone()];
         Tensor {
             data: Arc::new(RwLock::new(data)),
@@ -758,31 +1055,24 @@ impl Div for Tensor {
                 backward_op: Box::new(|grad_out, parents| {
                     let lhs = &parents[0];
                     let rhs = &parents[1];
-                    let lhs_data = lhs.data.read().unwrap().clone();
-                    let rhs_data = rhs.data.read().unwrap().clone();
+                    let lhs_data = lhs.data.read().unwrap();
+                    let rhs_data = rhs.data.read().unwrap();
                     if Arc::ptr_eq(&lhs.grad, &rhs.grad) {
                         let mut grad = lhs.grad.write().unwrap();
-                        for (i, &g) in grad_out.iter().enumerate() {
-                            let l = lhs_data[i];
-                            let r = rhs_data[i];
-                            let v = g / r - g * l / (r * r);
-                            grad[i] += v;
-                        }
+                        grad.par_iter_mut().zip(grad_out.par_iter()).zip(lhs_data.par_iter()).zip(rhs_data.par_iter())
+                            .for_each(|(((g, &go), &l), &r)| {
+                                *g += go / r - go * l / (r * r);
+                            });
                     } else {
                         {
                             let mut lhs_grad = lhs.grad.write().unwrap();
-                            for (i, &g) in grad_out.iter().enumerate() {
-                                let r = rhs_data[i];
-                                lhs_grad[i] += g / r;
-                            }
+                            lhs_grad.par_iter_mut().zip(grad_out.par_iter()).zip(rhs_data.par_iter())
+                                .for_each(|((lg, &g), &r)| *lg += g / r);
                         }
                         {
                             let mut rhs_grad = rhs.grad.write().unwrap();
-                            for (i, &g) in grad_out.iter().enumerate() {
-                                let l = lhs_data[i];
-                                let r = rhs_data[i];
-                                rhs_grad[i] -= g * l / (r * r);
-                            }
+                            rhs_grad.par_iter_mut().zip(grad_out.par_iter()).zip(lhs_data.par_iter()).zip(rhs_data.par_iter())
+                                .for_each(|(((rg, &g), &l), &r)| *rg -= g * l / (r * r));
                         }
                     }
                 }),
@@ -800,7 +1090,7 @@ impl Neg for Tensor {
     type Output = Tensor;
     fn neg(self) -> Tensor {
         let self_data = self.data.read().unwrap();
-        let data: Vec<f64> = self_data.iter().map(|&x| -x).collect();
+        let data: Vec<f64> = self_data.par_iter().map(|&x| -x).collect();
         let parents = vec![self.clone()];
         Tensor {
             data: Arc::new(RwLock::new(data)),
@@ -810,9 +1100,7 @@ impl Neg for Tensor {
                 parents,
                 backward_op: Box::new(|grad_out, parents| {
                     let mut inp_grad = parents[0].grad.write().unwrap();
-                    for (i, &g) in grad_out.iter().enumerate() {
-                        inp_grad[i] -= g;
-                    }
+                    inp_grad.par_iter_mut().zip(grad_out.par_iter()).for_each(|(ig, &g)| *ig -= g);
                 }),
             })),
         }
@@ -822,4 +1110,78 @@ impl Neg for Tensor {
 impl<'a> Neg for &'a Tensor {
     type Output = Tensor;
     fn neg(self) -> Tensor { -self.clone() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_broadcast_scalar() {
+        let t = Tensor::new(vec![5.0], vec![1]);
+        let b = t.broadcast(vec![2, 2]);
+        assert_eq!(b.shape, vec![2, 2]);
+        let data = b.data.read().unwrap();
+        assert_eq!(*data, vec![5.0, 5.0, 5.0, 5.0]);
+    }
+
+    #[test]
+    fn test_matmul_performance() {
+        use std::time::Instant;
+        let size = 1024;
+        println!("Initializing {}x{} tensors...", size, size);
+        let a = Tensor::rand(vec![size, size], -1.0, 1.0, 42);
+        let b = Tensor::rand(vec![size, size], -1.0, 1.0, 123);
+        
+        println!("Starting MatMul...");
+        let start = Instant::now();
+        let _c = a.matmul(&b);
+        let duration = start.elapsed();
+        println!("MatMul {}x{} took: {:.2?}", size, size, duration);
+    }
+
+    #[test]
+    fn test_conv2d_simple() {
+        // Input: 1x1x3x3
+        // [[1, 2, 3],
+        //  [4, 5, 6],
+        //  [7, 8, 9]]
+        let input = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], vec![1, 1, 3, 3]);
+        
+        // Weight: 1x1x2x2 (all ones)
+        // [[1, 1],
+        //  [1, 1]]
+        let weight = Tensor::new(vec![1.0, 1.0, 1.0, 1.0], vec![1, 1, 2, 2]);
+        
+        // Output should be 2x2
+        // [1+2+4+5, 2+3+5+6] = [12, 16]
+        // [4+5+7+8, 5+6+8+9] = [24, 28]
+        
+        let out = input.conv2d(&weight, 1, 0);
+        assert_eq!(out.shape, vec![1, 1, 2, 2]);
+        let data = out.data.read().unwrap();
+        assert_eq!(*data, vec![12.0, 16.0, 24.0, 28.0]);
+    }
+
+    #[test]
+    fn test_max_pool2d_simple() {
+        // Input: 1x1x4x4
+        let data: Vec<f64> = (0..16).map(|x| x as f64).collect();
+        let input = Tensor::new(data, vec![1, 1, 4, 4]);
+        
+        // Kernel 2, Stride 2
+        // [[0, 1, 2, 3],
+        //  [4, 5, 6, 7],
+        //  [8, 9, 10, 11],
+        //  [12,13, 14, 15]]
+        //
+        // Pool 2x2 s=2:
+        // [max(0,1,4,5)=5, max(2,3,6,7)=7]
+        // [max(8,9,12,13)=13, max(10,11,14,15)=15]
+        
+        let out = input.max_pool2d(2, 2, 0);
+        assert_eq!(out.shape, vec![1, 1, 2, 2]);
+        let d = out.data.read().unwrap();
+        assert_eq!(*d, vec![5.0, 7.0, 13.0, 15.0]);
+    }
 }
