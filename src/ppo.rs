@@ -1,10 +1,11 @@
 use crate::autograd::Tensor;
 use crate::neural::DIM;
-use crate::{PullState, dbn_env, prob_6, build_features};
+use crate::sim::{PullState, dbn_env, prob_6, build_features};
 use crate::config::Config;
 use crate::dbn::Dbn;
 use crate::rng::Rng;
-use crate::transformer::{LuckTransformer, Linear};
+use crate::transformer::LuckTransformer;
+use crate::nn::{Linear, Module};
 use std::collections::VecDeque;
 
 use serde::{Serialize, Deserialize};

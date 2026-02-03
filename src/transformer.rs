@@ -1,4 +1,5 @@
 use crate::autograd::{Tensor, Context};
+use crate::nn::{Linear, RMSNorm, Module};
 use std::sync::{Arc, RwLock};
 use rayon::prelude::*;
 use serde::{Serialize, Deserialize};
@@ -26,225 +27,6 @@ impl MLAConfig {
             v_head_dim: 64,
             max_seq_len: 2048,
         }
-    }
-}
-
-// --- Linear Layer Helper ---
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Linear {
-    pub w: Tensor,
-    pub b: Option<Tensor>,
-    pub in_dim: usize,
-    pub out_dim: usize,
-}
-
-impl Linear {
-    pub fn new(in_dim: usize, out_dim: usize, bias: bool, seed: u64) -> Self {
-        Self {
-            w: Tensor::rand(vec![in_dim, out_dim], -0.1, 0.1, seed),
-            b: if bias { Some(Tensor::zeros(vec![out_dim])) } else { None },
-            in_dim,
-            out_dim,
-        }
-    }
-    
-    pub fn forward(&self, x: &Tensor) -> Tensor {
-        // x: [..., in_dim]
-        // Flatten x to [N, in_dim] for matmul
-        let input_shape = x.shape.clone();
-        let batch_dim = input_shape.iter().take(input_shape.len() - 1).product();
-        let x_flat = x.reshape(vec![batch_dim, self.in_dim]);
-        
-        let out_flat = x_flat.matmul(&self.w); // [N, out_dim]
-        
-        let mut out = out_flat.reshape([input_shape[..input_shape.len()-1].to_vec(), vec![self.out_dim]].concat());
-        
-        if let Some(b) = &self.b {
-            // Manual broadcast for bias
-            let b_data = b.data.read().unwrap();
-            let out_data_len = batch_dim * self.out_dim;
-            let mut new_data = vec![0.0; out_data_len];
-            
-            {
-                let out_read = out.data.read().unwrap();
-                new_data.par_chunks_mut(self.out_dim).enumerate().for_each(|(i, chunk)| {
-                    let offset = i * self.out_dim;
-                    for j in 0..self.out_dim {
-                        chunk[j] = out_read[offset + j] + b_data[j];
-                    }
-                });
-            }
-            
-            // Re-wrap in Tensor with backward pass
-            let parents = vec![out.clone(), b.clone()];
-            let out_dim = self.out_dim;
-            
-            out = Tensor {
-                data: Arc::new(RwLock::new(new_data)),
-                grad: Arc::new(RwLock::new(vec![0.0; out_data_len])),
-                shape: out.shape.clone(),
-                _ctx: Some(Arc::new(Context {
-                    parents,
-                    backward_op: Box::new(move |grad_out, parents| {
-                        let out_tensor = &parents[0];
-                        let b_tensor = &parents[1];
-                        
-                        let mut out_grad = out_tensor.grad.write().unwrap();
-                        let mut b_grad = b_tensor.grad.write().unwrap();
-                        
-                        // dL/dout_tensor = grad_out (identity)
-                        out_grad.par_iter_mut().zip(grad_out.par_iter()).for_each(|(og, &g)| *og += g);
-                        
-                        // dL/db = sum(grad_out) over batch
-                        let total_elements = grad_out.len();
-                        let batch_size = total_elements / out_dim;
-                        
-                        b_grad.par_iter_mut().enumerate().for_each(|(j, bg)| {
-                            let mut sum = 0.0;
-                            for i in 0..batch_size {
-                                sum += grad_out[i * out_dim + j];
-                            }
-                            *bg += sum;
-                        });
-                    }),
-                })),
-            };
-        }
-        out
-    }
-
-    pub fn parameters(&self) -> Vec<Tensor> {
-        let mut p = vec![self.w.clone()];
-        if let Some(b) = &self.b {
-            p.push(b.clone());
-        }
-        p
-    }
-}
-
-// --- RMSNorm ---
-#[derive(Clone, Serialize, Deserialize)]
-pub struct RMSNorm {
-    pub weight: Tensor,
-    pub eps: f64,
-    pub dim: usize,
-}
-
-impl RMSNorm {
-    pub fn new(dim: usize, eps: f64, _seed: u64) -> Self {
-        // Initialize to 1.0 (no-op scaling initially)
-        // We use a small random variation to break symmetry if needed, but usually 1.0 is standard.
-        // Using rand around 1.0 might be better for training start? 
-        // Standard is 1.0.
-        Self {
-            weight: Tensor::new(vec![1.0; dim], vec![dim]),
-            eps,
-            dim,
-        }
-    }
-
-    pub fn forward(&self, x: &Tensor) -> Tensor {
-        // x: [Batch, Seq, Dim] or similar. Last dim must match self.dim.
-        let shape = &x.shape;
-        let last_dim = shape[shape.len() - 1];
-        assert_eq!(last_dim, self.dim, "RMSNorm dim mismatch");
-        
-        let x_data = x.data.read().unwrap();
-        let w_data = self.weight.data.read().unwrap();
-        
-        let num_elements = x_data.len();
-        let num_rows = num_elements / self.dim;
-        
-        let mut out_data = vec![0.0; num_elements];
-        let mut rms_cache = vec![0.0; num_rows];
-        let mut x_hat_cache = vec![0.0; num_elements];
-        
-        out_data.par_chunks_mut(self.dim)
-            .zip(x_hat_cache.par_chunks_mut(self.dim))
-            .zip(rms_cache.par_iter_mut())
-            .enumerate()
-            .for_each(|(r, ((out_row, x_hat_row), rms_ref))| {
-                let base = r * self.dim;
-                let mut sum_sq = 0.0;
-                for i in 0..self.dim {
-                    let val = x_data[base + i];
-                    sum_sq += val * val;
-                }
-                let rms = (sum_sq / self.dim as f64 + self.eps).sqrt();
-                *rms_ref = rms;
-                
-                for i in 0..self.dim {
-                    let val = x_data[base + i];
-                    let x_hat = val / rms;
-                    x_hat_row[i] = x_hat;
-                    out_row[i] = x_hat * w_data[i];
-                }
-            });
-        
-        let parents = vec![x.clone(), self.weight.clone()];
-        let dim = self.dim;
-        
-        let rms_cache = Arc::new(rms_cache);
-        let x_hat_cache = Arc::new(x_hat_cache);
-        
-        Tensor {
-            data: Arc::new(RwLock::new(out_data)),
-            grad: Arc::new(RwLock::new(vec![0.0; num_elements])),
-            shape: shape.clone(),
-            _ctx: Some(Arc::new(Context {
-                parents,
-                backward_op: Box::new(move |grad_out, parents| {
-                    let x_in = &parents[0];
-                    let w_in = &parents[1];
-                    
-                    let mut x_grad = x_in.grad.write().unwrap();
-                    let mut w_grad = w_in.grad.write().unwrap();
-                    let w_data = w_in.data.read().unwrap();
-                    
-                    // 1. Calculate dL/dx parallel over rows
-                    x_grad.par_chunks_mut(dim)
-                        .zip(grad_out.par_chunks(dim))
-                        .enumerate()
-                        .for_each(|(r, (x_g_row, g_out_row))| {
-                            let base = r * dim;
-                            let rms = rms_cache[r];
-                            let inv_rms = 1.0 / rms;
-                            
-                            let mut dot_sum = 0.0;
-                            for i in 0..dim {
-                                let g = g_out_row[i];
-                                let w = w_data[i];
-                                let dl_dxhat = g * w;
-                                dot_sum += dl_dxhat * x_hat_cache[base + i];
-                            }
-                            
-                            let mean_dot = dot_sum / dim as f64;
-                            
-                            for i in 0..dim {
-                                let g = g_out_row[i];
-                                let w = w_data[i];
-                                let dl_dxhat = g * w;
-                                let x_hat = x_hat_cache[base + i];
-                                x_g_row[i] += inv_rms * (dl_dxhat - x_hat * mean_dot);
-                            }
-                        });
-
-                    // 2. Accumulate weight gradient (reduction over batch)
-                    w_grad.par_iter_mut().enumerate().for_each(|(i, wg)| {
-                        let mut sum = 0.0;
-                        for r in 0..num_rows {
-                            let base = r * dim;
-                            sum += grad_out[base + i] * x_hat_cache[base + i];
-                        }
-                        *wg += sum;
-                    });
-                }),
-            })),
-        }
-    }
-    
-    pub fn parameters(&self) -> Vec<Tensor> {
-        vec![self.weight.clone()]
     }
 }
 
@@ -324,8 +106,14 @@ impl LuckTransformer {
         
         Tensor::new(out_data, vec![batch_size, dim])
     }
-    
-    pub fn parameters(&self) -> Vec<Tensor> {
+}
+
+impl Module for LuckTransformer {
+    fn forward(&self, input: &Tensor) -> Tensor {
+        self.forward(input, &[]) // Default usage without pity for Module trait
+    }
+
+    fn parameters(&self) -> Vec<Tensor> {
         let mut p = self.embed.parameters();
         p.extend(self.norm_1.parameters());
         p.extend(self.mla_layer.parameters());
@@ -337,6 +125,7 @@ impl LuckTransformer {
         p
     }
 }
+
 
 
 // --- RoPE: Rotary Positional Embeddings ---
@@ -955,12 +744,12 @@ mod tests {
         
         // Check if gradients propagated to weights
         // W_DKV is the first projection
-        let w_dkv_grad = mla.w_dkv.w.grad.read().unwrap();
+        let w_dkv_grad = mla.w_dkv.weight.grad.read().unwrap();
         let grad_sum: f64 = w_dkv_grad.iter().sum();
         assert!(grad_sum.abs() > 0.0, "Gradient should not be zero");
         
         // Check W_UK
-        let w_uk_grad = mla.w_uk.w.grad.read().unwrap();
+        let w_uk_grad = mla.w_uk.weight.grad.read().unwrap();
         let grad_sum_uk: f64 = w_uk_grad.iter().sum();
         assert!(grad_sum_uk.abs() > 0.0, "Gradient for W_UK should not be zero");
     }
@@ -1013,8 +802,8 @@ mod tests {
         assert!(params.len() > 10, "Should have many parameters");
         
         // Check if Embed gradients exist
-        let embed_grad = t.embed.w.grad.read().unwrap();
-        assert!(embed_grad.iter().any(|&g| g.abs() > 0.0), "Embed grad missing");
+        let embed_grad = t.embed.weight.grad.read().unwrap();
+        assert!(embed_grad.iter().any(|&g: &f64| g.abs() > 0.0), "Embed grad missing");
         
         // Check Norm grad
         let norm_grad = t.norm_1.weight.grad.read().unwrap();

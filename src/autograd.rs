@@ -5,6 +5,7 @@ use serde::{Serialize, Deserialize, Serializer, Deserializer};
 use serde::ser::SerializeStruct;
 use std::fs::File;
 use memmap2::Mmap;
+use crate::simd::{add_scaled_row, dot_product, vector_fma};
 
 // --- Autograd Engine ---
 
@@ -117,6 +118,25 @@ impl Tensor {
         Tensor::new(data, shape)
     }
 
+    pub fn detach(&self) -> Tensor {
+        Tensor {
+            data: self.data.clone(), // Share data
+            grad: self.grad.clone(), // Share grad? Or new grad? 
+            // Typically detach() creates a new Tensor that shares data but has NO graph history.
+            // But if we modify it, should it affect original? Yes.
+            // PyTorch detach: shares storage, requires_grad=False.
+            // Here we just want to break the graph.
+            shape: self.shape.clone(),
+            _ctx: None,
+        }
+    }
+    
+    // Create a new leaf tensor with same data (copy)
+    pub fn item(&self) -> f64 {
+        assert_eq!(self.shape.iter().product::<usize>(), 1);
+        self.data.read().unwrap()[0]
+    }
+
     pub fn backward(&self) {
         // Topological sort
         let mut visited = std::collections::HashSet::new();
@@ -151,6 +171,12 @@ impl Tensor {
             }
         }
     }
+    
+    // Explicitly clear the graph history to free memory
+    pub fn clear_graph(&mut self) {
+        self._ctx = None;
+    }
+
     
     pub fn zero_grad(&self) {
         let mut g = self.grad.write().unwrap();
@@ -231,53 +257,52 @@ impl Tensor {
                                  let grad_out_row_start = r * n;
                                  let lhs_grad_row_start = r * k;
                                  for i in 0..k {
-                                     let mut sum = 0.0;
                                      let rhs_row_start = i * n;
-                                     for c in 0..n {
-                                         sum += grad_out[grad_out_row_start + c] * rhs_data[rhs_row_start + c];
-                                     }
-                                     lhs_grad[lhs_grad_row_start + i] += sum;
+                                     let grad_row = &grad_out[grad_out_row_start..grad_out_row_start + n];
+                                     let rhs_row = &rhs_data[rhs_row_start..rhs_row_start + n];
+                                     lhs_grad[lhs_grad_row_start + i] += dot_product(grad_row, rhs_row);
                                  }
                              }
                         } else {
                             lhs_grad.par_chunks_mut(k).enumerate().for_each(|(r, lhs_row)| {
+                                let grad_out_row_start = r * n;
+                                let grad_row = &grad_out[grad_out_row_start..grad_out_row_start + n];
                                 for i in 0..k {
-                                    let mut sum = 0.0;
                                     let rhs_row_start = i * n;
-                                    let grad_out_row_start = r * n;
-                                    for c in 0..n {
-                                        sum += grad_out[grad_out_row_start + c] * rhs_data[rhs_row_start + c];
-                                    }
-                                    lhs_row[i] += sum;
+                                    let rhs_row = &rhs_data[rhs_row_start..rhs_row_start + n];
+                                    lhs_row[i] += dot_product(grad_row, rhs_row);
                                 }
                             });
                         }
                     }
                     
                     // dL/dRHS = LHS^T * grad_out
+                    // RHS_grad[i, :] += sum_r ( LHS[r, i] * grad_out[r, :] )
                     {
                         let mut rhs_grad = rhs.grad.write().unwrap();
                          let ops = k * n * m;
                          if ops < 32768 {
                              // Serial
+                             // Iterate over output rows (i)
                              for i in 0..k {
                                  let rhs_grad_row_start = i * n;
-                                 for c in 0..n {
-                                     let mut sum = 0.0;
-                                     for r in 0..m {
-                                         sum += lhs_data[r * k + i] * grad_out[r * n + c];
-                                     }
-                                     rhs_grad[rhs_grad_row_start + c] += sum;
+                                 let rhs_row = &mut rhs_grad[rhs_grad_row_start..rhs_grad_row_start + n];
+                                 for r in 0..m {
+                                     let scale = lhs_data[r * k + i];
+                                     if scale == 0.0 { continue; }
+                                     let grad_out_row_start = r * n;
+                                     let grad_row = &grad_out[grad_out_row_start..grad_out_row_start + n];
+                                     add_scaled_row(rhs_row, grad_row, scale);
                                  }
                              }
                          } else {
                             rhs_grad.par_chunks_mut(n).enumerate().for_each(|(i, rhs_row)| {
-                                for c in 0..n {
-                                    let mut sum = 0.0;
-                                    for r in 0..m {
-                                        sum += lhs_data[r * k + i] * grad_out[r * n + c];
-                                    }
-                                    rhs_row[c] += sum;
+                                for r in 0..m {
+                                    let scale = lhs_data[r * k + i];
+                                    if scale == 0.0 { continue; }
+                                    let grad_out_row_start = r * n;
+                                    let grad_row = &grad_out[grad_out_row_start..grad_out_row_start + n];
+                                    add_scaled_row(rhs_row, grad_row, scale);
                                 }
                             });
                          }
@@ -841,9 +866,7 @@ impl Tensor {
                              let u_ptr = &u_data[((k * c_in + c) * 16)..];
                              let v_ptr = &v_data[((t * c_in + c) * 16)..];
                              // Element-wise mul. Hot path!
-                             for x in 0..16 {
-                                 m[x] += u_ptr[x] * v_ptr[x];
-                             }
+                             vector_fma(&mut m, &u_ptr[0..16], &v_ptr[0..16]);
                          }
                          
                          // Y = A^T * m * A
