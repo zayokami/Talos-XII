@@ -1,7 +1,7 @@
-use crate::autograd::{Tensor, Context};
-use std::sync::{Arc, RwLock};
+use crate::autograd::{Context, Tensor};
 use rayon::prelude::*;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
+use std::sync::{Arc, RwLock};
 
 pub trait Module {
     fn forward(&self, input: &Tensor) -> Tensor;
@@ -26,7 +26,12 @@ impl Linear {
         } else {
             None
         };
-        Linear { weight, bias, in_features, out_features }
+        Linear {
+            weight,
+            bias,
+            in_features,
+            out_features,
+        }
     }
 }
 
@@ -35,59 +40,59 @@ impl Module for Linear {
         // Handle input flattening for N-D tensors (e.g. [Batch, Seq, Dim])
         let input_shape = &input.shape;
         let rank = input_shape.len();
-        
+
         let (x_flat, is_flattened) = if rank > 2 {
             let batch_dim: usize = input_shape.iter().take(rank - 1).product();
             (input.reshape(vec![batch_dim, self.in_features]), true)
         } else {
             (input.clone(), false)
         };
-        
+
         let out_flat = x_flat.matmul(&self.weight);
-        
+
         let mut out = if is_flattened {
-            let mut new_shape = input_shape[..rank-1].to_vec();
+            let mut new_shape = input_shape[..rank - 1].to_vec();
             new_shape.push(self.out_features);
             out_flat.reshape(new_shape)
         } else {
             out_flat
         };
-        
+
         if let Some(b) = &self.bias {
             // If out is [Batch, Out], broadcast b [Out] to [Batch, Out]
             // If out is [Batch, Seq, Out], flatten logic above handled matmul, but reshaping back
             // means out is 3D. We need to add bias to the last dim.
             // My Tensor::add currently requires exact shape match or simple broadcast.
             // Let's implement manual broadcast if needed, or rely on broadcast_to_batch if rank=2.
-            
+
             if out.shape.len() == 2 && out.shape[0] > 1 {
-                 // Batch mode (common case)
-                 let batch_size = out.shape[0];
-                 let b_broadcast = b.broadcast_to_batch(batch_size);
-                 out = out + b_broadcast;
+                // Batch mode (common case)
+                let batch_size = out.shape[0];
+                let b_broadcast = b.broadcast_to_batch(batch_size);
+                out = out + b_broadcast;
             } else if out.shape.len() > 2 {
-                 // N-D case: Flatten out again to add bias, then reshape back? 
-                 // Or just iterate.
-                 // Let's flatten, add, reshape.
-                 let total_elements = out.shape.iter().product::<usize>();
-                 let batch_dim = total_elements / self.out_features;
-                 
-                 let out_flat = out.reshape(vec![batch_dim, self.out_features]);
-                 let b_broadcast = b.broadcast_to_batch(batch_dim);
-                 let res_flat = out_flat + b_broadcast;
-                 out = res_flat.reshape(out.shape.clone());
+                // N-D case: Flatten out again to add bias, then reshape back?
+                // Or just iterate.
+                // Let's flatten, add, reshape.
+                let total_elements = out.shape.iter().product::<usize>();
+                let batch_dim = total_elements / self.out_features;
+
+                let out_flat = out.reshape(vec![batch_dim, self.out_features]);
+                let b_broadcast = b.broadcast_to_batch(batch_dim);
+                let res_flat = out_flat + b_broadcast;
+                out = res_flat.reshape(out.shape.clone());
             } else {
-                 // Single vector or exact match
-                 if out.shape != b.shape {
-                     if out.shape.len() == 2 && out.shape[0] == 1 {
-                         let b_reshaped = b.reshape(vec![1, self.out_features]);
-                         out = out + b_reshaped;
-                     } else {
-                         out = out + b.clone();
-                     }
-                 } else {
-                     out = out + b.clone();
-                 }
+                // Single vector or exact match
+                if out.shape != b.shape {
+                    if out.shape.len() == 2 && out.shape[0] == 1 {
+                        let b_reshaped = b.reshape(vec![1, self.out_features]);
+                        out = out + b_reshaped;
+                    } else {
+                        out = out + b.clone();
+                    }
+                } else {
+                    out = out + b.clone();
+                }
             }
         }
         out
@@ -125,18 +130,19 @@ impl Module for RMSNorm {
         let shape = &x.shape;
         let last_dim = shape[shape.len() - 1];
         assert_eq!(last_dim, self.dim, "RMSNorm dim mismatch");
-        
+
         let x_data = x.data.read().unwrap();
         let w_data = self.weight.data.read().unwrap();
-        
+
         let num_elements = x_data.len();
         let num_rows = num_elements / self.dim;
-        
+
         let mut out_data = vec![0.0; num_elements];
         let mut rms_cache = vec![0.0; num_rows];
         let mut x_hat_cache = vec![0.0; num_elements];
-        
-        out_data.par_chunks_mut(self.dim)
+
+        out_data
+            .par_chunks_mut(self.dim)
             .zip(x_hat_cache.par_chunks_mut(self.dim))
             .zip(rms_cache.par_iter_mut())
             .enumerate()
@@ -149,7 +155,7 @@ impl Module for RMSNorm {
                 }
                 let rms = (sum_sq / self.dim as f64 + self.eps).sqrt();
                 *rms_ref = rms;
-                
+
                 for i in 0..self.dim {
                     let val = x_data[base + i];
                     let x_hat = val / rms;
@@ -157,13 +163,13 @@ impl Module for RMSNorm {
                     out_row[i] = x_hat * w_data[i];
                 }
             });
-        
+
         let parents = vec![x.clone(), self.weight.clone()];
         let dim = self.dim;
-        
+
         let rms_cache = Arc::new(rms_cache);
         let x_hat_cache = Arc::new(x_hat_cache);
-        
+
         Tensor {
             data: Arc::new(RwLock::new(out_data)),
             grad: Arc::new(RwLock::new(vec![0.0; num_elements])),
@@ -173,20 +179,21 @@ impl Module for RMSNorm {
                 backward_op: Box::new(move |grad_out, parents| {
                     let x_in = &parents[0];
                     let w_in = &parents[1];
-                    
+
                     let mut x_grad = x_in.grad.write().unwrap();
                     let mut w_grad = w_in.grad.write().unwrap();
                     let w_data = w_in.data.read().unwrap();
-                    
+
                     // 1. Calculate dL/dx parallel over rows
-                    x_grad.par_chunks_mut(dim)
+                    x_grad
+                        .par_chunks_mut(dim)
                         .zip(grad_out.par_chunks(dim))
                         .enumerate()
                         .for_each(|(r, (x_g_row, g_out_row))| {
                             let base = r * dim;
                             let rms = rms_cache[r];
                             let inv_rms = 1.0 / rms;
-                            
+
                             let mut dot_sum = 0.0;
                             for i in 0..dim {
                                 let g = g_out_row[i];
@@ -194,9 +201,9 @@ impl Module for RMSNorm {
                                 let dl_dxhat = g * w;
                                 dot_sum += dl_dxhat * x_hat_cache[base + i];
                             }
-                            
+
                             let mean_dot = dot_sum / dim as f64;
-                            
+
                             for i in 0..dim {
                                 let g = g_out_row[i];
                                 let w = w_data[i];
@@ -211,17 +218,17 @@ impl Module for RMSNorm {
                     // We can't write to w_grad in parallel directly without lock or reduction.
                     // Simple approach: calculate partial sums and reduce.
                     // Or serial sum for weight grad (it's small, size Dim).
-                    
+
                     // Serial accumulation for now (safer/easier)
                     // Optimization: transpose loop orders if dim is large?
                     // Here dim is small (e.g. 512), rows is large (Batch*Seq).
                     // We iterate cols then rows.
-                    
+
                     // Using a thread-local accumulator would be better.
                     // For now, let's keep it simple or use Rayon reduce.
-                    
+
                     let num_rows = grad_out.len() / dim;
-                    
+
                     // Parallelize over dimension (feature)
                     w_grad.par_iter_mut().enumerate().for_each(|(i, wg)| {
                         let mut sum = 0.0;
@@ -235,9 +242,8 @@ impl Module for RMSNorm {
             })),
         }
     }
-    
+
     fn parameters(&self) -> Vec<Tensor> {
         vec![self.weight.clone()]
     }
 }
-

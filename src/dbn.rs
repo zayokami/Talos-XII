@@ -42,11 +42,13 @@ impl Matrix {
     pub fn affine_transform(input: &[f64], weights: &Matrix, bias: &[f64]) -> Vec<f64> {
         assert_eq!(input.len(), weights.rows);
         assert_eq!(bias.len(), weights.cols);
-        
+
         let mut output = bias.to_vec();
-        
+
         for (i, &in_val) in input.iter().enumerate().take(weights.rows) {
-            if in_val == 0.0 { continue; }
+            if in_val == 0.0 {
+                continue;
+            }
 
             let row_start = i * weights.cols;
             let row = &weights.data[row_start..row_start + weights.cols];
@@ -87,21 +89,27 @@ pub struct Rbm {
     pub hidden_size: usize,
     pub visible_type: UnitType,
     pub hidden_type: UnitType,
-    
+
     pub weights: Matrix,
     pub vbias: Vec<f64>,
     pub hbias: Vec<f64>,
-    
+
     pub d_weights: Matrix,
     pub d_vbias: Vec<f64>,
     pub d_hbias: Vec<f64>,
 }
 
 impl Rbm {
-    pub fn new(visible: usize, hidden: usize, v_type: UnitType, h_type: UnitType, rng: &mut Rng) -> Self {
+    pub fn new(
+        visible: usize,
+        hidden: usize,
+        v_type: UnitType,
+        h_type: UnitType,
+        rng: &mut Rng,
+    ) -> Self {
         let scale = (6.0 / (visible + hidden) as f64).sqrt();
         let weights = Matrix::random(visible, hidden, rng, scale);
-        
+
         Self {
             visible_size: visible,
             hidden_size: hidden,
@@ -138,7 +146,10 @@ impl Rbm {
     pub fn sample_h_given_v(&self, v: &[f64], rng: &mut Rng) -> (Vec<f64>, Vec<f64>) {
         let probs = self.propup(v);
         let samples = match self.hidden_type {
-            UnitType::Bernoulli => probs.iter().map(|&p| if rng.next_f64() < p { 1.0 } else { 0.0 }).collect(),
+            UnitType::Bernoulli => probs
+                .iter()
+                .map(|&p| if rng.next_f64() < p { 1.0 } else { 0.0 })
+                .collect(),
             UnitType::Gaussian => probs.iter().map(|&mu| mu + rng.next_f64_normal()).collect(),
         };
         (probs, samples)
@@ -148,15 +159,27 @@ impl Rbm {
     pub fn sample_v_given_h(&self, h: &[f64], rng: &mut Rng) -> (Vec<f64>, Vec<f64>) {
         let probs = self.propdown(h);
         let samples = match self.visible_type {
-            UnitType::Bernoulli => probs.iter().map(|&p| if rng.next_f64() < p { 1.0 } else { 0.0 }).collect(),
+            UnitType::Bernoulli => probs
+                .iter()
+                .map(|&p| if rng.next_f64() < p { 1.0 } else { 0.0 })
+                .collect(),
             UnitType::Gaussian => probs.iter().map(|&mu| mu + rng.next_f64_normal()).collect(),
         };
         (probs, samples)
     }
 
-    pub fn cd_k_batch(&mut self, inputs: &[Vec<f64>], k: usize, lr: f64, momentum: f64, rng: &mut Rng) -> f64 {
-        if inputs.is_empty() { return 0.0; }
-        
+    pub fn cd_k_batch(
+        &mut self,
+        inputs: &[Vec<f64>],
+        k: usize,
+        lr: f64,
+        momentum: f64,
+        rng: &mut Rng,
+    ) -> f64 {
+        if inputs.is_empty() {
+            return 0.0;
+        }
+
         // Gradient Accumulators
         let mut grad_w = vec![0.0; self.weights.data.len()];
         let mut grad_vb = vec![0.0; self.visible_size];
@@ -167,7 +190,7 @@ impl Rbm {
             assert_eq!(input.len(), self.visible_size, "Input size mismatch");
 
             let (h0_probs, h0_samples) = self.sample_h_given_v(input, rng);
-            
+
             let mut hk_samples = h0_samples.clone();
             let mut vk_probs = vec![];
             let mut vk_samples = vec![];
@@ -179,7 +202,7 @@ impl Rbm {
                 let (_, hs) = self.sample_h_given_v(&vk_samples, rng);
                 hk_samples = hs;
             }
-            
+
             let (hk_probs, _) = self.sample_h_given_v(&vk_samples, rng);
 
             // Accumulate Gradients (Positive phase - Negative phase)
@@ -213,7 +236,7 @@ impl Rbm {
 
         // Apply Gradients
         let batch_size = inputs.len() as f64;
-        
+
         // Update Weights
         for (i, g) in grad_w.iter().enumerate() {
             unsafe {
@@ -264,15 +287,27 @@ impl Dbn {
             panic!("DBN must have at least 2 layers");
         }
 
-        rbms.push(Rbm::new(layer_sizes[0], layer_sizes[1], UnitType::Gaussian, UnitType::Bernoulli, rng));
+        rbms.push(Rbm::new(
+            layer_sizes[0],
+            layer_sizes[1],
+            UnitType::Gaussian,
+            UnitType::Bernoulli,
+            rng,
+        ));
 
         for i in 1..layer_sizes.len() - 1 {
-            rbms.push(Rbm::new(layer_sizes[i], layer_sizes[i + 1], UnitType::Bernoulli, UnitType::Bernoulli, rng));
+            rbms.push(Rbm::new(
+                layer_sizes[i],
+                layer_sizes[i + 1],
+                UnitType::Bernoulli,
+                UnitType::Bernoulli,
+                rng,
+            ));
         }
-        
+
         Self { rbms }
     }
-    
+
     pub fn train(&mut self, rng: &mut Rng, data_count: usize, epochs: usize) {
         let mut input_data: Vec<Vec<f64>> = (0..data_count)
             .map(|_| {
@@ -288,22 +323,26 @@ impl Dbn {
 
         for i in 0..num_layers {
             let rbm = &mut self.rbms[i];
-            println!("Layer {}", i+1);
-            
+            println!("Layer {}", i + 1);
+
             for epoch in 0..epochs {
                 let mut error_sum = 0.0;
-                
+
                 // Shuffle data (optional but good practice)
                 // For now, just chunk it.
-                
+
                 let mut batches = 0;
                 for chunk in input_data.chunks(batch_size) {
-                     error_sum += rbm.cd_k_batch(chunk, 1, 0.01, 0.5, rng);
-                     batches += 1;
+                    error_sum += rbm.cd_k_batch(chunk, 1, 0.01, 0.5, rng);
+                    batches += 1;
                 }
-                
+
                 if epoch == 0 || (epoch + 1) == epochs {
-                     println!("Epoch {}: Error = {:.5}", epoch + 1, error_sum / batches as f64);
+                    println!(
+                        "Epoch {}: Error = {:.5}",
+                        epoch + 1,
+                        error_sum / batches as f64
+                    );
                 }
             }
 
@@ -321,7 +360,7 @@ impl Dbn {
 
     pub fn sample(&self, rng: &mut Rng, gibbs_steps: usize) -> Vec<f64> {
         let top_layer = self.rbms.last().unwrap();
-        
+
         let mut h = (0..top_layer.hidden_size)
             .map(|_| if rng.next_f64() < 0.5 { 1.0 } else { 0.0 })
             .collect::<Vec<f64>>();
@@ -333,7 +372,7 @@ impl Dbn {
         }
 
         let mut current_activations = h;
-        
+
         for i in (0..self.rbms.len()).rev() {
             let rbm = &self.rbms[i];
             let (_, v_samples) = rbm.sample_v_given_h(&current_activations, rng);

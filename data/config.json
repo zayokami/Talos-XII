@@ -1,4 +1,27 @@
 {
+  "_comment": {
+    "pool_name": "卡池名称",
+    "up_six": "当期 UP 六星列表",
+    "prob_6_base": "六星基础概率",
+    "prob_5_base": "五星基础概率",
+    "prob_4_base": "四星基础概率",
+    "soft_pity_start": "软保底开始抽数",
+    "small_pity_guarantee": "小保底触发抽数",
+    "big_pity_cumulative": "大保底累计抽数",
+    "luck_mode": "probability | dqn | ppo",
+    "fast_init": "true 启用快速初始化",
+    "ppo_mode": "auto | fast | balanced",
+    "ppo_total_steps": "PPO 总训练步数",
+    "ppo_steps_per_update": "每次更新的采样步数",
+    "ppo_k_epochs": "PPO 训练轮数",
+    "ppo_batch_size": "PPO 批大小",
+    "ppo_context_len": "PPO 序列上下文长度",
+    "worker_max_threads": "线程池最大线程数，0 自动",
+    "worker_reserve_cores": "保留 CPU 核心数",
+    "worker_priority": "线程优先级",
+    "worker_stack_size_mb": "线程栈大小 (MB)",
+    "f2p_sim_count": "F2P 分析模拟次数，0 走默认值"
+  },
   "pool_name": "熔火灼痕",
   "up_six": ["莱万汀"],
   "prob_6_base": 0.008,
@@ -18,6 +41,17 @@
   "four_stars": [
     "卡契尔", "安塔尔", "萤石", "秋栗"
   ],
-  "luck_mode": "probability",
-  "fast_init": false
+  "luck_mode": "ppo",
+  "fast_init": false,
+  "ppo_mode": "balanced",
+  "ppo_total_steps": 200000,
+  "ppo_steps_per_update": 2048,
+  "ppo_k_epochs": 8,
+  "ppo_batch_size": 256,
+  "ppo_context_len": 16,
+  "worker_max_threads": 0,
+  "worker_reserve_cores": 1,
+  "worker_priority": "above_normal",
+  "worker_stack_size_mb": 4,
+  "f2p_sim_count": 200000
 }

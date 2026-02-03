@@ -97,7 +97,7 @@ impl DenseLayer {
     pub fn new(rng_seed: u64) -> Self {
         let mut weights = [0.0; DIM * DIM];
         let mut bias = [0.0; DIM];
-        
+
         // Initial random weights (using simple LCG for deterministic initialization from seed)
         let mut x = rng_seed;
         let mut next_rand = || {
@@ -139,12 +139,14 @@ impl DenseLayer {
         output
     }
 
+    #[allow(dead_code)]
     pub fn get_params(&self) -> Vec<f64> {
         let mut params = Vec::new();
         self.write_params(&mut params);
         params
     }
 
+    #[allow(dead_code)]
     pub fn set_params(&mut self, params: &[f64]) -> bool {
         let mut idx = 0;
         if let Some(new_layer) = Self::read_params(params, &mut idx) {
@@ -229,11 +231,14 @@ impl LayerNorm {
         let sum: f64 = x.iter().sum();
         let mean = sum / DIM as f64;
 
-        let var_sum: f64 = x.iter().map(|v| {
-            let d = v - mean;
-            d * d
-        }).sum();
-        
+        let var_sum: f64 = x
+            .iter()
+            .map(|v| {
+                let d = v - mean;
+                d * d
+            })
+            .sum();
+
         let var = var_sum / DIM as f64;
         let std_dev = (var + self.epsilon).sqrt();
 
@@ -244,12 +249,14 @@ impl LayerNorm {
         output
     }
 
+    #[allow(dead_code)]
     pub fn get_params(&self) -> Vec<f64> {
         let mut params = Vec::new();
         self.write_params(&mut params);
         params
     }
 
+    #[allow(dead_code)]
     pub fn set_params(&mut self, params: &[f64]) -> bool {
         let mut idx = 0;
         if let Some(new_layer) = Self::read_params(params, &mut idx) {
@@ -276,7 +283,11 @@ impl LayerNorm {
         *idx += DIM;
         beta.copy_from_slice(&data[*idx..*idx + DIM]);
         *idx += DIM;
-        Some(LayerNorm { gamma, beta, epsilon: 1e-5 })
+        Some(LayerNorm {
+            gamma,
+            beta,
+            epsilon: 1e-5,
+        })
     }
 }
 
@@ -310,21 +321,23 @@ impl ResidualBlock {
         let h1 = self.d1.forward(x);
         let h1_norm = self.ln1.forward(&h1);
         let h1_act = tensor_relu(&h1_norm);
-        
+
         let h2 = self.d2.forward(&h1_act);
         let h2_norm = self.ln2.forward(&h2);
         let h2_act = tensor_relu(&h2_norm);
-        
+
         // Residual connection
         tensor_add(x, &h2_act)
     }
 
+    #[allow(dead_code)]
     pub fn get_params(&self) -> Vec<f64> {
         let mut params = Vec::new();
         self.write_params(&mut params);
         params
     }
 
+    #[allow(dead_code)]
     pub fn set_params(&mut self, params: &[f64]) -> bool {
         let mut idx = 0;
         if let Some(new_block) = Self::read_params(params, &mut idx) {
@@ -380,7 +393,7 @@ impl NeuralLuckOptimizer {
         }
         let linear_bias = next_rand();
         NeuralLuckOptimizer {
-            res_block: ResidualBlock::new(seed), 
+            res_block: ResidualBlock::new(seed),
             linear_weights,
             linear_bias,
         }
@@ -418,6 +431,7 @@ impl NeuralLuckOptimizer {
         2 * (DIM * DIM + DIM + 2 * DIM)
     }
 
+    #[allow(dead_code)]
     pub fn count_params_decision() -> usize {
         DIM + 1
     }
@@ -538,15 +552,20 @@ impl NeuralLuckOptimizer {
         linear_weights.copy_from_slice(&data[idx..idx + DIM]);
         idx += DIM;
         let linear_bias = data[idx];
-        Some(NeuralLuckOptimizer { res_block, linear_weights, linear_bias })
+        Some(NeuralLuckOptimizer {
+            res_block,
+            linear_weights,
+            linear_bias,
+        })
     }
 
     #[inline(always)]
     pub fn predict(&self, x: &Tensor, dropout_seed: u64) -> f64 {
         // Dropout logic
         let dropout_val = (dropout_seed.wrapping_mul(6364136223846793005) >> 56) as f64 / 256.0;
-        
-        if dropout_val < 0.05 { // Reduced dropout slightly
+
+        if dropout_val < 0.05 {
+            // Reduced dropout slightly
             return 0.0;
         }
 
@@ -557,14 +576,14 @@ impl NeuralLuckOptimizer {
         // We apply tanh to constrain it to [-1, 1], then scale it to a reasonable probability range (e.g. +/- 2%).
         // The network MUST learn to output positive values when the player is unlucky (loss_streak high)
         // and negative/zero values otherwise.
-        
-        let neural_output = y[0]; 
-        
+
+        let neural_output = y[0];
+
         // Tanh approximation for speed: x / (1 + |x|) or just clamp
         // Let's use standard clamp for simplicity but allow a wider range for the network to explore
         // Then we scale it down.
-        
-        let activation = neural_output.clamp(-1.0, 1.0); 
+
+        let activation = neural_output.clamp(-1.0, 1.0);
         let mut linear_sum = self.linear_bias;
         for (i, x_val) in x.iter().enumerate().take(DIM) {
             linear_sum += self.linear_weights[i] * x_val;

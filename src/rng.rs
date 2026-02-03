@@ -1,5 +1,5 @@
+use rand_core::{Error, RngCore};
 use std::time::{SystemTime, UNIX_EPOCH};
-use rand_core::{RngCore, Error};
 
 // --- Pseudo-Random Number Generator (Hand-rolled) ---
 // Algorithm: xoshiro256** (StarStar)
@@ -38,7 +38,7 @@ impl Rng {
         let since_the_epoch = start
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards");
-        
+
         // ENHANCEMENT 1: Better Seeding
         // Mix SystemTime (nanoseconds) with the memory address of a heap allocation.
         // This utilizes ASLR (Address Space Layout Randomization) as an additional entropy source,
@@ -87,10 +87,12 @@ impl Rng {
         // z0 = sqrt(-2 ln u1) cos(2 pi u2)
         // z1 = sqrt(-2 ln u1) sin(2 pi u2)
         // We only return z0 here for simplicity (stateful caching of z1 is possible but adds complexity)
-        
+
         let u1 = loop {
             let u = self.next_f64();
-            if u > 0.0 { break u; }
+            if u > 0.0 {
+                break u;
+            }
         };
         let u2 = self.next_f64();
 
@@ -99,7 +101,7 @@ impl Rng {
 
         r * theta.cos()
     }
-    
+
     // ENHANCEMENT 2: Unbiased Range Generation
     // Generates a random number in [0, range) using Rejection Sampling.
     // This eliminates "Modulo Bias" which occurs when the range is not a power of 2.
@@ -112,16 +114,6 @@ impl Rng {
                 return x % range;
             }
         }
-    }
-
-    // Pick a random element from a slice
-    pub fn choose<'a, T>(&mut self, slice: &'a [T]) -> &'a T {
-        if slice.is_empty() {
-            panic!("Cannot choose from empty slice");
-        }
-        // Use the unbiased bounded generator
-        let idx = self.next_u64_bounded(slice.len() as u64) as usize;
-        &slice[idx]
     }
 }
 
@@ -140,7 +132,7 @@ impl RngCore for Rng {
             let v = self.next_u64();
             let bytes = v.to_le_bytes();
             let n = std::cmp::min(dest.len() - i, 8);
-            dest[i..i+n].copy_from_slice(&bytes[..n]);
+            dest[i..i + n].copy_from_slice(&bytes[..n]);
             i += n;
         }
     }

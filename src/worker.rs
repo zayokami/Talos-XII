@@ -1,7 +1,7 @@
-use rayon::{ThreadPool, ThreadPoolBuilder};
-use std::sync::Arc;
-use std::panic::{self, AssertUnwindSafe};
 use crate::config::Config;
+use rayon::{ThreadPool, ThreadPoolBuilder};
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::Arc;
 
 #[cfg(windows)]
 mod win_priority {
@@ -41,9 +41,15 @@ pub struct GoodJobWorker {
 impl GoodJobWorker {
     #[allow(dead_code)]
     pub fn new(requested_threads: usize) -> Self {
-        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
         let num_threads = if requested_threads == 0 {
-            if cores > 2 { cores - 1 } else { cores }
+            if cores > 2 {
+                cores - 1
+            } else {
+                cores
+            }
         } else {
             requested_threads
         };
@@ -51,7 +57,9 @@ impl GoodJobWorker {
     }
 
     pub fn new_with_config(config: &Config) -> Self {
-        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
         let mut num_threads = if cores > config.worker_reserve_cores {
             cores - config.worker_reserve_cores
         } else {
@@ -71,7 +79,8 @@ impl GoodJobWorker {
 
     fn build_pool(num_threads: usize, stack_size: usize, priority: Option<String>) -> Self {
         #[cfg(windows)]
-        let priority_level = win_priority::priority_from_str(priority.as_deref().unwrap_or("above_normal"));
+        let priority_level =
+            win_priority::priority_from_str(priority.as_deref().unwrap_or("above_normal"));
         let pool = ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .thread_name(|i| format!("worker-thread-{}", i))
@@ -103,9 +112,9 @@ impl GoodJobWorker {
         F: FnOnce() -> R + Send,
         R: Send,
     {
-        let result = self.pool.install(|| {
-            panic::catch_unwind(AssertUnwindSafe(f))
-        });
+        let result = self
+            .pool
+            .install(|| panic::catch_unwind(AssertUnwindSafe(f)));
 
         match result {
             Ok(val) => Ok(val),

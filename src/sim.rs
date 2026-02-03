@@ -1,12 +1,14 @@
+use crate::autograd::Tensor as AutoTensor;
 use crate::config::Config;
 use crate::dbn::Dbn;
+use crate::dqn::{DuelingQNetwork, Experience};
 use crate::neural::{NeuralLuckOptimizer, Tensor, DIM};
-use crate::rng::Rng;
-use crate::dqn::DuelingQNetwork;
 use crate::ppo::{self, ActorCritic};
-use crate::autograd::Tensor as AutoTensor;
+use crate::rng::Rng;
 use crate::worker::GoodJobWorker;
 use rayon::prelude::*;
+use std::collections::VecDeque;
+use std::sync::mpsc::Sender;
 
 // Constants
 pub const DBN_GIBBS_STEPS: usize = 10;
@@ -15,8 +17,9 @@ pub const FREE_PULLS_WELFARE: u32 = 135;
 
 #[derive(Clone, Debug)]
 pub struct PullResult {
-    pub operator: String,
     pub rarity: u8,
+    pub operator_idx: usize,
+    pub is_up: bool,
 }
 
 #[derive(Clone)]
@@ -55,6 +58,27 @@ pub struct PullOutcome {
     pub rarity: u8,
     pub is_up: bool,
     pub big_pity_used: bool,
+    pub action: Option<usize>,
+    pub ppo_log_prob: Option<f64>,
+    pub ppo_value: Option<f64>,
+}
+
+#[derive(Clone)]
+pub struct NeuralSample {
+    pub state: Tensor,
+    pub reward: f64,
+}
+
+#[derive(Clone)]
+pub struct PpoExperience {
+    pub state: Vec<f64>,
+    pub seq_len: usize,
+    pub pity: Vec<usize>,
+    pub action: usize,
+    pub log_prob: f64,
+    pub reward: f64,
+    pub done: bool,
+    pub value: f64,
 }
 
 #[derive(Clone)]
@@ -106,13 +130,25 @@ pub fn expected_pulls_per_six(config: &Config) -> f64 {
     expected
 }
 
-pub fn build_features(pity_6: usize, total_pulls: usize, env_noise: f64, streak: usize, env_bias: f64, loss_streak: usize, config: &Config) -> Tensor {
+pub fn build_features(
+    pity_6: usize,
+    total_pulls: usize,
+    env_noise: f64,
+    streak: usize,
+    env_bias: f64,
+    loss_streak: usize,
+    config: &Config,
+) -> Tensor {
     let pity_norm = pity_6 as f64 / config.small_pity_guarantee as f64;
     let loss_norm = loss_streak as f64 / 3.0;
     // Use big_pity_cumulative for normalization if possible, or fallback to 100
-    let total_norm_base = if config.big_pity_cumulative > 0 { config.big_pity_cumulative as f64 } else { 120.0 };
+    let total_norm_base = if config.big_pity_cumulative > 0 {
+        config.big_pity_cumulative as f64
+    } else {
+        120.0
+    };
     let total_norm = (total_pulls % total_norm_base as usize) as f64 / total_norm_base;
-    
+
     [
         pity_norm,
         total_norm,
@@ -137,15 +173,24 @@ pub fn roll_one(
     config: &Config,
     nn_total_pulls: usize,
     big_pity_requires_not_up: bool,
+    ppo_state_seq: Option<&AutoTensor>,
+    ppo_pity_seq: Option<&[usize]>,
 ) -> PullOutcome {
     state.pity_6 += 1;
     state.total_pulls_in_pool += 1;
 
     let mut big_pity_used = false;
     let mut is_up = false;
+    let mut action_used = None;
+    let mut ppo_log_prob = None;
+    let mut ppo_value = None;
     let rarity: u8;
 
-    let big_pity_gate = if big_pity_requires_not_up { !state.has_obtained_up } else { true };
+    let big_pity_gate = if big_pity_requires_not_up {
+        !state.has_obtained_up
+    } else {
+        true
+    };
     if state.total_pulls_in_pool == config.big_pity_cumulative && big_pity_gate {
         rarity = 6;
         is_up = true;
@@ -155,7 +200,7 @@ pub fn roll_one(
         state.loss_streak = 0;
     } else {
         let base_prob_6 = prob_6(state.pity_6, config);
-        
+
         let x = build_features(
             state.pity_6,
             nn_total_pulls,
@@ -163,34 +208,49 @@ pub fn roll_one(
             state.streak_4_star,
             env_bias,
             state.loss_streak,
-            config
+            config,
         );
 
         let luck_factor = if config.luck_mode == "dqn" {
             if let Some(policy) = dqn_policy {
                 // Use DQN policy
                 let tensor_x = AutoTensor::new(x.to_vec(), vec![DIM]);
-                let (_, modifier) = policy.predict_action(&tensor_x);
+                let (idx, modifier) = policy.predict_action(&tensor_x);
+                action_used = Some(idx);
                 modifier
             } else {
                 // Fallback to probability if policy missing
-                let dropout_seed = (state.pity_6 as u64).wrapping_add((nn_total_pulls as u64).wrapping_mul(31)).wrapping_add((state.streak_4_star as u64).wrapping_mul(17));
+                let dropout_seed = (state.pity_6 as u64)
+                    .wrapping_add((nn_total_pulls as u64).wrapping_mul(31))
+                    .wrapping_add((state.streak_4_star as u64).wrapping_mul(17));
                 neural_opt.predict(&x, dropout_seed)
             }
         } else if config.luck_mode == "ppo" {
             if let Some(policy) = ppo_policy {
                 // Use PPO policy
-                let tensor_x = AutoTensor::new(x.to_vec(), vec![DIM]);
-                let (idx, _, _) = policy.step(&tensor_x, &[state.pity_6]);
+                let (idx, log_prob, value) =
+                    if let (Some(seq), Some(pities)) = (ppo_state_seq, ppo_pity_seq) {
+                        policy.step(seq, pities)
+                    } else {
+                        let tensor_x = AutoTensor::new(x.to_vec(), vec![DIM]);
+                        policy.step(&tensor_x, &[state.pity_6])
+                    };
+                action_used = Some(idx);
+                ppo_log_prob = Some(log_prob);
+                ppo_value = Some(value);
                 ppo::ACTIONS[idx]
             } else {
                 // Fallback
-                let dropout_seed = (state.pity_6 as u64).wrapping_add((nn_total_pulls as u64).wrapping_mul(31)).wrapping_add((state.streak_4_star as u64).wrapping_mul(17));
+                let dropout_seed = (state.pity_6 as u64)
+                    .wrapping_add((nn_total_pulls as u64).wrapping_mul(31))
+                    .wrapping_add((state.streak_4_star as u64).wrapping_mul(17));
                 neural_opt.predict(&x, dropout_seed)
             }
         } else {
             // Default probability mode
-            let dropout_seed = (state.pity_6 as u64).wrapping_add((nn_total_pulls as u64).wrapping_mul(31)).wrapping_add((state.streak_4_star as u64).wrapping_mul(17));
+            let dropout_seed = (state.pity_6 as u64)
+                .wrapping_add((nn_total_pulls as u64).wrapping_mul(31))
+                .wrapping_add((state.streak_4_star as u64).wrapping_mul(17));
             neural_opt.predict(&x, dropout_seed)
         };
 
@@ -229,6 +289,9 @@ pub fn roll_one(
         rarity,
         is_up,
         big_pity_used,
+        action: action_used,
+        ppo_log_prob,
+        ppo_value,
     }
 }
 
@@ -241,6 +304,9 @@ pub fn simulate_core(
     ppo_policy: Option<&ActorCritic>,
     dbn: &Dbn,
     config: &Config,
+    exp_sender: Option<&Sender<Experience>>,
+    neural_sender: Option<&Sender<NeuralSample>>,
+    ppo_sender: Option<&Sender<PpoExperience>>,
 ) -> (SimStatsResult, Option<Vec<PullResult>>) {
     let mut big_pity_used = false;
     let mut six_count = 0;
@@ -260,12 +326,8 @@ pub fn simulate_core(
         loss_streak: 0,
     };
 
-    let non_up_six: Vec<String> = if control.collect_details {
-        config.six_stars
-            .iter()
-            .filter(|s| !config.up_six.contains(s))
-            .cloned()
-            .collect()
+    let non_up_six = if control.collect_details {
+        build_non_up_six(config)
     } else {
         Vec::new()
     };
@@ -277,6 +339,16 @@ pub fn simulate_core(
     };
 
     let mut pulls_done = 0usize;
+    let ppo_active = ppo_policy.is_some() && config.luck_mode == "ppo";
+    let context_len = if config.ppo_context_len > 0 {
+        config.ppo_context_len
+    } else {
+        8
+    };
+    let mut history_buffer: VecDeque<Tensor> = VecDeque::with_capacity(context_len);
+    let mut pity_buffer: VecDeque<usize> = VecDeque::with_capacity(context_len);
+    let mut seq_data: Vec<f64> = Vec::with_capacity(context_len * DIM);
+    let mut pity_vec: Vec<usize> = Vec::with_capacity(context_len);
     loop {
         if let Some(max_pulls) = control.max_pulls {
             if pulls_done >= max_pulls {
@@ -290,11 +362,53 @@ pub fn simulate_core(
             cost_jade += COST_PER_PULL;
         }
 
+        let current_pity = state.pity_6;
         let nn_total_pulls = if control.nn_total_pulls_one_based {
             pulls_done + 1
         } else {
             pulls_done
         };
+
+        let current_state = build_features(
+            state.pity_6,
+            nn_total_pulls,
+            env_noise,
+            state.streak_4_star,
+            env_bias,
+            state.loss_streak,
+            config,
+        );
+        let mut ppo_state_tensor: Option<AutoTensor> = None;
+        let mut ppo_seq_data: Option<Vec<f64>> = None;
+        let mut ppo_seq_len = 0usize;
+        let mut ppo_pity_vec: Option<Vec<usize>> = None;
+        let mut ppo_pity_slice: Option<&[usize]> = None;
+        if ppo_active {
+            history_buffer.push_back(current_state);
+            pity_buffer.push_back(current_pity);
+            if history_buffer.len() > context_len {
+                history_buffer.pop_front();
+            }
+            if pity_buffer.len() > context_len {
+                pity_buffer.pop_front();
+            }
+            let seq_len = history_buffer.len();
+            seq_data.clear();
+            for s in history_buffer.iter() {
+                seq_data.extend_from_slice(s);
+            }
+            ppo_state_tensor = Some(AutoTensor::new(seq_data.clone(), vec![seq_len, DIM]));
+            if ppo_sender.is_some() {
+                ppo_seq_data = Some(seq_data.clone());
+            }
+            ppo_seq_len = seq_len;
+            pity_vec.clear();
+            pity_vec.extend(pity_buffer.iter().copied());
+            ppo_pity_slice = Some(&pity_vec);
+            if ppo_sender.is_some() {
+                ppo_pity_vec = Some(pity_vec.clone());
+            }
+        }
 
         let outcome = roll_one(
             &mut state,
@@ -307,6 +421,18 @@ pub fn simulate_core(
             config,
             nn_total_pulls,
             control.big_pity_requires_not_up,
+            ppo_state_tensor.as_ref(),
+            ppo_pity_slice,
+        );
+
+        let next_state = build_features(
+            state.pity_6,
+            nn_total_pulls + 1,
+            env_noise,
+            state.streak_4_star,
+            env_bias,
+            state.loss_streak,
+            config,
         );
 
         if outcome.big_pity_used {
@@ -322,21 +448,94 @@ pub fn simulate_core(
             max_loss_streak = state.loss_streak;
         }
 
-        if let Some(ref mut pulls_vec) = pulls {
-            let op_name: &String = match outcome.rarity {
-                6 => {
+        if let (Some(action), Some(sender)) = (outcome.action, exp_sender) {
+            let mut reward = -0.1;
+            if outcome.rarity == 6 {
+                if outcome.is_up {
+                    reward += 10.0;
+                } else {
+                    reward += 2.0;
+                }
+            }
+            if state.loss_streak >= 2 {
+                reward -= (state.loss_streak as f64) * 0.5;
+            }
+            let done = outcome.is_up || (pulls_done + 1) >= 300;
+            let _ = sender.send(Experience {
+                state: current_state.to_vec(),
+                action,
+                reward,
+                next_state: next_state.to_vec(),
+                done,
+                td_error: 1.0,
+            });
+        }
+        if let Some(sender) = neural_sender {
+            let mut reward = -0.1;
+            if outcome.rarity == 6 {
+                if outcome.is_up {
+                    reward += 1.0;
+                } else {
+                    reward += 0.2;
+                }
+            }
+            if state.loss_streak >= 2 {
+                reward -= (state.loss_streak as f64) * 0.2;
+            }
+            let _ = sender.send(NeuralSample {
+                state: current_state,
+                reward,
+            });
+        }
+        if let (Some(log_prob), Some(value), Some(sender), Some(state_data), Some(pity_vec)) = (
+            outcome.ppo_log_prob,
+            outcome.ppo_value,
+            ppo_sender,
+            ppo_seq_data,
+            ppo_pity_vec,
+        ) {
+            if let Some(action) = outcome.action {
+                let mut reward = -0.1;
+                if outcome.rarity == 6 {
                     if outcome.is_up {
-                        rng.choose(&config.up_six)
+                        reward += 10.0;
                     } else {
-                        rng.choose(&non_up_six)
+                        reward += 2.0;
                     }
                 }
-                5 => rng.choose(&config.five_stars),
-                _ => rng.choose(&config.four_stars),
+                if state.loss_streak >= 2 {
+                    reward -= (state.loss_streak as f64) * 2.0;
+                }
+                let done = outcome.is_up || (pulls_done + 1) >= 300;
+                let _ = sender.send(PpoExperience {
+                    state: state_data,
+                    seq_len: ppo_seq_len,
+                    pity: pity_vec,
+                    action,
+                    log_prob,
+                    reward,
+                    done,
+                    value,
+                });
+            }
+        }
+
+        if let Some(ref mut pulls_vec) = pulls {
+            let op_idx = match outcome.rarity {
+                6 => {
+                    if outcome.is_up {
+                        rng.next_u64_bounded(config.up_six.len() as u64) as usize
+                    } else {
+                        rng.next_u64_bounded(non_up_six.len() as u64) as usize
+                    }
+                }
+                5 => rng.next_u64_bounded(config.five_stars.len() as u64) as usize,
+                _ => rng.next_u64_bounded(config.four_stars.len() as u64) as usize,
             };
             pulls_vec.push(PullResult {
-                operator: op_name.to_string(),
                 rarity: outcome.rarity,
+                operator_idx: op_idx,
+                is_up: outcome.is_up,
             });
         }
 
@@ -367,7 +566,46 @@ pub fn simulate_core(
     (stats, pulls)
 }
 
-pub fn simulate_fast(num_pulls: usize, rng: &mut Rng, available_free_pulls: u32, neural_opt: &NeuralLuckOptimizer, dqn_policy: Option<&DuelingQNetwork>, ppo_policy: Option<&ActorCritic>, dbn: &Dbn, config: &Config) -> SimStatsResult {
+pub fn build_non_up_six(config: &Config) -> Vec<String> {
+    config
+        .six_stars
+        .iter()
+        .filter(|s| !config.up_six.contains(s))
+        .cloned()
+        .collect()
+}
+
+pub fn resolve_operator_name<'a>(
+    pull: &PullResult,
+    config: &'a Config,
+    non_up_six: &'a [String],
+) -> &'a str {
+    match pull.rarity {
+        6 => {
+            if pull.is_up {
+                &config.up_six[pull.operator_idx]
+            } else {
+                &non_up_six[pull.operator_idx]
+            }
+        }
+        5 => &config.five_stars[pull.operator_idx],
+        _ => &config.four_stars[pull.operator_idx],
+    }
+}
+
+pub fn simulate_fast(
+    num_pulls: usize,
+    rng: &mut Rng,
+    available_free_pulls: u32,
+    neural_opt: &NeuralLuckOptimizer,
+    dqn_policy: Option<&DuelingQNetwork>,
+    ppo_policy: Option<&ActorCritic>,
+    dbn: &Dbn,
+    config: &Config,
+    exp_sender: Option<&Sender<Experience>>,
+    neural_sender: Option<&Sender<NeuralSample>>,
+    ppo_sender: Option<&Sender<PpoExperience>>,
+) -> SimStatsResult {
     let control = SimControl {
         max_pulls: Some(num_pulls),
         stop_on_up: false,
@@ -376,11 +614,35 @@ pub fn simulate_fast(num_pulls: usize, rng: &mut Rng, available_free_pulls: u32,
         collect_details: false,
         big_pity_requires_not_up: true,
     };
-    simulate_core(&control, rng, available_free_pulls, neural_opt, dqn_policy, ppo_policy, dbn, config).0
+    simulate_core(
+        &control,
+        rng,
+        available_free_pulls,
+        neural_opt,
+        dqn_policy,
+        ppo_policy,
+        dbn,
+        config,
+        exp_sender,
+        neural_sender,
+        ppo_sender,
+    )
+    .0
 }
 
-
-pub fn simulate_one(num_pulls: usize, rng: &mut Rng, available_free_pulls: u32, neural_opt: &NeuralLuckOptimizer, dqn_policy: Option<&DuelingQNetwork>, ppo_policy: Option<&ActorCritic>, dbn: &Dbn, config: &Config) -> SimulationResult {
+pub fn simulate_one(
+    num_pulls: usize,
+    rng: &mut Rng,
+    available_free_pulls: u32,
+    neural_opt: &NeuralLuckOptimizer,
+    dqn_policy: Option<&DuelingQNetwork>,
+    ppo_policy: Option<&ActorCritic>,
+    dbn: &Dbn,
+    config: &Config,
+    exp_sender: Option<&Sender<Experience>>,
+    neural_sender: Option<&Sender<NeuralSample>>,
+    ppo_sender: Option<&Sender<PpoExperience>>,
+) -> SimulationResult {
     let control = SimControl {
         max_pulls: Some(num_pulls),
         stop_on_up: false,
@@ -389,7 +651,19 @@ pub fn simulate_one(num_pulls: usize, rng: &mut Rng, available_free_pulls: u32, 
         collect_details: true,
         big_pity_requires_not_up: true,
     };
-    let (stats, pulls_opt) = simulate_core(&control, rng, available_free_pulls, neural_opt, dqn_policy, ppo_policy, dbn, config);
+    let (stats, pulls_opt) = simulate_core(
+        &control,
+        rng,
+        available_free_pulls,
+        neural_opt,
+        dqn_policy,
+        ppo_policy,
+        dbn,
+        config,
+        exp_sender,
+        neural_sender,
+        ppo_sender,
+    );
     let pulls = pulls_opt.unwrap_or_default();
     SimulationResult {
         pulls,
@@ -401,81 +675,165 @@ pub fn simulate_one(num_pulls: usize, rng: &mut Rng, available_free_pulls: u32, 
     }
 }
 
-pub fn simulate_stats(num_pulls: usize, num_sims: usize, seed: u64, neural_opt: &NeuralLuckOptimizer, dqn_policy: Option<&DuelingQNetwork>, ppo_policy: Option<&ActorCritic>, dbn: &Dbn, config: &Config, worker: &GoodJobWorker) -> (usize, usize, usize, usize) {
+fn compute_chunk_size(num_sims: usize, worker: &GoodJobWorker) -> usize {
+    if num_sims == 0 {
+        return 1;
+    }
+    let threads = worker.thread_count().max(1);
+    let target_chunks = threads.saturating_mul(8).max(1);
+    let mut size = num_sims.div_ceil(target_chunks);
+    if size < 64 {
+        size = 64;
+    }
+    if size > num_sims {
+        size = num_sims;
+    }
+    size
+}
+
+pub fn simulate_stats(
+    num_pulls: usize,
+    num_sims: usize,
+    seed: u64,
+    neural_opt: &NeuralLuckOptimizer,
+    dqn_policy: Option<&DuelingQNetwork>,
+    ppo_policy: Option<&ActorCritic>,
+    dbn: &Dbn,
+    config: &Config,
+    worker: &GoodJobWorker,
+    exp_sender: Option<&Sender<Experience>>,
+    neural_sender: Option<&Sender<NeuralSample>>,
+    ppo_sender: Option<&Sender<PpoExperience>>,
+) -> (usize, usize, usize, usize) {
     let mut master_rng = Rng::from_seed(seed);
     let base_seed = master_rng.next_u64();
 
-    let chunk_size = 64usize;
-    let chunk_count = (num_sims + chunk_size - 1) / chunk_size;
-    let (total_six, total_up, total_big_pity, total_with_up) = worker.execute(|| {
-        (0..chunk_count).into_par_iter()
-            .map(|chunk_idx| {
-                let start = chunk_idx * chunk_size;
-                let end = (start + chunk_size).min(num_sims);
-                let mut local_rng = Rng::from_seed(base_seed.wrapping_add(chunk_idx as u64));
-                let mut total_six = 0usize;
-                let mut total_up = 0usize;
-                let mut total_big_pity = 0usize;
-                let mut total_with_up = 0usize;
-                for _ in start..end {
-                    let res = simulate_fast(num_pulls, &mut local_rng, 0, neural_opt, dqn_policy, ppo_policy, dbn, config);
-                    total_six += res.six_count;
-                    total_up += res.up_count;
-                    if res.big_pity_used { total_big_pity += 1; }
-                    if res.up_count > 0 { total_with_up += 1; }
-                }
-                (total_six, total_up, total_big_pity, total_with_up)
-            })
-            .reduce(|| (0, 0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3))
-    }).unwrap_or_else(|e| {
-        println!("[Error] Simulation failed: {}", e);
-        (0, 0, 0, 0)
-    });
+    let chunk_size = compute_chunk_size(num_sims, worker);
+    let chunk_count = num_sims.div_ceil(chunk_size);
+    let (total_six, total_up, total_big_pity, total_with_up) = worker
+        .execute(|| {
+            (0..chunk_count)
+                .into_par_iter()
+                .map(|chunk_idx| {
+                    let start = chunk_idx * chunk_size;
+                    let end = (start + chunk_size).min(num_sims);
+                    let mut local_rng = Rng::from_seed(base_seed.wrapping_add(chunk_idx as u64));
+                    let mut total_six = 0usize;
+                    let mut total_up = 0usize;
+                    let mut total_big_pity = 0usize;
+                    let mut total_with_up = 0usize;
+                    for _ in start..end {
+                        let res = simulate_fast(
+                            num_pulls,
+                            &mut local_rng,
+                            0,
+                            neural_opt,
+                            dqn_policy,
+                            ppo_policy,
+                            dbn,
+                            config,
+                            exp_sender,
+                            neural_sender,
+                            ppo_sender,
+                        );
+                        total_six += res.six_count;
+                        total_up += res.up_count;
+                        if res.big_pity_used {
+                            total_big_pity += 1;
+                        }
+                        if res.up_count > 0 {
+                            total_with_up += 1;
+                        }
+                    }
+                    (total_six, total_up, total_big_pity, total_with_up)
+                })
+                .reduce(
+                    || (0, 0, 0, 0),
+                    |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3),
+                )
+        })
+        .unwrap_or_else(|e| {
+            println!("[Error] Simulation failed: {}", e);
+            (0, 0, 0, 0)
+        });
 
     (total_six, total_up, total_big_pity, total_with_up)
 }
 
-pub fn simulate_f2p_clearing(num_sims: usize, seed: u64, neural_opt: &NeuralLuckOptimizer, dqn_policy: Option<&DuelingQNetwork>, ppo_policy: Option<&ActorCritic>, dbn: &Dbn, config: &Config, worker: &GoodJobWorker) -> (Option<f64>, usize) {
+pub fn simulate_f2p_clearing(
+    num_sims: usize,
+    seed: u64,
+    neural_opt: &NeuralLuckOptimizer,
+    dqn_policy: Option<&DuelingQNetwork>,
+    ppo_policy: Option<&ActorCritic>,
+    dbn: &Dbn,
+    config: &Config,
+    worker: &GoodJobWorker,
+    exp_sender: Option<&Sender<Experience>>,
+    neural_sender: Option<&Sender<NeuralSample>>,
+    ppo_sender: Option<&Sender<PpoExperience>>,
+) -> (Option<f64>, usize) {
     let mut master_rng = Rng::from_seed(seed);
     let base_seed = master_rng.next_u64();
 
-    let chunk_size = 64usize;
-    let chunk_count = (num_sims + chunk_size - 1) / chunk_size;
-    let (total_extra_cost, extra_cost_samples, success_count_val) = worker.execute(|| {
-        (0..chunk_count).into_par_iter()
-            .map(|chunk_idx| {
-                let start = chunk_idx * chunk_size;
-                let end = (start + chunk_size).min(num_sims);
-                let mut local_rng = Rng::from_seed(base_seed.wrapping_add(chunk_idx as u64));
-                let control = SimControl {
-                    max_pulls: None,
-                    stop_on_up: true,
-                    // Fix: Ensure we use all available free pulls, covering the big pity if enough
-                    stop_after_total_pulls: Some(FREE_PULLS_WELFARE.max(config.big_pity_cumulative as u32) as usize),
-                    nn_total_pulls_one_based: true,
-                    collect_details: false,
-                    big_pity_requires_not_up: false,
-                };
-                let mut total_extra = 0u64;
-                let mut total_samples = 0usize;
-                let mut total_success = 0usize;
-                for _ in start..end {
-                    let (stats, _) = simulate_core(&control, &mut local_rng, FREE_PULLS_WELFARE, neural_opt, dqn_policy, ppo_policy, dbn, config);
-                    let success = if stats.up_count > 0 { 1 } else { 0 };
-                    let extra = if stats.cost_jade > 0 { stats.cost_jade as u64 } else { 0 };
-                    let extra_sample = if stats.cost_jade > 0 { 1 } else { 0 };
-                    total_extra += extra;
-                    total_samples += extra_sample;
-                    total_success += success;
-                }
-                (total_extra, total_samples, total_success)
-            })
-            .reduce(|| (0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
-    }).unwrap_or_else(|e| {
-        println!("[Error] Cost Analysis failed: {}", e);
-        (0, 0, 0)
-    });
-    
+    let chunk_size = compute_chunk_size(num_sims, worker);
+    let chunk_count = num_sims.div_ceil(chunk_size);
+    let (total_extra_cost, extra_cost_samples, success_count_val) = worker
+        .execute(|| {
+            (0..chunk_count)
+                .into_par_iter()
+                .map(|chunk_idx| {
+                    let start = chunk_idx * chunk_size;
+                    let end = (start + chunk_size).min(num_sims);
+                    let mut local_rng = Rng::from_seed(base_seed.wrapping_add(chunk_idx as u64));
+                    let control = SimControl {
+                        max_pulls: None,
+                        stop_on_up: true,
+                        // Fix: Ensure we use all available free pulls, covering the big pity if enough
+                        stop_after_total_pulls: Some(
+                            FREE_PULLS_WELFARE.max(config.big_pity_cumulative as u32) as usize,
+                        ),
+                        nn_total_pulls_one_based: true,
+                        collect_details: false,
+                        big_pity_requires_not_up: false,
+                    };
+                    let mut total_extra = 0u64;
+                    let mut total_samples = 0usize;
+                    let mut total_success = 0usize;
+                    for _ in start..end {
+                        let (stats, _) = simulate_core(
+                            &control,
+                            &mut local_rng,
+                            FREE_PULLS_WELFARE,
+                            neural_opt,
+                            dqn_policy,
+                            ppo_policy,
+                            dbn,
+                            config,
+                            exp_sender,
+                            neural_sender,
+                            ppo_sender,
+                        );
+                        let success = if stats.up_count > 0 { 1 } else { 0 };
+                        let extra = if stats.cost_jade > 0 {
+                            stats.cost_jade as u64
+                        } else {
+                            0
+                        };
+                        let extra_sample = if stats.cost_jade > 0 { 1 } else { 0 };
+                        total_extra += extra;
+                        total_samples += extra_sample;
+                        total_success += success;
+                    }
+                    (total_extra, total_samples, total_success)
+                })
+                .reduce(|| (0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
+        })
+        .unwrap_or_else(|e| {
+            println!("[Error] Cost Analysis failed: {}", e);
+            (0, 0, 0)
+        });
+
     let avg_extra_cost = if extra_cost_samples == 0 {
         None
     } else {
@@ -492,7 +850,7 @@ pub fn simulate_for_data_collection(
     config: &Config,
 ) -> Vec<(Tensor, f64)> {
     let mut data = Vec::with_capacity(num_sims * 80); // Estimate ~80 pulls per sim on average
-    
+
     // We run simulations and capture the state at each pull
     for _ in 0..num_sims {
         // Reset state for each user simulation
@@ -505,14 +863,14 @@ pub fn simulate_for_data_collection(
         };
         let (env_noise, env_bias) = dbn_env(dbn, rng);
         let mut pulls_done = 0;
-        
+
         // Run until we get a few 6-stars or hit a limit to get a good trajectory
         // We simulate a "season" of pulls for a user (e.g. 200 pulls)
         let max_pulls = 200;
-        
+
         while pulls_done < max_pulls {
             let nn_total_pulls = pulls_done; // 0-based
-            
+
             // Build features for CURRENT state
             let x = build_features(
                 state.pity_6,
@@ -521,13 +879,15 @@ pub fn simulate_for_data_collection(
                 state.streak_4_star,
                 env_bias,
                 state.loss_streak,
-                config
+                config,
             );
-            
+
             // Calculate what the neural network WOULD output
-            let dropout_seed = (state.pity_6 as u64).wrapping_add((nn_total_pulls as u64).wrapping_mul(31)).wrapping_add((state.streak_4_star as u64).wrapping_mul(17));
+            let dropout_seed = (state.pity_6 as u64)
+                .wrapping_add((nn_total_pulls as u64).wrapping_mul(31))
+                .wrapping_add((state.streak_4_star as u64).wrapping_mul(17));
             let y = neural_opt.predict(&x, dropout_seed);
-            
+
             data.push((x, y));
 
             // Advance state using the game rules
@@ -544,11 +904,13 @@ pub fn simulate_for_data_collection(
                 env_bias,
                 config,
                 nn_total_pulls,
-                true // big_pity_requires_not_up
+                true, // big_pity_requires_not_up
+                None,
+                None,
             );
-            
+
             pulls_done += 1;
-            
+
             // Optional: Break early if we have enough data or specific conditions
             // But 200 pulls is a good "lifecycle" to capture early, mid, and late game states.
         }
@@ -561,13 +923,20 @@ pub fn format_f2p_probability_line(total_episodes: usize, early_success_episodes
         "Probability to get UP with ONLY free resources: ≥99.99 % (all succeeded early)".to_string()
     } else {
         let rate = early_success_episodes as f64 / total_episodes as f64;
-        format!("Probability to get UP with ONLY free resources: {:.2}%", rate * 100.0)
+        format!(
+            "Probability to get UP with ONLY free resources: {:.2}%",
+            rate * 100.0
+        )
     }
 }
 
 pub fn format_avg_extra_cost_line(avg_extra_cost: Option<f64>) -> String {
     match avg_extra_cost {
-        Some(cost) => format!("Avg Extra Jade Cost: {:.0} (Approx. {:.1} extra pulls)", cost, cost / 500.0),
+        Some(cost) => format!(
+            "Avg Extra Jade Cost: {:.0} (Approx. {:.1} extra pulls)",
+            cost,
+            cost / 500.0
+        ),
         None => "Avg Extra Jade Cost: N/A".to_string(),
     }
 }
