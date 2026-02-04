@@ -107,6 +107,39 @@ impl LuckTransformer {
 
         Tensor::new(out_data, vec![batch_size, dim])
     }
+
+    pub fn forward_inference(&self, x: &[f64]) -> Vec<f64> {
+        let h = self.embed.forward_inference(x);
+        
+        let h_norm1 = self.norm_1.forward_inference(&h);
+        let attn_out = self.mla_layer.forward_inference(&h_norm1);
+        
+        // Residual h + attn_out
+        let mut h2 = vec![0.0; h.len()];
+        for i in 0..h.len() { h2[i] = h[i] + attn_out[i]; }
+        
+        let h_norm2 = self.norm_2.forward_inference(&h2);
+        let f1 = self.ffn_1.forward_inference(&h_norm2);
+        
+        // ReLU
+        let mut f1_relu = f1;
+        for v in f1_relu.iter_mut() { if *v < 0.0 { *v = 0.0; } }
+        
+        let f2 = self.ffn_2.forward_inference(&f1_relu);
+        
+        // Residual h2 + f2
+        let mut h3 = vec![0.0; h2.len()];
+        for i in 0..h2.len() { h3[i] = h2[i] + f2[i]; }
+        
+        let h_final = self.norm_final.forward_inference(&h3);
+        self.out_proj.forward_inference(&h_final)
+    }
+
+    pub fn last_token_inference(&self, x: &[f64]) -> Vec<f64> {
+        let dim = self.out_proj.out_features;
+        let start = x.len().saturating_sub(dim);
+        x[start..].to_vec()
+    }
 }
 
 impl Module for LuckTransformer {
@@ -246,6 +279,38 @@ impl RoPE {
                 }),
             })),
         }
+    }
+
+    pub fn forward_inference(&self, x: &[f64], seq_len: usize, start_pos: usize) -> Vec<f64> {
+        let dim = self.dim;
+        let num_elements = x.len();
+        let mut out = x.to_vec();
+        
+        let total_batches = num_elements / (seq_len * dim);
+
+        for b in 0..total_batches {
+            for t in 0..seq_len {
+                let pos = start_pos + t;
+                // Safety check for cache bounds
+                if pos * (dim / 2) >= self.cos_cache.len() {
+                    continue; 
+                }
+                let cache_idx = pos * (dim / 2);
+                let base_idx = b * (seq_len * dim) + t * dim;
+
+                for i in 0..dim / 2 {
+                    let c = self.cos_cache[cache_idx + i];
+                    let s = self.sin_cache[cache_idx + i];
+
+                    let r1 = x[base_idx + 2 * i];
+                    let r2 = x[base_idx + 2 * i + 1];
+
+                    out[base_idx + 2 * i] = r1 * c - r2 * s;
+                    out[base_idx + 2 * i + 1] = r1 * s + r2 * c;
+                }
+            }
+        }
+        out
     }
 }
 
@@ -409,6 +474,134 @@ impl MultiHeadLatentAttention {
         let final_out = att_out_transposed.reshape(vec![batch_size, seq_len, num_heads * head_dim]);
 
         self.w_o.forward(&final_out)
+    }
+
+    pub fn forward_inference(&self, x: &[f64]) -> Vec<f64> {
+        use crate::simd::{add_scaled_row, dot_product};
+        
+        let dim = self.config.dim;
+        let num_heads = self.config.num_heads;
+        let head_dim = self.config.v_head_dim;
+        let rope_dim = self.config.qk_rope_dim;
+        
+        let num_elements = x.len();
+        let seq_len = num_elements / dim;
+
+        let c_kv = self.w_dkv.forward_inference(x); 
+        let k_c = self.w_uk.forward_inference(&c_kv); 
+        let v_c = self.w_uv.forward_inference(&c_kv); 
+        let k_r_flat = self.w_kr.forward_inference(x); 
+        let q_c = self.w_q.forward_inference(x); 
+        let q_r_flat = self.w_qr.forward_inference(x); 
+        
+        let mut k_r_rot = k_r_flat.clone();
+        let mut q_r_rot = q_r_flat.clone();
+        
+        for t in 0..seq_len {
+            let pos = t; 
+            let cache_offset = pos * (rope_dim / 2);
+             if cache_offset >= self.rope.cos_cache.len() { continue; }
+             
+            for h in 0..num_heads {
+                let base = t * (num_heads * rope_dim) + h * rope_dim;
+                for i in 0..rope_dim/2 {
+                    let c = self.rope.cos_cache[cache_offset + i];
+                    let s = self.rope.sin_cache[cache_offset + i];
+                    
+                    let idx1 = base + 2*i;
+                    let idx2 = base + 2*i+1;
+                    
+                    let r1 = k_r_flat[idx1];
+                    let r2 = k_r_flat[idx2];
+                    k_r_rot[idx1] = r1*c - r2*s;
+                    k_r_rot[idx2] = r1*s + r2*c;
+                    
+                    let q1 = q_r_flat[idx1];
+                    let q2 = q_r_flat[idx2];
+                    q_r_rot[idx1] = q1*c - q2*s;
+                    q_r_rot[idx2] = q1*s + q2*c;
+                }
+            }
+        }
+        
+        let total_head_dim = head_dim + rope_dim;
+        let mut q = vec![0.0; seq_len * num_heads * total_head_dim];
+        let mut k = vec![0.0; seq_len * num_heads * total_head_dim];
+        
+        for t in 0..seq_len {
+            for h in 0..num_heads {
+                let dst_base = t * (num_heads * total_head_dim) + h * total_head_dim;
+                
+                let src_c_base = t * (num_heads * head_dim) + h * head_dim;
+                for i in 0..head_dim {
+                    q[dst_base + i] = q_c[src_c_base + i];
+                    k[dst_base + i] = k_c[src_c_base + i];
+                }
+                
+                let src_r_base = t * (num_heads * rope_dim) + h * rope_dim;
+                for i in 0..rope_dim {
+                    q[dst_base + head_dim + i] = q_r_rot[src_r_base + i];
+                    k[dst_base + head_dim + i] = k_r_rot[src_r_base + i];
+                }
+            }
+        }
+        
+        let mut att_scores = vec![0.0; num_heads * seq_len * seq_len];
+        let scale = 1.0 / (total_head_dim as f64).sqrt();
+        
+        for h in 0..num_heads {
+            for i in 0..seq_len {
+                for j in 0..seq_len { 
+                    let base_q = i * (num_heads * total_head_dim) + h * total_head_dim;
+                    let base_k = j * (num_heads * total_head_dim) + h * total_head_dim;
+                    
+                    let q_slice = &q[base_q..base_q + total_head_dim];
+                    let k_slice = &k[base_k..base_k + total_head_dim];
+                    
+                    let dot = dot_product(q_slice, k_slice);
+                    att_scores[h * (seq_len * seq_len) + i * seq_len + j] = dot * scale;
+                }
+            }
+        }
+        
+        for h in 0..num_heads {
+            for i in 0..seq_len {
+                let start = h * (seq_len * seq_len) + i * seq_len;
+                let end = start + seq_len;
+                let slice = &mut att_scores[start..end];
+                
+                let max = slice.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+                let mut sum = 0.0;
+                for v in slice.iter_mut() {
+                    *v = (*v - max).exp();
+                    sum += *v;
+                }
+                for v in slice.iter_mut() {
+                    *v /= sum;
+                }
+            }
+        }
+        
+        let mut att_out = vec![0.0; seq_len * num_heads * head_dim];
+        
+        for h in 0..num_heads {
+            for i in 0..seq_len {
+                let base_out = i * (num_heads * head_dim) + h * head_dim;
+                let out_slice = &mut att_out[base_out..base_out + head_dim];
+                
+                for j in 0..seq_len {
+                    let score = att_scores[h * (seq_len * seq_len) + i * seq_len + j];
+                    if score == 0.0 { continue; }
+                    
+                    let base_v = j * (num_heads * head_dim) + h * head_dim;
+                    let v_slice = &v_c[base_v..base_v + head_dim];
+                    
+                    add_scaled_row(out_slice, v_slice, score);
+                }
+            }
+        }
+        
+        self.w_o.forward_inference(&att_out)
     }
 
     // Helper: Batched MatMul Q * K^T -> Scores [B, Seq, Seq]

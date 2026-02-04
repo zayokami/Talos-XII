@@ -89,6 +89,7 @@ pub struct SimControl {
     pub nn_total_pulls_one_based: bool,
     pub collect_details: bool,
     pub big_pity_requires_not_up: bool,
+    pub fast_inference: bool,
 }
 
 pub fn dbn_env(dbn: &Dbn, rng: &mut Rng) -> (f64, f64) {
@@ -175,6 +176,8 @@ pub fn roll_one(
     big_pity_requires_not_up: bool,
     ppo_state_seq: Option<&AutoTensor>,
     ppo_pity_seq: Option<&[usize]>,
+    fast_inference: bool,
+    ppo_seq_data: Option<&[f64]>,
 ) -> PullOutcome {
     state.pity_6 += 1;
     state.total_pulls_in_pool += 1;
@@ -228,17 +231,28 @@ pub fn roll_one(
         } else if config.luck_mode == "ppo" {
             if let Some(policy) = ppo_policy {
                 // Use PPO policy
-                let (idx, log_prob, value) =
-                    if let (Some(seq), Some(pities)) = (ppo_state_seq, ppo_pity_seq) {
-                        policy.step(seq, pities)
+                if fast_inference {
+                    if let Some(seq_data) = ppo_seq_data {
+                        let idx = policy.step_inference(seq_data);
+                        action_used = Some(idx);
+                        ppo::ACTIONS[idx]
                     } else {
-                        let tensor_x = AutoTensor::new(x.to_vec(), vec![DIM]);
-                        policy.step(&tensor_x, &[state.pity_6])
-                    };
-                action_used = Some(idx);
-                ppo_log_prob = Some(log_prob);
-                ppo_value = Some(value);
-                ppo::ACTIONS[idx]
+                        // Fallback: should usually have seq data if PPO is active
+                        0.0 
+                    }
+                } else {
+                    let (idx, log_prob, value) =
+                        if let (Some(seq), Some(pities)) = (ppo_state_seq, ppo_pity_seq) {
+                            policy.step(seq, pities)
+                        } else {
+                            let tensor_x = AutoTensor::new(x.to_vec(), vec![DIM]);
+                            policy.step(&tensor_x, &[state.pity_6])
+                        };
+                    action_used = Some(idx);
+                    ppo_log_prob = Some(log_prob);
+                    ppo_value = Some(value);
+                    ppo::ACTIONS[idx]
+                }
             } else {
                 // Fallback
                 let dropout_seed = (state.pity_6 as u64)
@@ -380,6 +394,7 @@ pub fn simulate_core(
         );
         let mut ppo_state_tensor: Option<AutoTensor> = None;
         let mut ppo_seq_data: Option<Vec<f64>> = None;
+        let mut ppo_seq_slice: Option<&[f64]> = None;
         let mut ppo_seq_len = 0usize;
         let mut ppo_pity_vec: Option<Vec<usize>> = None;
         let mut ppo_pity_slice: Option<&[usize]> = None;
@@ -397,7 +412,12 @@ pub fn simulate_core(
             for s in history_buffer.iter() {
                 seq_data.extend_from_slice(s);
             }
-            ppo_state_tensor = Some(AutoTensor::new(seq_data.clone(), vec![seq_len, DIM]));
+            
+            ppo_seq_slice = Some(&seq_data);
+            
+            if !control.fast_inference || ppo_sender.is_some() {
+                ppo_state_tensor = Some(AutoTensor::new(seq_data.clone(), vec![seq_len, DIM]));
+            }
             if ppo_sender.is_some() {
                 ppo_seq_data = Some(seq_data.clone());
             }
@@ -423,6 +443,8 @@ pub fn simulate_core(
             control.big_pity_requires_not_up,
             ppo_state_tensor.as_ref(),
             ppo_pity_slice,
+            control.fast_inference,
+            ppo_seq_slice,
         );
 
         let next_state = build_features(
@@ -613,6 +635,7 @@ pub fn simulate_fast(
         nn_total_pulls_one_based: false,
         collect_details: false,
         big_pity_requires_not_up: true,
+        fast_inference: true,
     };
     simulate_core(
         &control,
@@ -650,6 +673,7 @@ pub fn simulate_one(
         nn_total_pulls_one_based: false,
         collect_details: true,
         big_pity_requires_not_up: true,
+        fast_inference: false,
     };
     let (stats, pulls_opt) = simulate_core(
         &control,
@@ -772,7 +796,7 @@ pub fn simulate_f2p_clearing(
     exp_sender: Option<&Sender<Experience>>,
     neural_sender: Option<&Sender<NeuralSample>>,
     ppo_sender: Option<&Sender<PpoExperience>>,
-) -> (Option<f64>, usize) {
+) -> (u64, usize, usize) {
     let mut master_rng = Rng::from_seed(seed);
     let base_seed = master_rng.next_u64();
 
@@ -796,6 +820,7 @@ pub fn simulate_f2p_clearing(
                         nn_total_pulls_one_based: true,
                         collect_details: false,
                         big_pity_requires_not_up: false,
+                        fast_inference: true,
                     };
                     let mut total_extra = 0u64;
                     let mut total_samples = 0usize;
@@ -834,12 +859,7 @@ pub fn simulate_f2p_clearing(
             (0, 0, 0)
         });
 
-    let avg_extra_cost = if extra_cost_samples == 0 {
-        None
-    } else {
-        Some(total_extra_cost as f64 / extra_cost_samples as f64)
-    };
-    (avg_extra_cost, success_count_val)
+    (total_extra_cost, extra_cost_samples, success_count_val)
 }
 
 pub fn simulate_for_data_collection(
@@ -906,6 +926,8 @@ pub fn simulate_for_data_collection(
                 nn_total_pulls,
                 true, // big_pity_requires_not_up
                 None,
+                None,
+                false,
                 None,
             );
 

@@ -348,6 +348,43 @@ impl ActorCritic {
 
         (action_idx, log_prob, val)
     }
+
+    // Fast inference without Autograd graph
+    pub fn step_inference(&self, state: &[f64]) -> usize {
+        let seq = self.backbone.forward_inference(state);
+        let last = self.backbone.last_token_inference(&seq);
+        let logits = self.actor_head.forward_inference(&last);
+        
+        // Softmax
+        let mut max_l = -1e9;
+        for &v in logits.iter() {
+            if v > max_l { max_l = v; }
+        }
+        let mut sum_exp = 0.0;
+        let mut probs = vec![0.0; ACTION_SPACE];
+        for i in 0..ACTION_SPACE {
+            probs[i] = (logits[i] - max_l).exp();
+            sum_exp += probs[i];
+        }
+        for i in 0..ACTION_SPACE {
+            probs[i] /= sum_exp;
+        }
+        
+        // Sample
+        let mut r = rand::random::<f64>();
+        let mut action_idx = 0;
+        for i in 0..ACTION_SPACE {
+            if r < probs[i] {
+                action_idx = i;
+                break;
+            }
+            r -= probs[i];
+        }
+        if action_idx == ACTION_SPACE {
+            action_idx = ACTION_SPACE - 1;
+        }
+        action_idx
+    }
 }
 
 // --- Optimizer (Adam) ---

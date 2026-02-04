@@ -385,6 +385,7 @@ pub fn train_neural_optimizer(
                         nn_total_pulls_one_based: true,
                         collect_details: false,
                         big_pity_requires_not_up: false,
+                        fast_inference: true,
                     };
                     let (stats, _) = simulate_core(
                         &control,

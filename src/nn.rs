@@ -33,6 +33,38 @@ impl Linear {
             out_features,
         }
     }
+
+    pub fn forward_inference(&self, input: &[f64]) -> Vec<f64> {
+        let in_dim = self.in_features;
+        let out_dim = self.out_features;
+        let num_rows = input.len() / in_dim;
+        let mut out = vec![0.0; num_rows * out_dim];
+        let w_data = self.weight.data.read().unwrap();
+        let b_data = self.bias.as_ref().map(|b| b.data.read().unwrap());
+
+        use crate::simd::add_scaled_row;
+
+        for r in 0..num_rows {
+            let row_offset_in = r * in_dim;
+            let row_offset_out = r * out_dim;
+            
+            // Initialize with bias if present
+            if let Some(b) = &b_data {
+                let out_row = &mut out[row_offset_out..row_offset_out + out_dim];
+                out_row.copy_from_slice(b);
+            }
+
+            for i in 0..in_dim {
+                let scale = input[row_offset_in + i];
+                if scale == 0.0 { continue; } // Optimization for sparse inputs (ReLU)
+                
+                let w_row = &w_data[i * out_dim..(i + 1) * out_dim];
+                let out_row = &mut out[row_offset_out..row_offset_out + out_dim];
+                add_scaled_row(out_row, w_row, scale);
+            }
+        }
+        out
+    }
 }
 
 impl Module for Linear {
@@ -121,6 +153,27 @@ impl RMSNorm {
             eps,
             dim,
         }
+    }
+
+    pub fn forward_inference(&self, input: &[f64]) -> Vec<f64> {
+        let dim = self.dim;
+        let num_rows = input.len() / dim;
+        let mut out = vec![0.0; input.len()];
+        let w_data = self.weight.data.read().unwrap();
+
+        for r in 0..num_rows {
+            let base = r * dim;
+            let mut sum_sq = 0.0;
+            for i in 0..dim {
+                let val = input[base + i];
+                sum_sq += val * val;
+            }
+            let rms = (sum_sq / dim as f64 + self.eps).sqrt();
+            for i in 0..dim {
+                out[base + i] = (input[base + i] / rms) * w_data[i];
+            }
+        }
+        out
     }
 }
 

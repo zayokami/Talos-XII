@@ -80,7 +80,7 @@ impl GoodJobWorker {
     fn build_pool(num_threads: usize, stack_size: usize, priority: Option<String>) -> Self {
         #[cfg(windows)]
         let priority_level =
-            win_priority::priority_from_str(priority.as_deref().unwrap_or("above_normal"));
+            win_priority::priority_from_str(priority.as_deref().unwrap_or("normal"));
         let pool = ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .thread_name(|i| format!("worker-thread-{}", i))

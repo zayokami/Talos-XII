@@ -425,48 +425,88 @@ fn main() {
                 "[System] Running {} simulations for probability...",
                 sim_count_prob
             );
+
+            let batches = 100;
+            let batch_size_prob = sim_count_prob / batches;
+            let mut total_up_agg = 0;
+            let mut total_with_up_agg = 0;
+
             let start_time = Instant::now();
-            let (_, total_up, _, total_with_up) = simulate_stats(
-                FREE_PULLS_WELFARE as usize,
-                sim_count_prob,
-                rng.next_u64(),
-                &trained_neural_opt,
-                Some(&dqn_policy),
-                Some(&ppo_policy),
-                &dbn,
-                &config,
-                &worker,
-                None,
-                None,
-                None,
-            );
+            
+            for i in 0..batches {
+                let (_, total_up, _, total_with_up) = simulate_stats(
+                    FREE_PULLS_WELFARE as usize,
+                    batch_size_prob,
+                    rng.next_u64(),
+                    &trained_neural_opt,
+                    Some(&dqn_policy),
+                    Some(&ppo_policy),
+                    &dbn,
+                    &config,
+                    &worker,
+                    None,
+                    None,
+                    None,
+                );
+                total_up_agg += total_up;
+                total_with_up_agg += total_with_up;
+                
+                print!("\rProgress: {:>3}%", i + 1);
+                io::stdout().flush().unwrap();
+            }
+            println!(); // Newline after progress
+
             let elapsed = start_time.elapsed();
-            let prob_line = format_f2p_probability_line(sim_count_prob, total_with_up);
+            // Recalculate total sims actually run (integer division might lose a few, but negligible)
+            let total_sims_run = batch_size_prob * batches;
+            
+            let prob_line = format_f2p_probability_line(total_sims_run, total_with_up_agg);
             println!("{}", prob_line);
             println!(
                 "Expected UP Count: {:.2}",
-                total_up as f64 / sim_count_prob as f64
+                total_up_agg as f64 / total_sims_run as f64
             );
             println!("Time taken: {:.2?}", elapsed);
             println!(
                 "Throughput: {:.0} sims/sec",
-                sim_count_prob as f64 / elapsed.as_secs_f64()
+                total_sims_run as f64 / elapsed.as_secs_f64()
             );
 
             println!("\nCalculating average EXTRA cost for F2P players to get UP...");
-            let (avg_extra_cost, _) = simulate_f2p_clearing(
-                sim_count_cost,
-                rng.next_u64(),
-                &trained_neural_opt,
-                Some(&dqn_policy),
-                Some(&ppo_policy),
-                &dbn,
-                &config,
-                &worker,
-                None,
-                None,
-                None,
-            );
+            println!("[System] Running {} simulations for cost analysis...", sim_count_cost);
+            
+            let batch_size_cost = sim_count_cost / batches;
+            let mut total_extra_cost_agg = 0u64;
+            let mut extra_cost_samples_agg = 0usize;
+
+            for i in 0..batches {
+                let (cost_sum, samples, _) = simulate_f2p_clearing(
+                    batch_size_cost,
+                    rng.next_u64(),
+                    &trained_neural_opt,
+                    Some(&dqn_policy),
+                    Some(&ppo_policy),
+                    &dbn,
+                    &config,
+                    &worker,
+                    None,
+                    None,
+                    None,
+                );
+                total_extra_cost_agg += cost_sum;
+                extra_cost_samples_agg += samples;
+                
+                print!("\rProgress: {:>3}%", i + 1);
+                io::stdout().flush().unwrap();
+            }
+            println!();
+
+            let avg_extra_cost = if extra_cost_samples_agg == 0 {
+                None
+            } else {
+                Some(total_extra_cost_agg as f64 / extra_cost_samples_agg as f64)
+            };
+            
             let avg_cost_line = format_avg_extra_cost_line(avg_extra_cost);
             println!("{}", avg_cost_line);
         }
@@ -749,52 +789,88 @@ fn run_interactive(
         sim_count_prob
     );
 
-    let start_time = Instant::now();
-    // Fix: Pass FREE_PULLS_WELFARE as num_pulls instead of 0, otherwise simulation exits immediately!
-    let dqn_guard = dqn_shared.read().unwrap();
-    let neural_guard = neural_shared.read().unwrap();
-    let ppo_guard = ppo_shared.read().unwrap();
-    let (_, total_up, _, total_with_up) = simulate_stats(
-        FREE_PULLS_WELFARE as usize,
-        sim_count_prob,
-        rng.next_u64(),
-        &neural_guard,
-        Some(&dqn_guard),
-        Some(&ppo_guard),
-        &dbn,
-        &config,
-        &worker,
-        None,
-        None,
-        None,
-    );
+    let batches = 100;
+            let batch_size_prob = sim_count_prob / batches;
+            let mut total_up_agg = 0;
+            let mut total_with_up_agg = 0;
+
+            let start_time = Instant::now();
+            // Fix: Pass FREE_PULLS_WELFARE as num_pulls instead of 0, otherwise simulation exits immediately!
+            let dqn_guard = dqn_shared.read().unwrap();
+            let neural_guard = neural_shared.read().unwrap();
+            let ppo_guard = ppo_shared.read().unwrap();
+            
+            for i in 0..batches {
+                let (_, total_up, _, total_with_up) = simulate_stats(
+                    FREE_PULLS_WELFARE as usize,
+                    batch_size_prob,
+                    rng.next_u64(),
+                    &neural_guard,
+                    Some(&dqn_guard),
+                    Some(&ppo_guard),
+                    &dbn,
+                    &config,
+                    &worker,
+                    None,
+                    None,
+                    None,
+                );
+                total_up_agg += total_up;
+                total_with_up_agg += total_with_up;
+                
+                print!("\rProgress: {:>3}%", i + 1);
+                io::stdout().flush().unwrap();
+            }
+    println!();
+
     let elapsed = start_time.elapsed();
-    let prob_line = format_f2p_probability_line(sim_count_prob, total_with_up);
+    let total_sims_run = batch_size_prob * batches;
+    let prob_line = format_f2p_probability_line(total_sims_run, total_with_up_agg);
     println!("{}", prob_line);
     println!(
         "Expected UP Count: {:.2}",
-        total_up as f64 / sim_count_prob as f64
+        total_up_agg as f64 / total_sims_run as f64
     );
     println!("Time taken: {:.2?}", elapsed);
     println!(
         "Throughput: {:.0} sims/sec",
-        sim_count_prob as f64 / elapsed.as_secs_f64()
+        total_sims_run as f64 / elapsed.as_secs_f64()
     );
 
     println!("\nCalculating average EXTRA cost for F2P players to get UP...");
-    let (avg_extra_cost, _) = simulate_f2p_clearing(
-        sim_count_cost,
-        rng.next_u64(),
-        &neural_guard,
-        Some(&dqn_guard),
-        Some(&ppo_guard),
-        &dbn,
-        &config,
-        &worker,
-        None,
-        None,
-        None,
-    );
+    println!("[System] Running {} simulations for cost analysis...", sim_count_cost);
+    
+    let batch_size_cost = sim_count_cost / batches;
+    let mut total_extra_cost_agg = 0u64;
+    let mut extra_cost_samples_agg = 0usize;
+
+    for i in 0..batches {
+        let (cost_sum, samples, _) = simulate_f2p_clearing(
+            batch_size_cost,
+            rng.next_u64(),
+            &neural_guard,
+            Some(&dqn_guard),
+            Some(&ppo_guard),
+            &dbn,
+            &config,
+            &worker,
+            None,
+            None,
+            None,
+        );
+        total_extra_cost_agg += cost_sum;
+        extra_cost_samples_agg += samples;
+        
+        print!("\rProgress: {:>3}%", i + 1);
+        io::stdout().flush().unwrap();
+    }
+    println!();
+
+    let avg_extra_cost = if extra_cost_samples_agg == 0 {
+        None
+    } else {
+        Some(total_extra_cost_agg as f64 / extra_cost_samples_agg as f64)
+    };
     let avg_cost_line = format_avg_extra_cost_line(avg_extra_cost);
     println!("{}", avg_cost_line);
     println!("Total Value ~ 41000 Jade (Expected Cost for First UP)");
@@ -1029,6 +1105,7 @@ mod tests {
             nn_total_pulls_one_based: true,
             collect_details: false,
             big_pity_requires_not_up: false,
+            fast_inference: true,
         };
         let (stats, _) = simulate_core(
             &control,
