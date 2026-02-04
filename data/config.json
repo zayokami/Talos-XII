@@ -20,7 +20,8 @@
     "worker_reserve_cores": "保留 CPU 核心数",
     "worker_priority": "线程优先级",
     "worker_stack_size_mb": "线程栈大小 (MB)",
-    "f2p_sim_count": "F2P 分析模拟次数，0 走默认值"
+    "f2p_sim_count": "F2P 分析模拟次数，0 走默认值",
+    "language": "语言 (zh/en)"
   },
   "pool_name": "熔火灼痕",
   "up_six": ["莱万汀"],
@@ -53,5 +54,6 @@
   "worker_reserve_cores": 1,
   "worker_priority": "above_normal",
   "worker_stack_size_mb": 4,
-  "f2p_sim_count": 200000
+  "f2p_sim_count": 200000,
+  "language": "zh"
 }

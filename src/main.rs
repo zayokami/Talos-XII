@@ -13,12 +13,14 @@ mod simd;
 mod trainer; // Training logic
 mod transformer;
 mod worker;
+mod i18n;
 
 use autograd::Tensor as AutoTensor;
 use clap::{Parser, Subcommand};
 use config::Config;
 use dbn::Dbn;
 use dqn::{train_dqn, DuelingQNetwork, Experience, OnlineDqnTrainer};
+use i18n::{I18n, Language};
 use log::info;
 use neural::NeuralLuckOptimizer;
 use ppo::{train_ppo, ActorCritic, OnlinePpoTrainer};
@@ -194,6 +196,7 @@ fn benchmark_simulation(
     ppo_policy: Option<&ActorCritic>,
     dbn: &Dbn,
     config: &Config,
+    lang: Language,
 ) {
     let fast_sims = 10_000usize;
     let fast_pulls = 200usize;
@@ -205,11 +208,12 @@ fn benchmark_simulation(
     }
     let fast_elapsed = start_fast.elapsed();
     println!(
-        "[Bench] simulate_fast: {} sims of {} pulls in {:.2?} ({:.0} sims/sec)",
-        fast_sims,
-        fast_pulls,
-        fast_elapsed,
-        fast_sims as f64 / fast_elapsed.as_secs_f64()
+        "{}",
+        I18n::get(lang, "bench_fast")
+            .replacen("{}", &fast_sims.to_string(), 1)
+            .replacen("{}", &fast_pulls.to_string(), 1)
+            .replace("{:.2?}", &format!("{:.2?}", fast_elapsed))
+            .replace("{:.0}", &format!("{:.0}", fast_sims as f64 / fast_elapsed.as_secs_f64()))
     );
 
     let one_sims = 300usize;
@@ -222,11 +226,12 @@ fn benchmark_simulation(
     }
     let one_elapsed = start_one.elapsed();
     println!(
-        "[Bench] simulate_one: {} sims of {} pulls in {:.2?} ({:.0} sims/sec)",
-        one_sims,
-        one_pulls,
-        one_elapsed,
-        one_sims as f64 / one_elapsed.as_secs_f64()
+        "{}",
+        I18n::get(lang, "bench_one")
+            .replacen("{}", &one_sims.to_string(), 1)
+            .replacen("{}", &one_pulls.to_string(), 1)
+            .replace("{:.2?}", &format!("{:.2?}", one_elapsed))
+            .replace("{:.0}", &format!("{:.0}", one_sims as f64 / one_elapsed.as_secs_f64()))
     );
 }
 
@@ -331,6 +336,7 @@ fn main() {
 
     let (config, dbn, trained_neural_opt, dqn_policy, ppo_policy, worker, mut rng) =
         initialize_system(&args);
+    let lang = Language::from_config(&config);
 
     match args.command.clone().unwrap_or(Commands::Interactive) {
         Commands::Interactive => {
@@ -342,6 +348,7 @@ fn main() {
                 ppo_policy,
                 worker,
                 rng,
+                lang,
             );
         }
         Commands::Simulate { count, pulls } => {
@@ -360,9 +367,20 @@ fn main() {
                 None,
                 None,
             );
-            println!("Simulations: {}, Pulls per sim: {}", count, pulls);
-            println!("Avg 6-Star: {:.4}", six_count as f64 / count as f64);
-            println!("Avg UP: {:.4}", up_count as f64 / count as f64);
+            println!(
+                "{}",
+                I18n::get(lang, "batch_sim_header")
+                    .replacen("{}", &count.to_string(), 1)
+                    .replacen("{}", &pulls.to_string(), 1)
+            );
+            println!(
+                "{}",
+                I18n::get(lang, "avg_6_star").replace("{:.4}", &format!("{:.4}", six_count as f64 / count as f64))
+            );
+            println!(
+                "{}",
+                I18n::get(lang, "avg_up").replace("{:.4}", &format!("{:.4}", up_count as f64 / count as f64))
+            );
         }
         Commands::Benchmark => {
             benchmark_simulation(
@@ -372,13 +390,14 @@ fn main() {
                 Some(&ppo_policy),
                 &dbn,
                 &config,
+                lang,
             );
             demo_mmap_tensor();
         }
         Commands::F2p => {
             println!(
-                "\n=== F2P Welfare Analysis ({} Free Pulls) ===",
-                FREE_PULLS_WELFARE
+                "{}",
+                I18n::get(lang, "f2p_header").replace("{}", &FREE_PULLS_WELFARE.to_string())
             );
             #[cfg(debug_assertions)]
             let sim_count_prob = if config.f2p_sim_count_prob > 0 {
@@ -422,8 +441,8 @@ fn main() {
             };
 
             println!(
-                "[System] Running {} simulations for probability...",
-                sim_count_prob
+                "{}",
+                I18n::get(lang, "sys_run_prob").replace("{}", &sim_count_prob.to_string())
             );
 
             let batches = 100;
@@ -451,7 +470,7 @@ fn main() {
                 total_up_agg += total_up;
                 total_with_up_agg += total_with_up;
                 
-                print!("\rProgress: {:>3}%", i + 1);
+                print!("\r{}", I18n::get(lang, "progress").replace("{:>3}", &format!("{:>3}", i + 1)));
                 io::stdout().flush().unwrap();
             }
             println!(); // Newline after progress
@@ -463,17 +482,20 @@ fn main() {
             let prob_line = format_f2p_probability_line(total_sims_run, total_with_up_agg);
             println!("{}", prob_line);
             println!(
-                "Expected UP Count: {:.2}",
-                total_up_agg as f64 / total_sims_run as f64
+                "{}",
+                I18n::get(lang, "expected_up").replace("{:.2}", &format!("{:.2}", total_up_agg as f64 / total_sims_run as f64))
             );
-            println!("Time taken: {:.2?}", elapsed);
+            println!("{}", I18n::get(lang, "time_taken").replace("{:.2?}", &format!("{:.2?}", elapsed)));
             println!(
-                "Throughput: {:.0} sims/sec",
-                total_sims_run as f64 / elapsed.as_secs_f64()
+                "{}",
+                I18n::get(lang, "throughput").replace("{:.0}", &format!("{:.0}", total_sims_run as f64 / elapsed.as_secs_f64()))
             );
 
-            println!("\nCalculating average EXTRA cost for F2P players to get UP...");
-            println!("[System] Running {} simulations for cost analysis...", sim_count_cost);
+            println!("{}", I18n::get(lang, "calc_cost"));
+            println!(
+                "{}",
+                I18n::get(lang, "sys_run_cost").replace("{}", &sim_count_cost.to_string())
+            );
             
             let batch_size_cost = sim_count_cost / batches;
             let mut total_extra_cost_agg = 0u64;
@@ -496,7 +518,7 @@ fn main() {
                 total_extra_cost_agg += cost_sum;
                 extra_cost_samples_agg += samples;
                 
-                print!("\rProgress: {:>3}%", i + 1);
+                print!("\r{}", I18n::get(lang, "progress").replace("{:>3}", &format!("{:>3}", i + 1)));
                 io::stdout().flush().unwrap();
             }
             println!();
@@ -521,6 +543,7 @@ fn run_interactive(
     ppo_policy: ActorCritic,
     worker: GoodJobWorker,
     mut rng: Rng,
+    lang: Language,
 ) {
     let dqn_shared = Arc::new(RwLock::new(dqn_policy.clone()));
     let neural_shared = Arc::new(RwLock::new(trained_neural_opt.clone()));
@@ -664,64 +687,67 @@ fn run_interactive(
     }
 
     // === EXPLAINABILITY REPORT ===
-    println!("\n[Model Insight] Linear Manifold Analysis:");
+    println!("{}", I18n::get(lang, "insight_header"));
     let rl_w = trained_neural_opt.linear_weights;
     let rl_b = trained_neural_opt.linear_bias;
 
     let feature_names = [
-        "Pity Progress (0-1)",
-        "Total Pulls Norm",
-        "Env Noise",
-        "Loss Streak Norm",
-        "4-Star Streak Norm",
-        "Env Bias",
-        "Pity * Loss (Interaction)",
-        "Total Pulls (Quadratic)",
+        I18n::get(lang, "feat_pity"),
+        I18n::get(lang, "feat_total_norm"),
+        I18n::get(lang, "feat_env_noise"),
+        I18n::get(lang, "feat_loss_norm"),
+        I18n::get(lang, "feat_streak_4"),
+        I18n::get(lang, "feat_env_bias"),
+        I18n::get(lang, "feat_pity_loss"),
+        I18n::get(lang, "feat_total_sq"),
     ];
     for (i, name) in feature_names.iter().enumerate() {
         let w = rl_w[i];
         let impact = if w.abs() < 0.001 {
-            "Neutral"
+            I18n::get(lang, "impact_neutral")
         } else if w > 0.0 {
-            "Boost Luck"
+            I18n::get(lang, "impact_boost")
         } else {
-            "Reduce Luck"
+            I18n::get(lang, "impact_reduce")
         };
         println!("  - {:<25}: {:>8.4} [{}]", name, w, impact);
     }
-    println!("  - {:<25}: {:>8.4} [Bias]", "Base Bias", rl_b);
+    println!("  - {:<25}: {:>8.4} {}", I18n::get(lang, "lbl_base_bias"), rl_b, I18n::get(lang, "impact_base"));
 
     // === Ask User for Interaction Mode ===
     let use_ppo = prompt_yes_no(
-        "[System] Use PPO (Transformer) Brain for simulation? (y/n): ",
+        &I18n::get(lang, "prompt_ppo"),
         true,
     );
 
-    println!("=== Talos-XII Wish Simulator (Neural-Evolutionary) ===");
-    println!("Pool Name: {}", config.pool_name);
-    println!("UP Operator(s): {}", config.up_six.join(", "));
+    println!("{}", I18n::get(lang, "header_title"));
+    println!("{}", I18n::get(lang, "header_pool").replace("{}", &config.pool_name));
+    println!("{}", I18n::get(lang, "header_up").replace("{}", &config.up_six.join(", ")));
     println!(
-        "Probabilities: 6-Star {:.1}% (Soft Pity start at {}, +5%/pull)",
-        config.prob_6_base * 100.0,
-        config.soft_pity_start
+        "{}",
+        I18n::get(lang, "header_prob")
+            .replace("{:.1}", &format!("{:.1}", config.prob_6_base * 100.0))
+            .replace("{}", &config.soft_pity_start.to_string())
     );
     println!(
-        "Rules: {} Pulls Guarantee 6* (50/50 UP, No Guarantee on Loss)",
-        config.small_pity_guarantee
+        "{}",
+        I18n::get(lang, "header_rules").replace("{}", &config.small_pity_guarantee.to_string())
     );
     println!(
-        "Big Pity: Cumulative {} pulls guarantee UP (Once per pool)",
-        config.big_pity_cumulative
+        "{}",
+        I18n::get(lang, "header_big_pity").replace("{}", &config.big_pity_cumulative.to_string())
     );
     println!(
-        "Economy: {} Jade/Pull | ~{} Free Pulls (Welfare)",
-        COST_PER_PULL, FREE_PULLS_WELFARE
+        "{}",
+        I18n::get(lang, "header_economy")
+            .replacen("{}", &COST_PER_PULL.to_string(), 1)
+            .replacen("{}", &FREE_PULLS_WELFARE.to_string(), 1)
     );
-    println!("Neural Core: Online (Evolved for Luck Balancing)");
+    println!("{}", I18n::get(lang, "header_neural"));
 
-    println!("\n[System] PRNG Initialized: xoshiro256**");
+    println!("\n{}", I18n::get(lang, "sys_prng"));
     if cfg!(debug_assertions) && !config.fast_init {
-        println!("\n[System] Benchmarking simulation throughput...");
+        println!("\n{}", I18n::get(lang, "sys_bench"));
         let dqn_guard = dqn_shared.read().unwrap();
         let neural_guard = neural_shared.read().unwrap();
         let ppo_guard = ppo_shared.read().unwrap();
@@ -732,14 +758,15 @@ fn run_interactive(
             Some(&ppo_guard),
             &dbn,
             &config,
+            lang,
         );
         demo_mmap_tensor();
     }
 
     // F2P Analysis
     println!(
-        "\n=== F2P Welfare Analysis ({} Free Pulls) ===",
-        FREE_PULLS_WELFARE
+        "{}",
+        I18n::get(lang, "f2p_header").replace("{}", &FREE_PULLS_WELFARE.to_string())
     );
 
     // Adjust simulation count based on build profile to prevent hanging in Debug mode
@@ -785,8 +812,8 @@ fn run_interactive(
     };
 
     println!(
-        "[System] Running {} simulations for probability...",
-        sim_count_prob
+        "{}",
+        I18n::get(lang, "sys_run_prob").replace("{}", &sim_count_prob.to_string())
     );
 
     let batches = 100;
@@ -818,7 +845,7 @@ fn run_interactive(
                 total_up_agg += total_up;
                 total_with_up_agg += total_with_up;
                 
-                print!("\rProgress: {:>3}%", i + 1);
+                print!("\r{}", I18n::get(lang, "progress").replace("{:>3}", &format!("{:>3}", i + 1)));
                 io::stdout().flush().unwrap();
             }
     println!();
@@ -828,17 +855,20 @@ fn run_interactive(
     let prob_line = format_f2p_probability_line(total_sims_run, total_with_up_agg);
     println!("{}", prob_line);
     println!(
-        "Expected UP Count: {:.2}",
-        total_up_agg as f64 / total_sims_run as f64
+        "{}",
+        I18n::get(lang, "expected_up").replace("{:.2}", &format!("{:.2}", total_up_agg as f64 / total_sims_run as f64))
     );
-    println!("Time taken: {:.2?}", elapsed);
+    println!("{}", I18n::get(lang, "time_taken").replace("{:.2?}", &format!("{:.2?}", elapsed)));
     println!(
-        "Throughput: {:.0} sims/sec",
-        total_sims_run as f64 / elapsed.as_secs_f64()
+        "{}",
+        I18n::get(lang, "throughput").replace("{:.0}", &format!("{:.0}", total_sims_run as f64 / elapsed.as_secs_f64()))
     );
 
-    println!("\nCalculating average EXTRA cost for F2P players to get UP...");
-    println!("[System] Running {} simulations for cost analysis...", sim_count_cost);
+    println!("{}", I18n::get(lang, "calc_cost"));
+    println!(
+        "{}",
+        I18n::get(lang, "sys_run_cost").replace("{}", &sim_count_cost.to_string())
+    );
     
     let batch_size_cost = sim_count_cost / batches;
     let mut total_extra_cost_agg = 0u64;
@@ -861,7 +891,7 @@ fn run_interactive(
         total_extra_cost_agg += cost_sum;
         extra_cost_samples_agg += samples;
         
-        print!("\rProgress: {:>3}%", i + 1);
+        print!("\r{}", I18n::get(lang, "progress").replace("{:>3}", &format!("{:>3}", i + 1)));
         io::stdout().flush().unwrap();
     }
     println!();
@@ -873,13 +903,13 @@ fn run_interactive(
     };
     let avg_cost_line = format_avg_extra_cost_line(avg_extra_cost);
     println!("{}", avg_cost_line);
-    println!("Total Value ~ 41000 Jade (Expected Cost for First UP)");
+    println!("{}", I18n::get(lang, "total_value"));
     drop(dqn_guard);
     drop(neural_guard);
     drop(ppo_guard);
 
     loop {
-        print!("\nEnter number of pulls (default 10, or 'q' to quit): ");
+        print!("{}", I18n::get(lang, "prompt_pulls"));
         io::stdout().flush().unwrap();
 
         let mut input = String::new();
@@ -887,7 +917,7 @@ fn run_interactive(
         let input = input.trim();
 
         if input.eq_ignore_ascii_case("q") {
-            println!("Exiting. Goodbye!");
+            println!("{}", I18n::get(lang, "exit_msg"));
             break;
         }
 
@@ -897,22 +927,22 @@ fn run_interactive(
             match input.parse::<usize>() {
                 Ok(val) => {
                     if val > 1_000_000 {
-                        println!("Input too large, capped at 1,000,000 to prevent memory issues.");
+                        println!("{}", I18n::get(lang, "input_too_large"));
                         1_000_000
                     } else {
                         val
                     }
                 }
                 Err(_) => {
-                    println!("Invalid input. Using default 10.");
+                    println!("{}", I18n::get(lang, "invalid_input"));
                     10
                 }
             }
         };
 
         print!(
-            "Use Welfare Resources ({} pulls)? (y/n, default y): ",
-            FREE_PULLS_WELFARE
+            "{}",
+            I18n::get(lang, "prompt_welfare").replace("{}", &FREE_PULLS_WELFARE.to_string())
         );
         io::stdout().flush().unwrap();
         let mut w_input = String::new();
@@ -920,7 +950,7 @@ fn run_interactive(
         let use_welfare = !w_input.trim().eq_ignore_ascii_case("n");
         let free_pulls = if use_welfare { FREE_PULLS_WELFARE } else { 0 };
 
-        print!("Enter simulation count (default 1, max 1M): ");
+        print!("{}", I18n::get(lang, "prompt_sim_count"));
         io::stdout().flush().unwrap();
         let mut sim_input = String::new();
         io::stdin().read_line(&mut sim_input).unwrap();
@@ -932,9 +962,7 @@ fn run_interactive(
             match sim_input.parse::<usize>() {
                 Ok(val) => {
                     if val > 1_000_000 {
-                        println!(
-                            "Simulation count too large, capped at 1,000,000 to prevent CPU hang."
-                        );
+                        println!("{}", I18n::get(lang, "sim_count_too_large"));
                         1_000_000
                     } else {
                         val
@@ -966,8 +994,12 @@ fn run_interactive(
             let s_avg = s_total as f64 / sims_n as f64;
             let u_avg = u_total as f64 / sims_n as f64;
             println!(
-                "\n{} simulations of {}-pulls: Avg 6-Star {:.3} | UP {:.3}",
-                sims_n, n, s_avg, u_avg
+                "{}",
+                I18n::get(lang, "sim_result_stats")
+                    .replacen("{}", &sims_n.to_string(), 1)
+                    .replacen("{}", &n.to_string(), 1)
+                    .replacen("{:.3}", &format!("{:.3}", s_avg), 1)
+                    .replacen("{:.3}", &format!("{:.3}", u_avg), 1)
             );
         } else {
             let start_time = Instant::now();
@@ -989,16 +1021,38 @@ fn run_interactive(
                 ppo_sender.as_ref(),
             );
             let elapsed = start_time.elapsed();
-            println!("\nSingle {}-pull result (Time: {:.2?}):", n, elapsed);
-            println!("6-Star: {} | UP: {}", res.six_count, res.up_count);
+            println!(
+                "{}",
+                I18n::get(lang, "single_sim_result")
+                    .replace("{}", &n.to_string())
+                    .replace("{:.2?}", &format!("{:.2?}", elapsed))
+            );
+            println!(
+                "{}",
+                I18n::get(lang, "single_stats")
+                    .replacen("{}", &res.six_count.to_string(), 1)
+                    .replacen("{}", &res.up_count.to_string(), 1)
+            );
             let non_up_six = build_non_up_six(&config);
             // Show first 20 details
             for (i, p) in res.pulls.iter().take(20).enumerate() {
                 let op_name = resolve_operator_name(p, &config, &non_up_six);
                 if p.is_up {
-                    println!("{}. {} ({} Star) [UP]", i + 1, op_name, p.rarity);
+                    println!(
+                        "{}. {} ({} {}) [UP]",
+                        i + 1,
+                        op_name,
+                        p.rarity,
+                        I18n::get(lang, "unit_star")
+                    );
                 } else {
-                    println!("{}. {} ({} Star)", i + 1, op_name, p.rarity);
+                    println!(
+                        "{}. {} ({} {})",
+                        i + 1,
+                        op_name,
+                        p.rarity,
+                        I18n::get(lang, "unit_star")
+                    );
                 }
             }
             if res.pulls.len() > 20 {

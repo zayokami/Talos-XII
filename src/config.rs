@@ -258,6 +258,7 @@ pub struct Config {
     pub online_train_ppo: bool,
     pub train_interval_ms: usize,
     pub max_train_steps_per_tick: usize,
+    pub language: Option<String>,
 }
 
 impl Config {
@@ -295,6 +296,7 @@ impl Config {
             online_train_ppo: false,
             train_interval_ms: 50,
             max_train_steps_per_tick: 1,
+            language: None,
         }
     }
 
@@ -431,6 +433,9 @@ impl Config {
             }
             if let Some(v) = map.get("max_train_steps_per_tick") {
                 config.max_train_steps_per_tick = v.as_f64().unwrap_or(1.0) as usize;
+            }
+            if let Some(v) = map.get("language") {
+                config.language = v.as_str().map(|s| s.to_string());
             }
         }
 
