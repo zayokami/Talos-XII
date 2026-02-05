@@ -140,6 +140,43 @@ impl LuckTransformer {
         let start = x.len().saturating_sub(dim);
         x[start..].to_vec()
     }
+
+    pub fn forward_inference_step(
+        &self,
+        x: &[f64],
+        kv_cache: &mut KVCache,
+        start_pos: usize,
+    ) -> Vec<f64> {
+        // x: [Dim] (one token)
+        let h = self.embed.forward_inference(x);
+        let h_norm1 = self.norm_1.forward_inference(&h);
+        
+        let attn_out = self.mla_layer.forward_inference_cached(&h_norm1, kv_cache, start_pos);
+        
+        // Residual
+        let mut h2 = vec![0.0; h.len()];
+        for i in 0..h.len() { h2[i] = h[i] + attn_out[i]; }
+        
+        let h_norm2 = self.norm_2.forward_inference(&h2);
+        
+        let f1 = self.ffn_1.forward_inference(&h_norm2);
+        // ReLU
+        let mut f1_relu = f1;
+        for v in f1_relu.iter_mut() { if *v < 0.0 { *v = 0.0; } }
+        
+        let f2 = self.ffn_2.forward_inference(&f1_relu);
+        
+        // Residual
+        let mut h3 = vec![0.0; h2.len()];
+        for i in 0..h2.len() { h3[i] = h2[i] + f2[i]; }
+        
+        let h_final = self.norm_final.forward_inference(&h3);
+        self.out_proj.forward_inference(&h_final)
+    }
+
+    pub fn prune_kv_cache(&self, kv_cache: &mut KVCache, max_seq_len: usize) {
+        self.mla_layer.prune_kv_cache(kv_cache, max_seq_len);
+    }
 }
 
 impl Module for LuckTransformer {
@@ -281,6 +318,7 @@ impl RoPE {
         }
     }
 
+    #[allow(dead_code)]
     pub fn forward_inference(&self, x: &[f64], seq_len: usize, start_pos: usize) -> Vec<f64> {
         let dim = self.dim;
         let num_elements = x.len();
@@ -339,6 +377,29 @@ pub struct MultiHeadLatentAttention {
     pub w_o: Linear,
 
     pub rope: RoPE,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct KVCache {
+    // k_cache: [num_heads][seq_len * total_head_dim]
+    pub k_cache: Vec<Vec<f64>>,
+    // v_cache: [num_heads][seq_len * head_dim]
+    pub v_cache: Vec<Vec<f64>>,
+}
+
+impl KVCache {
+    pub fn new(num_heads: usize) -> Self {
+        Self {
+            k_cache: vec![Vec::new(); num_heads],
+            v_cache: vec![Vec::new(); num_heads],
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn clear(&mut self) {
+        for h in self.k_cache.iter_mut() { h.clear(); }
+        for h in self.v_cache.iter_mut() { h.clear(); }
+    }
 }
 
 impl MultiHeadLatentAttention {
@@ -570,15 +631,8 @@ impl MultiHeadLatentAttention {
                 let end = start + seq_len;
                 let slice = &mut att_scores[start..end];
                 
-                let max = slice.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-                let mut sum = 0.0;
-                for v in slice.iter_mut() {
-                    *v = (*v - max).exp();
-                    sum += *v;
-                }
-                for v in slice.iter_mut() {
-                    *v /= sum;
-                }
+                let sum = crate::simd::softmax_exp_sum(slice);
+                crate::simd::vector_scale(slice, 1.0 / sum);
             }
         }
         
@@ -604,6 +658,189 @@ impl MultiHeadLatentAttention {
         self.w_o.forward_inference(&att_out)
     }
 
+    // --- KV Cache Support ---
+    pub fn forward_inference_cached(
+        &self,
+        x: &[f64],
+        kv_cache: &mut KVCache,
+        start_pos: usize,
+    ) -> Vec<f64> {
+        use crate::simd::{add_scaled_row, dot_product};
+
+        let dim = self.config.dim;
+        let num_heads = self.config.num_heads;
+        let head_dim = self.config.v_head_dim;
+        let rope_dim = self.config.qk_rope_dim;
+
+        // x is expected to be a single token or a short sequence
+        let num_elements = x.len();
+        let seq_len = num_elements / dim;
+        
+        // 1. Projections
+        let c_kv = self.w_dkv.forward_inference(x);
+        let k_c = self.w_uk.forward_inference(&c_kv);
+        let v_c = self.w_uv.forward_inference(&c_kv);
+        let k_r_flat = self.w_kr.forward_inference(x);
+        let q_c = self.w_q.forward_inference(x);
+        let q_r_flat = self.w_qr.forward_inference(x);
+
+        // 2. RoPE Rotation
+        let mut k_r_rot = k_r_flat.clone();
+        let mut q_r_rot = q_r_flat.clone();
+
+        for t in 0..seq_len {
+            let pos = start_pos + t;
+            let cache_offset = pos * (rope_dim / 2);
+            if cache_offset >= self.rope.cos_cache.len() { continue; }
+
+            for h in 0..num_heads {
+                let base = t * (num_heads * rope_dim) + h * rope_dim;
+                for i in 0..rope_dim / 2 {
+                    let c = self.rope.cos_cache[cache_offset + i];
+                    let s = self.rope.sin_cache[cache_offset + i];
+
+                    let idx1 = base + 2 * i;
+                    let idx2 = base + 2 * i + 1;
+
+                    let r1 = k_r_flat[idx1];
+                    let r2 = k_r_flat[idx2];
+                    k_r_rot[idx1] = r1 * c - r2 * s;
+                    k_r_rot[idx2] = r1 * s + r2 * c;
+
+                    let q1 = q_r_flat[idx1];
+                    let q2 = q_r_flat[idx2];
+                    q_r_rot[idx1] = q1 * c - q2 * s;
+                    q_r_rot[idx2] = q1 * s + q2 * c;
+                }
+            }
+        }
+
+        // 3. Assemble Q and K for current tokens
+        let total_head_dim = head_dim + rope_dim;
+        let mut q = vec![0.0; seq_len * num_heads * total_head_dim];
+        let mut k = vec![0.0; seq_len * num_heads * total_head_dim];
+
+        for t in 0..seq_len {
+            for h in 0..num_heads {
+                let dst_base = t * (num_heads * total_head_dim) + h * total_head_dim;
+
+                let src_c_base = t * (num_heads * head_dim) + h * head_dim;
+                for i in 0..head_dim {
+                    q[dst_base + i] = q_c[src_c_base + i];
+                    k[dst_base + i] = k_c[src_c_base + i];
+                }
+
+                let src_r_base = t * (num_heads * rope_dim) + h * rope_dim;
+                for i in 0..rope_dim {
+                    q[dst_base + head_dim + i] = q_r_rot[src_r_base + i];
+                    k[dst_base + head_dim + i] = k_r_rot[src_r_base + i];
+                }
+            }
+        }
+
+        // 4. Update KV Cache
+        // Append current k and v_c to cache
+        // v_c needs reshaping to [seq_len, num_heads, head_dim] logic
+        for t in 0..seq_len {
+            for h in 0..num_heads {
+                let k_start = t * (num_heads * total_head_dim) + h * total_head_dim;
+                let k_slice = &k[k_start..k_start + total_head_dim];
+                kv_cache.k_cache[h].extend_from_slice(k_slice);
+
+                let v_start = t * (num_heads * head_dim) + h * head_dim;
+                let v_slice = &v_c[v_start..v_start + head_dim];
+                kv_cache.v_cache[h].extend_from_slice(v_slice);
+            }
+        }
+
+        // 5. Attention with Cache
+        // Q: [seq_len, num_heads, total_head_dim]
+        // K_cache: [num_heads, cached_len + seq_len, total_head_dim]
+        // V_cache: [num_heads, cached_len + seq_len, head_dim]
+        
+        let cached_len = kv_cache.k_cache[0].len() / total_head_dim;
+        let mut att_scores = vec![0.0; num_heads * seq_len * cached_len];
+        let scale = 1.0 / (total_head_dim as f64).sqrt();
+
+        // Q * K^T
+        for h in 0..num_heads {
+            let k_cache_head = &kv_cache.k_cache[h];
+            for i in 0..seq_len {
+                let q_start = i * (num_heads * total_head_dim) + h * total_head_dim;
+                let q_vec = &q[q_start..q_start + total_head_dim];
+                
+                for j in 0..cached_len {
+                    let k_vec = &k_cache_head[j * total_head_dim..(j + 1) * total_head_dim];
+                    let score = dot_product(q_vec, k_vec) * scale;
+                    att_scores[h * (seq_len * cached_len) + i * cached_len + j] = score;
+                }
+            }
+        }
+
+        // Softmax
+        for h in 0..num_heads {
+            for i in 0..seq_len {
+                let start = h * (seq_len * cached_len) + i * cached_len;
+                let end = start + cached_len;
+                let slice = &mut att_scores[start..end];
+                
+                let sum = crate::simd::softmax_exp_sum(slice);
+                crate::simd::vector_scale(slice, 1.0 / sum);
+            }
+        }
+
+        // Scores * V
+        let mut att_out = vec![0.0; seq_len * num_heads * head_dim];
+        for h in 0..num_heads {
+            let v_cache_head = &kv_cache.v_cache[h];
+            for i in 0..seq_len {
+                let out_start = i * (num_heads * head_dim) + h * head_dim;
+                let out_slice = &mut att_out[out_start..out_start + head_dim];
+                
+                for j in 0..cached_len {
+                    let score = att_scores[h * (seq_len * cached_len) + i * cached_len + j];
+                    if score.abs() < 1e-9 { continue; }
+                    
+                    let v_vec = &v_cache_head[j * head_dim..(j + 1) * head_dim];
+                    add_scaled_row(out_slice, v_vec, score);
+                }
+            }
+        }
+
+        self.w_o.forward_inference(&att_out)
+    }
+
+    pub fn prune_kv_cache(&self, kv_cache: &mut KVCache, max_seq_len: usize) {
+        let head_dim = self.config.v_head_dim;
+        let rope_dim = self.config.qk_rope_dim;
+        let total_head_dim = head_dim + rope_dim;
+
+        if kv_cache.k_cache.is_empty() { return; }
+        let current_len = kv_cache.k_cache[0].len() / total_head_dim;
+        
+        if current_len > max_seq_len {
+            let remove_count = current_len - max_seq_len;
+            
+            for h in 0..kv_cache.k_cache.len() {
+                // Remove from front of K
+                let k_remove_elements = remove_count * total_head_dim;
+                if k_remove_elements < kv_cache.k_cache[h].len() {
+                    kv_cache.k_cache[h].drain(0..k_remove_elements);
+                } else {
+                    kv_cache.k_cache[h].clear();
+                }
+
+                // Remove from front of V
+                let v_remove_elements = remove_count * head_dim;
+                if v_remove_elements < kv_cache.v_cache[h].len() {
+                    kv_cache.v_cache[h].drain(0..v_remove_elements);
+                } else {
+                    kv_cache.v_cache[h].clear();
+                }
+            }
+        }
+    }
+
     // Helper: Batched MatMul Q * K^T -> Scores [B, Seq, Seq]
     fn batched_matmul_qt_k(
         &self,
@@ -623,17 +860,16 @@ impl MultiHeadLatentAttention {
         let out_data: Vec<f64> = (0..b)
             .into_par_iter()
             .flat_map_iter(|batch_idx| {
+                use crate::simd::dot_product;
                 let base_q = batch_idx * seq * dim;
                 let base_k = batch_idx * seq * dim;
                 let mut batch_out = Vec::with_capacity(seq * seq);
 
                 for i in 0..seq {
                     for j in 0..seq {
-                        let mut sum = 0.0;
-                        for d in 0..dim {
-                            sum += q_data[base_q + i * dim + d] * k_data[base_k + j * dim + d];
-                        }
-                        batch_out.push(sum);
+                        let q_slice = &q_data[base_q + i * dim..base_q + i * dim + dim];
+                        let k_slice = &k_data[base_k + j * dim..base_k + j * dim + dim];
+                        batch_out.push(dot_product(q_slice, k_slice));
                     }
                 }
                 batch_out
@@ -707,17 +943,21 @@ impl MultiHeadLatentAttention {
         let out_data: Vec<f64> = (0..b)
             .into_par_iter()
             .flat_map_iter(|batch_idx| {
+                use crate::simd::add_scaled_row;
                 let base_p = batch_idx * seq * seq;
                 let base_v = batch_idx * seq * dim_v;
-                let mut batch_out = Vec::with_capacity(seq * dim_v);
+                
+                // Initialize output buffer for this batch
+                let mut batch_out = vec![0.0; seq * dim_v];
 
                 for i in 0..seq {
-                    for d in 0..dim_v {
-                        let mut sum = 0.0;
-                        for j in 0..seq {
-                            sum += p_data[base_p + i * seq + j] * v_data[base_v + j * dim_v + d];
-                        }
-                        batch_out.push(sum);
+                    let out_row = &mut batch_out[i * dim_v..(i + 1) * dim_v];
+                    for j in 0..seq {
+                        let p_val = p_data[base_p + i * seq + j];
+                        if p_val.abs() < 1e-9 { continue; } // Optimization for sparsity
+                        
+                        let v_row = &v_data[base_v + j * dim_v..base_v + (j + 1) * dim_v];
+                        add_scaled_row(out_row, v_row, p_val);
                     }
                 }
                 batch_out

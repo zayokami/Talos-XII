@@ -5,6 +5,7 @@ use crate::dqn::{DuelingQNetwork, Experience};
 use crate::neural::{NeuralLuckOptimizer, Tensor, DIM};
 use crate::ppo::{self, ActorCritic};
 use crate::rng::Rng;
+use crate::transformer::KVCache;
 use crate::worker::GoodJobWorker;
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -178,6 +179,8 @@ pub fn roll_one(
     ppo_pity_seq: Option<&[usize]>,
     fast_inference: bool,
     ppo_seq_data: Option<&[f64]>,
+    kv_cache: &mut Option<KVCache>,
+    start_pos: usize,
 ) -> PullOutcome {
     state.pity_6 += 1;
     state.total_pulls_in_pool += 1;
@@ -232,7 +235,11 @@ pub fn roll_one(
             if let Some(policy) = ppo_policy {
                 // Use PPO policy
                 if fast_inference {
-                    if let Some(seq_data) = ppo_seq_data {
+                    if let Some(cache) = kv_cache {
+                        let idx = policy.step_inference_cached(&x, cache, start_pos);
+                        action_used = Some(idx);
+                        ppo::ACTIONS[idx]
+                    } else if let Some(seq_data) = ppo_seq_data {
                         let idx = policy.step_inference(seq_data);
                         action_used = Some(idx);
                         ppo::ACTIONS[idx]
@@ -363,6 +370,17 @@ pub fn simulate_core(
     let mut pity_buffer: VecDeque<usize> = VecDeque::with_capacity(context_len);
     let mut seq_data: Vec<f64> = Vec::with_capacity(context_len * DIM);
     let mut pity_vec: Vec<usize> = Vec::with_capacity(context_len);
+
+    let mut kv_cache = if ppo_active && control.fast_inference {
+        if let Some(policy) = ppo_policy {
+            Some(KVCache::new(policy.backbone.mla_layer.config.num_heads))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     loop {
         if let Some(max_pulls) = control.max_pulls {
             if pulls_done >= max_pulls {
@@ -445,7 +463,13 @@ pub fn simulate_core(
             ppo_pity_slice,
             control.fast_inference,
             ppo_seq_slice,
+            &mut kv_cache,
+            pulls_done,
         );
+
+        if let (Some(policy), Some(cache)) = (ppo_policy, &mut kv_cache) {
+             policy.prune_cache(cache, context_len);
+        }
 
         let next_state = build_features(
             state.pity_6,
@@ -929,6 +953,8 @@ pub fn simulate_for_data_collection(
                 None,
                 false,
                 None,
+                &mut None,
+                0,
             );
 
             pulls_done += 1;

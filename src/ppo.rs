@@ -5,7 +5,7 @@ use crate::neural::DIM;
 use crate::nn::{Linear, Module};
 use crate::rng::Rng;
 use crate::sim::{build_features, dbn_env, prob_6, PpoExperience, PullState};
-use crate::transformer::LuckTransformer;
+use crate::transformer::{LuckTransformer, KVCache};
 use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
@@ -384,6 +384,50 @@ impl ActorCritic {
             action_idx = ACTION_SPACE - 1;
         }
         action_idx
+    }
+
+    pub fn step_inference_cached(
+        &self,
+        state: &[f64],
+        kv_cache: &mut KVCache,
+        start_pos: usize,
+    ) -> usize {
+        let last = self.backbone.forward_inference_step(state, kv_cache, start_pos);
+        let logits = self.actor_head.forward_inference(&last);
+        
+        // Softmax
+        let mut max_l = -1e9;
+        for &v in logits.iter() {
+            if v > max_l { max_l = v; }
+        }
+        let mut sum_exp = 0.0;
+        let mut probs = vec![0.0; ACTION_SPACE];
+        for i in 0..ACTION_SPACE {
+            probs[i] = (logits[i] - max_l).exp();
+            sum_exp += probs[i];
+        }
+        for i in 0..ACTION_SPACE {
+            probs[i] /= sum_exp;
+        }
+        
+        // Sample
+        let mut r = rand::random::<f64>();
+        let mut action_idx = 0;
+        for i in 0..ACTION_SPACE {
+            if r < probs[i] {
+                action_idx = i;
+                break;
+            }
+            r -= probs[i];
+        }
+        if action_idx == ACTION_SPACE {
+            action_idx = ACTION_SPACE - 1;
+        }
+        action_idx
+    }
+
+    pub fn prune_cache(&self, kv_cache: &mut KVCache, max_len: usize) {
+        self.backbone.prune_kv_cache(kv_cache, max_len);
     }
 }
 

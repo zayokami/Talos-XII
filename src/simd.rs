@@ -327,6 +327,75 @@ unsafe fn vector_fma_avx2(dst: &mut [f64], a: &[f64], b: &[f64]) {
     }
 }
 
+// --- Softmax Helpers ---
+
+#[inline(always)]
+pub fn softmax_exp_sum(row: &mut [f64]) -> f64 {
+    let len = row.len();
+    if len == 0 { return 0.0; }
+
+    // 1. Find Max
+    let mut max_val = f64::NEG_INFINITY;
+    for &x in row.iter() {
+        if x > max_val { max_val = x; }
+    }
+
+    // 2. Exp and Sum
+    // We can SIMD this if we had a SIMD exp function, but std doesn't provide one.
+    // For now, standard loop is okay, or we could implement a polynomial approx.
+    // Let's stick to standard exp for correctness first, but structure it for compiler autovectorization.
+    
+    let mut sum = 0.0;
+    for x in row.iter_mut() {
+        *x = (*x - max_val).exp();
+        sum += *x;
+    }
+    
+    sum
+}
+
+#[inline(always)]
+pub fn vector_scale(row: &mut [f64], scale: f64) {
+    let _len = row.len();
+    
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            unsafe {
+                vector_scale_avx2(row, scale);
+            }
+            return;
+        }
+    }
+    
+    // Fallback
+    for x in row.iter_mut() {
+        *x *= scale;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vector_scale_avx2(row: &mut [f64], scale: f64) {
+    use core::arch::x86_64::*;
+    let len = row.len();
+    let mut i = 0;
+    let scale_vec = _mm256_set1_pd(scale);
+
+    while i + 4 <= len {
+        let ptr = row.as_mut_ptr().add(i);
+        let val = _mm256_loadu_pd(ptr);
+        let res = _mm256_mul_pd(val, scale_vec);
+        _mm256_storeu_pd(ptr, res);
+        i += 4;
+    }
+
+    while i < len {
+        *row.get_unchecked_mut(i) *= scale;
+        i += 1;
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn vector_fma_avx2_fma(dst: &mut [f64], a: &[f64], b: &[f64]) {
