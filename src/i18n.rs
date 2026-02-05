@@ -84,8 +84,8 @@ impl I18n {
             (Language::Cn, "prompt_ppo") => format!("{}", "[系统] 是否使用 PPO (Transformer) 决策大脑进行模拟？(y/n): ".yellow()),
 
             // === Header ===
-            (Language::En, "header_title") => format!("{}", "=== Talos-XII Wish Simulator (Neural-Evolutionary) ===".purple().bold()),
-            (Language::Cn, "header_title") => format!("{}", "=== Talos-XII 愿望模拟器 (神经进化版) ===".purple().bold()),
+            (Language::En, "header_title") => format!("{}", "=== Talos-XII v0.3.0 by zayoka ===".purple().bold()),
+            (Language::Cn, "header_title") => format!("{}", "=== Talos-XII v0.3.0 by zayoka===".purple().bold()),
             
             (Language::En, "header_pool") => "Pool Name: {}".to_string(),
             (Language::Cn, "header_pool") => "卡池名称: {}".to_string(),
@@ -147,7 +147,7 @@ impl I18n {
             (Language::Cn, "prompt_pulls") => format!("{}", "\n输入抽数 (默认 10, 或 'q' 退出): ".yellow()),
             
             (Language::En, "exit_msg") => "Exiting. Goodbye!".to_string(),
-            (Language::Cn, "exit_msg") => "正在退出。再见！".to_string(),
+            (Language::Cn, "exit_msg") => "正在退出中。再见！".to_string(),
             
             (Language::En, "input_too_large") => "Input too large, capped at 1,000,000 to prevent memory issues.".red().to_string(),
             (Language::Cn, "input_too_large") => "输入过大，已限制为 1,000,000 以防止内存问题。".red().to_string(),
