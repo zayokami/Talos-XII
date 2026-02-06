@@ -5,7 +5,7 @@ use crate::neural::DIM;
 use crate::nn::{Linear, Module};
 use crate::rng::Rng;
 use crate::sim::{build_features, dbn_env, prob_6, PpoExperience, PullState};
-use crate::transformer::{LuckTransformer, KVCache};
+use crate::transformer::{KVCache, LuckTransformer};
 use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
@@ -354,11 +354,13 @@ impl ActorCritic {
         let seq = self.backbone.forward_inference(state);
         let last = self.backbone.last_token_inference(&seq);
         let logits = self.actor_head.forward_inference(&last);
-        
+
         // Softmax
         let mut max_l = -1e9;
         for &v in logits.iter() {
-            if v > max_l { max_l = v; }
+            if v > max_l {
+                max_l = v;
+            }
         }
         let mut sum_exp = 0.0;
         let mut probs = vec![0.0; ACTION_SPACE];
@@ -369,7 +371,7 @@ impl ActorCritic {
         for i in 0..ACTION_SPACE {
             probs[i] /= sum_exp;
         }
-        
+
         // Sample
         let mut r = rand::random::<f64>();
         let mut action_idx = 0;
@@ -392,13 +394,17 @@ impl ActorCritic {
         kv_cache: &mut KVCache,
         start_pos: usize,
     ) -> usize {
-        let last = self.backbone.forward_inference_step(state, kv_cache, start_pos);
+        let last = self
+            .backbone
+            .forward_inference_step(state, kv_cache, start_pos);
         let logits = self.actor_head.forward_inference(&last);
-        
+
         // Softmax
         let mut max_l = -1e9;
         for &v in logits.iter() {
-            if v > max_l { max_l = v; }
+            if v > max_l {
+                max_l = v;
+            }
         }
         let mut sum_exp = 0.0;
         let mut probs = vec![0.0; ACTION_SPACE];
@@ -409,7 +415,7 @@ impl ActorCritic {
         for i in 0..ACTION_SPACE {
             probs[i] /= sum_exp;
         }
-        
+
         // Sample
         let mut r = rand::random::<f64>();
         let mut action_idx = 0;
@@ -1016,6 +1022,13 @@ impl OnlinePpoTrainer {
     }
 
     pub fn sync_to(&self, shared: &std::sync::RwLock<ActorCritic>) {
+        for attempt in 0..3u64 {
+            if let Ok(mut guard) = shared.try_write() {
+                *guard = self.ppo.policy.clone();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1 + attempt));
+        }
         if let Ok(mut guard) = shared.write() {
             *guard = self.ppo.policy.clone();
         }

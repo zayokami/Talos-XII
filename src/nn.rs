@@ -47,7 +47,7 @@ impl Linear {
         for r in 0..num_rows {
             let row_offset_in = r * in_dim;
             let row_offset_out = r * out_dim;
-            
+
             // Initialize with bias if present
             if let Some(b) = &b_data {
                 let out_row = &mut out[row_offset_out..row_offset_out + out_dim];
@@ -56,8 +56,10 @@ impl Linear {
 
             for i in 0..in_dim {
                 let scale = input[row_offset_in + i];
-                if scale == 0.0 { continue; } // Optimization for sparse inputs (ReLU)
-                
+                if scale == 0.0 {
+                    continue;
+                } // Optimization for sparse inputs (ReLU)
+
                 let w_row = &w_data[i * out_dim..(i + 1) * out_dim];
                 let out_row = &mut out[row_offset_out..row_offset_out + out_dim];
                 add_scaled_row(out_row, w_row, scale);

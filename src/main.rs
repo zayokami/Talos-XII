@@ -4,6 +4,7 @@ mod dbn;
 mod dqn;
 #[cfg(test)]
 mod grad_check;
+mod i18n;
 mod neural;
 mod nn;
 mod ppo;
@@ -13,7 +14,6 @@ mod simd;
 mod trainer; // Training logic
 mod transformer;
 mod worker;
-mod i18n;
 
 use autograd::Tensor as AutoTensor;
 use clap::{Parser, Subcommand};
@@ -213,7 +213,10 @@ fn benchmark_simulation(
             .replacen("{}", &fast_sims.to_string(), 1)
             .replacen("{}", &fast_pulls.to_string(), 1)
             .replace("{:.2?}", &format!("{:.2?}", fast_elapsed))
-            .replace("{:.0}", &format!("{:.0}", fast_sims as f64 / fast_elapsed.as_secs_f64()))
+            .replace(
+                "{:.0}",
+                &format!("{:.0}", fast_sims as f64 / fast_elapsed.as_secs_f64())
+            )
     );
 
     let one_sims = 300usize;
@@ -231,7 +234,10 @@ fn benchmark_simulation(
             .replacen("{}", &one_sims.to_string(), 1)
             .replacen("{}", &one_pulls.to_string(), 1)
             .replace("{:.2?}", &format!("{:.2?}", one_elapsed))
-            .replace("{:.0}", &format!("{:.0}", one_sims as f64 / one_elapsed.as_secs_f64()))
+            .replace(
+                "{:.0}",
+                &format!("{:.0}", one_sims as f64 / one_elapsed.as_secs_f64())
+            )
     );
 }
 
@@ -375,11 +381,13 @@ fn main() {
             );
             println!(
                 "{}",
-                I18n::get(lang, "avg_6_star").replace("{:.4}", &format!("{:.4}", six_count as f64 / count as f64))
+                I18n::get(lang, "avg_6_star")
+                    .replace("{:.4}", &format!("{:.4}", six_count as f64 / count as f64))
             );
             println!(
                 "{}",
-                I18n::get(lang, "avg_up").replace("{:.4}", &format!("{:.4}", up_count as f64 / count as f64))
+                I18n::get(lang, "avg_up")
+                    .replace("{:.4}", &format!("{:.4}", up_count as f64 / count as f64))
             );
         }
         Commands::Benchmark => {
@@ -451,7 +459,7 @@ fn main() {
             let mut total_with_up_agg = 0;
 
             let start_time = Instant::now();
-            
+
             for i in 0..batches {
                 let (_, total_up, _, total_with_up) = simulate_stats(
                     FREE_PULLS_WELFARE as usize,
@@ -469,8 +477,11 @@ fn main() {
                 );
                 total_up_agg += total_up;
                 total_with_up_agg += total_with_up;
-                
-                print!("\r{}", I18n::get(lang, "progress").replace("{:>3}", &format!("{:>3}", i + 1)));
+
+                print!(
+                    "\r{}",
+                    I18n::get(lang, "progress").replace("{:>3}", &format!("{:>3}", i + 1))
+                );
                 io::stdout().flush().unwrap();
             }
             println!(); // Newline after progress
@@ -478,17 +489,26 @@ fn main() {
             let elapsed = start_time.elapsed();
             // Recalculate total sims actually run (integer division might lose a few, but negligible)
             let total_sims_run = batch_size_prob * batches;
-            
+
             let prob_line = format_f2p_probability_line(total_sims_run, total_with_up_agg);
             println!("{}", prob_line);
             println!(
                 "{}",
-                I18n::get(lang, "expected_up").replace("{:.2}", &format!("{:.2}", total_up_agg as f64 / total_sims_run as f64))
+                I18n::get(lang, "expected_up").replace(
+                    "{:.2}",
+                    &format!("{:.2}", total_up_agg as f64 / total_sims_run as f64)
+                )
             );
-            println!("{}", I18n::get(lang, "time_taken").replace("{:.2?}", &format!("{:.2?}", elapsed)));
             println!(
                 "{}",
-                I18n::get(lang, "throughput").replace("{:.0}", &format!("{:.0}", total_sims_run as f64 / elapsed.as_secs_f64()))
+                I18n::get(lang, "time_taken").replace("{:.2?}", &format!("{:.2?}", elapsed))
+            );
+            println!(
+                "{}",
+                I18n::get(lang, "throughput").replace(
+                    "{:.0}",
+                    &format!("{:.0}", total_sims_run as f64 / elapsed.as_secs_f64())
+                )
             );
 
             println!("{}", I18n::get(lang, "calc_cost"));
@@ -496,7 +516,7 @@ fn main() {
                 "{}",
                 I18n::get(lang, "sys_run_cost").replace("{}", &sim_count_cost.to_string())
             );
-            
+
             let batch_size_cost = sim_count_cost / batches;
             let mut total_extra_cost_agg = 0u64;
             let mut extra_cost_samples_agg = 0usize;
@@ -517,8 +537,11 @@ fn main() {
                 );
                 total_extra_cost_agg += cost_sum;
                 extra_cost_samples_agg += samples;
-                
-                print!("\r{}", I18n::get(lang, "progress").replace("{:>3}", &format!("{:>3}", i + 1)));
+
+                print!(
+                    "\r{}",
+                    I18n::get(lang, "progress").replace("{:>3}", &format!("{:>3}", i + 1))
+                );
                 io::stdout().flush().unwrap();
             }
             println!();
@@ -528,7 +551,7 @@ fn main() {
             } else {
                 Some(total_extra_cost_agg as f64 / extra_cost_samples_agg as f64)
             };
-            
+
             let avg_cost_line = format_avg_extra_cost_line(avg_extra_cost);
             println!("{}", avg_cost_line);
         }
@@ -566,6 +589,8 @@ fn run_interactive(
         online_handles.push(thread::spawn(move || {
             let mut local_rng = Rng::from_seed(trainer_seed.wrapping_add(1));
             let mut last_report = Instant::now();
+            let mut last_sync = Instant::now();
+            let max_drain = 2048usize;
             loop {
                 if stop.load(Ordering::Relaxed) {
                     break;
@@ -574,7 +599,7 @@ fn run_interactive(
                 while let Ok(exp) = rx.try_recv() {
                     trainer.push(exp);
                     drained += 1;
-                    if drained > 4096 {
+                    if drained >= max_drain {
                         break;
                     }
                 }
@@ -586,8 +611,9 @@ fn run_interactive(
                         break;
                     }
                 }
-                if steps > 0 {
+                if steps > 0 && last_sync.elapsed() >= Duration::from_millis(interval_ms) {
                     trainer.sync_to(&shared);
+                    last_sync = Instant::now();
                     if last_report.elapsed().as_secs_f64() >= 2.0 {
                         info!(
                             "[Online DQN] steps={} buffer={}",
@@ -612,20 +638,25 @@ fn run_interactive(
         let mut trainer = OnlineNeuralTrainer::from_model(trained_neural_opt.clone());
         online_handles.push(thread::spawn(move || {
             let mut last_report = Instant::now();
+            let mut last_sync = Instant::now();
+            let max_drain = max_steps.max(1).min(2048);
             loop {
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
                 let mut drained = 0usize;
                 while let Ok(sample) = rx.try_recv() {
-                    let _ = trainer.train_step(&sample);
-                    drained += 1;
-                    if drained > 4096 {
+                    if drained >= max_drain {
                         break;
                     }
+                    let _ = trainer.train_step(&sample);
+                    drained += 1;
                 }
-                if trainer.steps_done() > 0 {
+                if trainer.steps_done() > 0
+                    && last_sync.elapsed() >= Duration::from_millis(interval_ms)
+                {
                     trainer.sync_to(&shared);
+                    last_sync = Instant::now();
                     if last_report.elapsed().as_secs_f64() >= 2.0 {
                         info!("[Online Neural] steps={}", trainer.steps_done());
                         last_report = Instant::now();
@@ -650,6 +681,8 @@ fn run_interactive(
         let mut trainer = OnlinePpoTrainer::new(trainer_seed, 2, 128);
         online_handles.push(thread::spawn(move || {
             let mut last_report = Instant::now();
+            let mut last_sync = Instant::now();
+            let max_drain = 2048usize;
             loop {
                 if stop.load(Ordering::Relaxed) {
                     break;
@@ -658,7 +691,7 @@ fn run_interactive(
                 while let Ok(exp) = rx.try_recv() {
                     trainer.push(exp);
                     drained += 1;
-                    if drained > 4096 {
+                    if drained >= max_drain {
                         break;
                     }
                 }
@@ -670,8 +703,9 @@ fn run_interactive(
                         break;
                     }
                 }
-                if steps > 0 {
+                if steps > 0 && last_sync.elapsed() >= Duration::from_millis(interval_ms) {
                     trainer.sync_to(&shared);
+                    last_sync = Instant::now();
                     if last_report.elapsed().as_secs_f64() >= 2.0 {
                         info!(
                             "[Online PPO] steps={} buffer={}",
@@ -712,17 +746,25 @@ fn run_interactive(
         };
         println!("  - {:<25}: {:>8.4} [{}]", name, w, impact);
     }
-    println!("  - {:<25}: {:>8.4} {}", I18n::get(lang, "lbl_base_bias"), rl_b, I18n::get(lang, "impact_base"));
-
-    // === Ask User for Interaction Mode ===
-    let use_ppo = prompt_yes_no(
-        &I18n::get(lang, "prompt_ppo"),
-        true,
+    println!(
+        "  - {:<25}: {:>8.4} {}",
+        I18n::get(lang, "lbl_base_bias"),
+        rl_b,
+        I18n::get(lang, "impact_base")
     );
 
+    // === Ask User for Interaction Mode ===
+    let use_ppo = prompt_yes_no(&I18n::get(lang, "prompt_ppo"), true);
+
     println!("{}", I18n::get(lang, "header_title"));
-    println!("{}", I18n::get(lang, "header_pool").replace("{}", &config.pool_name));
-    println!("{}", I18n::get(lang, "header_up").replace("{}", &config.up_six.join(", ")));
+    println!(
+        "{}",
+        I18n::get(lang, "header_pool").replace("{}", &config.pool_name)
+    );
+    println!(
+        "{}",
+        I18n::get(lang, "header_up").replace("{}", &config.up_six.join(", "))
+    );
     println!(
         "{}",
         I18n::get(lang, "header_prob")
@@ -817,37 +859,40 @@ fn run_interactive(
     );
 
     let batches = 100;
-            let batch_size_prob = sim_count_prob / batches;
-            let mut total_up_agg = 0;
-            let mut total_with_up_agg = 0;
+    let batch_size_prob = sim_count_prob / batches;
+    let mut total_up_agg = 0;
+    let mut total_with_up_agg = 0;
 
-            let start_time = Instant::now();
-            // Fix: Pass FREE_PULLS_WELFARE as num_pulls instead of 0, otherwise simulation exits immediately!
-            let dqn_guard = dqn_shared.read().unwrap();
-            let neural_guard = neural_shared.read().unwrap();
-            let ppo_guard = ppo_shared.read().unwrap();
-            
-            for i in 0..batches {
-                let (_, total_up, _, total_with_up) = simulate_stats(
-                    FREE_PULLS_WELFARE as usize,
-                    batch_size_prob,
-                    rng.next_u64(),
-                    &neural_guard,
-                    Some(&dqn_guard),
-                    Some(&ppo_guard),
-                    &dbn,
-                    &config,
-                    &worker,
-                    None,
-                    None,
-                    None,
-                );
-                total_up_agg += total_up;
-                total_with_up_agg += total_with_up;
-                
-                print!("\r{}", I18n::get(lang, "progress").replace("{:>3}", &format!("{:>3}", i + 1)));
-                io::stdout().flush().unwrap();
-            }
+    let start_time = Instant::now();
+    // Fix: Pass FREE_PULLS_WELFARE as num_pulls instead of 0, otherwise simulation exits immediately!
+    let dqn_guard = dqn_shared.read().unwrap();
+    let neural_guard = neural_shared.read().unwrap();
+    let ppo_guard = ppo_shared.read().unwrap();
+
+    for i in 0..batches {
+        let (_, total_up, _, total_with_up) = simulate_stats(
+            FREE_PULLS_WELFARE as usize,
+            batch_size_prob,
+            rng.next_u64(),
+            &neural_guard,
+            Some(&dqn_guard),
+            Some(&ppo_guard),
+            &dbn,
+            &config,
+            &worker,
+            None,
+            None,
+            None,
+        );
+        total_up_agg += total_up;
+        total_with_up_agg += total_with_up;
+
+        print!(
+            "\r{}",
+            I18n::get(lang, "progress").replace("{:>3}", &format!("{:>3}", i + 1))
+        );
+        io::stdout().flush().unwrap();
+    }
     println!();
 
     let elapsed = start_time.elapsed();
@@ -856,12 +901,21 @@ fn run_interactive(
     println!("{}", prob_line);
     println!(
         "{}",
-        I18n::get(lang, "expected_up").replace("{:.2}", &format!("{:.2}", total_up_agg as f64 / total_sims_run as f64))
+        I18n::get(lang, "expected_up").replace(
+            "{:.2}",
+            &format!("{:.2}", total_up_agg as f64 / total_sims_run as f64)
+        )
     );
-    println!("{}", I18n::get(lang, "time_taken").replace("{:.2?}", &format!("{:.2?}", elapsed)));
     println!(
         "{}",
-        I18n::get(lang, "throughput").replace("{:.0}", &format!("{:.0}", total_sims_run as f64 / elapsed.as_secs_f64()))
+        I18n::get(lang, "time_taken").replace("{:.2?}", &format!("{:.2?}", elapsed))
+    );
+    println!(
+        "{}",
+        I18n::get(lang, "throughput").replace(
+            "{:.0}",
+            &format!("{:.0}", total_sims_run as f64 / elapsed.as_secs_f64())
+        )
     );
 
     println!("{}", I18n::get(lang, "calc_cost"));
@@ -869,7 +923,7 @@ fn run_interactive(
         "{}",
         I18n::get(lang, "sys_run_cost").replace("{}", &sim_count_cost.to_string())
     );
-    
+
     let batch_size_cost = sim_count_cost / batches;
     let mut total_extra_cost_agg = 0u64;
     let mut extra_cost_samples_agg = 0usize;
@@ -890,8 +944,11 @@ fn run_interactive(
         );
         total_extra_cost_agg += cost_sum;
         extra_cost_samples_agg += samples;
-        
-        print!("\r{}", I18n::get(lang, "progress").replace("{:>3}", &format!("{:>3}", i + 1)));
+
+        print!(
+            "\r{}",
+            I18n::get(lang, "progress").replace("{:>3}", &format!("{:>3}", i + 1))
+        );
         io::stdout().flush().unwrap();
     }
     println!();

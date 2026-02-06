@@ -515,6 +515,15 @@ impl OnlineNeuralTrainer {
     }
 
     pub fn sync_to(&self, shared: &RwLock<NeuralLuckOptimizer>) {
+        for attempt in 0..3u64 {
+            if let Ok(mut guard) = shared.try_write() {
+                guard.res_block = self.model.res_block.clone();
+                guard.linear_weights = self.ema_linear;
+                guard.linear_bias = self.ema_bias;
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1 + attempt));
+        }
         if let Ok(mut guard) = shared.write() {
             guard.res_block = self.model.res_block.clone();
             guard.linear_weights = self.ema_linear;

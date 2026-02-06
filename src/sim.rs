@@ -64,6 +64,199 @@ pub struct PullOutcome {
     pub ppo_value: Option<f64>,
 }
 
+struct PolicyDecision {
+    luck_factor: f64,
+    action: Option<usize>,
+    ppo_log_prob: Option<f64>,
+    ppo_value: Option<f64>,
+}
+
+struct PpoInputs {
+    seq_len: usize,
+    seq_data: Option<Vec<f64>>,
+    seq_tensor: Option<AutoTensor>,
+    pity_vec: Option<Vec<usize>>,
+}
+
+impl PpoInputs {
+    fn empty() -> Self {
+        Self {
+            seq_len: 0,
+            seq_data: None,
+            seq_tensor: None,
+            pity_vec: None,
+        }
+    }
+}
+
+struct PpoContext {
+    active: bool,
+    context_len: usize,
+    history_buffer: VecDeque<Tensor>,
+    pity_buffer: VecDeque<usize>,
+    seq_data: Vec<f64>,
+    pity_vec: Vec<usize>,
+    kv_cache: Option<KVCache>,
+}
+
+impl PpoContext {
+    fn new(
+        active: bool,
+        context_len: usize,
+        ppo_policy: Option<&ActorCritic>,
+        fast_inference: bool,
+    ) -> Self {
+        let kv_cache = if active && fast_inference {
+            ppo_policy.map(|policy| KVCache::new(policy.backbone.mla_layer.config.num_heads))
+        } else {
+            None
+        };
+        Self {
+            active,
+            context_len,
+            history_buffer: VecDeque::with_capacity(context_len),
+            pity_buffer: VecDeque::with_capacity(context_len),
+            seq_data: Vec::with_capacity(context_len * DIM),
+            pity_vec: Vec::with_capacity(context_len),
+            kv_cache,
+        }
+    }
+
+    fn build_inputs(
+        &mut self,
+        current_state: Tensor,
+        current_pity: usize,
+        need_tensor: bool,
+    ) -> PpoInputs {
+        if !self.active {
+            return PpoInputs::empty();
+        }
+        self.history_buffer.push_back(current_state);
+        self.pity_buffer.push_back(current_pity);
+        if self.history_buffer.len() > self.context_len {
+            self.history_buffer.pop_front();
+        }
+        if self.pity_buffer.len() > self.context_len {
+            self.pity_buffer.pop_front();
+        }
+        let seq_len = self.history_buffer.len();
+        if need_tensor {
+            self.seq_data.clear();
+            for s in self.history_buffer.iter() {
+                self.seq_data.extend_from_slice(s);
+            }
+            self.pity_vec.clear();
+            self.pity_vec.extend(self.pity_buffer.iter().copied());
+            let seq_tensor = Some(AutoTensor::new(self.seq_data.clone(), vec![seq_len, DIM]));
+            PpoInputs {
+                seq_len,
+                seq_data: Some(self.seq_data.clone()),
+                seq_tensor,
+                pity_vec: Some(self.pity_vec.clone()),
+            }
+        } else {
+            PpoInputs {
+                seq_len,
+                seq_data: None,
+                seq_tensor: None,
+                pity_vec: None,
+            }
+        }
+    }
+
+    fn kv_cache_mut(&mut self) -> &mut Option<KVCache> {
+        &mut self.kv_cache
+    }
+
+    fn prune_cache(&mut self, policy: &ActorCritic) {
+        if let Some(cache) = &mut self.kv_cache {
+            policy.prune_cache(cache, self.context_len);
+        }
+    }
+}
+
+fn decide_policy(
+    state: &PullState,
+    nn_total_pulls: usize,
+    config: &Config,
+    neural_opt: &NeuralLuckOptimizer,
+    dqn_policy: Option<&DuelingQNetwork>,
+    ppo_policy: Option<&ActorCritic>,
+    current_features: &Tensor,
+    ppo_state_seq: Option<&AutoTensor>,
+    ppo_pity_seq: Option<&[usize]>,
+    fast_inference: bool,
+    ppo_seq_data: Option<&[f64]>,
+    kv_cache: &mut Option<KVCache>,
+    start_pos: usize,
+) -> PolicyDecision {
+    if config.luck_mode == "dqn" {
+        if let Some(policy) = dqn_policy {
+            let tensor_x = AutoTensor::new(current_features.to_vec(), vec![DIM]);
+            let (idx, modifier) = policy.predict_action(&tensor_x);
+            return PolicyDecision {
+                luck_factor: modifier,
+                action: Some(idx),
+                ppo_log_prob: None,
+                ppo_value: None,
+            };
+        }
+    } else if config.luck_mode == "ppo" {
+        if let Some(policy) = ppo_policy {
+            if fast_inference {
+                if let Some(cache) = kv_cache {
+                    let idx = policy.step_inference_cached(current_features, cache, start_pos);
+                    return PolicyDecision {
+                        luck_factor: ppo::ACTIONS[idx],
+                        action: Some(idx),
+                        ppo_log_prob: None,
+                        ppo_value: None,
+                    };
+                }
+                if let Some(seq_data) = ppo_seq_data {
+                    let idx = policy.step_inference(seq_data);
+                    return PolicyDecision {
+                        luck_factor: ppo::ACTIONS[idx],
+                        action: Some(idx),
+                        ppo_log_prob: None,
+                        ppo_value: None,
+                    };
+                }
+                return PolicyDecision {
+                    luck_factor: 0.0,
+                    action: None,
+                    ppo_log_prob: None,
+                    ppo_value: None,
+                };
+            }
+            let (idx, log_prob, value) =
+                if let (Some(seq), Some(pities)) = (ppo_state_seq, ppo_pity_seq) {
+                    policy.step(seq, pities)
+                } else {
+                    let tensor_x = AutoTensor::new(current_features.to_vec(), vec![DIM]);
+                    policy.step(&tensor_x, &[state.pity_6])
+                };
+            return PolicyDecision {
+                luck_factor: ppo::ACTIONS[idx],
+                action: Some(idx),
+                ppo_log_prob: Some(log_prob),
+                ppo_value: Some(value),
+            };
+        }
+    }
+
+    let dropout_seed = (state.pity_6 as u64)
+        .wrapping_add((nn_total_pulls as u64).wrapping_mul(31))
+        .wrapping_add((state.streak_4_star as u64).wrapping_mul(17));
+    let luck_factor = neural_opt.predict(current_features, dropout_seed);
+    PolicyDecision {
+        luck_factor,
+        action: None,
+        ppo_log_prob: None,
+        ppo_value: None,
+    }
+}
+
 #[derive(Clone)]
 pub struct NeuralSample {
     pub state: Tensor,
@@ -217,65 +410,26 @@ pub fn roll_one(
             config,
         );
 
-        let luck_factor = if config.luck_mode == "dqn" {
-            if let Some(policy) = dqn_policy {
-                // Use DQN policy
-                let tensor_x = AutoTensor::new(x.to_vec(), vec![DIM]);
-                let (idx, modifier) = policy.predict_action(&tensor_x);
-                action_used = Some(idx);
-                modifier
-            } else {
-                // Fallback to probability if policy missing
-                let dropout_seed = (state.pity_6 as u64)
-                    .wrapping_add((nn_total_pulls as u64).wrapping_mul(31))
-                    .wrapping_add((state.streak_4_star as u64).wrapping_mul(17));
-                neural_opt.predict(&x, dropout_seed)
-            }
-        } else if config.luck_mode == "ppo" {
-            if let Some(policy) = ppo_policy {
-                // Use PPO policy
-                if fast_inference {
-                    if let Some(cache) = kv_cache {
-                        let idx = policy.step_inference_cached(&x, cache, start_pos);
-                        action_used = Some(idx);
-                        ppo::ACTIONS[idx]
-                    } else if let Some(seq_data) = ppo_seq_data {
-                        let idx = policy.step_inference(seq_data);
-                        action_used = Some(idx);
-                        ppo::ACTIONS[idx]
-                    } else {
-                        // Fallback: should usually have seq data if PPO is active
-                        0.0 
-                    }
-                } else {
-                    let (idx, log_prob, value) =
-                        if let (Some(seq), Some(pities)) = (ppo_state_seq, ppo_pity_seq) {
-                            policy.step(seq, pities)
-                        } else {
-                            let tensor_x = AutoTensor::new(x.to_vec(), vec![DIM]);
-                            policy.step(&tensor_x, &[state.pity_6])
-                        };
-                    action_used = Some(idx);
-                    ppo_log_prob = Some(log_prob);
-                    ppo_value = Some(value);
-                    ppo::ACTIONS[idx]
-                }
-            } else {
-                // Fallback
-                let dropout_seed = (state.pity_6 as u64)
-                    .wrapping_add((nn_total_pulls as u64).wrapping_mul(31))
-                    .wrapping_add((state.streak_4_star as u64).wrapping_mul(17));
-                neural_opt.predict(&x, dropout_seed)
-            }
-        } else {
-            // Default probability mode
-            let dropout_seed = (state.pity_6 as u64)
-                .wrapping_add((nn_total_pulls as u64).wrapping_mul(31))
-                .wrapping_add((state.streak_4_star as u64).wrapping_mul(17));
-            neural_opt.predict(&x, dropout_seed)
-        };
+        let decision = decide_policy(
+            state,
+            nn_total_pulls,
+            config,
+            neural_opt,
+            dqn_policy,
+            ppo_policy,
+            &x,
+            ppo_state_seq,
+            ppo_pity_seq,
+            fast_inference,
+            ppo_seq_data,
+            kv_cache,
+            start_pos,
+        );
+        action_used = decision.action;
+        ppo_log_prob = decision.ppo_log_prob;
+        ppo_value = decision.ppo_value;
 
-        let final_prob_6 = (base_prob_6 + luck_factor).clamp(0.0, 1.0);
+        let final_prob_6 = (base_prob_6 + decision.luck_factor).clamp(0.0, 1.0);
         let r = rng.next_f64();
 
         if r < final_prob_6 {
@@ -366,20 +520,8 @@ pub fn simulate_core(
     } else {
         8
     };
-    let mut history_buffer: VecDeque<Tensor> = VecDeque::with_capacity(context_len);
-    let mut pity_buffer: VecDeque<usize> = VecDeque::with_capacity(context_len);
-    let mut seq_data: Vec<f64> = Vec::with_capacity(context_len * DIM);
-    let mut pity_vec: Vec<usize> = Vec::with_capacity(context_len);
-
-    let mut kv_cache = if ppo_active && control.fast_inference {
-        if let Some(policy) = ppo_policy {
-            Some(KVCache::new(policy.backbone.mla_layer.config.num_heads))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let mut ppo_context =
+        PpoContext::new(ppo_active, context_len, ppo_policy, control.fast_inference);
 
     loop {
         if let Some(max_pulls) = control.max_pulls {
@@ -410,43 +552,8 @@ pub fn simulate_core(
             state.loss_streak,
             config,
         );
-        let mut ppo_state_tensor: Option<AutoTensor> = None;
-        let mut ppo_seq_data: Option<Vec<f64>> = None;
-        let mut ppo_seq_slice: Option<&[f64]> = None;
-        let mut ppo_seq_len = 0usize;
-        let mut ppo_pity_vec: Option<Vec<usize>> = None;
-        let mut ppo_pity_slice: Option<&[usize]> = None;
-        if ppo_active {
-            history_buffer.push_back(current_state);
-            pity_buffer.push_back(current_pity);
-            if history_buffer.len() > context_len {
-                history_buffer.pop_front();
-            }
-            if pity_buffer.len() > context_len {
-                pity_buffer.pop_front();
-            }
-            let seq_len = history_buffer.len();
-            seq_data.clear();
-            for s in history_buffer.iter() {
-                seq_data.extend_from_slice(s);
-            }
-            
-            ppo_seq_slice = Some(&seq_data);
-            
-            if !control.fast_inference || ppo_sender.is_some() {
-                ppo_state_tensor = Some(AutoTensor::new(seq_data.clone(), vec![seq_len, DIM]));
-            }
-            if ppo_sender.is_some() {
-                ppo_seq_data = Some(seq_data.clone());
-            }
-            ppo_seq_len = seq_len;
-            pity_vec.clear();
-            pity_vec.extend(pity_buffer.iter().copied());
-            ppo_pity_slice = Some(&pity_vec);
-            if ppo_sender.is_some() {
-                ppo_pity_vec = Some(pity_vec.clone());
-            }
-        }
+        let need_tensor = !control.fast_inference || ppo_sender.is_some();
+        let ppo_inputs = ppo_context.build_inputs(current_state, current_pity, need_tensor);
 
         let outcome = roll_one(
             &mut state,
@@ -459,16 +566,16 @@ pub fn simulate_core(
             config,
             nn_total_pulls,
             control.big_pity_requires_not_up,
-            ppo_state_tensor.as_ref(),
-            ppo_pity_slice,
+            ppo_inputs.seq_tensor.as_ref(),
+            ppo_inputs.pity_vec.as_deref(),
             control.fast_inference,
-            ppo_seq_slice,
-            &mut kv_cache,
+            ppo_inputs.seq_data.as_deref(),
+            ppo_context.kv_cache_mut(),
             pulls_done,
         );
 
-        if let (Some(policy), Some(cache)) = (ppo_policy, &mut kv_cache) {
-             policy.prune_cache(cache, context_len);
+        if let Some(policy) = ppo_policy {
+            ppo_context.prune_cache(policy);
         }
 
         let next_state = build_features(
@@ -494,77 +601,17 @@ pub fn simulate_core(
             max_loss_streak = state.loss_streak;
         }
 
-        if let (Some(action), Some(sender)) = (outcome.action, exp_sender) {
-            let mut reward = -0.1;
-            if outcome.rarity == 6 {
-                if outcome.is_up {
-                    reward += 10.0;
-                } else {
-                    reward += 2.0;
-                }
-            }
-            if state.loss_streak >= 2 {
-                reward -= (state.loss_streak as f64) * 0.5;
-            }
-            let done = outcome.is_up || (pulls_done + 1) >= 300;
-            let _ = sender.send(Experience {
-                state: current_state.to_vec(),
-                action,
-                reward,
-                next_state: next_state.to_vec(),
-                done,
-                td_error: 1.0,
-            });
-        }
-        if let Some(sender) = neural_sender {
-            let mut reward = -0.1;
-            if outcome.rarity == 6 {
-                if outcome.is_up {
-                    reward += 1.0;
-                } else {
-                    reward += 0.2;
-                }
-            }
-            if state.loss_streak >= 2 {
-                reward -= (state.loss_streak as f64) * 0.2;
-            }
-            let _ = sender.send(NeuralSample {
-                state: current_state,
-                reward,
-            });
-        }
-        if let (Some(log_prob), Some(value), Some(sender), Some(state_data), Some(pity_vec)) = (
-            outcome.ppo_log_prob,
-            outcome.ppo_value,
+        record_training_samples(
+            &outcome,
+            &current_state,
+            &next_state,
+            pulls_done,
+            &state,
+            exp_sender,
+            neural_sender,
             ppo_sender,
-            ppo_seq_data,
-            ppo_pity_vec,
-        ) {
-            if let Some(action) = outcome.action {
-                let mut reward = -0.1;
-                if outcome.rarity == 6 {
-                    if outcome.is_up {
-                        reward += 10.0;
-                    } else {
-                        reward += 2.0;
-                    }
-                }
-                if state.loss_streak >= 2 {
-                    reward -= (state.loss_streak as f64) * 2.0;
-                }
-                let done = outcome.is_up || (pulls_done + 1) >= 300;
-                let _ = sender.send(PpoExperience {
-                    state: state_data,
-                    seq_len: ppo_seq_len,
-                    pity: pity_vec,
-                    action,
-                    log_prob,
-                    reward,
-                    done,
-                    value,
-                });
-            }
-        }
+            &ppo_inputs,
+        );
 
         if let Some(ref mut pulls_vec) = pulls {
             let op_idx = match outcome.rarity {
@@ -612,6 +659,91 @@ pub fn simulate_core(
     (stats, pulls)
 }
 
+fn record_training_samples(
+    outcome: &PullOutcome,
+    current_state: &Tensor,
+    next_state: &Tensor,
+    pulls_done: usize,
+    state: &PullState,
+    exp_sender: Option<&Sender<Experience>>,
+    neural_sender: Option<&Sender<NeuralSample>>,
+    ppo_sender: Option<&Sender<PpoExperience>>,
+    ppo_inputs: &PpoInputs,
+) {
+    if let (Some(action), Some(sender)) = (outcome.action, exp_sender) {
+        let mut reward = -0.1;
+        if outcome.rarity == 6 {
+            if outcome.is_up {
+                reward += 10.0;
+            } else {
+                reward += 2.0;
+            }
+        }
+        if state.loss_streak >= 2 {
+            reward -= (state.loss_streak as f64) * 0.5;
+        }
+        let done = outcome.is_up || (pulls_done + 1) >= 300;
+        let _ = sender.send(Experience {
+            state: current_state.to_vec(),
+            action,
+            reward,
+            next_state: next_state.to_vec(),
+            done,
+            td_error: 1.0,
+        });
+    }
+
+    if let Some(sender) = neural_sender {
+        let mut reward = -0.1;
+        if outcome.rarity == 6 {
+            if outcome.is_up {
+                reward += 1.0;
+            } else {
+                reward += 0.2;
+            }
+        }
+        if state.loss_streak >= 2 {
+            reward -= (state.loss_streak as f64) * 0.2;
+        }
+        let _ = sender.send(NeuralSample {
+            state: *current_state,
+            reward,
+        });
+    }
+
+    if let (Some(log_prob), Some(value), Some(sender)) =
+        (outcome.ppo_log_prob, outcome.ppo_value, ppo_sender)
+    {
+        if let (Some(action), Some(state_data), Some(pity_vec)) = (
+            outcome.action,
+            ppo_inputs.seq_data.as_ref(),
+            ppo_inputs.pity_vec.as_ref(),
+        ) {
+            let mut reward = -0.1;
+            if outcome.rarity == 6 {
+                if outcome.is_up {
+                    reward += 10.0;
+                } else {
+                    reward += 2.0;
+                }
+            }
+            if state.loss_streak >= 2 {
+                reward -= (state.loss_streak as f64) * 2.0;
+            }
+            let done = outcome.is_up || (pulls_done + 1) >= 300;
+            let _ = sender.send(PpoExperience {
+                state: state_data.clone(),
+                seq_len: ppo_inputs.seq_len,
+                pity: pity_vec.clone(),
+                action,
+                log_prob,
+                reward,
+                done,
+                value,
+            });
+        }
+    }
+}
 pub fn build_non_up_six(config: &Config) -> Vec<String> {
     config
         .six_stars
@@ -986,5 +1118,119 @@ pub fn format_avg_extra_cost_line(avg_extra_cost: Option<f64>) -> String {
             cost / 500.0
         ),
         None => "Avg Extra Jade Cost: N/A".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_context() -> (Config, Dbn, NeuralLuckOptimizer) {
+        let config = Config::load("data/config.json");
+        let mut rng = Rng::from_seed(1234);
+        let dbn = Dbn::new(&[8, 16, 8], &mut rng);
+        let neural_opt = NeuralLuckOptimizer::new(5678);
+        (config, dbn, neural_opt)
+    }
+
+    #[test]
+    fn simulate_core_triggers_big_pity() {
+        let (config, dbn, neural_opt) = build_context();
+        let mut rng = Rng::from_seed(3);
+        let control = SimControl {
+            max_pulls: Some(config.big_pity_cumulative),
+            stop_on_up: false,
+            stop_after_total_pulls: None,
+            nn_total_pulls_one_based: false,
+            collect_details: false,
+            big_pity_requires_not_up: false,
+            fast_inference: true,
+        };
+        let (stats, _) = simulate_core(
+            &control,
+            &mut rng,
+            0,
+            &neural_opt,
+            None,
+            None,
+            &dbn,
+            &config,
+            None,
+            None,
+            None,
+        );
+        assert!(stats.big_pity_used);
+        assert!(stats.up_count >= 1);
+    }
+
+    #[test]
+    fn ppo_context_respects_context_len() {
+        let mut context = PpoContext::new(true, 2, None, false);
+        let inputs1 = context.build_inputs([0.0; DIM], 1, true);
+        assert_eq!(inputs1.seq_len, 1);
+        assert_eq!(inputs1.seq_data.as_ref().unwrap().len(), DIM);
+        let inputs2 = context.build_inputs([0.0; DIM], 2, true);
+        assert_eq!(inputs2.seq_len, 2);
+        assert_eq!(inputs2.seq_data.as_ref().unwrap().len(), DIM * 2);
+        let inputs3 = context.build_inputs([0.0; DIM], 3, true);
+        assert_eq!(inputs3.seq_len, 2);
+        assert_eq!(inputs3.pity_vec.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn ppo_fast_slow_alignment_distribution() {
+        let policy = crate::ppo::ActorCritic::new(12345);
+        let seq_len = 6;
+        let mut flat = vec![0.0; seq_len * DIM];
+        for t in 0..seq_len {
+            for i in 0..DIM {
+                flat[t * DIM + i] = (t as f64) * 0.01 + (i as f64) * 0.001;
+            }
+        }
+        let pity: Vec<usize> = (0..seq_len).collect();
+        let state_tensor = AutoTensor::new(flat.clone(), vec![seq_len, DIM]);
+
+        let slow_logits = policy.forward_actor(&state_tensor, &pity);
+        let slow_data = slow_logits.data.read().unwrap().clone();
+        let slow_probs = softmax(&slow_data);
+
+        let mut kv = crate::transformer::KVCache::new(policy.backbone.mla_layer.config.num_heads);
+        kv.clear();
+        let mut last = vec![0.0; 0];
+        for t in 0..seq_len {
+            let token = &flat[t * DIM..(t + 1) * DIM];
+            last = policy.backbone.forward_inference_step(token, &mut kv, t);
+        }
+        let fast_logits = policy.actor_head.forward_inference(&last);
+        let fast_probs = softmax(&fast_logits);
+
+        let mut diff_sum = 0.0;
+        for i in 0..5 {
+            diff_sum += (slow_probs[i] - fast_probs[i]).abs();
+        }
+        assert!(
+            diff_sum < 1e-6,
+            "Probability mismatch too large: {}",
+            diff_sum
+        );
+    }
+
+    fn softmax(logits: &[f64]) -> Vec<f64> {
+        let mut max_l = f64::NEG_INFINITY;
+        for &v in logits {
+            if v > max_l {
+                max_l = v;
+            }
+        }
+        let mut sum = 0.0;
+        let mut out = vec![0.0; logits.len()];
+        for (i, &v) in logits.iter().enumerate() {
+            out[i] = (v - max_l).exp();
+            sum += out[i];
+        }
+        for v in out.iter_mut() {
+            *v /= sum;
+        }
+        out
     }
 }

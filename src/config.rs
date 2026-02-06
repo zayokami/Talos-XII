@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 
@@ -52,6 +52,8 @@ impl JsonValue {
 struct JsonParser {
     chars: Vec<char>,
     pos: usize,
+    line: usize,
+    col: usize,
 }
 
 impl JsonParser {
@@ -59,6 +61,8 @@ impl JsonParser {
         JsonParser {
             chars: input.chars().collect(),
             pos: 0,
+            line: 1,
+            col: 1,
         }
     }
 
@@ -68,7 +72,20 @@ impl JsonParser {
             return Ok(JsonValue::Null);
         }
 
-        match self.chars[self.pos] {
+        let value = self.parse_value()?;
+        self.skip_whitespace();
+        if self.pos < self.chars.len() {
+            return Err(self.error("Unexpected trailing content"));
+        }
+        Ok(value)
+    }
+
+    fn parse_value(&mut self) -> Result<JsonValue, String> {
+        self.skip_whitespace();
+        if self.peek().is_none() {
+            return Err(self.error("Unexpected EOF"));
+        }
+        match self.peek().unwrap() {
             '{' => self.parse_object(),
             '[' => self.parse_array(),
             '"' => self.parse_string().map(JsonValue::String),
@@ -85,41 +102,45 @@ impl JsonParser {
                 Ok(JsonValue::Null)
             }
             c if c == '-' || c.is_ascii_digit() => self.parse_number(),
-            c => Err(format!("Unexpected character: {}", c)),
+            c => Err(self.error(&format!("Unexpected character: {}", c))),
         }
     }
 
     fn skip_whitespace(&mut self) {
-        while self.pos < self.chars.len() && self.chars[self.pos].is_whitespace() {
-            self.pos += 1;
+        while let Some(c) = self.peek() {
+            if c.is_whitespace() {
+                self.advance();
+            } else {
+                break;
+            }
         }
     }
 
     fn consume(&mut self, s: &str) -> Result<(), String> {
         for c in s.chars() {
-            if self.pos >= self.chars.len() || self.chars[self.pos] != c {
-                return Err(format!("Expected '{}'", s));
+            if self.peek() != Some(c) {
+                return Err(self.error(&format!("Expected '{}'", s)));
             }
-            self.pos += 1;
+            self.advance();
         }
         Ok(())
     }
 
     fn parse_string(&mut self) -> Result<String, String> {
-        self.pos += 1; // skip "
+        if self.peek() != Some('"') {
+            return Err(self.error("Expected '\"' to start string"));
+        }
+        self.advance();
         let mut s = String::new();
-        while self.pos < self.chars.len() {
-            let c = self.chars[self.pos];
-            self.pos += 1;
+        while let Some(c) = self.advance() {
             if c == '"' {
                 return Ok(s);
             }
             if c == '\\' {
-                if self.pos >= self.chars.len() {
-                    return Err("Unexpected EOF in string".to_string());
-                }
-                let escaped = self.chars[self.pos];
-                self.pos += 1;
+                let escaped = match self.advance() {
+                    Some(ch) => ch,
+                    None => return Err(self.error("Unexpected EOF in string escape")),
+                };
                 match escaped {
                     '"' => s.push('"'),
                     '\\' => s.push('\\'),
@@ -129,96 +150,255 @@ impl JsonParser {
                     'n' => s.push('\n'),
                     'r' => s.push('\r'),
                     't' => s.push('\t'),
-                    // Basic unicode support could be added here if needed
-                    _ => s.push(escaped),
+                    'u' => {
+                        let code_point = self.parse_unicode_escape()?;
+                        if let Some(ch) = std::char::from_u32(code_point) {
+                            s.push(ch);
+                        } else {
+                            return Err(self.error("Invalid Unicode code point"));
+                        }
+                    }
+                    _ => return Err(self.error(&format!("Invalid escape: \\{}", escaped))),
                 }
             } else {
                 s.push(c);
             }
         }
-        Err("Unexpected EOF in string".to_string())
+        Err(self.error("Unexpected EOF in string"))
     }
 
     fn parse_number(&mut self) -> Result<JsonValue, String> {
-        let start = self.pos;
-        if self.pos < self.chars.len() && self.chars[self.pos] == '-' {
-            self.pos += 1;
-        }
-        while self.pos < self.chars.len() && self.chars[self.pos].is_ascii_digit() {
-            self.pos += 1;
-        }
-        if self.pos < self.chars.len() && self.chars[self.pos] == '.' {
-            self.pos += 1;
-            while self.pos < self.chars.len() && self.chars[self.pos].is_ascii_digit() {
-                self.pos += 1;
+        let mut s = String::new();
+        if let Some(c) = self.peek() {
+            if c == '-' {
+                s.push(c);
+                self.advance();
             }
         }
-        let s: String = self.chars[start..self.pos].iter().collect();
+
+        let mut int_digits = 0usize;
+        while let Some(c) = self.peek() {
+            if c.is_ascii_digit() {
+                s.push(c);
+                self.advance();
+                int_digits += 1;
+            } else {
+                break;
+            }
+        }
+        if int_digits == 0 {
+            return Err(self.error("Invalid number"));
+        }
+
+        if self.peek() == Some('.') {
+            s.push('.');
+            self.advance();
+            let mut frac_digits = 0usize;
+            while let Some(c) = self.peek() {
+                if c.is_ascii_digit() {
+                    s.push(c);
+                    self.advance();
+                    frac_digits += 1;
+                } else {
+                    break;
+                }
+            }
+            if frac_digits == 0 {
+                return Err(self.error("Invalid fraction"));
+            }
+        }
+
+        if let Some(c) = self.peek() {
+            if c == 'e' || c == 'E' {
+                s.push(c);
+                self.advance();
+                if let Some(sign) = self.peek() {
+                    if sign == '+' || sign == '-' {
+                        s.push(sign);
+                        self.advance();
+                    }
+                }
+                let mut exp_digits = 0usize;
+                while let Some(c) = self.peek() {
+                    if c.is_ascii_digit() {
+                        s.push(c);
+                        self.advance();
+                        exp_digits += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if exp_digits == 0 {
+                    return Err(self.error("Invalid exponent"));
+                }
+            }
+        }
+
         s.parse::<f64>()
             .map(JsonValue::Number)
-            .map_err(|_| format!("Invalid number: {}", s))
+            .map_err(|_| self.error(&format!("Invalid number: {}", s)))
     }
 
     fn parse_array(&mut self) -> Result<JsonValue, String> {
-        self.pos += 1; // skip [
+        if self.peek() != Some('[') {
+            return Err(self.error("Expected '['"));
+        }
+        self.advance();
         let mut arr = Vec::new();
         self.skip_whitespace();
-        if self.pos < self.chars.len() && self.chars[self.pos] == ']' {
-            self.pos += 1;
+        if self.peek() == Some(']') {
+            self.advance();
             return Ok(JsonValue::Array(arr));
         }
         loop {
-            arr.push(self.parse()?);
             self.skip_whitespace();
-            if self.pos >= self.chars.len() {
-                return Err("Unexpected EOF in array".to_string());
+            arr.push(self.parse_value()?);
+            self.skip_whitespace();
+            if self.peek().is_none() {
+                return Err(self.error("Unexpected EOF in array"));
             }
-            match self.chars[self.pos] {
-                ',' => self.pos += 1,
+            match self.peek().unwrap() {
+                ',' => {
+                    self.advance();
+                }
                 ']' => {
-                    self.pos += 1;
+                    self.advance();
                     return Ok(JsonValue::Array(arr));
                 }
-                c => return Err(format!("Expected ',' or ']' in array, found {}", c)),
+                c => return Err(self.error(&format!("Expected ',' or ']' in array, found {}", c))),
             }
         }
     }
 
     fn parse_object(&mut self) -> Result<JsonValue, String> {
-        self.pos += 1; // skip {
+        if self.peek() != Some('{') {
+            return Err(self.error("Expected '{'"));
+        }
+        self.advance();
         let mut map = HashMap::new();
         self.skip_whitespace();
-        if self.pos < self.chars.len() && self.chars[self.pos] == '}' {
-            self.pos += 1;
+        if self.peek() == Some('}') {
+            self.advance();
             return Ok(JsonValue::Object(map));
         }
         loop {
             self.skip_whitespace();
-            if self.chars[self.pos] != '"' {
-                return Err("Expected string key in object".to_string());
+            if self.peek() != Some('"') {
+                return Err(self.error("Expected string key in object"));
             }
             let key = self.parse_string()?;
             self.skip_whitespace();
-            if self.pos >= self.chars.len() || self.chars[self.pos] != ':' {
-                return Err("Expected ':' after key".to_string());
+            if self.peek() != Some(':') {
+                return Err(self.error("Expected ':' after key"));
             }
-            self.pos += 1; // skip :
-            let value = self.parse()?;
+            self.advance();
+            self.skip_whitespace();
+            let value = self.parse_value()?;
             map.insert(key, value);
 
             self.skip_whitespace();
-            if self.pos >= self.chars.len() {
-                return Err("Unexpected EOF in object".to_string());
+            if self.peek().is_none() {
+                return Err(self.error("Unexpected EOF in object"));
             }
-            match self.chars[self.pos] {
-                ',' => self.pos += 1,
+            match self.peek().unwrap() {
+                ',' => {
+                    self.advance();
+                }
                 '}' => {
-                    self.pos += 1;
+                    self.advance();
                     return Ok(JsonValue::Object(map));
                 }
-                c => return Err(format!("Expected ',' or '}}' in object, found {}", c)),
+                c => {
+                    return Err(self.error(&format!("Expected ',' or '}}' in object, found {}", c)))
+                }
             }
         }
+    }
+
+    fn peek(&self) -> Option<char> {
+        self.chars.get(self.pos).copied()
+    }
+
+    fn advance(&mut self) -> Option<char> {
+        if self.pos >= self.chars.len() {
+            return None;
+        }
+        let c = self.chars[self.pos];
+        self.pos += 1;
+        if c == '\n' {
+            self.line += 1;
+            self.col = 1;
+        } else {
+            self.col += 1;
+        }
+        Some(c)
+    }
+
+    fn parse_unicode_escape(&mut self) -> Result<u32, String> {
+        let mut code: u32 = 0;
+        for _ in 0..4 {
+            let c = match self.advance() {
+                Some(ch) => ch,
+                None => return Err(self.error("Unexpected EOF in unicode escape")),
+            };
+            let digit = c
+                .to_digit(16)
+                .ok_or_else(|| self.error("Invalid unicode escape"))?;
+            code = (code << 4) | digit;
+        }
+        if (0xD800..=0xDBFF).contains(&code) {
+            let saved_pos = self.pos;
+            let saved_line = self.line;
+            let saved_col = self.col;
+            if self.peek() == Some('\\') {
+                self.advance();
+                if self.peek() == Some('u') {
+                    self.advance();
+                    let mut low: u32 = 0;
+                    for _ in 0..4 {
+                        let c = match self.advance() {
+                            Some(ch) => ch,
+                            None => return Err(self.error("Unexpected EOF in unicode escape")),
+                        };
+                        let digit = c
+                            .to_digit(16)
+                            .ok_or_else(|| self.error("Invalid unicode escape"))?;
+                        low = (low << 4) | digit;
+                    }
+                    if (0xDC00..=0xDFFF).contains(&low) {
+                        let high_ten = code - 0xD800;
+                        let low_ten = low - 0xDC00;
+                        return Ok(0x10000 + ((high_ten << 10) | low_ten));
+                    } else {
+                        return Err(self.error("Invalid unicode surrogate pair"));
+                    }
+                }
+            }
+            self.pos = saved_pos;
+            self.line = saved_line;
+            self.col = saved_col;
+            return Err(self.error("Invalid unicode surrogate pair"));
+        }
+        Ok(code)
+    }
+
+    fn error(&self, msg: &str) -> String {
+        let pos = self.pos.min(self.chars.len());
+        let mut line_start = pos;
+        while line_start > 0 && self.chars[line_start - 1] != '\n' {
+            line_start -= 1;
+        }
+        let mut line_end = pos;
+        while line_end < self.chars.len() && self.chars[line_end] != '\n' {
+            line_end += 1;
+        }
+        let line_text: String = self.chars[line_start..line_end].iter().collect();
+        let caret_pos = if self.col == 0 { 1 } else { self.col };
+        let caret = " ".repeat(caret_pos.saturating_sub(1)) + "^";
+        format!(
+            "JSON parse error at line {}, col {}: {}\n{}\n{}",
+            self.line, self.col, msg, line_text, caret
+        )
     }
 }
 
@@ -301,6 +481,11 @@ impl Config {
     }
 
     pub fn load(path: &str) -> Self {
+        if path == "default" {
+            eprintln!("[System] Using built-in default configuration.");
+            return Config::default();
+        }
+
         let file_result = File::open(path);
 
         // Robustness: If file not found, try to look in parent directories (useful for IDE/target builds)
@@ -314,14 +499,13 @@ impl Config {
                         f
                     }
                     Err(_) => {
-                        // If still not found, we CANNOT proceed safely without config in a data-driven app.
-                        // We must pause to let user see the error before "crashing" (closing window).
-                        println!("\n[FATAL ERROR] Configuration file not found!");
-                        println!("Looked at: './{}' and '../../{}'", path, path);
-                        println!("Please ensure the 'data' folder is in the same directory as the executable.");
-                        println!("\nPress Enter to exit...");
-                        let mut s = String::new();
-                        std::io::stdin().read_line(&mut s).unwrap();
+                        eprintln!("[FATAL ERROR] Configuration file not found.");
+                        eprintln!("Looked at: './{}' and '../../{}'", path, path);
+                        eprintln!("Use --config <path> or explicitly pass --config default to use built-in defaults.");
+                        if path == "data/config.json" {
+                            eprintln!("[WARNING] Missing data/config.json. Falling back to built-in defaults for development.");
+                            return Config::default();
+                        }
                         std::process::exit(1);
                     }
                 }
@@ -333,11 +517,18 @@ impl Config {
             .expect("Failed to read config file");
 
         let mut parser = JsonParser::new(&contents);
-        let root = parser.parse().expect("Failed to parse JSON config");
+        let root = match parser.parse() {
+            Ok(value) => value,
+            Err(err) => {
+                eprintln!("[FATAL ERROR] {}", err);
+                std::process::exit(1);
+            }
+        };
 
         let mut config = Config::default();
 
         if let JsonValue::Object(map) = root {
+            warn_unknown_fields(&map);
             if let Some(v) = map.get("pool_name") {
                 config.pool_name = v.as_str().unwrap_or("").to_string();
             }
@@ -440,5 +631,112 @@ impl Config {
         }
 
         config
+    }
+}
+
+fn warn_unknown_fields(map: &HashMap<String, JsonValue>) {
+    let known: HashSet<&'static str> = [
+        "pool_name",
+        "up_six",
+        "prob_6_base",
+        "prob_5_base",
+        "prob_4_base",
+        "soft_pity_start",
+        "small_pity_guarantee",
+        "big_pity_cumulative",
+        "six_stars",
+        "five_stars",
+        "four_stars",
+        "luck_mode",
+        "fast_init",
+        "ppo_mode",
+        "ppo_total_steps",
+        "ppo_steps_per_update",
+        "ppo_k_epochs",
+        "ppo_batch_size",
+        "ppo_context_len",
+        "worker_max_threads",
+        "worker_reserve_cores",
+        "worker_priority",
+        "worker_stack_size_mb",
+        "f2p_sim_count",
+        "f2p_sim_count_prob",
+        "f2p_sim_count_cost",
+        "online_train",
+        "online_train_dqn",
+        "online_train_neural",
+        "online_train_ppo",
+        "train_interval_ms",
+        "max_train_steps_per_tick",
+        "language",
+    ]
+    .into_iter()
+    .collect();
+
+    for key in map.keys() {
+        if !known.contains(key.as_str()) {
+            eprintln!("[Config Warning] Unknown field: {}", key);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_ok(input: &str) -> JsonValue {
+        let mut parser = JsonParser::new(input);
+        parser.parse().unwrap()
+    }
+
+    #[test]
+    fn parse_empty_object() {
+        let value = parse_ok("{}");
+        if let JsonValue::Object(map) = value {
+            assert!(map.is_empty());
+        } else {
+            panic!("Expected object");
+        }
+    }
+
+    #[test]
+    fn parse_nested_array() {
+        let value = parse_ok("[1, [2, 3], 4]");
+        if let JsonValue::Array(arr) = value {
+            assert_eq!(arr.len(), 3);
+        } else {
+            panic!("Expected array");
+        }
+    }
+
+    #[test]
+    fn parse_unicode_escape() {
+        let value = parse_ok(r#""\u4e2d\u6587""#);
+        if let JsonValue::String(s) = value {
+            assert_eq!(s, "中文");
+        } else {
+            panic!("Expected string");
+        }
+    }
+
+    #[test]
+    fn parse_scientific_number() {
+        let value = parse_ok(r#"[1e-3, -2.5E+2]"#);
+        if let JsonValue::Array(arr) = value {
+            assert!((arr[0].as_f64().unwrap() - 0.001).abs() < 1e-12);
+            assert!((arr[1].as_f64().unwrap() + 250.0).abs() < 1e-9);
+        } else {
+            panic!("Expected array");
+        }
+    }
+
+    #[test]
+    fn parse_escape_sequences() {
+        let value = parse_ok(r#""line1\nline2\t\"""#);
+        if let JsonValue::String(s) = value {
+            assert_eq!(s, "line1\nline2\t\"");
+        } else {
+            panic!("Expected string");
+        }
     }
 }
