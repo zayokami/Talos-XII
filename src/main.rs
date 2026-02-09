@@ -1,3 +1,4 @@
+mod achf;
 mod autograd;
 mod config;
 mod dbn;
@@ -36,7 +37,8 @@ use worker::GoodJobWorker;
 use sim::{
     build_non_up_six, format_avg_extra_cost_line, format_f2p_probability_line,
     resolve_operator_name, simulate_f2p_clearing, simulate_fast, simulate_one, simulate_stats,
-    NeuralSample, PpoExperience, COST_PER_PULL, FREE_PULLS_WELFARE,
+    NeuralSample, PpoExperience, SimModelContext, SimRunContext, COST_PER_PULL,
+    FREE_PULLS_WELFARE,
 };
 use trainer::{
     train_linear_regression, train_manifold_rl, train_neural_optimizer, OnlineNeuralTrainer,
@@ -198,13 +200,21 @@ fn benchmark_simulation(
     config: &Config,
     lang: Language,
 ) {
+    let ctx = SimModelContext {
+        neural_opt,
+        dqn_policy,
+        ppo_policy,
+        dbn,
+        config,
+        exp_sender: None,
+        neural_sender: None,
+        ppo_sender: None,
+    };
     let fast_sims = 10_000usize;
     let fast_pulls = 200usize;
     let start_fast = Instant::now();
     for _ in 0..fast_sims {
-        let _ = simulate_fast(
-            fast_pulls, rng, 0, neural_opt, dqn_policy, ppo_policy, dbn, config, None, None, None,
-        );
+        let _ = simulate_fast(fast_pulls, rng, 0, &ctx);
     }
     let fast_elapsed = start_fast.elapsed();
     println!(
@@ -223,9 +233,7 @@ fn benchmark_simulation(
     let one_pulls = 120usize;
     let start_one = Instant::now();
     for _ in 0..one_sims {
-        let _ = simulate_one(
-            one_pulls, rng, 0, neural_opt, dqn_policy, ppo_policy, dbn, config, None, None, None,
-        );
+        let _ = simulate_one(one_pulls, rng, 0, &ctx);
     }
     let one_elapsed = start_one.elapsed();
     println!(
@@ -302,7 +310,7 @@ fn initialize_system(
 
     // DQN
     let dqn_policy = if config.online_train && config.online_train_dqn {
-        DuelingQNetwork::new(rng.next_u64())
+        DuelingQNetwork::new(rng.next_u64(), &config.achf)
     } else {
         train_dqn(&trained_neural_opt, &mut rng, &dbn, &config)
     };
@@ -310,6 +318,7 @@ fn initialize_system(
     // PPO
     let ppo_policy = if !args.force {
         if let Some(cached) = load_ppo_model("ppo.cache") {
+            cached.freeze_achf_for_inference();
             info!("[PPO] Cached model loaded.");
             cached
         } else {
@@ -346,7 +355,7 @@ fn main() {
 
     match args.command.clone().unwrap_or(Commands::Interactive) {
         Commands::Interactive => {
-            run_interactive(
+            run_interactive(RunInteractiveArgs {
                 config,
                 dbn,
                 trained_neural_opt,
@@ -355,24 +364,22 @@ fn main() {
                 worker,
                 rng,
                 lang,
-            );
+            });
         }
         Commands::Simulate { count, pulls } => {
             // Run simulation
-            let (six_count, up_count, _, _) = simulate_stats(
-                pulls,
-                count,
-                rng.next_u64(),
-                &trained_neural_opt,
-                Some(&dqn_policy),
-                Some(&ppo_policy),
-                &dbn,
-                &config,
-                &worker,
-                None,
-                None,
-                None,
-            );
+            let ctx = SimRunContext {
+                neural_opt: &trained_neural_opt,
+                dqn_policy: Some(&dqn_policy),
+                ppo_policy: Some(&ppo_policy),
+                dbn: &dbn,
+                config: &config,
+                worker: &worker,
+                exp_sender: None,
+                neural_sender: None,
+                ppo_sender: None,
+            };
+            let (six_count, up_count, _, _) = simulate_stats(pulls, count, rng.next_u64(), &ctx);
             println!(
                 "{}",
                 I18n::get(lang, "batch_sim_header")
@@ -459,21 +466,24 @@ fn main() {
             let mut total_with_up_agg = 0;
 
             let start_time = Instant::now();
+            let ctx = SimRunContext {
+                neural_opt: &trained_neural_opt,
+                dqn_policy: Some(&dqn_policy),
+                ppo_policy: Some(&ppo_policy),
+                dbn: &dbn,
+                config: &config,
+                worker: &worker,
+                exp_sender: None,
+                neural_sender: None,
+                ppo_sender: None,
+            };
 
             for i in 0..batches {
                 let (_, total_up, _, total_with_up) = simulate_stats(
                     FREE_PULLS_WELFARE as usize,
                     batch_size_prob,
                     rng.next_u64(),
-                    &trained_neural_opt,
-                    Some(&dqn_policy),
-                    Some(&ppo_policy),
-                    &dbn,
-                    &config,
-                    &worker,
-                    None,
-                    None,
-                    None,
+                    &ctx,
                 );
                 total_up_agg += total_up;
                 total_with_up_agg += total_with_up;
@@ -522,19 +532,8 @@ fn main() {
             let mut extra_cost_samples_agg = 0usize;
 
             for i in 0..batches {
-                let (cost_sum, samples, _) = simulate_f2p_clearing(
-                    batch_size_cost,
-                    rng.next_u64(),
-                    &trained_neural_opt,
-                    Some(&dqn_policy),
-                    Some(&ppo_policy),
-                    &dbn,
-                    &config,
-                    &worker,
-                    None,
-                    None,
-                    None,
-                );
+                let (cost_sum, samples, _) =
+                    simulate_f2p_clearing(batch_size_cost, rng.next_u64(), &ctx);
                 total_extra_cost_agg += cost_sum;
                 extra_cost_samples_agg += samples;
 
@@ -558,16 +557,28 @@ fn main() {
     }
 }
 
-fn run_interactive(
+struct RunInteractiveArgs {
     config: Config,
     dbn: Dbn,
     trained_neural_opt: NeuralLuckOptimizer,
     dqn_policy: DuelingQNetwork,
     ppo_policy: ActorCritic,
     worker: GoodJobWorker,
-    mut rng: Rng,
+    rng: Rng,
     lang: Language,
-) {
+}
+
+fn run_interactive(args: RunInteractiveArgs) {
+    let RunInteractiveArgs {
+        config,
+        dbn,
+        trained_neural_opt,
+        dqn_policy,
+        ppo_policy,
+        worker,
+        mut rng,
+        lang,
+    } = args;
     let dqn_shared = Arc::new(RwLock::new(dqn_policy.clone()));
     let neural_shared = Arc::new(RwLock::new(trained_neural_opt.clone()));
     let ppo_shared = Arc::new(RwLock::new(ppo_policy.clone()));
@@ -639,7 +650,7 @@ fn run_interactive(
         online_handles.push(thread::spawn(move || {
             let mut last_report = Instant::now();
             let mut last_sync = Instant::now();
-            let max_drain = max_steps.max(1).min(2048);
+            let max_drain = max_steps.clamp(1, 2048);
             loop {
                 if stop.load(Ordering::Relaxed) {
                     break;
@@ -678,7 +689,8 @@ fn run_interactive(
         let interval_ms = (config.train_interval_ms.max(1) as u64).max(5);
         let max_steps = config.max_train_steps_per_tick.max(1);
         let trainer_seed = rng.next_u64();
-        let mut trainer = OnlinePpoTrainer::new(trainer_seed, 2, 128);
+        let achf = config.achf.clone();
+        let mut trainer = OnlinePpoTrainer::new(trainer_seed, 2, 128, &achf);
         online_handles.push(thread::spawn(move || {
             let mut last_report = Instant::now();
             let mut last_sync = Instant::now();
@@ -868,21 +880,24 @@ fn run_interactive(
     let dqn_guard = dqn_shared.read().unwrap();
     let neural_guard = neural_shared.read().unwrap();
     let ppo_guard = ppo_shared.read().unwrap();
+    let ctx = SimRunContext {
+        neural_opt: &neural_guard,
+        dqn_policy: Some(&dqn_guard),
+        ppo_policy: Some(&ppo_guard),
+        dbn: &dbn,
+        config: &config,
+        worker: &worker,
+        exp_sender: None,
+        neural_sender: None,
+        ppo_sender: None,
+    };
 
     for i in 0..batches {
         let (_, total_up, _, total_with_up) = simulate_stats(
             FREE_PULLS_WELFARE as usize,
             batch_size_prob,
             rng.next_u64(),
-            &neural_guard,
-            Some(&dqn_guard),
-            Some(&ppo_guard),
-            &dbn,
-            &config,
-            &worker,
-            None,
-            None,
-            None,
+            &ctx,
         );
         total_up_agg += total_up;
         total_with_up_agg += total_with_up;
@@ -929,19 +944,7 @@ fn run_interactive(
     let mut extra_cost_samples_agg = 0usize;
 
     for i in 0..batches {
-        let (cost_sum, samples, _) = simulate_f2p_clearing(
-            batch_size_cost,
-            rng.next_u64(),
-            &neural_guard,
-            Some(&dqn_guard),
-            Some(&ppo_guard),
-            &dbn,
-            &config,
-            &worker,
-            None,
-            None,
-            None,
-        );
+        let (cost_sum, samples, _) = simulate_f2p_clearing(batch_size_cost, rng.next_u64(), &ctx);
         total_extra_cost_agg += cost_sum;
         extra_cost_samples_agg += samples;
 
@@ -1034,20 +1037,18 @@ fn run_interactive(
             let neural_guard = neural_shared.read().unwrap();
             let ppo_guard = ppo_shared.read().unwrap();
             let active_ppo = if use_ppo { Some(&*ppo_guard) } else { None };
-            let (s_total, u_total, _, _) = simulate_stats(
-                n,
-                sims_n,
-                rng.next_u64(),
-                &neural_guard,
-                Some(&dqn_guard),
-                active_ppo,
-                &dbn,
-                &config,
-                &worker,
-                None,
-                None,
-                None,
-            );
+            let ctx = SimRunContext {
+                neural_opt: &neural_guard,
+                dqn_policy: Some(&dqn_guard),
+                ppo_policy: active_ppo,
+                dbn: &dbn,
+                config: &config,
+                worker: &worker,
+                exp_sender: None,
+                neural_sender: None,
+                ppo_sender: None,
+            };
+            let (s_total, u_total, _, _) = simulate_stats(n, sims_n, rng.next_u64(), &ctx);
             let s_avg = s_total as f64 / sims_n as f64;
             let u_avg = u_total as f64 / sims_n as f64;
             println!(
@@ -1064,18 +1065,21 @@ fn run_interactive(
             let neural_guard = neural_shared.read().unwrap();
             let ppo_guard = ppo_shared.read().unwrap();
             let active_ppo = if use_ppo { Some(&*ppo_guard) } else { None };
+            let ctx = SimModelContext {
+                neural_opt: &neural_guard,
+                dqn_policy: Some(&dqn_guard),
+                ppo_policy: active_ppo,
+                dbn: &dbn,
+                config: &config,
+                exp_sender: dqn_sender.as_ref(),
+                neural_sender: neural_sender.as_ref(),
+                ppo_sender: ppo_sender.as_ref(),
+            };
             let res = simulate_one(
                 n,
                 &mut rng,
                 free_pulls,
-                &neural_guard,
-                Some(&dqn_guard),
-                active_ppo,
-                &dbn,
-                &config,
-                dqn_sender.as_ref(),
-                neural_sender.as_ref(),
-                ppo_sender.as_ref(),
+                &ctx,
             );
             let elapsed = start_time.elapsed();
             println!(
@@ -1138,7 +1142,7 @@ fn run_interactive(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sim::{simulate_core, simulate_fast, simulate_one, SimControl}; // Updated import
+    use sim::{simulate_core, simulate_fast, simulate_one, SimControl, SimModelContext};
 
     fn build_context() -> (Config, Dbn, NeuralLuckOptimizer) {
         let config = Config::load("data/config.json");
@@ -1154,19 +1158,17 @@ mod tests {
         let mut rng = Rng::from_seed(1);
         let num_pulls = 200;
         let free_pulls = FREE_PULLS_WELFARE;
-        let res = simulate_fast(
-            num_pulls,
-            &mut rng,
-            free_pulls,
-            &neural_opt,
-            None,
-            None,
-            &dbn,
-            &config,
-            None,
-            None,
-            None,
-        );
+        let ctx = SimModelContext {
+            neural_opt: &neural_opt,
+            dqn_policy: None,
+            ppo_policy: None,
+            dbn: &dbn,
+            config: &config,
+            exp_sender: None,
+            neural_sender: None,
+            ppo_sender: None,
+        };
+        let res = simulate_fast(num_pulls, &mut rng, free_pulls, &ctx);
         let expected_free_used = free_pulls.min(num_pulls as u32);
         let expected_cost = (num_pulls as u32 - expected_free_used) * COST_PER_PULL;
         assert_eq!(res.free_pulls_used, expected_free_used);
@@ -1179,19 +1181,17 @@ mod tests {
         let mut rng = Rng::from_seed(2);
         let num_pulls = 120;
         let free_pulls = FREE_PULLS_WELFARE;
-        let res = simulate_one(
-            num_pulls,
-            &mut rng,
-            free_pulls,
-            &neural_opt,
-            None,
-            None,
-            &dbn,
-            &config,
-            None,
-            None,
-            None,
-        );
+        let ctx = SimModelContext {
+            neural_opt: &neural_opt,
+            dqn_policy: None,
+            ppo_policy: None,
+            dbn: &dbn,
+            config: &config,
+            exp_sender: None,
+            neural_sender: None,
+            ppo_sender: None,
+        };
+        let res = simulate_one(num_pulls, &mut rng, free_pulls, &ctx);
         let six_count = res.pulls.iter().filter(|p| p.rarity == 6).count();
         let up_count = res.pulls.iter().filter(|p| p.is_up).count();
         let expected_free_used = free_pulls.min(num_pulls as u32);
@@ -1218,19 +1218,17 @@ mod tests {
             big_pity_requires_not_up: false,
             fast_inference: true,
         };
-        let (stats, _) = simulate_core(
-            &control,
-            &mut rng,
-            FREE_PULLS_WELFARE,
-            &neural_opt,
-            None,
-            None,
-            &dbn,
-            &config,
-            None,
-            None,
-            None,
-        );
+        let ctx = SimModelContext {
+            neural_opt: &neural_opt,
+            dqn_policy: None,
+            ppo_policy: None,
+            dbn: &dbn,
+            config: &config,
+            exp_sender: None,
+            neural_sender: None,
+            ppo_sender: None,
+        };
+        let (stats, _) = simulate_core(&control, &mut rng, FREE_PULLS_WELFARE, &ctx);
         assert!(stats.up_count > 0);
     }
 }

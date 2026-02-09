@@ -4,6 +4,7 @@ use crate::neural::{NeuralLuckOptimizer, DIM};
 use crate::rng::Rng;
 use crate::sim::{
     expected_pulls_per_six, simulate_fast, simulate_for_data_collection, NeuralSample,
+    SimModelContext,
 };
 use crate::simd::add_scaled_row;
 use crate::worker::GoodJobWorker;
@@ -88,9 +89,17 @@ fn evaluate_manifold_reward(
     config: &Config,
 ) -> f64 {
     let sims = if cfg!(debug_assertions) { 2000 } else { 6000 };
-    let res = simulate_fast(
-        sims, rng, 0, model, None, None, dbn, config, None, None, None,
-    );
+    let ctx = SimModelContext {
+        neural_opt: model,
+        dqn_policy: None,
+        ppo_policy: None,
+        dbn,
+        config,
+        exp_sender: None,
+        neural_sender: None,
+        ppo_sender: None,
+    };
+    let res = simulate_fast(sims, rng, 0, &ctx);
     let expected_pulls = expected_pulls_per_six(config);
     let target_rate = if expected_pulls > 0.0 {
         1.0 / expected_pulls
@@ -275,8 +284,8 @@ pub fn train_manifold_rl(
             m[i] = beta1 * m[i] + (1.0 - beta1) * g;
             v_sq[i] = beta2 * v_sq[i] + (1.0 - beta2) * g * g;
 
-            let m_hat = m[i] / (1.0 - beta1.powi((iter + 1) as i32));
-            let v_hat = v_sq[i] / (1.0 - beta2.powi((iter + 1) as i32));
+            let m_hat = m[i] / (1.0 - beta1.powi(iter + 1));
+            let v_hat = v_sq[i] / (1.0 - beta2.powi(iter + 1));
 
             params[i] += lr * m_hat / (v_hat.sqrt() + epsilon);
         }
@@ -290,8 +299,8 @@ pub fn train_manifold_rl(
         let mut v_sum_analysis = 0.0;
         let mut v_sum_decision = 0.0;
 
-        for i in 0..n_params {
-            let v_hat = v_sq[i] / (1.0 - beta2.powi((iter + 1) as i32));
+        for (i, v_val) in v_sq.iter().enumerate() {
+            let v_hat = v_val / (1.0 - beta2.powi(iter + 1));
             if i < n_analysis {
                 v_sum_analysis += v_hat;
             } else {
@@ -375,7 +384,7 @@ pub fn train_neural_optimizer(
                 .into_par_iter()
                 .map(|idx| {
                     // Use crate::sim::SimControl instead of local struct
-                    use crate::sim::{simulate_core, SimControl};
+                    use crate::sim::{simulate_core, SimControl, SimModelContext};
 
                     let mut local_rng = Rng::from_seed(eval_seeds[idx]);
                     let control = SimControl {
@@ -387,19 +396,17 @@ pub fn train_neural_optimizer(
                         big_pity_requires_not_up: false,
                         fast_inference: true,
                     };
-                    let (stats, _) = simulate_core(
-                        &control,
-                        &mut local_rng,
-                        0,
-                        &population[idx],
-                        None,
-                        None,
+                    let model_ctx = SimModelContext {
+                        neural_opt: &population[idx],
+                        dqn_policy: None,
+                        ppo_policy: None,
                         dbn,
                         config,
-                        None,
-                        None,
-                        None,
-                    );
+                        exp_sender: None,
+                        neural_sender: None,
+                        ppo_sender: None,
+                    };
+                    let (stats, _) = simulate_core(&control, &mut local_rng, 0, &model_ctx);
 
                     let rate_6 = stats.six_count as f64 / sims_per_genome as f64;
 

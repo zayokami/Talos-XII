@@ -1,5 +1,6 @@
+use crate::achf::AchfLayer;
 use crate::autograd::Tensor;
-use crate::config::Config;
+use crate::config::{AchfConfig, Config};
 use crate::dbn::Dbn;
 use crate::neural::{NeuralLuckOptimizer, DIM};
 use crate::nn::{Linear, Module};
@@ -33,6 +34,7 @@ pub struct DuelingQNetwork {
     l2: Linear,
     val_head: Linear,
     adv_head: Linear,
+    achf: Option<AchfLayer>,
 }
 
 impl Module for DuelingQNetwork {
@@ -46,29 +48,42 @@ impl Module for DuelingQNetwork {
         p.extend(self.l2.parameters());
         p.extend(self.val_head.parameters());
         p.extend(self.adv_head.parameters());
+        if let Some(achf) = &self.achf {
+            p.extend(achf.parameters());
+        }
         p
     }
 }
 
 impl DuelingQNetwork {
-    pub fn new(seed: u64) -> Self {
+    pub fn new(seed: u64, achf: &AchfConfig) -> Self {
         let l1 = Linear::new(DIM, 64, true, seed);
         let l2 = Linear::new(64, 64, true, seed.wrapping_add(1));
         let val_head = Linear::new(64, 1, true, seed.wrapping_add(2));
         let adv_head = Linear::new(64, ACTION_SPACE, true, seed.wrapping_add(3));
+        let achf_layer = if achf.enabled && achf.apply_dqn {
+            Some(AchfLayer::new(64, achf.clone(), seed.wrapping_add(500)))
+        } else {
+            None
+        };
 
         DuelingQNetwork {
             l1,
             l2,
             val_head,
             adv_head,
+            achf: achf_layer,
         }
     }
 
     pub fn forward_impl(&self, state: &Tensor) -> Tensor {
         // state: (Batch, 8) or (8)
         let x = self.l1.forward(state).relu();
-        let x = self.l2.forward(&x).relu();
+        let mut x = self.l2.forward(&x).relu();
+        if let Some(achf) = &self.achf {
+            let residual = achf.forward_residual(&x);
+            x = &x + &residual;
+        }
 
         let val = self.val_head.forward(&x); // (Batch, 1) or (1)
         let adv = self.adv_head.forward(&x); // (Batch, 5) or (5)
@@ -110,6 +125,35 @@ impl DuelingQNetwork {
         self.forward_impl(state)
     }
 
+    pub fn achf_config(&self) -> AchfConfig {
+        self.achf
+            .as_ref()
+            .map(|achf| achf.config.clone())
+            .unwrap_or_else(AchfConfig::default)
+    }
+
+    pub fn update_achf_after_backward(&self) {
+        if let Some(achf) = &self.achf {
+            achf.update_after_backward();
+        }
+    }
+
+    pub fn freeze_achf_for_inference(&self) {
+        if let Some(achf) = &self.achf {
+            achf.freeze_for_inference();
+        }
+    }
+
+    pub fn achf_cache_stats(&self) -> Option<crate::achf::AchfCacheStats> {
+        self.achf.as_ref().map(|achf| achf.cache_stats())
+    }
+
+    pub fn achf_orthogonal_penalty(&self) -> Option<Tensor> {
+        self.achf
+            .as_ref()
+            .and_then(|achf| achf.orthogonal_penalty())
+    }
+
     // Copy weights
     pub fn load_state_dict(&mut self, other: &Self) {
         fn copy_tensor(dst: &mut Tensor, src: &Tensor) {
@@ -129,6 +173,9 @@ impl DuelingQNetwork {
         copy_linear(&mut self.l2, &other.l2);
         copy_linear(&mut self.val_head, &other.val_head);
         copy_linear(&mut self.adv_head, &other.adv_head);
+        if let (Some(dst), Some(src)) = (&mut self.achf, &other.achf) {
+            dst.load_state_dict(src);
+        }
     }
 
     pub fn soft_update(&mut self, source: &Self, tau: f64) {
@@ -151,6 +198,9 @@ impl DuelingQNetwork {
         update_linear(&mut self.l2, &source.l2);
         update_linear(&mut self.val_head, &source.val_head);
         update_linear(&mut self.adv_head, &source.adv_head);
+        if let (Some(dst), Some(src)) = (&mut self.achf, &source.achf) {
+            dst.soft_update(src, tau);
+        }
     }
 
     pub fn predict_action(&self, state: &Tensor) -> (usize, f64) {
@@ -313,8 +363,8 @@ impl ReplayBuffer {
         candidates.sort_by(|a, b| b.td_error.partial_cmp(&a.td_error).unwrap());
 
         // Take top batch_size
-        for i in 0..batch_size.min(candidates.len()) {
-            batch.push(candidates[i].clone());
+        for candidate in candidates.iter().take(batch_size.min(candidates.len())) {
+            batch.push(candidate.clone());
         }
 
         batch
@@ -345,8 +395,8 @@ pub fn train_dqn(
 ) -> DuelingQNetwork {
     println!("\n[DQN] Initializing Double Dueling DQN Training...");
 
-    let policy_net = DuelingQNetwork::new(rng.next_u64());
-    let mut target_net = DuelingQNetwork::new(rng.next_u64());
+    let policy_net = DuelingQNetwork::new(rng.next_u64(), &config.achf);
+    let mut target_net = DuelingQNetwork::new(rng.next_u64(), &config.achf);
     target_net.load_state_dict(&policy_net); // Sync weights
 
     let mut optimizer = Adam::new(policy_net.parameters(), LEARNING_RATE);
@@ -433,12 +483,10 @@ pub fn train_dqn(
             } else {
                 state_struct.loss_streak += 1;
             }
+        } else if state_struct.streak_4_star >= 9 || r < final_prob_6 + config.prob_5_base {
+            state_struct.streak_4_star = 0;
         } else {
-            if state_struct.streak_4_star >= 9 || r < final_prob_6 + config.prob_5_base {
-                state_struct.streak_4_star = 0;
-            } else {
-                state_struct.streak_4_star += 1;
-            }
+            state_struct.streak_4_star += 1;
         }
         pulls_done += 1;
 
@@ -560,12 +608,16 @@ pub fn train_dqn(
             let target_tensor = Tensor::new(target_vals, vec![BATCH_SIZE, 1]);
 
             // 4. Loss
-            let loss = q_actions.mse_loss(&target_tensor);
+            let mut loss = q_actions.mse_loss(&target_tensor);
+            if let Some(reg) = policy_net.achf_orthogonal_penalty() {
+                loss = loss + reg;
+            }
 
             let forward_time = start_forward.elapsed();
 
             let start_backward = std::time::Instant::now();
             loss.backward();
+            policy_net.update_achf_after_backward();
             let backward_time = start_backward.elapsed();
 
             let start_opt = std::time::Instant::now();
@@ -624,9 +676,47 @@ pub fn train_dqn(
             use std::io::Write;
             std::io::stdout().flush().unwrap();
         }
+
+        if config.achf.cache_log_interval_steps > 0
+            && step % config.achf.cache_log_interval_steps == 0
+        {
+            if let Some(stats) = policy_net.achf_cache_stats() {
+                if stats.calls > 0 {
+                    println!("\n{}", format_achf_stats(&stats));
+                }
+            }
+        }
     }
     println!("\n[DQN] Training Complete.");
+    policy_net.freeze_achf_for_inference();
     policy_net
+}
+
+fn format_achf_stats(stats: &crate::achf::AchfCacheStats) -> String {
+    let calls = stats.calls as f64;
+    let hit_rate = if calls > 0.0 {
+        stats.cache_hits as f64 / calls
+    } else {
+        0.0
+    };
+    format!(
+        "[ACHF] Calls: {} | Hit: {:.2}% | Miss: {} | Skip: {} | LowRank: {} | Dense: {} | CachedEMA(ns): {:.1}/{:.1} | LowRankEMA(ns): {:.1}/{:.1} | DecisionEMA(ns): {:.1}/{:.1} | Bias: {:.3} | Samples: {}/{}",
+        stats.calls,
+        hit_rate * 100.0,
+        stats.cache_misses,
+        stats.cache_skips,
+        stats.low_rank_paths,
+        stats.dense_paths,
+        stats.ema_cached_ns,
+        stats.ema_cached_long_ns,
+        stats.ema_low_rank_ns,
+        stats.ema_low_rank_long_ns,
+        stats.decision_ema_ns,
+        stats.decision_ema_long_ns,
+        stats.adaptive_bias,
+        stats.latency_samples,
+        stats.decision_samples
+    )
 }
 
 pub struct OnlineDqnTrainer {
@@ -639,7 +729,8 @@ pub struct OnlineDqnTrainer {
 
 impl OnlineDqnTrainer {
     pub fn from_policy(policy: DuelingQNetwork, seed: u64) -> Self {
-        let mut target = DuelingQNetwork::new(seed);
+        let achf = policy.achf_config();
+        let mut target = DuelingQNetwork::new(seed, &achf);
         target.load_state_dict(&policy);
         let optimizer = Adam::new(policy.parameters(), LEARNING_RATE);
         Self {
@@ -711,8 +802,12 @@ impl OnlineDqnTrainer {
             target_vals.push(target);
         }
         let target_tensor = Tensor::new(target_vals, vec![BATCH_SIZE, 1]);
-        let loss = q_actions.mse_loss(&target_tensor);
+        let mut loss = q_actions.mse_loss(&target_tensor);
+        if let Some(reg) = self.policy.achf_orthogonal_penalty() {
+            loss = loss + reg;
+        }
         loss.backward();
+        self.policy.update_achf_after_backward();
         self.optimizer.step();
         self.target.soft_update(&self.policy, 0.005);
         self.steps_done += 1;

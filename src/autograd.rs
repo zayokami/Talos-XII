@@ -48,9 +48,11 @@ impl<'de> Deserialize<'de> for Tensor {
     }
 }
 
+type BackwardOp = Box<dyn Fn(&Vec<f64>, &Vec<Tensor>) + Send + Sync>;
+
 pub struct Context {
     pub parents: Vec<Tensor>,
-    pub backward_op: Box<dyn Fn(&Vec<f64>, &Vec<Tensor>) + Send + Sync>, // receives grad_output, parents
+    pub backward_op: BackwardOp, // receives grad_output, parents
 }
 
 impl Tensor {
@@ -298,10 +300,10 @@ impl Tensor {
                                     let grad_out_row_start = r * n;
                                     let grad_row =
                                         &grad_out[grad_out_row_start..grad_out_row_start + n];
-                                    for i in 0..k {
+                                    for (i, lhs_val) in lhs_row.iter_mut().enumerate().take(k) {
                                         let rhs_row_start = i * n;
                                         let rhs_row = &rhs_data[rhs_row_start..rhs_row_start + n];
-                                        lhs_row[i] += dot_product(grad_row, rhs_row);
+                                        *lhs_val += dot_product(grad_row, rhs_row);
                                     }
                                 });
                         }
@@ -481,6 +483,37 @@ impl Tensor {
         }
     }
 
+    pub fn transpose2d(&self) -> Tensor {
+        assert_eq!(self.shape.len(), 2, "Transpose requires 2D tensor");
+        let rows = self.shape[0];
+        let cols = self.shape[1];
+        let self_data = self.data.read().unwrap();
+        let mut out_data = vec![0.0; self_data.len()];
+        for r in 0..rows {
+            for c in 0..cols {
+                out_data[c * rows + r] = self_data[r * cols + c];
+            }
+        }
+        let parents = vec![self.clone()];
+        Tensor {
+            data: Arc::new(RwLock::new(out_data)),
+            grad: Arc::new(RwLock::new(vec![0.0; rows * cols])),
+            shape: vec![cols, rows],
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    let input = &parents[0];
+                    let mut inp_grad = input.grad.write().unwrap();
+                    for r in 0..rows {
+                        for c in 0..cols {
+                            inp_grad[r * cols + c] += grad_out[c * rows + r];
+                        }
+                    }
+                }),
+            })),
+        }
+    }
+
     pub fn broadcast(&self, new_shape: Vec<usize>) -> Tensor {
         assert_eq!(
             self.shape,
@@ -655,7 +688,7 @@ impl Tensor {
 
         // Iterate and copy
         // This is generic N-dim transpose
-        for i in 0..len {
+        for (i, value) in new_data.iter_mut().enumerate().take(len) {
             // Unravel index 'i' based on new_shape
             let mut temp = i;
             let mut coords = vec![0; rank];
@@ -673,7 +706,7 @@ impl Tensor {
                 old_idx += coords[d] * strides[d];
             }
 
-            new_data[i] = self_data[old_idx];
+            *value = self_data[old_idx];
         }
 
         let parents = vec![self.clone()];
@@ -710,7 +743,7 @@ impl Tensor {
                         new_strides[i] = new_strides[i + 1] * new_shape[i + 1];
                     }
 
-                    for i in 0..grad_out.len() {
+                    for (i, grad_val) in grad_out.iter().enumerate() {
                         // i is index in grad_out (transposed layout)
                         // We want to find corresponding index in inp_grad (original layout)
 
@@ -731,7 +764,7 @@ impl Tensor {
                             old_idx += coords[d] * strides[d];
                         }
 
-                        inp_grad[old_idx] += grad_out[i];
+                        inp_grad[old_idx] += *grad_val;
                     }
                 }),
             })),
@@ -831,7 +864,7 @@ impl Tensor {
 
                     // Read 3x3 weight
                     let w_base = (k * c_in + c) * 9;
-                    let g00 = weight_data[w_base + 0];
+                    let g00 = weight_data[w_base];
                     let g01 = weight_data[w_base + 1];
                     let g02 = weight_data[w_base + 2];
                     let g10 = weight_data[w_base + 3];
@@ -887,8 +920,8 @@ impl Tensor {
             let input_data = self.data.read().unwrap();
 
             // Output is computed in 2x2 blocks (tiles).
-            let n_tiles_h = (h_out + 1) / 2;
-            let n_tiles_w = (w_out + 1) / 2;
+            let n_tiles_h = h_out.div_ceil(2);
+            let n_tiles_w = w_out.div_ceil(2);
             let n_tiles = n_tiles_h * n_tiles_w;
 
             let out_plane_len = h_out * w_out;
@@ -955,11 +988,11 @@ impl Tensor {
                             // 2. V = Tmp * B
                             for i in 0..4 {
                                 // row i
-                                let t0 = tmp[i * 4 + 0];
+                                let t0 = tmp[i * 4];
                                 let t1 = tmp[i * 4 + 1];
                                 let t2 = tmp[i * 4 + 2];
                                 let t3 = tmp[i * 4 + 3];
-                                v_block[i * 4 + 0] = t0 - t2;
+                                v_block[i * 4] = t0 - t2;
                                 v_block[i * 4 + 1] = t1 + t2;
                                 v_block[i * 4 + 2] = t2 - t1;
                                 v_block[i * 4 + 3] = t1 - t3;
@@ -1646,7 +1679,7 @@ impl Add for Tensor {
     }
 }
 
-impl<'a, 'b> Add<&'b Tensor> for &'a Tensor {
+impl<'b> Add<&'b Tensor> for &Tensor {
     type Output = Tensor;
     fn add(self, rhs: &'b Tensor) -> Tensor {
         self.clone() + rhs.clone()
@@ -1694,7 +1727,7 @@ impl Sub for Tensor {
     }
 }
 
-impl<'a, 'b> Sub<&'b Tensor> for &'a Tensor {
+impl<'b> Sub<&'b Tensor> for &Tensor {
     type Output = Tensor;
     fn sub(self, rhs: &'b Tensor) -> Tensor {
         self.clone() - rhs.clone()
@@ -1759,7 +1792,7 @@ impl Mul for Tensor {
     }
 }
 
-impl<'a, 'b> Mul<&'b Tensor> for &'a Tensor {
+impl<'b> Mul<&'b Tensor> for &Tensor {
     type Output = Tensor;
     fn mul(self, rhs: &'b Tensor) -> Tensor {
         self.clone() * rhs.clone()
@@ -1823,7 +1856,7 @@ impl Div for Tensor {
     }
 }
 
-impl<'a, 'b> Div<&'b Tensor> for &'a Tensor {
+impl<'b> Div<&'b Tensor> for &Tensor {
     type Output = Tensor;
     fn div(self, rhs: &'b Tensor) -> Tensor {
         self.clone() / rhs.clone()
@@ -1854,7 +1887,7 @@ impl Neg for Tensor {
     }
 }
 
-impl<'a> Neg for &'a Tensor {
+impl Neg for &Tensor {
     type Output = Tensor;
     fn neg(self) -> Tensor {
         -self.clone()

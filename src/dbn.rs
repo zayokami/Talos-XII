@@ -220,9 +220,9 @@ impl Rbm {
                 grad_vb[i] += input_i - vk_sample_i;
             }
 
-            for j in 0..self.hidden_size {
+            for (j, grad_val) in grad_hb.iter_mut().enumerate().take(self.hidden_size) {
                 unsafe {
-                    grad_hb[j] += *h0_probs.get_unchecked(j) - *hk_probs.get_unchecked(j);
+                    *grad_val += *h0_probs.get_unchecked(j) - *hk_probs.get_unchecked(j);
                 }
             }
 

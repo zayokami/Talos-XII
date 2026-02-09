@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
@@ -404,6 +405,87 @@ impl JsonParser {
 
 // --- Configuration (Data-Driven) ---
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AchfConfig {
+    pub enabled: bool,
+    pub mode: String,
+    pub proj_mode: String,
+    pub proj_freq: usize,
+    pub proj_steps: usize,
+    pub lambda_ortho: f64,
+    pub gate_mode: String,
+    pub gate_momentum: f64,
+    pub gate_beta: f64,
+    pub gate_alpha: f64,
+    pub g_min: f64,
+    pub gate_warmup_steps: usize,
+    pub gate_k_clip: f64,
+    pub g_target_min: f64,
+    pub g_target_max: f64,
+    pub g_min_adapt_rate: f64,
+    pub g_min_momentum: f64,
+    pub cache_min_rows: usize,
+    pub cache_min_nonzero_ratio: f64,
+    pub cache_sparsity_sample_rows: usize,
+    pub cache_cost_bias: f64,
+    pub cache_adapt_rate: f64,
+    pub cache_bias_min: f64,
+    pub cache_bias_max: f64,
+    pub cache_latency_ema: f64,
+    pub cache_latency_long_ema: f64,
+    pub cache_adapt_blend: f64,
+    pub cache_latency_sample_every: u64,
+    pub cache_log_interval_steps: usize,
+    pub cache_log_per_layer: bool,
+    pub rank: usize,
+    pub apply_attn: bool,
+    pub apply_ffn: bool,
+    pub apply_dqn: bool,
+    pub infer_gate: String,
+}
+
+impl AchfConfig {
+    pub fn default() -> Self {
+        AchfConfig {
+            enabled: false,
+            mode: "lite".to_string(),
+            proj_mode: "rowcol".to_string(),
+            proj_freq: 8,
+            proj_steps: 0,
+            lambda_ortho: 1e-3,
+            gate_mode: "grad_ema".to_string(),
+            gate_momentum: 0.95,
+            gate_beta: 0.7,
+            gate_alpha: 0.0,
+            g_min: 0.2,
+            gate_warmup_steps: 0,
+            gate_k_clip: 0.0,
+            g_target_min: 0.3,
+            g_target_max: 0.8,
+            g_min_adapt_rate: 0.0,
+            g_min_momentum: 0.9,
+            cache_min_rows: 0,
+            cache_min_nonzero_ratio: 0.0,
+            cache_sparsity_sample_rows: 0,
+            cache_cost_bias: 1.0,
+            cache_adapt_rate: 0.0,
+            cache_bias_min: 0.2,
+            cache_bias_max: 5.0,
+            cache_latency_ema: 0.9,
+            cache_latency_long_ema: 0.99,
+            cache_adapt_blend: 0.5,
+            cache_latency_sample_every: 1,
+            cache_log_interval_steps: 0,
+            cache_log_per_layer: false,
+            rank: 0,
+            apply_attn: false,
+            apply_ffn: true,
+            apply_dqn: false,
+            infer_gate: "g_min".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub pool_name: String,
@@ -439,6 +521,7 @@ pub struct Config {
     pub train_interval_ms: usize,
     pub max_train_steps_per_tick: usize,
     pub language: Option<String>,
+    pub achf: AchfConfig,
 }
 
 impl Config {
@@ -477,6 +560,7 @@ impl Config {
             train_interval_ms: 50,
             max_train_steps_per_tick: 1,
             language: None,
+            achf: AchfConfig::default(),
         }
     }
 
@@ -628,6 +712,113 @@ impl Config {
             if let Some(v) = map.get("language") {
                 config.language = v.as_str().map(|s| s.to_string());
             }
+            if let Some(JsonValue::Object(achf_map)) = map.get("achf") {
+                if let Some(v) = achf_map.get("enabled") {
+                    config.achf.enabled = v.as_bool().unwrap_or(false);
+                }
+                if let Some(v) = achf_map.get("mode") {
+                    config.achf.mode = v.as_str().unwrap_or("lite").to_string();
+                }
+                if let Some(v) = achf_map.get("proj_mode") {
+                    config.achf.proj_mode = v.as_str().unwrap_or("rowcol").to_string();
+                }
+                if let Some(v) = achf_map.get("proj_freq") {
+                    config.achf.proj_freq = v.as_f64().unwrap_or(8.0) as usize;
+                }
+                if let Some(v) = achf_map.get("proj_steps") {
+                    config.achf.proj_steps = v.as_f64().unwrap_or(0.0) as usize;
+                }
+                if let Some(v) = achf_map.get("lambda_ortho") {
+                    config.achf.lambda_ortho = v.as_f64().unwrap_or(1e-3);
+                }
+                if let Some(v) = achf_map.get("gate_mode") {
+                    config.achf.gate_mode = v.as_str().unwrap_or("grad_ema").to_string();
+                }
+                if let Some(v) = achf_map.get("gate_momentum") {
+                    config.achf.gate_momentum = v.as_f64().unwrap_or(0.95);
+                }
+                if let Some(v) = achf_map.get("gate_beta") {
+                    config.achf.gate_beta = v.as_f64().unwrap_or(0.7);
+                }
+                if let Some(v) = achf_map.get("gate_alpha") {
+                    config.achf.gate_alpha = v.as_f64().unwrap_or(0.0);
+                }
+                if let Some(v) = achf_map.get("g_min") {
+                    config.achf.g_min = v.as_f64().unwrap_or(0.2);
+                }
+                if let Some(v) = achf_map.get("gate_warmup_steps") {
+                    config.achf.gate_warmup_steps = v.as_f64().unwrap_or(0.0) as usize;
+                }
+                if let Some(v) = achf_map.get("gate_k_clip") {
+                    config.achf.gate_k_clip = v.as_f64().unwrap_or(0.0);
+                }
+                if let Some(v) = achf_map.get("g_target_min") {
+                    config.achf.g_target_min = v.as_f64().unwrap_or(0.3);
+                }
+                if let Some(v) = achf_map.get("g_target_max") {
+                    config.achf.g_target_max = v.as_f64().unwrap_or(0.8);
+                }
+                if let Some(v) = achf_map.get("g_min_adapt_rate") {
+                    config.achf.g_min_adapt_rate = v.as_f64().unwrap_or(0.0);
+                }
+                if let Some(v) = achf_map.get("g_min_momentum") {
+                    config.achf.g_min_momentum = v.as_f64().unwrap_or(0.9);
+                }
+                if let Some(v) = achf_map.get("cache_min_rows") {
+                    config.achf.cache_min_rows = v.as_f64().unwrap_or(0.0) as usize;
+                }
+                if let Some(v) = achf_map.get("cache_min_nonzero_ratio") {
+                    config.achf.cache_min_nonzero_ratio = v.as_f64().unwrap_or(0.0);
+                }
+                if let Some(v) = achf_map.get("cache_sparsity_sample_rows") {
+                    config.achf.cache_sparsity_sample_rows = v.as_f64().unwrap_or(0.0) as usize;
+                }
+                if let Some(v) = achf_map.get("cache_cost_bias") {
+                    config.achf.cache_cost_bias = v.as_f64().unwrap_or(1.0);
+                }
+                if let Some(v) = achf_map.get("cache_adapt_rate") {
+                    config.achf.cache_adapt_rate = v.as_f64().unwrap_or(0.0);
+                }
+                if let Some(v) = achf_map.get("cache_bias_min") {
+                    config.achf.cache_bias_min = v.as_f64().unwrap_or(0.2);
+                }
+                if let Some(v) = achf_map.get("cache_bias_max") {
+                    config.achf.cache_bias_max = v.as_f64().unwrap_or(5.0);
+                }
+                if let Some(v) = achf_map.get("cache_latency_ema") {
+                    config.achf.cache_latency_ema = v.as_f64().unwrap_or(0.9);
+                }
+                if let Some(v) = achf_map.get("cache_latency_long_ema") {
+                    config.achf.cache_latency_long_ema = v.as_f64().unwrap_or(0.99);
+                }
+                if let Some(v) = achf_map.get("cache_adapt_blend") {
+                    config.achf.cache_adapt_blend = v.as_f64().unwrap_or(0.5);
+                }
+                if let Some(v) = achf_map.get("cache_latency_sample_every") {
+                    config.achf.cache_latency_sample_every = v.as_f64().unwrap_or(1.0) as u64;
+                }
+                if let Some(v) = achf_map.get("cache_log_interval_steps") {
+                    config.achf.cache_log_interval_steps = v.as_f64().unwrap_or(0.0) as usize;
+                }
+                if let Some(v) = achf_map.get("cache_log_per_layer") {
+                    config.achf.cache_log_per_layer = v.as_bool().unwrap_or(false);
+                }
+                if let Some(v) = achf_map.get("rank") {
+                    config.achf.rank = v.as_f64().unwrap_or(0.0) as usize;
+                }
+                if let Some(v) = achf_map.get("apply_attn") {
+                    config.achf.apply_attn = v.as_bool().unwrap_or(false);
+                }
+                if let Some(v) = achf_map.get("apply_ffn") {
+                    config.achf.apply_ffn = v.as_bool().unwrap_or(true);
+                }
+                if let Some(v) = achf_map.get("apply_dqn") {
+                    config.achf.apply_dqn = v.as_bool().unwrap_or(false);
+                }
+                if let Some(v) = achf_map.get("infer_gate") {
+                    config.achf.infer_gate = v.as_str().unwrap_or("g_min").to_string();
+                }
+            }
         }
 
         config
@@ -669,6 +860,7 @@ fn warn_unknown_fields(map: &HashMap<String, JsonValue>) {
         "train_interval_ms",
         "max_train_steps_per_tick",
         "language",
+        "achf",
     ]
     .into_iter()
     .collect();

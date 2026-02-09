@@ -1,4 +1,6 @@
+use crate::achf::{aggregate_cache_stats_iter, AchfCacheStats, AchfLayer};
 use crate::autograd::{Context, Tensor};
+use crate::config::AchfConfig;
 use crate::nn::{Linear, Module, RMSNorm};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -37,15 +39,23 @@ pub struct LuckTransformer {
     pub embed: Linear,
     pub norm_1: RMSNorm,
     pub mla_layer: MultiHeadLatentAttention,
+    pub achf_attn: Option<AchfLayer>,
     pub norm_2: RMSNorm,
     pub ffn_1: Linear,
     pub ffn_2: Linear,
+    pub achf_ffn: Option<AchfLayer>,
     pub norm_final: RMSNorm,
     pub out_proj: Linear,
 }
 
 impl LuckTransformer {
-    pub fn new(in_dim: usize, hidden_dim: usize, _bias: bool, seed: u64) -> Self {
+    pub fn new(
+        in_dim: usize,
+        hidden_dim: usize,
+        _bias: bool,
+        seed: u64,
+        achf: &AchfConfig,
+    ) -> Self {
         let mla_config = MLAConfig {
             dim: hidden_dim,
             num_heads: 4,
@@ -56,13 +66,34 @@ impl LuckTransformer {
             max_seq_len: 256,
         };
 
+        let achf_attn = if achf.enabled && achf.apply_attn {
+            Some(AchfLayer::new(
+                hidden_dim,
+                achf.clone(),
+                seed.wrapping_add(1000),
+            ))
+        } else {
+            None
+        };
+        let achf_ffn = if achf.enabled && achf.apply_ffn {
+            Some(AchfLayer::new(
+                hidden_dim,
+                achf.clone(),
+                seed.wrapping_add(1100),
+            ))
+        } else {
+            None
+        };
+
         Self {
             embed: Linear::new(in_dim, hidden_dim, true, seed),
             norm_1: RMSNorm::new(hidden_dim, 1e-5, seed + 5),
             mla_layer: MultiHeadLatentAttention::new(mla_config, seed + 10),
+            achf_attn,
             norm_2: RMSNorm::new(hidden_dim, 1e-5, seed + 15),
             ffn_1: Linear::new(hidden_dim, hidden_dim * 2, true, seed + 20),
             ffn_2: Linear::new(hidden_dim * 2, hidden_dim, true, seed + 30),
+            achf_ffn,
             norm_final: RMSNorm::new(hidden_dim, 1e-5, seed + 35),
             out_proj: Linear::new(hidden_dim, hidden_dim, true, seed + 40),
         }
@@ -76,13 +107,21 @@ impl LuckTransformer {
         // Block 1: MLA (Pre-Norm)
         let h_norm1 = self.norm_1.forward(&h);
         let attn_out = self.mla_layer.forward(&h_norm1);
-        let h2 = h + attn_out;
+        let mut h2 = h.clone() + attn_out;
+        if let Some(achf) = &self.achf_attn {
+            let residual = achf.forward_residual(&h);
+            h2 = &h2 + &residual;
+        }
 
         // Block 2: FFN (Pre-Norm)
         let h_norm2 = self.norm_2.forward(&h2);
         let f1 = self.ffn_1.forward(&h_norm2).relu();
         let f2 = self.ffn_2.forward(&f1);
-        let h3 = h2 + f2;
+        let mut h3 = h2.clone() + f2;
+        if let Some(achf) = &self.achf_ffn {
+            let residual = achf.forward_residual(&h2);
+            h3 = &h3 + &residual;
+        }
 
         // Final Norm + Output
         let h_final = self.norm_final.forward(&h3);
@@ -108,6 +147,61 @@ impl LuckTransformer {
         Tensor::new(out_data, vec![batch_size, dim])
     }
 
+    pub fn update_achf_after_backward(&self) {
+        if let Some(achf) = &self.achf_attn {
+            achf.update_after_backward();
+        }
+        if let Some(achf) = &self.achf_ffn {
+            achf.update_after_backward();
+        }
+    }
+
+    pub fn freeze_achf_for_inference(&self) {
+        if let Some(achf) = &self.achf_attn {
+            achf.freeze_for_inference();
+        }
+        if let Some(achf) = &self.achf_ffn {
+            achf.freeze_for_inference();
+        }
+    }
+
+    pub fn achf_cache_stats_iter(&self) -> impl Iterator<Item = AchfCacheStats> + '_ {
+        let stats = [
+            self.achf_attn.as_ref().map(|achf| achf.cache_stats()),
+            self.achf_ffn.as_ref().map(|achf| achf.cache_stats()),
+        ];
+        stats.into_iter().flatten()
+    }
+
+    pub fn achf_cache_stats_aggregate(&self) -> AchfCacheStats {
+        let stats = [
+            self.achf_attn.as_ref().map(|achf| achf.cache_stats()),
+            self.achf_ffn.as_ref().map(|achf| achf.cache_stats()),
+        ];
+        aggregate_cache_stats_iter(stats.into_iter().flatten())
+    }
+
+    pub fn achf_orthogonal_penalty(&self) -> Option<Tensor> {
+        let mut reg: Option<Tensor> = None;
+        if let Some(achf) = &self.achf_attn {
+            if let Some(val) = achf.orthogonal_penalty() {
+                reg = Some(match reg {
+                    Some(r) => r + val,
+                    None => val,
+                });
+            }
+        }
+        if let Some(achf) = &self.achf_ffn {
+            if let Some(val) = achf.orthogonal_penalty() {
+                reg = Some(match reg {
+                    Some(r) => r + val,
+                    None => val,
+                });
+            }
+        }
+        reg
+    }
+
     pub fn forward_inference(&self, x: &[f64]) -> Vec<f64> {
         let h = self.embed.forward_inference(x);
 
@@ -118,6 +212,12 @@ impl LuckTransformer {
         let mut h2 = vec![0.0; h.len()];
         for i in 0..h.len() {
             h2[i] = h[i] + attn_out[i];
+        }
+        if let Some(achf) = &self.achf_attn {
+            let achf_out = achf.forward_inference_residual(&h);
+            for i in 0..h2.len() {
+                h2[i] += achf_out[i];
+            }
         }
 
         let h_norm2 = self.norm_2.forward_inference(&h2);
@@ -137,6 +237,12 @@ impl LuckTransformer {
         let mut h3 = vec![0.0; h2.len()];
         for i in 0..h2.len() {
             h3[i] = h2[i] + f2[i];
+        }
+        if let Some(achf) = &self.achf_ffn {
+            let achf_out = achf.forward_inference_residual(&h2);
+            for i in 0..h3.len() {
+                h3[i] += achf_out[i];
+            }
         }
 
         let h_final = self.norm_final.forward_inference(&h3);
@@ -168,6 +274,12 @@ impl LuckTransformer {
         for i in 0..h.len() {
             h2[i] = h[i] + attn_out[i];
         }
+        if let Some(achf) = &self.achf_attn {
+            let achf_out = achf.forward_inference_residual(&h);
+            for i in 0..h2.len() {
+                h2[i] += achf_out[i];
+            }
+        }
 
         let h_norm2 = self.norm_2.forward_inference(&h2);
 
@@ -186,6 +298,12 @@ impl LuckTransformer {
         let mut h3 = vec![0.0; h2.len()];
         for i in 0..h2.len() {
             h3[i] = h2[i] + f2[i];
+        }
+        if let Some(achf) = &self.achf_ffn {
+            let achf_out = achf.forward_inference_residual(&h2);
+            for i in 0..h3.len() {
+                h3[i] += achf_out[i];
+            }
         }
 
         let h_final = self.norm_final.forward_inference(&h3);
@@ -206,9 +324,15 @@ impl Module for LuckTransformer {
         let mut p = self.embed.parameters();
         p.extend(self.norm_1.parameters());
         p.extend(self.mla_layer.parameters());
+        if let Some(achf) = &self.achf_attn {
+            p.extend(achf.parameters());
+        }
         p.extend(self.norm_2.parameters());
         p.extend(self.ffn_1.parameters());
         p.extend(self.ffn_2.parameters());
+        if let Some(achf) = &self.achf_ffn {
+            p.extend(achf.parameters());
+        }
         p.extend(self.norm_final.parameters());
         p.extend(self.out_proj.parameters());
         p
@@ -618,16 +742,17 @@ impl MultiHeadLatentAttention {
                 let dst_base = t * (num_heads * total_head_dim) + h * total_head_dim;
 
                 let src_c_base = t * (num_heads * head_dim) + h * head_dim;
-                for i in 0..head_dim {
-                    q[dst_base + i] = q_c[src_c_base + i];
-                    k[dst_base + i] = k_c[src_c_base + i];
-                }
+                q[dst_base..dst_base + head_dim]
+                    .copy_from_slice(&q_c[src_c_base..src_c_base + head_dim]);
+                k[dst_base..dst_base + head_dim]
+                    .copy_from_slice(&k_c[src_c_base..src_c_base + head_dim]);
 
                 let src_r_base = t * (num_heads * rope_dim) + h * rope_dim;
-                for i in 0..rope_dim {
-                    q[dst_base + head_dim + i] = q_r_rot[src_r_base + i];
-                    k[dst_base + head_dim + i] = k_r_rot[src_r_base + i];
-                }
+                let dst_r_base = dst_base + head_dim;
+                q[dst_r_base..dst_r_base + rope_dim]
+                    .copy_from_slice(&q_r_rot[src_r_base..src_r_base + rope_dim]);
+                k[dst_r_base..dst_r_base + rope_dim]
+                    .copy_from_slice(&k_r_rot[src_r_base..src_r_base + rope_dim]);
             }
         }
 
@@ -748,21 +873,43 @@ impl MultiHeadLatentAttention {
         let mut q = vec![0.0; seq_len * num_heads * total_head_dim];
         let mut k = vec![0.0; seq_len * num_heads * total_head_dim];
 
+        if seq_len > 0 {
+            let target_k = self.config.max_seq_len * total_head_dim;
+            let target_v = self.config.max_seq_len * head_dim;
+            for h in 0..num_heads {
+                let k_cache = &mut kv_cache.k_cache[h];
+                if k_cache.is_empty() {
+                    let cap = k_cache.capacity();
+                    if cap < target_k {
+                        k_cache.reserve(target_k - cap);
+                    }
+                }
+                let v_cache = &mut kv_cache.v_cache[h];
+                if v_cache.is_empty() {
+                    let cap = v_cache.capacity();
+                    if cap < target_v {
+                        v_cache.reserve(target_v - cap);
+                    }
+                }
+            }
+        }
+
         for t in 0..seq_len {
             for h in 0..num_heads {
                 let dst_base = t * (num_heads * total_head_dim) + h * total_head_dim;
 
                 let src_c_base = t * (num_heads * head_dim) + h * head_dim;
-                for i in 0..head_dim {
-                    q[dst_base + i] = q_c[src_c_base + i];
-                    k[dst_base + i] = k_c[src_c_base + i];
-                }
+                q[dst_base..dst_base + head_dim]
+                    .copy_from_slice(&q_c[src_c_base..src_c_base + head_dim]);
+                k[dst_base..dst_base + head_dim]
+                    .copy_from_slice(&k_c[src_c_base..src_c_base + head_dim]);
 
                 let src_r_base = t * (num_heads * rope_dim) + h * rope_dim;
-                for i in 0..rope_dim {
-                    q[dst_base + head_dim + i] = q_r_rot[src_r_base + i];
-                    k[dst_base + head_dim + i] = k_r_rot[src_r_base + i];
-                }
+                let dst_r_base = dst_base + head_dim;
+                q[dst_r_base..dst_r_base + rope_dim]
+                    .copy_from_slice(&q_r_rot[src_r_base..src_r_base + rope_dim]);
+                k[dst_r_base..dst_r_base + rope_dim]
+                    .copy_from_slice(&k_r_rot[src_r_base..src_r_base + rope_dim]);
             }
         }
 
@@ -1301,7 +1448,8 @@ mod tests {
     #[test]
     fn test_luck_transformer_integration() {
         // Use small dims for test
-        let t = LuckTransformer::new(8, 8, true, 42);
+        let achf = crate::config::AchfConfig::default();
+        let t = LuckTransformer::new(8, 8, true, 42, &achf);
         let x = Tensor::rand(vec![1, 5, 8], -0.1, 0.1, 123);
 
         let out = t.forward(&x, &[]);

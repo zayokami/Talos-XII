@@ -36,24 +36,6 @@ fn sum_f64(values: &[f64]) -> f64 {
             return sum_f64_neon(values);
         }
     }
-    #[cfg(target_arch = "aarch64")]
-    {
-        unsafe {
-            return sum_sq_diff_neon(values, mean);
-        }
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        unsafe {
-            return sum_sq_diff_neon(values, mean);
-        }
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        unsafe {
-            return sum_sq_diff_neon(values, mean);
-        }
-    }
     let mut sum = 0.0;
     for &v in values {
         sum += v;
@@ -251,8 +233,8 @@ pub struct ActorCritic {
 }
 
 impl ActorCritic {
-    pub fn new(seed: u64) -> Self {
-        let backbone = LuckTransformer::new(DIM, 64, true, seed);
+    pub fn new(seed: u64, achf: &crate::config::AchfConfig) -> Self {
+        let backbone = LuckTransformer::new(DIM, 64, true, seed, achf);
         let actor_head = Linear::new(64, ACTION_SPACE, true, seed.wrapping_add(100));
         let critic_head = Linear::new(64, 1, true, seed.wrapping_add(200));
 
@@ -306,6 +288,18 @@ impl ActorCritic {
         p
     }
 
+    pub fn update_achf_after_backward(&self) {
+        self.backbone.update_achf_after_backward();
+    }
+
+    pub fn freeze_achf_for_inference(&self) {
+        self.backbone.freeze_achf_for_inference();
+    }
+
+    pub fn achf_orthogonal_penalty(&self) -> Option<Tensor> {
+        self.backbone.achf_orthogonal_penalty()
+    }
+
     // Returns (action_idx, log_prob, value)
     pub fn step(&self, state: &Tensor, pity: &[usize]) -> (usize, f64, f64) {
         let logits = self.forward_actor(state, pity);
@@ -320,27 +314,24 @@ impl ActorCritic {
             }
         }
         let mut sum_exp = 0.0;
-        let mut probs = vec![0.0; ACTION_SPACE];
-        for i in 0..ACTION_SPACE {
-            probs[i] = (logits_data[i] - max_l).exp();
-            sum_exp += probs[i];
+        let mut probs = [0.0; ACTION_SPACE];
+        for (i, prob) in probs.iter_mut().enumerate() {
+            *prob = (logits_data[i] - max_l).exp();
+            sum_exp += *prob;
         }
-        for i in 0..ACTION_SPACE {
-            probs[i] /= sum_exp;
+        for prob in probs.iter_mut() {
+            *prob /= sum_exp;
         }
 
         // Sample
         let mut r = rand::random::<f64>();
-        let mut action_idx = 0;
-        for i in 0..ACTION_SPACE {
-            if r < probs[i] {
+        let mut action_idx = ACTION_SPACE - 1;
+        for (i, prob) in probs.iter().enumerate() {
+            if r < *prob {
                 action_idx = i;
                 break;
             }
-            r -= probs[i];
-        }
-        if action_idx == ACTION_SPACE {
-            action_idx = ACTION_SPACE - 1;
+            r -= *prob;
         }
 
         let log_prob = probs[action_idx].ln();
@@ -363,27 +354,24 @@ impl ActorCritic {
             }
         }
         let mut sum_exp = 0.0;
-        let mut probs = vec![0.0; ACTION_SPACE];
-        for i in 0..ACTION_SPACE {
-            probs[i] = (logits[i] - max_l).exp();
-            sum_exp += probs[i];
+        let mut probs = [0.0; ACTION_SPACE];
+        for (i, prob) in probs.iter_mut().enumerate() {
+            *prob = (logits[i] - max_l).exp();
+            sum_exp += *prob;
         }
-        for i in 0..ACTION_SPACE {
-            probs[i] /= sum_exp;
+        for prob in probs.iter_mut() {
+            *prob /= sum_exp;
         }
 
         // Sample
         let mut r = rand::random::<f64>();
-        let mut action_idx = 0;
-        for i in 0..ACTION_SPACE {
-            if r < probs[i] {
+        let mut action_idx = ACTION_SPACE - 1;
+        for (i, prob) in probs.iter().enumerate() {
+            if r < *prob {
                 action_idx = i;
                 break;
             }
-            r -= probs[i];
-        }
-        if action_idx == ACTION_SPACE {
-            action_idx = ACTION_SPACE - 1;
+            r -= *prob;
         }
         action_idx
     }
@@ -407,33 +395,38 @@ impl ActorCritic {
             }
         }
         let mut sum_exp = 0.0;
-        let mut probs = vec![0.0; ACTION_SPACE];
-        for i in 0..ACTION_SPACE {
-            probs[i] = (logits[i] - max_l).exp();
-            sum_exp += probs[i];
+        let mut probs = [0.0; ACTION_SPACE];
+        for (i, prob) in probs.iter_mut().enumerate() {
+            *prob = (logits[i] - max_l).exp();
+            sum_exp += *prob;
         }
-        for i in 0..ACTION_SPACE {
-            probs[i] /= sum_exp;
+        for prob in probs.iter_mut() {
+            *prob /= sum_exp;
         }
 
         // Sample
         let mut r = rand::random::<f64>();
-        let mut action_idx = 0;
-        for i in 0..ACTION_SPACE {
-            if r < probs[i] {
+        let mut action_idx = ACTION_SPACE - 1;
+        for (i, prob) in probs.iter().enumerate() {
+            if r < *prob {
                 action_idx = i;
                 break;
             }
-            r -= probs[i];
-        }
-        if action_idx == ACTION_SPACE {
-            action_idx = ACTION_SPACE - 1;
+            r -= *prob;
         }
         action_idx
     }
 
     pub fn prune_cache(&self, kv_cache: &mut KVCache, max_len: usize) {
         self.backbone.prune_kv_cache(kv_cache, max_len);
+    }
+
+    pub fn achf_cache_stats_iter(&self) -> impl Iterator<Item = crate::achf::AchfCacheStats> + '_ {
+        self.backbone.achf_cache_stats_iter()
+    }
+
+    pub fn achf_cache_stats_aggregate(&self) -> crate::achf::AchfCacheStats {
+        self.backbone.achf_cache_stats_aggregate()
     }
 }
 
@@ -552,7 +545,28 @@ struct Memory {
     values: Vec<f64>,
 }
 
-pub struct PPO {
+pub(crate) struct PpoStoreInput {
+    state: Tensor,
+    pity: Vec<usize>,
+    action: usize,
+    log_prob: f64,
+    reward: f64,
+    done: bool,
+    value: f64,
+}
+
+pub(crate) struct PpoStoreRawInput {
+    state: Vec<f64>,
+    seq_len: usize,
+    pity: Vec<usize>,
+    action: usize,
+    log_prob: f64,
+    reward: f64,
+    done: bool,
+    value: f64,
+}
+
+pub struct Ppo {
     pub policy: ActorCritic,
     optimizer: Adam,
     memory: Memory,
@@ -561,11 +575,16 @@ pub struct PPO {
     reward_normalizer: RunningMeanStd,
 }
 
-impl PPO {
-    pub fn new(seed: u64, k_epochs: usize, batch_size: usize) -> Self {
-        let policy = ActorCritic::new(seed);
+impl Ppo {
+    pub fn new(
+        seed: u64,
+        k_epochs: usize,
+        batch_size: usize,
+        achf: &crate::config::AchfConfig,
+    ) -> Self {
+        let policy = ActorCritic::new(seed, achf);
         let optimizer = Adam::new(policy.parameters(), 0.0003);
-        PPO {
+        Ppo {
             policy,
             optimizer,
             memory: Memory {
@@ -584,32 +603,41 @@ impl PPO {
         }
     }
 
-    pub fn store(
-        &mut self,
-        state: Tensor,
-        pity: Vec<usize>,
-        action: usize,
-        log_prob: f64,
-        reward: f64,
-        done: bool,
-        value: f64,
-    ) {
-        let seq_len = state.shape.get(0).copied().unwrap_or(1);
+    pub(crate) fn store(&mut self, input: PpoStoreInput) {
+        let PpoStoreInput {
+            state,
+            pity,
+            action,
+            log_prob,
+            reward,
+            done,
+            value,
+        } = input;
+        let seq_len = state.shape.first().copied().unwrap_or(1);
         let data = state.data.read().unwrap().clone();
-        self.store_raw(data, seq_len, pity, action, log_prob, reward, done, value);
+        self.store_raw(PpoStoreRawInput {
+            state: data,
+            seq_len,
+            pity,
+            action,
+            log_prob,
+            reward,
+            done,
+            value,
+        });
     }
 
-    pub fn store_raw(
-        &mut self,
-        state: Vec<f64>,
-        seq_len: usize,
-        pity: Vec<usize>,
-        action: usize,
-        log_prob: f64,
-        reward: f64,
-        done: bool,
-        value: f64,
-    ) {
+    pub(crate) fn store_raw(&mut self, input: PpoStoreRawInput) {
+        let PpoStoreRawInput {
+            state,
+            seq_len,
+            pity,
+            action,
+            log_prob,
+            reward,
+            done,
+            value,
+        } = input;
         // Update reward normalizer
         self.reward_normalizer.update(reward);
         self.memory.states_raw.push(state);
@@ -641,7 +669,7 @@ impl PPO {
         let values = std::mem::take(&mut self.memory.values);
         let states: Vec<Tensor> = states_raw
             .into_iter()
-            .zip(state_lens.into_iter())
+            .zip(state_lens)
             .map(|(data, seq_len)| Tensor::new(data, vec![seq_len, DIM]))
             .collect();
         let mut advantages = vec![0.0; len];
@@ -652,7 +680,7 @@ impl PPO {
         // Normalize rewards for GAE calculation
         let norm_rewards: Vec<f64> = rewards
             .iter()
-            .map(|&r| self.reward_normalizer.normalize(r).max(-10.0).min(10.0)) // Clip for stability
+            .map(|&r| self.reward_normalizer.normalize(r).clamp(-10.0, 10.0)) // Clip for stability
             .collect();
 
         for t in (0..len).rev() {
@@ -752,9 +780,12 @@ impl PPO {
                 }
 
                 let batch_size_tensor = Tensor::new(vec![batch_len as f64], vec![1]);
-                let final_loss = loss_accum / batch_size_tensor;
-
+                let mut final_loss = loss_accum / batch_size_tensor;
+                if let Some(reg) = self.policy.achf_orthogonal_penalty() {
+                    final_loss = final_loss + reg;
+                }
                 final_loss.backward();
+                self.policy.update_achf_after_backward();
                 self.optimizer.step();
             }
 
@@ -806,7 +837,7 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
     } else {
         8
     };
-    let mut ppo = PPO::new(rng.next_u64(), k_epochs, batch_size);
+    let mut ppo = Ppo::new(rng.next_u64(), k_epochs, batch_size, &config.achf);
     let mut steps_done = 0;
 
     let mut state_struct = PullState {
@@ -849,7 +880,7 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
             )
             .to_vec();
 
-            let current_pity = state_struct.pity_6 as usize;
+            let current_pity = state_struct.pity_6;
 
             history_buffer.push_back(current_state_raw);
             pity_buffer.push_back(current_pity);
@@ -900,12 +931,10 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
                 } else {
                     state_struct.loss_streak += 1;
                 }
+            } else if state_struct.streak_4_star >= 9 || r < final_prob_6 + config.prob_5_base {
+                state_struct.streak_4_star = 0;
             } else {
-                if state_struct.streak_4_star >= 9 || r < final_prob_6 + config.prob_5_base {
-                    state_struct.streak_4_star = 0;
-                } else {
-                    state_struct.streak_4_star += 1;
-                }
+                state_struct.streak_4_star += 1;
             }
             pulls_done += 1;
 
@@ -933,15 +962,15 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
 
             let done = is_up || pulls_done >= 300;
 
-            ppo.store(
-                current_state_tensor,
-                pity_vec.clone(),
-                action_idx,
+            ppo.store(PpoStoreInput {
+                state: current_state_tensor,
+                pity: pity_vec.clone(),
+                action: action_idx,
                 log_prob,
                 reward,
                 done,
-                val,
-            );
+                value: val,
+            });
 
             if done {
                 history_buffer.clear();
@@ -970,6 +999,23 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
         ppo.update(current_lr);
         steps_done += steps_per_update;
 
+        if config.achf.cache_log_interval_steps > 0
+            && steps_done % config.achf.cache_log_interval_steps == 0
+        {
+            if config.achf.cache_log_per_layer {
+                for (idx, stats) in ppo.policy.achf_cache_stats_iter().enumerate() {
+                    if stats.calls > 0 {
+                        println!("\n[ACHF-L{}] {}", idx, format_achf_stats(&stats));
+                    }
+                }
+            } else {
+                let stats = ppo.policy.achf_cache_stats_aggregate();
+                if stats.calls > 0 {
+                    println!("\n{}", format_achf_stats(&stats));
+                }
+            }
+        }
+
         let avg_r = if recent_rewards.is_empty() {
             0.0
         } else {
@@ -983,33 +1029,66 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
         std::io::stdout().flush().unwrap();
     }
     println!("\n[PPO] Training Complete.");
+    ppo.policy.freeze_achf_for_inference();
     ppo.policy
 }
 
+fn format_achf_stats(stats: &crate::achf::AchfCacheStats) -> String {
+    let calls = stats.calls as f64;
+    let hit_rate = if calls > 0.0 {
+        stats.cache_hits as f64 / calls
+    } else {
+        0.0
+    };
+    format!(
+        "[ACHF] Calls: {} | Hit: {:.2}% | Miss: {} | Skip: {} | LowRank: {} | Dense: {} | CachedEMA(ns): {:.1}/{:.1} | LowRankEMA(ns): {:.1}/{:.1} | DecisionEMA(ns): {:.1}/{:.1} | Bias: {:.3} | Samples: {}/{}",
+        stats.calls,
+        hit_rate * 100.0,
+        stats.cache_misses,
+        stats.cache_skips,
+        stats.low_rank_paths,
+        stats.dense_paths,
+        stats.ema_cached_ns,
+        stats.ema_cached_long_ns,
+        stats.ema_low_rank_ns,
+        stats.ema_low_rank_long_ns,
+        stats.decision_ema_ns,
+        stats.decision_ema_long_ns,
+        stats.adaptive_bias,
+        stats.latency_samples,
+        stats.decision_samples
+    )
+}
+
 pub struct OnlinePpoTrainer {
-    ppo: PPO,
+    ppo: Ppo,
     steps_done: usize,
 }
 
 impl OnlinePpoTrainer {
-    pub fn new(seed: u64, k_epochs: usize, batch_size: usize) -> Self {
+    pub fn new(
+        seed: u64,
+        k_epochs: usize,
+        batch_size: usize,
+        achf: &crate::config::AchfConfig,
+    ) -> Self {
         Self {
-            ppo: PPO::new(seed, k_epochs, batch_size),
+            ppo: Ppo::new(seed, k_epochs, batch_size, achf),
             steps_done: 0,
         }
     }
 
     pub fn push(&mut self, exp: PpoExperience) {
-        self.ppo.store_raw(
-            exp.state,
-            exp.seq_len,
-            exp.pity,
-            exp.action,
-            exp.log_prob,
-            exp.reward,
-            exp.done,
-            exp.value,
-        );
+        self.ppo.store_raw(PpoStoreRawInput {
+            state: exp.state,
+            seq_len: exp.seq_len,
+            pity: exp.pity,
+            action: exp.action,
+            log_prob: exp.log_prob,
+            reward: exp.reward,
+            done: exp.done,
+            value: exp.value,
+        });
     }
 
     pub fn train_step(&mut self, current_lr: f64) -> bool {
@@ -1072,7 +1151,7 @@ mod tests {
 
     #[test]
     fn test_actor_critic_shapes() {
-        let policy = ActorCritic::new(42);
+        let policy = ActorCritic::new(42, &crate::config::AchfConfig::default());
 
         // Case 1: 1D input [DIM] (e.g. [8])
         let state_1d = Tensor::new(vec![0.5; DIM], vec![DIM]);

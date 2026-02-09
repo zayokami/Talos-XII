@@ -7,12 +7,12 @@ use std::sync::Arc;
 mod win_priority {
     use std::ffi::c_void;
 
-    type HANDLE = *mut c_void;
+    type Handle = *mut c_void;
 
     #[link(name = "kernel32")]
     extern "system" {
-        fn GetCurrentThread() -> HANDLE;
-        fn SetThreadPriority(hThread: HANDLE, nPriority: i32) -> i32;
+        fn GetCurrentThread() -> Handle;
+        fn SetThreadPriority(hThread: Handle, nPriority: i32) -> i32;
     }
 
     const THREAD_PRIORITY_NORMAL: i32 = 0;
