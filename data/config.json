@@ -124,7 +124,7 @@
   "worker_stack_size_mb": 4,
   "f2p_sim_count": 200000,
   "achf": {
-    "enabled": false,
+    "enabled": true,
     "mode": "lite",
     "proj_mode": "rowcol",
     "proj_freq": 8,
