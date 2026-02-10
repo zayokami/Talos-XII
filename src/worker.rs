@@ -18,6 +18,10 @@ mod win_priority {
     const THREAD_PRIORITY_NORMAL: i32 = 0;
     const THREAD_PRIORITY_ABOVE_NORMAL: i32 = 1;
     const THREAD_PRIORITY_HIGHEST: i32 = 2;
+    const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
+    const THREAD_PRIORITY_LOWEST: i32 = -2;
+    const THREAD_PRIORITY_IDLE: i32 = -15;
+    const THREAD_PRIORITY_TIME_CRITICAL: i32 = 15;
 
     pub unsafe fn set_current_thread_priority(level: i32) {
         let handle = GetCurrentThread();
@@ -26,9 +30,14 @@ mod win_priority {
 
     pub fn priority_from_str(s: &str) -> i32 {
         match s {
+            "time_critical" => THREAD_PRIORITY_TIME_CRITICAL,
             "highest" => THREAD_PRIORITY_HIGHEST,
+            "above_normal" => THREAD_PRIORITY_ABOVE_NORMAL,
             "normal" => THREAD_PRIORITY_NORMAL,
-            _ => THREAD_PRIORITY_ABOVE_NORMAL,
+            "below_normal" => THREAD_PRIORITY_BELOW_NORMAL,
+            "lowest" => THREAD_PRIORITY_LOWEST,
+            "idle" => THREAD_PRIORITY_IDLE,
+            _ => THREAD_PRIORITY_HIGHEST,
         }
     }
 }

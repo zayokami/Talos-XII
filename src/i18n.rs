@@ -99,7 +99,7 @@ impl I18n {
                 format!("{}", "=== Talos-XII v0.3.0 by zayoka ===".purple().bold())
             }
             (Language::Cn, "header_title") => {
-                format!("{}", "=== Talos-XII v0.3.0 by zayoka===".purple().bold())
+                format!("{}", "=== Talos-XII v0.3.0 by zayoka ===".purple().bold())
             }
 
             (Language::En, "header_pool") => "Pool Name: {}".to_string(),

@@ -6,7 +6,11 @@ use crate::nn::{Linear, Module};
 use crate::rng::Rng;
 use crate::sim::{build_features, dbn_env, prob_6, PpoExperience, PullState};
 use crate::transformer::{KVCache, LuckTransformer};
+use crate::worker::GoodJobWorker;
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+use rayon::prelude::*;
+use rand::seq::SliceRandom;
 
 use serde::{Deserialize, Serialize};
 
@@ -281,6 +285,31 @@ impl ActorCritic {
         }
     }
 
+    pub fn forward_actor_critic(&self, state: &Tensor, pity: &[usize]) -> (Tensor, Tensor) {
+        let x = if state.shape.len() == 1 {
+            state.reshape(vec![1, 1, state.shape[0]])
+        } else if state.shape.len() == 2 {
+            state.reshape(vec![1, state.shape[0], state.shape[1]])
+        } else {
+            state.clone()
+        };
+        let seq = self.backbone.forward(&x, pity);
+        let last = self.backbone.last_token(&seq);
+        let logits = self.actor_head.forward(&last);
+        let value = self.critic_head.forward(&last);
+        let logits = if logits.shape.len() == 2 && logits.shape[0] == 1 {
+            logits.reshape(vec![logits.shape[1]])
+        } else {
+            logits
+        };
+        let value = if value.shape.len() == 2 && value.shape[0] == 1 {
+            value.reshape(vec![value.shape[1]])
+        } else {
+            value
+        };
+        (logits, value)
+    }
+
     pub fn parameters(&self) -> Vec<Tensor> {
         let mut p = self.backbone.parameters();
         p.extend(self.actor_head.parameters());
@@ -302,8 +331,7 @@ impl ActorCritic {
 
     // Returns (action_idx, log_prob, value)
     pub fn step(&self, state: &Tensor, pity: &[usize]) -> (usize, f64, f64) {
-        let logits = self.forward_actor(state, pity);
-        let value = self.forward_critic(state, pity);
+        let (logits, value) = self.forward_actor_critic(state, pity);
 
         // Softmax
         let logits_data = logits.data.read().unwrap();
@@ -374,6 +402,48 @@ impl ActorCritic {
             r -= *prob;
         }
         action_idx
+    }
+
+    pub fn step_inference_cached_with_value(
+        &self,
+        state: &[f64],
+        kv_cache: &mut KVCache,
+        start_pos: usize,
+    ) -> (usize, f64, f64) {
+        let last = self
+            .backbone
+            .forward_inference_step(state, kv_cache, start_pos);
+        let logits = self.actor_head.forward_inference(&last);
+        let value = self.critic_head.forward_inference(&last);
+
+        let mut max_l = -1e9;
+        for &v in logits.iter() {
+            if v > max_l {
+                max_l = v;
+            }
+        }
+        let mut sum_exp = 0.0;
+        let mut probs = [0.0; ACTION_SPACE];
+        for (i, prob) in probs.iter_mut().enumerate() {
+            *prob = (logits[i] - max_l).exp();
+            sum_exp += *prob;
+        }
+        for prob in probs.iter_mut() {
+            *prob /= sum_exp;
+        }
+
+        let mut r = rand::random::<f64>();
+        let mut action_idx = ACTION_SPACE - 1;
+        for (i, prob) in probs.iter().enumerate() {
+            if r < *prob {
+                action_idx = i;
+                break;
+            }
+            r -= *prob;
+        }
+        let log_prob = probs[action_idx].ln();
+        let val = value[0];
+        (action_idx, log_prob, val)
     }
 
     pub fn step_inference_cached(
@@ -545,16 +615,6 @@ struct Memory {
     values: Vec<f64>,
 }
 
-pub(crate) struct PpoStoreInput {
-    state: Tensor,
-    pity: Vec<usize>,
-    action: usize,
-    log_prob: f64,
-    reward: f64,
-    done: bool,
-    value: f64,
-}
-
 pub(crate) struct PpoStoreRawInput {
     state: Vec<f64>,
     seq_len: usize,
@@ -601,30 +661,6 @@ impl Ppo {
             batch_size,
             reward_normalizer: RunningMeanStd::new(),
         }
-    }
-
-    pub(crate) fn store(&mut self, input: PpoStoreInput) {
-        let PpoStoreInput {
-            state,
-            pity,
-            action,
-            log_prob,
-            reward,
-            done,
-            value,
-        } = input;
-        let seq_len = state.shape.first().copied().unwrap_or(1);
-        let data = state.data.read().unwrap().clone();
-        self.store_raw(PpoStoreRawInput {
-            state: data,
-            seq_len,
-            pity,
-            action,
-            log_prob,
-            reward,
-            done,
-            value,
-        });
     }
 
     pub(crate) fn store_raw(&mut self, input: PpoStoreRawInput) {
@@ -704,13 +740,26 @@ impl Ppo {
 
         // Target KL Divergence for Early Stopping
         let target_kl = 0.015;
+        let mut indices: Vec<usize> = (0..len).collect();
+        let action_masks: Vec<Tensor> = (0..ACTION_SPACE)
+            .map(|idx| {
+                let mut mask_vec = vec![0.0; ACTION_SPACE];
+                mask_vec[idx] = 1.0;
+                Tensor::new(mask_vec, vec![ACTION_SPACE])
+            })
+            .collect();
 
-        for _ in 0..self.k_epochs {
-            let indices: Vec<usize> = (0..len).collect();
+        let total_batches = (len + self.batch_size - 1) / self.batch_size;
+        let mut last_update = Instant::now();
+        let update_every = Duration::from_millis(500);
+        let mut update_batches_done = 0usize;
+        for epoch_idx in 0..self.k_epochs {
+            indices.shuffle(&mut rand::thread_rng());
             let mut approx_kl = 0.0;
             let mut batch_count = 0.0;
+            let mut early_stop = false;
 
-            for chunk in indices.chunks(self.batch_size) {
+            for (batch_idx, chunk) in indices.chunks(self.batch_size).enumerate() {
                 self.optimizer.zero_grad();
 
                 let mut loss_accum = Tensor::zeros(vec![1]);
@@ -724,8 +773,7 @@ impl Ppo {
                     let advantage = norm_advantages[i];
                     let return_val = returns[i];
 
-                    let logits = self.policy.forward_actor(state, pity);
-                    let value = self.policy.forward_critic(state, pity);
+                    let (logits, value) = self.policy.forward_actor_critic(state, pity);
 
                     let max_logit = logits
                         .data
@@ -739,9 +787,7 @@ impl Ppo {
                     let sum_exp = exp_logits.sum();
                     let log_sum_exp = sum_exp.log() + Tensor::new(vec![max_logit], vec![1]);
 
-                    let mut mask_vec = vec![0.0; ACTION_SPACE];
-                    mask_vec[action_idx] = 1.0;
-                    let mask = Tensor::new(mask_vec, vec![ACTION_SPACE]);
+                    let mask = action_masks[action_idx].clone();
 
                     let log_probs = logits.clone() - log_sum_exp.broadcast(vec![ACTION_SPACE]);
 
@@ -787,6 +833,34 @@ impl Ppo {
                 final_loss.backward();
                 self.policy.update_achf_after_backward();
                 self.optimizer.step();
+
+                if batch_count > 0.0 && (approx_kl / batch_count) > target_kl * 1.5 {
+                    early_stop = true;
+                }
+
+                update_batches_done += 1;
+                if last_update.elapsed() >= update_every {
+                    print!(
+                        "\r[PPO] Updating: {}/{} | Epoch {}/{} | Batch {}/{}",
+                        update_batches_done,
+                        total_batches * self.k_epochs,
+                        epoch_idx + 1,
+                        self.k_epochs,
+                        batch_idx + 1,
+                        total_batches
+                    );
+                    use std::io::Write;
+                    std::io::stdout().flush().unwrap();
+                    last_update = Instant::now();
+                }
+
+                if early_stop {
+                    break;
+                }
+            }
+
+            if early_stop {
+                break;
             }
 
             // Early Stopping check
@@ -799,6 +873,192 @@ impl Ppo {
             }
         }
     }
+}
+
+struct PpoEnvState {
+    state_struct: PullState,
+    env_noise: f64,
+    env_bias: f64,
+    pulls_done: usize,
+    history_buffer: VecDeque<Vec<f64>>,
+    pity_buffer: VecDeque<usize>,
+    flat_data: Vec<f64>,
+    pity_vec: Vec<usize>,
+    kv_cache: KVCache,
+    episode_reward: f64,
+    rng: Rng,
+}
+
+impl PpoEnvState {
+    fn new(seed: u64, dbn: &Dbn, context_len: usize, num_heads: usize) -> Self {
+        let mut rng = Rng::from_seed(seed);
+        let (env_noise, env_bias) = dbn_env(dbn, &mut rng);
+        Self {
+            state_struct: PullState {
+                pity_6: 0,
+                total_pulls_in_pool: 0,
+                has_obtained_up: false,
+                streak_4_star: 0,
+                loss_streak: 0,
+            },
+            env_noise,
+            env_bias,
+            pulls_done: 0,
+            history_buffer: VecDeque::with_capacity(context_len),
+            pity_buffer: VecDeque::with_capacity(context_len),
+            flat_data: Vec::with_capacity(context_len * DIM),
+            pity_vec: Vec::with_capacity(context_len),
+            kv_cache: KVCache::new(num_heads),
+            episode_reward: 0.0,
+            rng,
+        }
+    }
+
+    fn reset(&mut self, dbn: &Dbn) {
+        self.history_buffer.clear();
+        self.pity_buffer.clear();
+        self.kv_cache.clear();
+        self.state_struct = PullState {
+            pity_6: 0,
+            total_pulls_in_pool: 0,
+            has_obtained_up: false,
+            streak_4_star: 0,
+            loss_streak: 0,
+        };
+        let (env_noise, env_bias) = dbn_env(dbn, &mut self.rng);
+        self.env_noise = env_noise;
+        self.env_bias = env_bias;
+        self.pulls_done = 0;
+        self.episode_reward = 0.0;
+    }
+
+    fn step(
+        &mut self,
+        policy: &ActorCritic,
+        dbn: &Dbn,
+        config: &Config,
+        context_len: usize,
+    ) -> PpoStepResult {
+        let current_state_raw = build_features(
+            self.state_struct.pity_6,
+            self.pulls_done,
+            self.env_noise,
+            self.state_struct.streak_4_star,
+            self.env_bias,
+            self.state_struct.loss_streak,
+            config,
+        )
+        .to_vec();
+
+        let current_pity = self.state_struct.pity_6;
+
+        self.history_buffer.push_back(current_state_raw);
+        self.pity_buffer.push_back(current_pity);
+        if self.history_buffer.len() > context_len {
+            self.history_buffer.pop_front();
+            self.pity_buffer.pop_front();
+            policy.prune_cache(&mut self.kv_cache, context_len);
+        }
+
+        let seq_len = self.history_buffer.len();
+        self.flat_data.clear();
+        for s in self.history_buffer.iter() {
+            self.flat_data.extend_from_slice(s);
+        }
+        self.pity_vec.clear();
+        self.pity_vec.extend(self.pity_buffer.iter().copied());
+        let token = self.history_buffer.back().unwrap().as_slice();
+        let (action_idx, log_prob, val) =
+            policy.step_inference_cached_with_value(token, &mut self.kv_cache, seq_len - 1);
+
+        let luck_modifier = ACTIONS[action_idx];
+        let base_prob_6 = prob_6(self.state_struct.pity_6, config);
+        let final_prob_6 = (base_prob_6 + luck_modifier).clamp(0.0, 1.0);
+
+        let r = self.rng.next_f64();
+        let mut is_six = false;
+        let mut is_up = false;
+
+        self.state_struct.pity_6 += 1;
+        self.state_struct.total_pulls_in_pool += 1;
+
+        if self.state_struct.total_pulls_in_pool == config.big_pity_cumulative
+            && !self.state_struct.has_obtained_up
+        {
+            is_six = true;
+            is_up = true;
+            self.state_struct.pity_6 = 0;
+            self.state_struct.streak_4_star = 0;
+            self.state_struct.loss_streak = 0;
+            self.state_struct.has_obtained_up = true;
+        } else if r < final_prob_6 {
+            is_six = true;
+            self.state_struct.pity_6 = 0;
+            self.state_struct.streak_4_star = 0;
+            if self.rng.next_f64() < 0.5 {
+                is_up = true;
+                self.state_struct.loss_streak = 0;
+                self.state_struct.has_obtained_up = true;
+            } else {
+                self.state_struct.loss_streak += 1;
+            }
+        } else if self.state_struct.streak_4_star >= 9 || r < final_prob_6 + config.prob_5_base {
+            self.state_struct.streak_4_star = 0;
+        } else {
+            self.state_struct.streak_4_star += 1;
+        }
+        self.pulls_done += 1;
+
+        let mut reward = -0.1;
+        if is_six {
+            if is_up {
+                reward += 10.0;
+                if self.pulls_done < 80 {
+                    reward += 5.0;
+                }
+                if self.pulls_done < 50 {
+                    reward += 5.0;
+                }
+            } else {
+                reward += 2.0;
+            }
+        }
+        if self.state_struct.loss_streak >= 2 {
+            reward -= (self.state_struct.loss_streak as f64) * 2.0;
+        }
+        self.episode_reward += reward;
+
+        let done = is_up || self.pulls_done >= 300;
+
+        let experience = PpoStoreRawInput {
+            state: self.flat_data.clone(),
+            seq_len,
+            pity: self.pity_vec.clone(),
+            action: action_idx,
+            log_prob,
+            reward,
+            done,
+            value: val,
+        };
+
+        let finished_reward = if done {
+            let r = self.episode_reward;
+            self.reset(dbn);
+            Some(r)
+        } else {
+            None
+        };
+
+        PpoStepResult {
+            experience,
+            finished_reward,
+        }
+    }
+}
+
+struct PpoStepResult {
+    experience: PpoStoreRawInput,
+    finished_reward: Option<f64>,
 }
 
 pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
@@ -837,23 +1097,27 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
     } else {
         8
     };
+    let num_envs = if config.ppo_num_envs > 0 {
+        config.ppo_num_envs
+    } else {
+        1
+    };
+    let worker = GoodJobWorker::new_with_config(config);
     let mut ppo = Ppo::new(rng.next_u64(), k_epochs, batch_size, &config.achf);
     let mut steps_done = 0;
 
-    let mut state_struct = PullState {
-        pity_6: 0,
-        total_pulls_in_pool: 0,
-        has_obtained_up: false,
-        streak_4_star: 0,
-        loss_streak: 0,
-    };
-    let (mut env_noise, mut env_bias) = dbn_env(dbn, rng);
-    let mut pulls_done = 0;
-
-    let mut history_buffer: VecDeque<Vec<f64>> = VecDeque::with_capacity(context_len);
-    let mut pity_buffer: VecDeque<usize> = VecDeque::with_capacity(context_len);
-    let mut flat_data: Vec<f64> = Vec::with_capacity(context_len * DIM);
-    let mut pity_vec: Vec<usize> = Vec::with_capacity(context_len);
+    let env_seeds: Vec<u64> = (0..num_envs).map(|_| rng.next_u64()).collect();
+    let mut envs: Vec<PpoEnvState> = env_seeds
+        .into_iter()
+        .map(|seed| {
+            PpoEnvState::new(
+                seed,
+                dbn,
+                context_len,
+                ppo.policy.backbone.mla_layer.config.num_heads,
+            )
+        })
+        .collect();
 
     let mut recent_rewards: VecDeque<f64> = VecDeque::with_capacity(50);
     let mut _episode_count = 0;
@@ -861,139 +1125,79 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
     // Linear LR decay
     let initial_lr = 0.0003;
 
+    let heartbeat_every = if fast_mode { 128 } else { 512 };
+    let mut last_heartbeat = Instant::now();
+    let mut remainder_offset = 0usize;
     while steps_done < total_steps {
-        let mut episode_reward = 0.0;
-
         // Calculate LR
         let progress = steps_done as f64 / total_steps as f64;
         let current_lr = initial_lr * (1.0 - progress).max(0.1); // Decay to 10%
 
-        for _ in 0..steps_per_update {
-            let current_state_raw = build_features(
-                state_struct.pity_6,
-                pulls_done,
-                env_noise,
-                state_struct.streak_4_star,
-                env_bias,
-                state_struct.loss_streak,
-                config,
-            )
-            .to_vec();
-
-            let current_pity = state_struct.pity_6;
-
-            history_buffer.push_back(current_state_raw);
-            pity_buffer.push_back(current_pity);
-            if history_buffer.len() > context_len {
-                history_buffer.pop_front();
-                pity_buffer.pop_front();
+        let rounds = steps_per_update / num_envs;
+        let remainder = steps_per_update % num_envs;
+        let mut collected = 0usize;
+        for _ in 0..rounds {
+            let step_results: Vec<PpoStepResult> = worker
+                .execute(|| {
+                    envs.par_iter_mut()
+                        .map(|env| env.step(&ppo.policy, dbn, config, context_len))
+                        .collect()
+                })
+                .unwrap_or_else(|msg| panic!("{}", msg));
+            for result in step_results {
+                ppo.store_raw(result.experience);
+                if let Some(done_reward) = result.finished_reward {
+                    _episode_count += 1;
+                    recent_rewards.push_back(done_reward);
+                    if recent_rewards.len() > 50 {
+                        recent_rewards.pop_front();
+                    }
+                }
             }
-
-            let seq_len = history_buffer.len();
-            flat_data.clear();
-            for s in history_buffer.iter() {
-                flat_data.extend_from_slice(s);
-            }
-            let current_state_tensor = Tensor::new(flat_data.clone(), vec![seq_len, DIM]);
-
-            pity_vec.clear();
-            pity_vec.extend(pity_buffer.iter().copied());
-            let (action_idx, log_prob, val) = ppo.policy.step(&current_state_tensor, &pity_vec);
-
-            let luck_modifier = ACTIONS[action_idx];
-            let base_prob_6 = prob_6(state_struct.pity_6, config);
-            let final_prob_6 = (base_prob_6 + luck_modifier).clamp(0.0, 1.0);
-
-            let r = rng.next_f64();
-            let mut is_six = false;
-            let mut is_up = false;
-
-            state_struct.pity_6 += 1;
-            state_struct.total_pulls_in_pool += 1;
-
-            if state_struct.total_pulls_in_pool == config.big_pity_cumulative
-                && !state_struct.has_obtained_up
+            collected += num_envs;
+            if collected % heartbeat_every == 0
+                && last_heartbeat.elapsed() >= Duration::from_millis(300)
             {
-                is_six = true;
-                is_up = true;
-                state_struct.pity_6 = 0;
-                state_struct.streak_4_star = 0;
-                state_struct.loss_streak = 0;
-                state_struct.has_obtained_up = true;
-            } else if r < final_prob_6 {
-                is_six = true;
-                state_struct.pity_6 = 0;
-                state_struct.streak_4_star = 0;
-                if rng.next_f64() < 0.5 {
-                    is_up = true;
-                    state_struct.loss_streak = 0;
-                    state_struct.has_obtained_up = true;
-                } else {
-                    state_struct.loss_streak += 1;
-                }
-            } else if state_struct.streak_4_star >= 9 || r < final_prob_6 + config.prob_5_base {
-                state_struct.streak_4_star = 0;
-            } else {
-                state_struct.streak_4_star += 1;
+                let global_step = (steps_done + collected).min(total_steps);
+                let avg_env_reward =
+                    envs.iter().map(|e| e.episode_reward).sum::<f64>() / num_envs as f64;
+                print!(
+                    "\r[PPO] Collecting: {}/{} | Avg Reward: {:.2} | LR: {:.6}",
+                    global_step, total_steps, avg_env_reward, current_lr
+                );
+                use std::io::Write;
+                std::io::stdout().flush().unwrap();
+                last_heartbeat = Instant::now();
             }
-            pulls_done += 1;
-
-            let mut reward = -0.1;
-            if is_six {
-                // Massive reward for getting UP, especially early
-                if is_up {
-                    reward += 10.0;
-                    // Bonus for efficiency: early pulls get more reward
-                    if pulls_done < 80 {
-                        reward += 5.0;
-                    }
-                    if pulls_done < 50 {
-                        reward += 5.0;
-                    }
-                } else {
-                    // Small reward for non-up 6* to encourage hitting 6* at least
-                    reward += 2.0;
-                }
-            }
-            if state_struct.loss_streak >= 2 {
-                reward -= (state_struct.loss_streak as f64) * 2.0; // Heavily penalize consecutive losses
-            }
-            episode_reward += reward;
-
-            let done = is_up || pulls_done >= 300;
-
-            ppo.store(PpoStoreInput {
-                state: current_state_tensor,
-                pity: pity_vec.clone(),
-                action: action_idx,
-                log_prob,
-                reward,
-                done,
-                value: val,
-            });
-
-            if done {
-                history_buffer.clear();
-                pity_buffer.clear();
+        }
+        if remainder > 0 {
+            let start = remainder_offset % num_envs;
+            for i in 0..remainder {
+                let idx = (start + i) % num_envs;
+                let result = envs[idx].step(&ppo.policy, dbn, config, context_len);
+            ppo.store_raw(result.experience);
+            if let Some(done_reward) = result.finished_reward {
                 _episode_count += 1;
-                recent_rewards.push_back(episode_reward);
+                recent_rewards.push_back(done_reward);
                 if recent_rewards.len() > 50 {
                     recent_rewards.pop_front();
                 }
-
-                state_struct = PullState {
-                    pity_6: 0,
-                    total_pulls_in_pool: 0,
-                    has_obtained_up: false,
-                    streak_4_star: 0,
-                    loss_streak: 0,
-                };
-                let new_env = dbn_env(dbn, rng);
-                env_noise = new_env.0;
-                env_bias = new_env.1;
-                pulls_done = 0;
-                episode_reward = 0.0;
             }
+            collected += 1;
+            if collected % heartbeat_every == 0
+                && last_heartbeat.elapsed() >= Duration::from_millis(300)
+            {
+                let global_step = (steps_done + collected).min(total_steps);
+                print!(
+                    "\r[PPO] Collecting: {}/{} | Avg Reward: {:.2} | LR: {:.6}",
+                    global_step, total_steps, envs[idx].episode_reward, current_lr
+                );
+                use std::io::Write;
+                std::io::stdout().flush().unwrap();
+                last_heartbeat = Instant::now();
+            }
+            }
+            remainder_offset = (remainder_offset + remainder) % num_envs;
         }
 
         ppo.update(current_lr);

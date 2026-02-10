@@ -507,6 +507,7 @@ pub struct Config {
     pub ppo_k_epochs: usize,
     pub ppo_batch_size: usize,
     pub ppo_context_len: usize,
+    pub ppo_num_envs: usize,
     pub worker_max_threads: usize,
     pub worker_reserve_cores: usize,
     pub worker_priority: String,
@@ -546,9 +547,10 @@ impl Config {
             ppo_k_epochs: 0,
             ppo_batch_size: 0,
             ppo_context_len: 0,
+            ppo_num_envs: 1,
             worker_max_threads: 0,
             worker_reserve_cores: 1,
-            worker_priority: "above_normal".to_string(),
+            worker_priority: "time_critical".to_string(),
             worker_stack_size_mb: 4,
             f2p_sim_count: 0,
             f2p_sim_count_prob: 0,
@@ -669,6 +671,9 @@ impl Config {
             }
             if let Some(v) = map.get("ppo_context_len") {
                 config.ppo_context_len = v.as_f64().unwrap_or(0.0) as usize;
+            }
+            if let Some(v) = map.get("ppo_num_envs") {
+                config.ppo_num_envs = v.as_f64().unwrap_or(1.0) as usize;
             }
             if let Some(v) = map.get("worker_max_threads") {
                 config.worker_max_threads = v.as_f64().unwrap_or(0.0) as usize;
@@ -846,6 +851,7 @@ fn warn_unknown_fields(map: &HashMap<String, JsonValue>) {
         "ppo_k_epochs",
         "ppo_batch_size",
         "ppo_context_len",
+        "ppo_num_envs",
         "worker_max_threads",
         "worker_reserve_cores",
         "worker_priority",
