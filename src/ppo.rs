@@ -249,6 +249,7 @@ impl ActorCritic {
         }
     }
 
+    #[allow(dead_code)]
     pub fn forward_actor(&self, state: &Tensor, pity: &[usize]) -> Tensor {
         let x = if state.shape.len() == 1 {
             state.reshape(vec![1, 1, state.shape[0]])
@@ -267,6 +268,7 @@ impl ActorCritic {
         }
     }
 
+    #[allow(dead_code)]
     pub fn forward_critic(&self, state: &Tensor, pity: &[usize]) -> Tensor {
         let x = if state.shape.len() == 1 {
             state.reshape(vec![1, 1, state.shape[0]])
@@ -982,8 +984,24 @@ impl PpoEnvState {
         self.state_struct.pity_6 += 1;
         self.state_struct.total_pulls_in_pool += 1;
 
-        if self.state_struct.total_pulls_in_pool == config.big_pity_cumulative
-            && !self.state_struct.has_obtained_up
+        let big_pity_gate = if config.big_pity_requires_not_up {
+            !self.state_struct.has_obtained_up
+        } else {
+            true
+        };
+        if config.up_pity_soft > 0
+            && self.state_struct.total_pulls_in_pool == config.up_pity_soft
+            && big_pity_gate
+        {
+            is_six = true;
+            is_up = true;
+            self.state_struct.pity_6 = 0;
+            self.state_struct.streak_4_star = 0;
+            self.state_struct.loss_streak = 0;
+            self.state_struct.has_obtained_up = true;
+        } else if config.big_pity_cumulative > 0
+            && self.state_struct.total_pulls_in_pool == config.big_pity_cumulative
+            && big_pity_gate
         {
             is_six = true;
             is_up = true;
@@ -995,14 +1013,20 @@ impl PpoEnvState {
             is_six = true;
             self.state_struct.pity_6 = 0;
             self.state_struct.streak_4_star = 0;
-            if self.rng.next_f64() < 0.5 {
-                is_up = true;
-                self.state_struct.loss_streak = 0;
-                self.state_struct.has_obtained_up = true;
-            } else {
-                self.state_struct.loss_streak += 1;
+            if config.up_rate > 0.0 && !config.up_six.is_empty() {
+                if self.rng.next_f64() < config.up_rate {
+                    is_up = true;
+                    self.state_struct.loss_streak = 0;
+                    self.state_struct.has_obtained_up = true;
+                } else {
+                    self.state_struct.loss_streak += 1;
+                }
             }
-        } else if self.state_struct.streak_4_star >= 9 || r < final_prob_6 + config.prob_5_base {
+        } else if config.always_5_star
+            || (config.five_star_pity > 0
+                && self.state_struct.streak_4_star >= config.five_star_pity - 1)
+            || r < final_prob_6 + config.prob_5_base
+        {
             self.state_struct.streak_4_star = 0;
         } else {
             self.state_struct.streak_4_star += 1;

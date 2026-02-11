@@ -487,18 +487,47 @@ impl AchfConfig {
 }
 
 #[derive(Debug, Clone)]
-pub struct Config {
-    pub pool_name: String,
+pub struct PoolConfig {
+    pub id: String,
+    pub name: String,
+    pub pool_type: String,
     pub up_six: Vec<String>,
+    pub up_rate: f64,
     pub prob_6_base: f64,
     pub prob_5_base: f64,
     pub prob_4_base: f64,
     pub soft_pity_start: usize,
     pub small_pity_guarantee: usize,
     pub big_pity_cumulative: usize,
+    pub up_pity_soft: usize,
+    pub five_star_pity: usize,
+    pub always_5_star: bool,
+    pub big_pity_requires_not_up: bool,
     pub six_stars: Vec<String>,
     pub five_stars: Vec<String>,
     pub four_stars: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub pool_name: String,
+    pub up_six: Vec<String>,
+    pub up_rate: f64,
+    pub prob_6_base: f64,
+    pub prob_5_base: f64,
+    pub prob_4_base: f64,
+    pub soft_pity_start: usize,
+    pub small_pity_guarantee: usize,
+    pub big_pity_cumulative: usize,
+    pub up_pity_soft: usize,
+    pub five_star_pity: usize,
+    pub always_5_star: bool,
+    pub big_pity_requires_not_up: bool,
+    pub six_stars: Vec<String>,
+    pub five_stars: Vec<String>,
+    pub four_stars: Vec<String>,
+    pub pools: Vec<PoolConfig>,
+    pub active_pool: Option<String>,
     pub luck_mode: String, // "probability" (default) or "dqn"
     pub fast_init: bool,
     pub ppo_mode: String,
@@ -530,15 +559,22 @@ impl Config {
         Config {
             pool_name: "Unknown".to_string(),
             up_six: vec![],
+            up_rate: 0.5,
             prob_6_base: 0.008,
             prob_5_base: 0.08,
             prob_4_base: 0.912,
             soft_pity_start: 65,
             small_pity_guarantee: 80,
             big_pity_cumulative: 120,
+            up_pity_soft: 0,
+            five_star_pity: 10,
+            always_5_star: false,
+            big_pity_requires_not_up: true,
             six_stars: vec![],
             five_stars: vec![],
             four_stars: vec![],
+            pools: vec![],
+            active_pool: None,
             luck_mode: "probability".to_string(),
             fast_init: false,
             ppo_mode: "balanced".to_string(),
@@ -621,6 +657,9 @@ impl Config {
             if let Some(v) = map.get("up_six") {
                 config.up_six = v.to_string_vec();
             }
+            if let Some(v) = map.get("up_rate") {
+                config.up_rate = v.as_f64().unwrap_or(0.5);
+            }
             if let Some(v) = map.get("prob_6_base") {
                 config.prob_6_base = v.as_f64().unwrap_or(0.008);
             }
@@ -639,6 +678,18 @@ impl Config {
             if let Some(v) = map.get("big_pity_cumulative") {
                 config.big_pity_cumulative = v.as_f64().unwrap_or(120.0) as usize;
             }
+            if let Some(v) = map.get("up_pity_soft") {
+                config.up_pity_soft = v.as_f64().unwrap_or(0.0) as usize;
+            }
+            if let Some(v) = map.get("five_star_pity") {
+                config.five_star_pity = v.as_f64().unwrap_or(10.0) as usize;
+            }
+            if let Some(v) = map.get("always_5_star") {
+                config.always_5_star = v.as_bool().unwrap_or(false);
+            }
+            if let Some(v) = map.get("big_pity_requires_not_up") {
+                config.big_pity_requires_not_up = v.as_bool().unwrap_or(true);
+            }
             if let Some(v) = map.get("six_stars") {
                 config.six_stars = v.to_string_vec();
             }
@@ -647,6 +698,18 @@ impl Config {
             }
             if let Some(v) = map.get("four_stars") {
                 config.four_stars = v.to_string_vec();
+            }
+            if let Some(v) = map.get("active_pool") {
+                config.active_pool = v.as_str().map(|s| s.to_string());
+            }
+            if let Some(JsonValue::Array(pools)) = map.get("pools") {
+                config.pools = pools
+                    .iter()
+                    .filter_map(|v| match v {
+                        JsonValue::Object(pool_map) => Some(parse_pool_config(pool_map)),
+                        _ => None,
+                    })
+                    .collect();
             }
             if let Some(v) = map.get("luck_mode") {
                 config.luck_mode = v.as_str().unwrap_or("probability").to_string();
@@ -826,23 +889,155 @@ impl Config {
             }
         }
 
+        if !config.pools.is_empty() {
+            if let Some(active) = config.active_pool.clone() {
+                if !config.apply_pool(&active) {
+                    let first = config.pools[0].id.clone();
+                    config.apply_pool(&first);
+                    config.active_pool = Some(first);
+                }
+            } else {
+                let first = config.pools[0].id.clone();
+                config.apply_pool(&first);
+                config.active_pool = Some(first);
+            }
+        }
+
         config
     }
+}
+
+impl Config {
+    pub fn apply_pool(&mut self, pool_id: &str) -> bool {
+        let pool = match self.pools.iter().find(|p| p.id == pool_id) {
+            Some(p) => p.clone(),
+            None => return false,
+        };
+        self.pool_name = pool.name;
+        self.up_six = pool.up_six;
+        self.up_rate = pool.up_rate;
+        self.prob_6_base = pool.prob_6_base;
+        self.prob_5_base = pool.prob_5_base;
+        self.prob_4_base = pool.prob_4_base;
+        self.soft_pity_start = pool.soft_pity_start;
+        self.small_pity_guarantee = pool.small_pity_guarantee;
+        self.big_pity_cumulative = pool.big_pity_cumulative;
+        self.up_pity_soft = pool.up_pity_soft;
+        self.five_star_pity = pool.five_star_pity;
+        self.always_5_star = pool.always_5_star;
+        self.big_pity_requires_not_up = pool.big_pity_requires_not_up;
+        self.six_stars = pool.six_stars;
+        self.five_stars = pool.five_stars;
+        self.four_stars = pool.four_stars;
+        self.active_pool = Some(pool_id.to_string());
+        true
+    }
+}
+
+fn parse_pool_config(pool_map: &HashMap<String, JsonValue>) -> PoolConfig {
+    let mut pool = PoolConfig {
+        id: pool_map
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        name: pool_map
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown")
+            .to_string(),
+        pool_type: pool_map
+            .get("pool_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        up_six: pool_map
+            .get("up_six")
+            .map(|v| v.to_string_vec())
+            .unwrap_or_default(),
+        up_rate: pool_map
+            .get("up_rate")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.5),
+        prob_6_base: pool_map
+            .get("prob_6_base")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.008),
+        prob_5_base: pool_map
+            .get("prob_5_base")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.08),
+        prob_4_base: pool_map
+            .get("prob_4_base")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.912),
+        soft_pity_start: pool_map
+            .get("soft_pity_start")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(65.0) as usize,
+        small_pity_guarantee: pool_map
+            .get("small_pity_guarantee")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(80.0) as usize,
+        big_pity_cumulative: pool_map
+            .get("big_pity_cumulative")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(120.0) as usize,
+        up_pity_soft: pool_map
+            .get("up_pity_soft")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0) as usize,
+        five_star_pity: pool_map
+            .get("five_star_pity")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(10.0) as usize,
+        always_5_star: pool_map
+            .get("always_5_star")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        big_pity_requires_not_up: pool_map
+            .get("big_pity_requires_not_up")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
+        six_stars: pool_map
+            .get("six_stars")
+            .map(|v| v.to_string_vec())
+            .unwrap_or_default(),
+        five_stars: pool_map
+            .get("five_stars")
+            .map(|v| v.to_string_vec())
+            .unwrap_or_default(),
+        four_stars: pool_map
+            .get("four_stars")
+            .map(|v| v.to_string_vec())
+            .unwrap_or_default(),
+    };
+    if pool.up_rate <= 0.0 || pool.up_six.is_empty() {
+        pool.up_rate = 0.0;
+    }
+    pool
 }
 
 fn warn_unknown_fields(map: &HashMap<String, JsonValue>) {
     let known: HashSet<&'static str> = [
         "pool_name",
         "up_six",
+        "up_rate",
         "prob_6_base",
         "prob_5_base",
         "prob_4_base",
         "soft_pity_start",
         "small_pity_guarantee",
         "big_pity_cumulative",
+        "up_pity_soft",
+        "five_star_pity",
+        "always_5_star",
+        "big_pity_requires_not_up",
         "six_stars",
         "five_stars",
         "four_stars",
+        "pools",
+        "active_pool",
         "luck_mode",
         "fast_init",
         "ppo_mode",

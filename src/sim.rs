@@ -457,7 +457,18 @@ pub fn roll_one(
     } else {
         true
     };
-    if state.total_pulls_in_pool == config.big_pity_cumulative && big_pity_gate {
+    if config.up_pity_soft > 0 && state.total_pulls_in_pool == config.up_pity_soft && big_pity_gate
+    {
+        rarity = 6;
+        is_up = true;
+        big_pity_used = true;
+        state.pity_6 = 0;
+        state.streak_4_star = 0;
+        state.loss_streak = 0;
+    } else if config.big_pity_cumulative > 0
+        && state.total_pulls_in_pool == config.big_pity_cumulative
+        && big_pity_gate
+    {
         rarity = 6;
         is_up = true;
         big_pity_used = true;
@@ -504,15 +515,19 @@ pub fn roll_one(
             state.pity_6 = 0;
             state.streak_4_star = 0;
 
-            if rng.next_f64() < 0.5 {
-                is_up = true;
-                state.loss_streak = 0;
-            } else {
-                is_up = false;
-                state.loss_streak += 1;
+            if config.up_rate > 0.0 && !config.up_six.is_empty() {
+                if rng.next_f64() < config.up_rate {
+                    is_up = true;
+                    state.loss_streak = 0;
+                } else {
+                    is_up = false;
+                    state.loss_streak += 1;
+                }
             }
         } else {
-            let force_5_star = state.streak_4_star >= 9;
+            let force_5_star = config.always_5_star
+                || (config.five_star_pity > 0
+                    && state.streak_4_star >= config.five_star_pity - 1);
             if force_5_star || r < final_prob_6 + config.prob_5_base {
                 rarity = 5;
                 state.streak_4_star = 0;
@@ -707,13 +722,31 @@ fn simulate_core_with_context(
             let op_idx = match outcome.rarity {
                 6 => {
                     if outcome.is_up {
-                        rng.next_u64_bounded(ctx.config.up_six.len() as u64) as usize
+                        if ctx.config.up_six.is_empty() {
+                            0
+                        } else {
+                            rng.next_u64_bounded(ctx.config.up_six.len() as u64) as usize
+                        }
+                    } else if non_up_six.is_empty() {
+                        0
                     } else {
                         rng.next_u64_bounded(non_up_six.len() as u64) as usize
                     }
                 }
-                5 => rng.next_u64_bounded(ctx.config.five_stars.len() as u64) as usize,
-                _ => rng.next_u64_bounded(ctx.config.four_stars.len() as u64) as usize,
+                5 => {
+                    if ctx.config.five_stars.is_empty() {
+                        0
+                    } else {
+                        rng.next_u64_bounded(ctx.config.five_stars.len() as u64) as usize
+                    }
+                }
+                _ => {
+                    if ctx.config.four_stars.is_empty() {
+                        0
+                    } else {
+                        rng.next_u64_bounded(ctx.config.four_stars.len() as u64) as usize
+                    }
+                }
             };
             pulls_vec.push(PullResult {
                 rarity: outcome.rarity,
@@ -864,13 +897,28 @@ pub fn resolve_operator_name<'a>(
     match pull.rarity {
         6 => {
             if pull.is_up {
-                &config.up_six[pull.operator_idx]
+                config
+                    .up_six
+                    .get(pull.operator_idx)
+                    .map(|s| s.as_str())
+                    .unwrap_or("Unknown")
             } else {
-                &non_up_six[pull.operator_idx]
+                non_up_six
+                    .get(pull.operator_idx)
+                    .map(|s| s.as_str())
+                    .unwrap_or("Unknown")
             }
         }
-        5 => &config.five_stars[pull.operator_idx],
-        _ => &config.four_stars[pull.operator_idx],
+        5 => config
+            .five_stars
+            .get(pull.operator_idx)
+            .map(|s| s.as_str())
+            .unwrap_or("Unknown"),
+        _ => config
+            .four_stars
+            .get(pull.operator_idx)
+            .map(|s| s.as_str())
+            .unwrap_or("Unknown"),
     }
 }
 
@@ -886,7 +934,7 @@ pub fn simulate_fast(
         stop_after_total_pulls: None,
         nn_total_pulls_one_based: false,
         collect_details: false,
-        big_pity_requires_not_up: true,
+        big_pity_requires_not_up: ctx.config.big_pity_requires_not_up,
         fast_inference: true,
     };
     simulate_core(
@@ -910,7 +958,7 @@ pub fn simulate_one(
         stop_after_total_pulls: None,
         nn_total_pulls_one_based: false,
         collect_details: true,
-        big_pity_requires_not_up: true,
+        big_pity_requires_not_up: ctx.config.big_pity_requires_not_up,
         fast_inference: false,
     };
     let (stats, pulls_opt) = simulate_core(
@@ -1002,7 +1050,7 @@ pub fn simulate_stats(
                                 stop_after_total_pulls: None,
                                 nn_total_pulls_one_based: false,
                                 collect_details: false,
-                                big_pity_requires_not_up: true,
+                                big_pity_requires_not_up: ctx.config.big_pity_requires_not_up,
                                 fast_inference: true,
                             };
                             let (res, _) = simulate_core_with_context(

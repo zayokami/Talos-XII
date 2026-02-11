@@ -570,7 +570,7 @@ struct RunInteractiveArgs {
 
 fn run_interactive(args: RunInteractiveArgs) {
     let RunInteractiveArgs {
-        config,
+        mut config,
         dbn,
         trained_neural_opt,
         dqn_policy,
@@ -765,39 +765,175 @@ fn run_interactive(args: RunInteractiveArgs) {
         I18n::get(lang, "impact_base")
     );
 
-    // === Ask User for Interaction Mode ===
-    let use_ppo = prompt_yes_no(&I18n::get(lang, "prompt_ppo"), true);
+    let pool_type_label = |pool_type: &str, lang: Language| -> String {
+        match (pool_type, lang) {
+            ("character_up", Language::Cn) => "角色 UP".to_string(),
+            ("character_up", _) => "Character UP".to_string(),
+            ("weapon_up", Language::Cn) => "武器 UP".to_string(),
+            ("weapon_up", _) => "Weapon UP".to_string(),
+            ("standard", Language::Cn) => "基础寻访".to_string(),
+            ("standard", _) => "Standard".to_string(),
+            ("beginner", Language::Cn) => "启程寻访".to_string(),
+            ("beginner", _) => "Beginner".to_string(),
+            ("permanent", Language::Cn) => "常驻".to_string(),
+            ("permanent", _) => "Permanent".to_string(),
+            (_, Language::Cn) => "未知".to_string(),
+            _ => "Unknown".to_string(),
+        }
+    };
+    let print_pool_header = |config: &Config, lang: Language| {
+        let up_label = if config.up_six.is_empty() {
+            match lang {
+                Language::Cn => "无".to_string(),
+                _ => "None".to_string(),
+            }
+        } else {
+            config.up_six.join(", ")
+        };
+        let pool_type = config
+            .active_pool
+            .as_ref()
+            .and_then(|id| config.pools.iter().find(|p| &p.id == id))
+            .map(|p| pool_type_label(&p.pool_type, lang))
+            .unwrap_or_else(|| pool_type_label("unknown", lang));
+        let five_star_rule = if config.always_5_star {
+            I18n::get(lang, "rule_5star_every")
+        } else if config.five_star_pity > 0 {
+            I18n::get(lang, "rule_5star_pity").replace(
+                "{}",
+                &config.five_star_pity.to_string(),
+            )
+        } else {
+            I18n::get(lang, "rule_5star_off")
+        };
+        let big_pity_requires_not_up = if config.big_pity_requires_not_up {
+            I18n::get(lang, "label_yes")
+        } else {
+            I18n::get(lang, "label_no")
+        };
+        println!("{}", I18n::get(lang, "header_title"));
+        println!(
+            "{}",
+            I18n::get(lang, "header_pool").replace("{}", &config.pool_name)
+        );
+        println!(
+            "{}",
+            I18n::get(lang, "header_pool_type").replace("{}", &pool_type)
+        );
+        println!("{}", I18n::get(lang, "header_up").replace("{}", &up_label));
+        println!(
+            "{}",
+            I18n::get(lang, "header_prob")
+                .replace("{:.1}", &format!("{:.1}", config.prob_6_base * 100.0))
+                .replace("{}", &config.soft_pity_start.to_string())
+        );
+        println!(
+            "{}",
+            I18n::get(lang, "header_rules")
+                .replace("{}", &config.small_pity_guarantee.to_string())
+                .replace("{}", &format!("{:.0}", config.up_rate * 100.0))
+        );
+        println!(
+            "{}",
+            if config.up_pity_soft > 0 {
+                I18n::get(lang, "header_up_pity")
+                    .replace("{}", &config.up_pity_soft.to_string())
+            } else {
+                I18n::get(lang, "header_up_pity_off")
+            }
+        );
+        println!(
+            "{}",
+            I18n::get(lang, "header_five_star_rule").replace("{}", &five_star_rule)
+        );
+        println!(
+            "{}",
+            if config.big_pity_cumulative > 0 {
+                I18n::get(lang, "header_big_pity_on")
+                    .replace("{}", &config.big_pity_cumulative.to_string())
+                    .replace("{}", &big_pity_requires_not_up)
+            } else {
+                I18n::get(lang, "header_big_pity_off")
+            }
+        );
+        println!(
+            "{}",
+            I18n::get(lang, "header_economy")
+                .replacen("{}", &COST_PER_PULL.to_string(), 1)
+                .replacen("{}", &FREE_PULLS_WELFARE.to_string(), 1)
+        );
+        println!("{}", I18n::get(lang, "header_neural"));
+    };
 
-    println!("{}", I18n::get(lang, "header_title"));
-    println!(
-        "{}",
-        I18n::get(lang, "header_pool").replace("{}", &config.pool_name)
-    );
-    println!(
-        "{}",
-        I18n::get(lang, "header_up").replace("{}", &config.up_six.join(", "))
-    );
-    println!(
-        "{}",
-        I18n::get(lang, "header_prob")
-            .replace("{:.1}", &format!("{:.1}", config.prob_6_base * 100.0))
-            .replace("{}", &config.soft_pity_start.to_string())
-    );
-    println!(
-        "{}",
-        I18n::get(lang, "header_rules").replace("{}", &config.small_pity_guarantee.to_string())
-    );
-    println!(
-        "{}",
-        I18n::get(lang, "header_big_pity").replace("{}", &config.big_pity_cumulative.to_string())
-    );
-    println!(
-        "{}",
-        I18n::get(lang, "header_economy")
-            .replacen("{}", &COST_PER_PULL.to_string(), 1)
-            .replacen("{}", &FREE_PULLS_WELFARE.to_string(), 1)
-    );
-    println!("{}", I18n::get(lang, "header_neural"));
+    // === Ask User for Interaction Mode ===
+    let mut use_ppo = prompt_yes_no(&I18n::get(lang, "prompt_ppo"), true);
+    let mut default_pulls = 10usize;
+    let mut default_sims = 1usize;
+    let mut use_welfare_default = true;
+    let mut selected_pool_ids: Vec<String> = if let Some(active) = config.active_pool.clone() {
+        vec![active]
+    } else if !config.pools.is_empty() {
+        vec![config.pools[0].id.clone()]
+    } else {
+        vec![]
+    };
+
+    if !config.pools.is_empty() {
+        println!("{}", I18n::get(lang, "init_pool_list"));
+        for (idx, pool) in config.pools.iter().enumerate() {
+            let line = I18n::get(lang, "init_pool_item")
+                .replacen("{}", &(idx + 1).to_string(), 1)
+                .replacen("{}", &pool.name, 1)
+                .replacen("{}", &pool_type_label(&pool.pool_type, lang), 1);
+            println!("{}", line);
+        }
+        let default_index = 1usize;
+        print!(
+            "{}",
+            I18n::get(lang, "prompt_pool_select").replace("{}", &default_index.to_string())
+        );
+        io::stdout().flush().unwrap();
+        let mut pool_input = String::new();
+        io::stdin().read_line(&mut pool_input).unwrap();
+        let pool_input = pool_input.trim();
+        if pool_input.eq_ignore_ascii_case("all") {
+            let all_ids: Vec<String> = config.pools.iter().map(|p| p.id.clone()).collect();
+            if !all_ids.is_empty() && config.apply_pool(&all_ids[0]) {
+                selected_pool_ids = all_ids;
+            }
+        } else {
+            let mut indices = Vec::new();
+            if pool_input.is_empty() {
+                indices.push(default_index);
+            } else {
+                for token in pool_input
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .filter(|s| !s.is_empty())
+                {
+                    if let Ok(idx) = token.parse::<usize>() {
+                        if idx >= 1 && idx <= config.pools.len() {
+                            indices.push(idx);
+                        }
+                    }
+                }
+            }
+            indices.sort_unstable();
+            indices.dedup();
+            if !indices.is_empty() {
+                let mut ids = Vec::new();
+                for idx in indices {
+                    if let Some(pool) = config.pools.get(idx - 1) {
+                        ids.push(pool.id.clone());
+                    }
+                }
+                if !ids.is_empty() && config.apply_pool(&ids[0]) {
+                    selected_pool_ids = ids;
+                }
+            }
+        }
+    }
+
+    print_pool_header(&config, lang);
 
     println!("\n{}", I18n::get(lang, "sys_prng"));
     if cfg!(debug_assertions) && !config.fast_init {
@@ -969,7 +1105,10 @@ fn run_interactive(args: RunInteractiveArgs) {
     drop(ppo_guard);
 
     loop {
-        print!("{}", I18n::get(lang, "prompt_pulls"));
+        print!(
+            "{}",
+            I18n::get(lang, "prompt_pulls").replace("{}", &default_pulls.to_string())
+        );
         io::stdout().flush().unwrap();
 
         let mut input = String::new();
@@ -981,8 +1120,160 @@ fn run_interactive(args: RunInteractiveArgs) {
             break;
         }
 
+        let mut parts = input.split_whitespace();
+        let cmd = parts.next().unwrap_or("");
+        let cmd_lower = cmd.to_ascii_lowercase();
+        if cmd_lower == "h" || cmd_lower == "help" {
+            println!("{}", I18n::get(lang, "cmd_help"));
+            continue;
+        }
+        if cmd_lower == "ppo" {
+            use_ppo = !use_ppo;
+            let key = if use_ppo { "cmd_ppo_on" } else { "cmd_ppo_off" };
+            println!("{}", I18n::get(lang, key));
+            continue;
+        }
+        if cmd_lower == "w" || cmd_lower == "welfare" {
+            use_welfare_default = !use_welfare_default;
+            let key = if use_welfare_default {
+                "cmd_welfare_on"
+            } else {
+                "cmd_welfare_off"
+            };
+            println!("{}", I18n::get(lang, key));
+            continue;
+        }
+        if cmd_lower == "pool" {
+            let sub = parts.next().unwrap_or("list");
+            if sub.eq_ignore_ascii_case("list") {
+                let list_label = if config.pools.is_empty() {
+                    if lang == Language::Cn {
+                        "无".to_string()
+                    } else {
+                        "None".to_string()
+                    }
+                } else {
+                    config
+                        .pools
+                        .iter()
+                        .map(|p| {
+                            format!(
+                                "{}={}/{}",
+                                p.id,
+                                p.name,
+                                pool_type_label(&p.pool_type, lang)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                println!(
+                    "{}",
+                    I18n::get(lang, "cmd_pool_list").replace("{}", &list_label)
+                );
+            } else if sub.eq_ignore_ascii_case("multi") {
+                let mut valid_ids = Vec::new();
+                let mut list_tokens = Vec::new();
+                if let Some(first) = parts.next() {
+                    list_tokens.push(first.to_string());
+                    list_tokens.extend(parts.map(|s| s.to_string()));
+                }
+                let joined = list_tokens.join(" ");
+                for id in joined
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                {
+                    if config.pools.iter().any(|p| p.id == id) {
+                        valid_ids.push(id.to_string());
+                    }
+                }
+                if valid_ids.is_empty() {
+                    println!("{}", I18n::get(lang, "cmd_pool_multi_empty"));
+                } else {
+                    let first = valid_ids[0].clone();
+                    if config.apply_pool(&first) {
+                        selected_pool_ids = valid_ids;
+                        println!(
+                            "{}",
+                            I18n::get(lang, "cmd_pool_multi_set")
+                                .replace("{}", &selected_pool_ids.join(", "))
+                        );
+                        print_pool_header(&config, lang);
+                    }
+                }
+            } else if sub.eq_ignore_ascii_case("all") {
+                let all_ids: Vec<String> = config.pools.iter().map(|p| p.id.clone()).collect();
+                if !all_ids.is_empty() {
+                    let first = all_ids[0].clone();
+                    if config.apply_pool(&first) {
+                        selected_pool_ids = all_ids;
+                        println!("{}", I18n::get(lang, "cmd_pool_all_set"));
+                        print_pool_header(&config, lang);
+                    }
+                } else {
+                    println!("{}", I18n::get(lang, "cmd_pool_multi_empty"));
+                }
+            } else if config.apply_pool(sub) {
+                selected_pool_ids = vec![sub.to_string()];
+                println!(
+                    "{}",
+                    I18n::get(lang, "cmd_pool_switched").replace("{}", &config.pool_name)
+                );
+                print_pool_header(&config, lang);
+            } else {
+                println!(
+                    "{}",
+                    I18n::get(lang, "cmd_pool_not_found").replace("{}", sub)
+                );
+            }
+            continue;
+        }
+        if cmd_lower == "p" || cmd_lower == "pulls" {
+            if let Some(value) = parts.next() {
+                match value.parse::<usize>() {
+                    Ok(val) if val > 0 => {
+                        default_pulls = val.min(1_000_000);
+                        if val > 1_000_000 {
+                            println!("{}", I18n::get(lang, "input_too_large"));
+                        }
+                        println!(
+                            "{}",
+                            I18n::get(lang, "cmd_set_default_pulls")
+                                .replace("{}", &default_pulls.to_string())
+                        );
+                    }
+                    _ => println!("{}", I18n::get(lang, "invalid_input")),
+                }
+            } else {
+                println!("{}", I18n::get(lang, "cmd_invalid_command"));
+            }
+            continue;
+        }
+        if cmd_lower == "s" || cmd_lower == "sims" {
+            if let Some(value) = parts.next() {
+                match value.parse::<usize>() {
+                    Ok(val) if val > 0 => {
+                        default_sims = val.min(1_000_000);
+                        if val > 1_000_000 {
+                            println!("{}", I18n::get(lang, "sim_count_too_large"));
+                        }
+                        println!(
+                            "{}",
+                            I18n::get(lang, "cmd_set_default_sims")
+                                .replace("{}", &default_sims.to_string())
+                        );
+                    }
+                    _ => println!("{}", I18n::get(lang, "invalid_input")),
+                }
+            } else {
+                println!("{}", I18n::get(lang, "cmd_invalid_command"));
+            }
+            continue;
+        }
+
         let n = if input.is_empty() {
-            10
+            default_pulls
         } else {
             match input.parse::<usize>() {
                 Ok(val) => {
@@ -995,29 +1286,43 @@ fn run_interactive(args: RunInteractiveArgs) {
                 }
                 Err(_) => {
                     println!("{}", I18n::get(lang, "invalid_input"));
-                    10
+                    continue;
                 }
             }
         };
 
         print!(
             "{}",
-            I18n::get(lang, "prompt_welfare").replace("{}", &FREE_PULLS_WELFARE.to_string())
+            I18n::get(lang, "prompt_welfare")
+                .replacen("{}", &FREE_PULLS_WELFARE.to_string(), 1)
+                .replacen("{}", if use_welfare_default { "y" } else { "n" }, 1)
         );
         io::stdout().flush().unwrap();
         let mut w_input = String::new();
         io::stdin().read_line(&mut w_input).unwrap();
-        let use_welfare = !w_input.trim().eq_ignore_ascii_case("n");
+        let use_welfare = if w_input.trim().is_empty() {
+            use_welfare_default
+        } else if w_input.trim().eq_ignore_ascii_case("y") {
+            true
+        } else if w_input.trim().eq_ignore_ascii_case("n") {
+            false
+        } else {
+            println!("{}", I18n::get(lang, "invalid_input"));
+            continue;
+        };
         let free_pulls = if use_welfare { FREE_PULLS_WELFARE } else { 0 };
 
-        print!("{}", I18n::get(lang, "prompt_sim_count"));
+        print!(
+            "{}",
+            I18n::get(lang, "prompt_sim_count").replace("{}", &default_sims.to_string())
+        );
         io::stdout().flush().unwrap();
         let mut sim_input = String::new();
         io::stdin().read_line(&mut sim_input).unwrap();
         let sim_input = sim_input.trim();
 
         let sims_n = if sim_input.is_empty() {
-            1
+            default_sims
         } else {
             match sim_input.parse::<usize>() {
                 Ok(val) => {
@@ -1028,7 +1333,10 @@ fn run_interactive(args: RunInteractiveArgs) {
                         val
                     }
                 }
-                Err(_) => 1,
+                Err(_) => {
+                    println!("{}", I18n::get(lang, "invalid_input"));
+                    continue;
+                }
             }
         };
 
@@ -1037,34 +1345,106 @@ fn run_interactive(args: RunInteractiveArgs) {
             let neural_guard = neural_shared.read().unwrap();
             let ppo_guard = ppo_shared.read().unwrap();
             let active_ppo = if use_ppo { Some(&*ppo_guard) } else { None };
-            let ctx = SimRunContext {
-                neural_opt: &neural_guard,
-                dqn_policy: Some(&dqn_guard),
-                ppo_policy: active_ppo,
-                dbn: &dbn,
-                config: &config,
-                worker: &worker,
-                exp_sender: None,
-                neural_sender: None,
-                ppo_sender: None,
-            };
-            let (s_total, u_total, _, _) = simulate_stats(n, sims_n, rng.next_u64(), &ctx);
-            let s_avg = s_total as f64 / sims_n as f64;
-            let u_avg = u_total as f64 / sims_n as f64;
-            println!(
-                "{}",
-                I18n::get(lang, "sim_result_stats")
-                    .replacen("{}", &sims_n.to_string(), 1)
-                    .replacen("{}", &n.to_string(), 1)
-                    .replacen("{:.3}", &format!("{:.3}", s_avg), 1)
-                    .replacen("{:.3}", &format!("{:.3}", u_avg), 1)
-            );
+            if selected_pool_ids.len() > 1 {
+                for pool_id in selected_pool_ids.iter() {
+                    let mut pool_config = config.clone();
+                    if !pool_config.apply_pool(pool_id) {
+                        continue;
+                    }
+                    println!(
+                        "{}",
+                        I18n::get(lang, "sim_pool_header").replace("{}", &pool_config.pool_name)
+                    );
+                    let ctx = SimRunContext {
+                        neural_opt: &neural_guard,
+                        dqn_policy: Some(&dqn_guard),
+                        ppo_policy: active_ppo,
+                        dbn: &dbn,
+                        config: &pool_config,
+                        worker: &worker,
+                        exp_sender: None,
+                        neural_sender: None,
+                        ppo_sender: None,
+                    };
+                    let (s_total, u_total, _, _) =
+                        simulate_stats(n, sims_n, rng.next_u64(), &ctx);
+                    let s_avg = s_total as f64 / sims_n as f64;
+                    let u_avg = u_total as f64 / sims_n as f64;
+                    println!(
+                        "{}",
+                        I18n::get(lang, "sim_result_stats")
+                            .replacen("{}", &sims_n.to_string(), 1)
+                            .replacen("{}", &n.to_string(), 1)
+                            .replacen("{:.3}", &format!("{:.3}", s_avg), 1)
+                            .replacen("{:.3}", &format!("{:.3}", u_avg), 1)
+                    );
+                }
+            } else {
+                let ctx = SimRunContext {
+                    neural_opt: &neural_guard,
+                    dqn_policy: Some(&dqn_guard),
+                    ppo_policy: active_ppo,
+                    dbn: &dbn,
+                    config: &config,
+                    worker: &worker,
+                    exp_sender: None,
+                    neural_sender: None,
+                    ppo_sender: None,
+                };
+                let (s_total, u_total, _, _) = simulate_stats(n, sims_n, rng.next_u64(), &ctx);
+                let s_avg = s_total as f64 / sims_n as f64;
+                let u_avg = u_total as f64 / sims_n as f64;
+                println!(
+                    "{}",
+                    I18n::get(lang, "sim_result_stats")
+                        .replacen("{}", &sims_n.to_string(), 1)
+                        .replacen("{}", &n.to_string(), 1)
+                        .replacen("{:.3}", &format!("{:.3}", s_avg), 1)
+                        .replacen("{:.3}", &format!("{:.3}", u_avg), 1)
+                );
+            }
         } else {
             let start_time = Instant::now();
             let dqn_guard = dqn_shared.read().unwrap();
             let neural_guard = neural_shared.read().unwrap();
             let ppo_guard = ppo_shared.read().unwrap();
             let active_ppo = if use_ppo { Some(&*ppo_guard) } else { None };
+            if selected_pool_ids.len() > 1 {
+                for pool_id in selected_pool_ids.iter() {
+                    let mut pool_config = config.clone();
+                    if !pool_config.apply_pool(pool_id) {
+                        continue;
+                    }
+                    println!(
+                        "{}",
+                        I18n::get(lang, "sim_pool_header").replace("{}", &pool_config.pool_name)
+                    );
+                    let ctx = SimRunContext {
+                        neural_opt: &neural_guard,
+                        dqn_policy: Some(&dqn_guard),
+                        ppo_policy: active_ppo,
+                        dbn: &dbn,
+                        config: &pool_config,
+                        worker: &worker,
+                        exp_sender: None,
+                        neural_sender: None,
+                        ppo_sender: None,
+                    };
+                    let (s_total, u_total, _, _) =
+                        simulate_stats(n, 1, rng.next_u64(), &ctx);
+                    let s_avg = s_total as f64;
+                    let u_avg = u_total as f64;
+                    println!(
+                        "{}",
+                        I18n::get(lang, "sim_result_stats")
+                            .replacen("{}", "1", 1)
+                            .replacen("{}", &n.to_string(), 1)
+                            .replacen("{:.3}", &format!("{:.3}", s_avg), 1)
+                            .replacen("{:.3}", &format!("{:.3}", u_avg), 1)
+                    );
+                }
+                continue;
+            }
             let ctx = SimModelContext {
                 neural_opt: &neural_guard,
                 dqn_policy: Some(&dqn_guard),
