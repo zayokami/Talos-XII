@@ -9,7 +9,9 @@ use std::sync::{Arc, RwLock};
 
 // --- Autograd Engine ---
 
-// TensorData removed as we are using direct mmap-to-vec for stability for now.
+// Minimum element count to justify Rayon parallel dispatch.
+// Below this, serial iteration is faster due to scheduling overhead.
+const PAR_THRESHOLD: usize = 4096;
 
 #[derive(Clone)]
 pub struct Tensor {
@@ -289,8 +291,9 @@ impl Tensor {
                     let lhs = &parents[0];
                     let rhs = &parents[1];
 
-                    let lhs_data = lhs.data.read().unwrap();
-                    let rhs_data = rhs.data.read().unwrap();
+                    let guards = TensorReadGuard::new(&[lhs, rhs]);
+                    let lhs_data = guards.get(0);
+                    let rhs_data = guards.get(1);
 
                     // dL/dLHS = grad_out * RHS^T
                     {
@@ -375,15 +378,23 @@ impl Tensor {
 
     pub fn relu(&self) -> Tensor {
         let self_data = self.data.read().unwrap();
-        let data: Vec<f64> = self_data
-            .par_iter()
-            .map(|&x| if x > 0.0 { x } else { 0.0 })
-            .collect();
+        let len = self_data.len();
+        let data: Vec<f64> = if len >= PAR_THRESHOLD {
+            self_data
+                .par_iter()
+                .map(|&x| if x > 0.0 { x } else { 0.0 })
+                .collect()
+        } else {
+            self_data
+                .iter()
+                .map(|&x| if x > 0.0 { x } else { 0.0 })
+                .collect()
+        };
         let parents = vec![self.clone()];
 
         Tensor {
             data: Arc::new(RwLock::new(data)),
-            grad: Arc::new(RwLock::new(vec![0.0; self_data.len()])),
+            grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
             _ctx: Some(Arc::new(Context {
                 parents,
@@ -391,15 +402,23 @@ impl Tensor {
                     let input = &parents[0];
                     let input_data = input.data.read().unwrap();
                     let mut inp_grad = input.grad.write().unwrap();
-                    inp_grad
-                        .par_iter_mut()
-                        .zip(grad_out.par_iter())
-                        .zip(input_data.par_iter())
-                        .for_each(|((ig, &go), &val)| {
-                            if val > 0.0 {
-                                *ig += go;
+                    if inp_grad.len() >= PAR_THRESHOLD {
+                        inp_grad
+                            .par_iter_mut()
+                            .zip(grad_out.par_iter())
+                            .zip(input_data.par_iter())
+                            .for_each(|((ig, &go), &val)| {
+                                if val > 0.0 {
+                                    *ig += go;
+                                }
+                            });
+                    } else {
+                        for i in 0..inp_grad.len() {
+                            if input_data[i] > 0.0 {
+                                inp_grad[i] += grad_out[i];
                             }
-                        });
+                        }
+                    }
                 }),
             })),
         }
@@ -407,12 +426,17 @@ impl Tensor {
 
     pub fn log(&self) -> Tensor {
         let self_data = self.data.read().unwrap();
-        let data: Vec<f64> = self_data.par_iter().map(|&x| x.ln()).collect();
+        let len = self_data.len();
+        let data: Vec<f64> = if len >= PAR_THRESHOLD {
+            self_data.par_iter().map(|&x| x.ln()).collect()
+        } else {
+            self_data.iter().map(|&x| x.ln()).collect()
+        };
         let parents = vec![self.clone()];
 
         Tensor {
             data: Arc::new(RwLock::new(data)),
-            grad: Arc::new(RwLock::new(vec![0.0; self_data.len()])),
+            grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
             _ctx: Some(Arc::new(Context {
                 parents,
@@ -420,13 +444,19 @@ impl Tensor {
                     let input = &parents[0];
                     let input_data = input.data.read().unwrap();
                     let mut inp_grad = input.grad.write().unwrap();
-                    inp_grad
-                        .par_iter_mut()
-                        .zip(grad_out.par_iter())
-                        .zip(input_data.par_iter())
-                        .for_each(|((ig, &g), &id)| {
-                            *ig += g / id;
-                        });
+                    if inp_grad.len() >= PAR_THRESHOLD {
+                        inp_grad
+                            .par_iter_mut()
+                            .zip(grad_out.par_iter())
+                            .zip(input_data.par_iter())
+                            .for_each(|((ig, &g), &id)| {
+                                *ig += g / id;
+                            });
+                    } else {
+                        for i in 0..inp_grad.len() {
+                            inp_grad[i] += grad_out[i] / input_data[i];
+                        }
+                    }
                 }),
             })),
         }
@@ -434,27 +464,38 @@ impl Tensor {
 
     pub fn exp(&self) -> Tensor {
         let self_data = self.data.read().unwrap();
-        let data: Vec<f64> = self_data.par_iter().map(|&x| x.exp()).collect();
+        let len = self_data.len();
+        let data: Vec<f64> = if len >= PAR_THRESHOLD {
+            self_data.par_iter().map(|&x| x.exp()).collect()
+        } else {
+            self_data.iter().map(|&x| x.exp()).collect()
+        };
         let parents = vec![self.clone()];
+        // Cache forward result for backward (d/dx e^x = e^x)
+        let exp_cache = Arc::new(data.clone());
 
         Tensor {
             data: Arc::new(RwLock::new(data)),
-            grad: Arc::new(RwLock::new(vec![0.0; self_data.len()])),
+            grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
-                    // d/dx(e^x) = e^x
                     let input = &parents[0];
-                    let input_data = input.data.read().unwrap();
                     let mut inp_grad = input.grad.write().unwrap();
-                    inp_grad
-                        .par_iter_mut()
-                        .zip(grad_out.par_iter())
-                        .zip(input_data.par_iter())
-                        .for_each(|((ig, &g), &id)| {
-                            *ig += g * id.exp();
-                        });
+                    if inp_grad.len() >= PAR_THRESHOLD {
+                        inp_grad
+                            .par_iter_mut()
+                            .zip(grad_out.par_iter())
+                            .zip(exp_cache.par_iter())
+                            .for_each(|((ig, &g), &cached)| {
+                                *ig += g * cached;
+                            });
+                    } else {
+                        for i in 0..inp_grad.len() {
+                            inp_grad[i] += grad_out[i] * exp_cache[i];
+                        }
+                    }
                 }),
             })),
         }
@@ -462,7 +503,12 @@ impl Tensor {
 
     pub fn sum(&self) -> Tensor {
         let self_data = self.data.read().unwrap();
-        let sum_val: f64 = self_data.par_iter().sum();
+        let len = self_data.len();
+        let sum_val: f64 = if len >= PAR_THRESHOLD {
+            self_data.par_iter().sum()
+        } else {
+            self_data.iter().sum()
+        };
         let parents = vec![self.clone()];
 
         Tensor {
@@ -474,7 +520,13 @@ impl Tensor {
                 backward_op: Box::new(move |grad_out, parents| {
                     let mut inp_grad = parents[0].grad.write().unwrap();
                     let g = grad_out[0];
-                    inp_grad.par_iter_mut().for_each(|v| *v += g);
+                    if inp_grad.len() >= PAR_THRESHOLD {
+                        inp_grad.par_iter_mut().for_each(|v| *v += g);
+                    } else {
+                        for v in inp_grad.iter_mut() {
+                            *v += g;
+                        }
+                    }
                 }),
             })),
         }
@@ -483,7 +535,11 @@ impl Tensor {
     pub fn mean(&self) -> Tensor {
         let self_data = self.data.read().unwrap();
         let len = self_data.len();
-        let sum_val: f64 = self_data.par_iter().sum();
+        let sum_val: f64 = if len >= PAR_THRESHOLD {
+            self_data.par_iter().sum()
+        } else {
+            self_data.iter().sum()
+        };
         let parents = vec![self.clone()];
 
         Tensor {
@@ -495,7 +551,13 @@ impl Tensor {
                 backward_op: Box::new(move |grad_out, parents| {
                     let mut inp_grad = parents[0].grad.write().unwrap();
                     let g = grad_out[0] / len as f64;
-                    inp_grad.par_iter_mut().for_each(|v| *v += g);
+                    if inp_grad.len() >= PAR_THRESHOLD {
+                        inp_grad.par_iter_mut().for_each(|v| *v += g);
+                    } else {
+                        for v in inp_grad.iter_mut() {
+                            *v += g;
+                        }
+                    }
                 }),
             })),
         }
@@ -599,12 +661,17 @@ impl Tensor {
 
     pub fn sin(&self) -> Tensor {
         let self_data = self.data.read().unwrap();
-        let data: Vec<f64> = self_data.par_iter().map(|&x| x.sin()).collect();
+        let len = self_data.len();
+        let data: Vec<f64> = if len >= PAR_THRESHOLD {
+            self_data.par_iter().map(|&x| x.sin()).collect()
+        } else {
+            self_data.iter().map(|&x| x.sin()).collect()
+        };
         let parents = vec![self.clone()];
 
         Tensor {
             data: Arc::new(RwLock::new(data)),
-            grad: Arc::new(RwLock::new(vec![0.0; self_data.len()])),
+            grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
             _ctx: Some(Arc::new(Context {
                 parents,
@@ -612,13 +679,19 @@ impl Tensor {
                     let input = &parents[0];
                     let input_data = input.data.read().unwrap();
                     let mut inp_grad = input.grad.write().unwrap();
-                    inp_grad
-                        .par_iter_mut()
-                        .zip(grad_out.par_iter())
-                        .zip(input_data.par_iter())
-                        .for_each(|((ig, &g), &id)| {
-                            *ig += g * id.cos();
-                        });
+                    if inp_grad.len() >= PAR_THRESHOLD {
+                        inp_grad
+                            .par_iter_mut()
+                            .zip(grad_out.par_iter())
+                            .zip(input_data.par_iter())
+                            .for_each(|((ig, &g), &id)| {
+                                *ig += g * id.cos();
+                            });
+                    } else {
+                        for i in 0..inp_grad.len() {
+                            inp_grad[i] += grad_out[i] * input_data[i].cos();
+                        }
+                    }
                 }),
             })),
         }
@@ -626,12 +699,17 @@ impl Tensor {
 
     pub fn cos(&self) -> Tensor {
         let self_data = self.data.read().unwrap();
-        let data: Vec<f64> = self_data.par_iter().map(|&x| x.cos()).collect();
+        let len = self_data.len();
+        let data: Vec<f64> = if len >= PAR_THRESHOLD {
+            self_data.par_iter().map(|&x| x.cos()).collect()
+        } else {
+            self_data.iter().map(|&x| x.cos()).collect()
+        };
         let parents = vec![self.clone()];
 
         Tensor {
             data: Arc::new(RwLock::new(data)),
-            grad: Arc::new(RwLock::new(vec![0.0; self_data.len()])),
+            grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
             _ctx: Some(Arc::new(Context {
                 parents,
@@ -639,13 +717,19 @@ impl Tensor {
                     let input = &parents[0];
                     let input_data = input.data.read().unwrap();
                     let mut inp_grad = input.grad.write().unwrap();
-                    inp_grad
-                        .par_iter_mut()
-                        .zip(grad_out.par_iter())
-                        .zip(input_data.par_iter())
-                        .for_each(|((ig, &g), &id)| {
-                            *ig -= g * id.sin();
-                        });
+                    if inp_grad.len() >= PAR_THRESHOLD {
+                        inp_grad
+                            .par_iter_mut()
+                            .zip(grad_out.par_iter())
+                            .zip(input_data.par_iter())
+                            .for_each(|((ig, &g), &id)| {
+                                *ig -= g * id.sin();
+                            });
+                    } else {
+                        for i in 0..inp_grad.len() {
+                            inp_grad[i] -= grad_out[i] * input_data[i].sin();
+                        }
+                    }
                 }),
             })),
         }
@@ -653,39 +737,54 @@ impl Tensor {
 
     pub fn sqrt(&self) -> Tensor {
         let self_data = self.data.read().unwrap();
-        let data: Vec<f64> = self_data.par_iter().map(|&x| x.sqrt()).collect();
+        let len = self_data.len();
+        let data: Vec<f64> = if len >= PAR_THRESHOLD {
+            self_data.par_iter().map(|&x| x.sqrt()).collect()
+        } else {
+            self_data.iter().map(|&x| x.sqrt()).collect()
+        };
+        let sqrt_cache = data.clone();
         let parents = vec![self.clone()];
 
         Tensor {
             data: Arc::new(RwLock::new(data)),
-            grad: Arc::new(RwLock::new(vec![0.0; self_data.len()])),
+            grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
                     let input = &parents[0];
-                    let input_data = input.data.read().unwrap();
                     let mut inp_grad = input.grad.write().unwrap();
-                    inp_grad
-                        .par_iter_mut()
-                        .zip(grad_out.par_iter())
-                        .zip(input_data.par_iter())
-                        .for_each(|((ig, &g), &id)| {
-                            if id > 0.0 {
-                                *ig += g * 0.5 / id.sqrt();
+                    let len = inp_grad.len();
+                    // Reuse cached sqrt values: d/dx sqrt(x) = 0.5 / sqrt(x)
+                    if len >= PAR_THRESHOLD {
+                        inp_grad
+                            .par_iter_mut()
+                            .zip(grad_out.par_iter())
+                            .zip(sqrt_cache.par_iter())
+                            .for_each(|((ig, &g), &s)| {
+                                if s > 0.0 {
+                                    *ig += g * 0.5 / s;
+                                }
+                            });
+                    } else {
+                        for i in 0..len {
+                            if sqrt_cache[i] > 0.0 {
+                                inp_grad[i] += grad_out[i] * 0.5 / sqrt_cache[i];
                             }
-                        });
+                        }
+                    }
                 }),
             })),
         }
     }
 
     pub fn transpose(&self, dim0: usize, dim1: usize) -> Tensor {
-        // Full data copy transpose for simplicity
         let self_data = self.data.read().unwrap();
         let shape = &self.shape;
         let rank = shape.len();
         assert!(dim0 < rank && dim1 < rank);
+        assert!(rank <= 8, "transpose: rank > 8 not supported by stack-allocated coords");
 
         let mut new_shape = shape.clone();
         new_shape.swap(dim0, dim1);
@@ -693,32 +792,28 @@ impl Tensor {
         let len = self_data.len();
         let mut new_data = vec![0.0; len];
 
-        // Calculate strides
-        let mut strides = vec![1; rank];
+        let mut strides = [0usize; 8];
+        strides[rank - 1] = 1;
         for i in (0..rank - 1).rev() {
             strides[i] = strides[i + 1] * shape[i + 1];
         }
 
-        let mut new_strides = vec![1; rank];
+        let mut new_strides = [0usize; 8];
+        new_strides[rank - 1] = 1;
         for i in (0..rank - 1).rev() {
             new_strides[i] = new_strides[i + 1] * new_shape[i + 1];
         }
 
-        // Iterate and copy
-        // This is generic N-dim transpose
         for (i, value) in new_data.iter_mut().enumerate().take(len) {
-            // Unravel index 'i' based on new_shape
             let mut temp = i;
-            let mut coords = vec![0; rank];
+            let mut coords = [0usize; 8];
             for d in 0..rank {
                 coords[d] = temp / new_strides[d];
                 temp %= new_strides[d];
             }
 
-            // Swap coords to get old coordinates
             coords.swap(dim0, dim1);
 
-            // Ravel coords based on old shape (strides)
             let mut old_idx = 0;
             for d in 0..rank {
                 old_idx += coords[d] * strides[d];
@@ -730,6 +825,9 @@ impl Tensor {
         let parents = vec![self.clone()];
         let dim0_cap = dim0;
         let dim1_cap = dim1;
+        let cap_strides = strides;
+        let cap_new_strides = new_strides;
+        let cap_rank = rank;
 
         Tensor {
             data: Arc::new(RwLock::new(new_data)),
@@ -741,48 +839,22 @@ impl Tensor {
                     let input = &parents[0];
                     let mut inp_grad = input.grad.write().unwrap();
 
-                    // Transpose backward is transpose of grad
-                    // We need to map grad_out (which is in transposed shape) back to input shape
-
-                    let shape = &input.shape; // Old shape
-                    let rank = shape.len();
-
-                    // Recompute strides (captured closure would be better but expensive to copy vecs)
-                    let mut strides = vec![1; rank];
-                    for i in (0..rank - 1).rev() {
-                        strides[i] = strides[i + 1] * shape[i + 1];
-                    }
-
-                    // New shape (transposed)
-                    let mut new_shape = shape.clone();
-                    new_shape.swap(dim0_cap, dim1_cap);
-                    let mut new_strides = vec![1; rank];
-                    for i in (0..rank - 1).rev() {
-                        new_strides[i] = new_strides[i + 1] * new_shape[i + 1];
-                    }
-
-                    for (i, grad_val) in grad_out.iter().enumerate() {
-                        // i is index in grad_out (transposed layout)
-                        // We want to find corresponding index in inp_grad (original layout)
-
-                        // Unravel i using new_strides
+                    for (i, &grad_val) in grad_out.iter().enumerate() {
                         let mut temp = i;
-                        let mut coords = vec![0; rank];
-                        for d in 0..rank {
-                            coords[d] = temp / new_strides[d];
-                            temp %= new_strides[d];
+                        let mut coords = [0usize; 8];
+                        for d in 0..cap_rank {
+                            coords[d] = temp / cap_new_strides[d];
+                            temp %= cap_new_strides[d];
                         }
 
-                        // Swap coords back
                         coords.swap(dim0_cap, dim1_cap);
 
-                        // Ravel using strides
                         let mut old_idx = 0;
-                        for d in 0..rank {
-                            old_idx += coords[d] * strides[d];
+                        for d in 0..cap_rank {
+                            old_idx += coords[d] * cap_strides[d];
                         }
 
-                        inp_grad[old_idx] += *grad_val;
+                        inp_grad[old_idx] += grad_val;
                     }
                 }),
             })),
@@ -791,12 +863,17 @@ impl Tensor {
 
     pub fn clip(&self, min: f64, max: f64) -> Tensor {
         let self_data = self.data.read().unwrap();
-        let data: Vec<f64> = self_data.par_iter().map(|&x| x.max(min).min(max)).collect();
+        let len = self_data.len();
+        let data: Vec<f64> = if len >= PAR_THRESHOLD {
+            self_data.par_iter().map(|&x| x.max(min).min(max)).collect()
+        } else {
+            self_data.iter().map(|&x| x.max(min).min(max)).collect()
+        };
         let parents = vec![self.clone()];
 
         Tensor {
             data: Arc::new(RwLock::new(data)),
-            grad: Arc::new(RwLock::new(vec![0.0; self_data.len()])),
+            grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
             _ctx: Some(Arc::new(Context {
                 parents,
@@ -804,15 +881,24 @@ impl Tensor {
                     let input = &parents[0];
                     let input_data = input.data.read().unwrap();
                     let mut inp_grad = input.grad.write().unwrap();
-                    inp_grad
-                        .par_iter_mut()
-                        .zip(grad_out.par_iter())
-                        .zip(input_data.par_iter())
-                        .for_each(|((ig, &g), &id)| {
-                            if id >= min && id <= max {
-                                *ig += g;
+                    let len = inp_grad.len();
+                    if len >= PAR_THRESHOLD {
+                        inp_grad
+                            .par_iter_mut()
+                            .zip(grad_out.par_iter())
+                            .zip(input_data.par_iter())
+                            .for_each(|((ig, &g), &id)| {
+                                if id >= min && id <= max {
+                                    *ig += g;
+                                }
+                            });
+                    } else {
+                        for i in 0..len {
+                            if input_data[i] >= min && input_data[i] <= max {
+                                inp_grad[i] += grad_out[i];
                             }
-                        });
+                        }
+                    }
                 }),
             })),
         }
@@ -833,10 +919,17 @@ impl Tensor {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
                     let mut inp_grad = parents[0].grad.write().unwrap();
-                    inp_grad
-                        .par_iter_mut()
-                        .zip(grad_out.par_iter())
-                        .for_each(|(ig, &g)| *ig += g);
+                    let len = grad_out.len();
+                    if len >= PAR_THRESHOLD {
+                        inp_grad
+                            .par_iter_mut()
+                            .zip(grad_out.par_iter())
+                            .for_each(|(ig, &g)| *ig += g);
+                    } else {
+                        for i in 0..len {
+                            inp_grad[i] += grad_out[i];
+                        }
+                    }
                 }),
             })),
         }
@@ -1099,8 +1192,10 @@ impl Tensor {
                 backward_op: Box::new(move |grad_out, parents| {
                     let input = &parents[0];
                     let weight = &parents[1];
-                    let input_data = input.data.read().unwrap();
-                    let weight_data = weight.data.read().unwrap();
+                    // Use batch lock for better performance
+                    let guards = TensorReadGuard::new(&[input, weight]);
+                    let input_data = guards.get(0);
+                    let weight_data = guards.get(1);
 
                     let (n, c_in, h_in, w_in) = (
                         input.shape[0],
@@ -1339,8 +1434,10 @@ impl Tensor {
                 backward_op: Box::new(move |grad_out, parents| {
                     let input = &parents[0];
                     let weight = &parents[1];
-                    let input_data = input.data.read().unwrap();
-                    let weight_data = weight.data.read().unwrap();
+                    // Use batch lock for better performance
+                    let guards = TensorReadGuard::new(&[input, weight]);
+                    let input_data = guards.get(0);
+                    let weight_data = guards.get(1);
 
                     // dL/dInput
                     {
@@ -1663,34 +1760,50 @@ impl Add for Tensor {
         let guards = TensorReadGuard::new(&[&self, &rhs]);
         let self_data = guards.get(0);
         let rhs_data = guards.get(1);
-        let data: Vec<f64> = self_data
-            .par_iter()
-            .zip(rhs_data.par_iter())
-            .map(|(a, b)| a + b)
-            .collect();
+        let len = self_data.len();
+        let data: Vec<f64> = if len >= PAR_THRESHOLD {
+            self_data
+                .par_iter()
+                .zip(rhs_data.par_iter())
+                .map(|(a, b)| a + b)
+                .collect()
+        } else {
+            self_data.iter().zip(rhs_data.iter()).map(|(a, b)| a + b).collect()
+        };
         let parents = vec![self.clone(), rhs.clone()];
         Tensor {
             data: Arc::new(RwLock::new(data)),
-            grad: Arc::new(RwLock::new(vec![0.0; self_data.len()])),
+            grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(|grad_out, parents| {
-                    // Scope 1: LHS
+                    let len = grad_out.len();
                     {
                         let mut lhs_grad = parents[0].grad.write().unwrap();
-                        lhs_grad
-                            .par_iter_mut()
-                            .zip(grad_out.par_iter())
-                            .for_each(|(lg, &g)| *lg += g);
+                        if len >= PAR_THRESHOLD {
+                            lhs_grad
+                                .par_iter_mut()
+                                .zip(grad_out.par_iter())
+                                .for_each(|(lg, &g)| *lg += g);
+                        } else {
+                            for i in 0..len {
+                                lhs_grad[i] += grad_out[i];
+                            }
+                        }
                     }
-                    // Scope 2: RHS
                     {
                         let mut rhs_grad = parents[1].grad.write().unwrap();
-                        rhs_grad
-                            .par_iter_mut()
-                            .zip(grad_out.par_iter())
-                            .for_each(|(rg, &g)| *rg += g);
+                        if len >= PAR_THRESHOLD {
+                            rhs_grad
+                                .par_iter_mut()
+                                .zip(grad_out.par_iter())
+                                .for_each(|(rg, &g)| *rg += g);
+                        } else {
+                            for i in 0..len {
+                                rhs_grad[i] += grad_out[i];
+                            }
+                        }
                     }
                 }),
             })),
@@ -1712,34 +1825,50 @@ impl Sub for Tensor {
         let guards = TensorReadGuard::new(&[&self, &rhs]);
         let self_data = guards.get(0);
         let rhs_data = guards.get(1);
-        let data: Vec<f64> = self_data
-            .par_iter()
-            .zip(rhs_data.par_iter())
-            .map(|(a, b)| a - b)
-            .collect();
+        let len = self_data.len();
+        let data: Vec<f64> = if len >= PAR_THRESHOLD {
+            self_data
+                .par_iter()
+                .zip(rhs_data.par_iter())
+                .map(|(a, b)| a - b)
+                .collect()
+        } else {
+            self_data.iter().zip(rhs_data.iter()).map(|(a, b)| a - b).collect()
+        };
         let parents = vec![self.clone(), rhs.clone()];
         Tensor {
             data: Arc::new(RwLock::new(data)),
-            grad: Arc::new(RwLock::new(vec![0.0; self_data.len()])),
+            grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(|grad_out, parents| {
-                    // Scope 1: LHS
+                    let len = grad_out.len();
                     {
                         let mut lhs_grad = parents[0].grad.write().unwrap();
-                        lhs_grad
-                            .par_iter_mut()
-                            .zip(grad_out.par_iter())
-                            .for_each(|(lg, &g)| *lg += g);
+                        if len >= PAR_THRESHOLD {
+                            lhs_grad
+                                .par_iter_mut()
+                                .zip(grad_out.par_iter())
+                                .for_each(|(lg, &g)| *lg += g);
+                        } else {
+                            for i in 0..len {
+                                lhs_grad[i] += grad_out[i];
+                            }
+                        }
                     }
-                    // Scope 2: RHS
                     {
                         let mut rhs_grad = parents[1].grad.write().unwrap();
-                        rhs_grad
-                            .par_iter_mut()
-                            .zip(grad_out.par_iter())
-                            .for_each(|(rg, &g)| *rg -= g);
+                        if len >= PAR_THRESHOLD {
+                            rhs_grad
+                                .par_iter_mut()
+                                .zip(grad_out.par_iter())
+                                .for_each(|(rg, &g)| *rg -= g);
+                        } else {
+                            for i in 0..len {
+                                rhs_grad[i] -= grad_out[i];
+                            }
+                        }
                     }
                 }),
             })),
@@ -1757,54 +1886,77 @@ impl<'b> Sub<&'b Tensor> for &Tensor {
 impl Mul for Tensor {
     type Output = Tensor;
     fn mul(self, rhs: Tensor) -> Tensor {
-        // Broadcast support? For now assuming same shape or scalar broadcast
-        // Simplifying to same shape for now to avoid complexity
         assert_eq!(self.shape, rhs.shape, "Mul shape mismatch");
         let guards = TensorReadGuard::new(&[&self, &rhs]);
         let self_data = guards.get(0);
         let rhs_data = guards.get(1);
-        let data: Vec<f64> = self_data
-            .par_iter()
-            .zip(rhs_data.par_iter())
-            .map(|(a, b)| a * b)
-            .collect();
+        let len = self_data.len();
+        let data: Vec<f64> = if len >= PAR_THRESHOLD {
+            self_data
+                .par_iter()
+                .zip(rhs_data.par_iter())
+                .map(|(a, b)| a * b)
+                .collect()
+        } else {
+            self_data.iter().zip(rhs_data.iter()).map(|(a, b)| a * b).collect()
+        };
         let parents = vec![self.clone(), rhs.clone()];
         Tensor {
             data: Arc::new(RwLock::new(data)),
-            grad: Arc::new(RwLock::new(vec![0.0; self_data.len()])),
+            grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(|grad_out, parents| {
                     let lhs = &parents[0];
                     let rhs = &parents[1];
-                    let lhs_data = lhs.data.read().unwrap();
-                    let rhs_data = rhs.data.read().unwrap();
+                    let guards = TensorReadGuard::new(&[lhs, rhs]);
+                    let lhs_data = guards.get(0);
+                    let rhs_data = guards.get(1);
+                    let len = grad_out.len();
                     if Arc::ptr_eq(&lhs.grad, &rhs.grad) {
                         let mut grad = lhs.grad.write().unwrap();
-                        grad.par_iter_mut()
-                            .zip(grad_out.par_iter())
-                            .zip(lhs_data.par_iter())
-                            .zip(rhs_data.par_iter())
-                            .for_each(|(((g, &go), &l), &r)| {
-                                *g += go * (l + r);
-                            });
+                        if len >= PAR_THRESHOLD {
+                            grad.par_iter_mut()
+                                .zip(grad_out.par_iter())
+                                .zip(lhs_data.par_iter())
+                                .zip(rhs_data.par_iter())
+                                .for_each(|(((g, &go), &l), &r)| {
+                                    *g += go * (l + r);
+                                });
+                        } else {
+                            for i in 0..len {
+                                grad[i] += grad_out[i] * (lhs_data[i] + rhs_data[i]);
+                            }
+                        }
                     } else {
                         {
                             let mut lhs_grad = lhs.grad.write().unwrap();
-                            lhs_grad
-                                .par_iter_mut()
-                                .zip(grad_out.par_iter())
-                                .zip(rhs_data.par_iter())
-                                .for_each(|((lg, &g), &r)| *lg += g * r);
+                            if len >= PAR_THRESHOLD {
+                                lhs_grad
+                                    .par_iter_mut()
+                                    .zip(grad_out.par_iter())
+                                    .zip(rhs_data.par_iter())
+                                    .for_each(|((lg, &g), &r)| *lg += g * r);
+                            } else {
+                                for i in 0..len {
+                                    lhs_grad[i] += grad_out[i] * rhs_data[i];
+                                }
+                            }
                         }
                         {
                             let mut rhs_grad = rhs.grad.write().unwrap();
-                            rhs_grad
-                                .par_iter_mut()
-                                .zip(grad_out.par_iter())
-                                .zip(lhs_data.par_iter())
-                                .for_each(|((rg, &g), &l)| *rg += g * l);
+                            if len >= PAR_THRESHOLD {
+                                rhs_grad
+                                    .par_iter_mut()
+                                    .zip(grad_out.par_iter())
+                                    .zip(lhs_data.par_iter())
+                                    .for_each(|((rg, &g), &l)| *rg += g * l);
+                            } else {
+                                for i in 0..len {
+                                    rhs_grad[i] += grad_out[i] * lhs_data[i];
+                                }
+                            }
                         }
                     }
                 }),
@@ -1827,49 +1979,76 @@ impl Div for Tensor {
         let guards = TensorReadGuard::new(&[&self, &rhs]);
         let self_data = guards.get(0);
         let rhs_data = guards.get(1);
-        let data: Vec<f64> = self_data
-            .par_iter()
-            .zip(rhs_data.par_iter())
-            .map(|(a, b)| a / b)
-            .collect();
+        let len = self_data.len();
+        let data: Vec<f64> = if len >= PAR_THRESHOLD {
+            self_data
+                .par_iter()
+                .zip(rhs_data.par_iter())
+                .map(|(a, b)| a / b)
+                .collect()
+        } else {
+            self_data.iter().zip(rhs_data.iter()).map(|(a, b)| a / b).collect()
+        };
         let parents = vec![self.clone(), rhs.clone()];
         Tensor {
             data: Arc::new(RwLock::new(data)),
-            grad: Arc::new(RwLock::new(vec![0.0; self_data.len()])),
+            grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(|grad_out, parents| {
                     let lhs = &parents[0];
                     let rhs = &parents[1];
-                    let lhs_data = lhs.data.read().unwrap();
-                    let rhs_data = rhs.data.read().unwrap();
+                    let guards = TensorReadGuard::new(&[lhs, rhs]);
+                    let lhs_data = guards.get(0);
+                    let rhs_data = guards.get(1);
+                    let len = grad_out.len();
                     if Arc::ptr_eq(&lhs.grad, &rhs.grad) {
                         let mut grad = lhs.grad.write().unwrap();
-                        grad.par_iter_mut()
-                            .zip(grad_out.par_iter())
-                            .zip(lhs_data.par_iter())
-                            .zip(rhs_data.par_iter())
-                            .for_each(|(((g, &go), &l), &r)| {
-                                *g += go / r - go * l / (r * r);
-                            });
-                    } else {
-                        {
-                            let mut lhs_grad = lhs.grad.write().unwrap();
-                            lhs_grad
-                                .par_iter_mut()
-                                .zip(grad_out.par_iter())
-                                .zip(rhs_data.par_iter())
-                                .for_each(|((lg, &g), &r)| *lg += g / r);
-                        }
-                        {
-                            let mut rhs_grad = rhs.grad.write().unwrap();
-                            rhs_grad
-                                .par_iter_mut()
+                        if len >= PAR_THRESHOLD {
+                            grad.par_iter_mut()
                                 .zip(grad_out.par_iter())
                                 .zip(lhs_data.par_iter())
                                 .zip(rhs_data.par_iter())
-                                .for_each(|(((rg, &g), &l), &r)| *rg -= g * l / (r * r));
+                                .for_each(|(((g, &go), &l), &r)| {
+                                    *g += go / r - go * l / (r * r);
+                                });
+                        } else {
+                            for i in 0..len {
+                                let r = rhs_data[i];
+                                grad[i] += grad_out[i] / r - grad_out[i] * lhs_data[i] / (r * r);
+                            }
+                        }
+                    } else {
+                        {
+                            let mut lhs_grad = lhs.grad.write().unwrap();
+                            if len >= PAR_THRESHOLD {
+                                lhs_grad
+                                    .par_iter_mut()
+                                    .zip(grad_out.par_iter())
+                                    .zip(rhs_data.par_iter())
+                                    .for_each(|((lg, &g), &r)| *lg += g / r);
+                            } else {
+                                for i in 0..len {
+                                    lhs_grad[i] += grad_out[i] / rhs_data[i];
+                                }
+                            }
+                        }
+                        {
+                            let mut rhs_grad = rhs.grad.write().unwrap();
+                            if len >= PAR_THRESHOLD {
+                                rhs_grad
+                                    .par_iter_mut()
+                                    .zip(grad_out.par_iter())
+                                    .zip(lhs_data.par_iter())
+                                    .zip(rhs_data.par_iter())
+                                    .for_each(|(((rg, &g), &l), &r)| *rg -= g * l / (r * r));
+                            } else {
+                                for i in 0..len {
+                                    let r = rhs_data[i];
+                                    rhs_grad[i] -= grad_out[i] * lhs_data[i] / (r * r);
+                                }
+                            }
                         }
                     }
                 }),
@@ -1889,20 +2068,32 @@ impl Neg for Tensor {
     type Output = Tensor;
     fn neg(self) -> Tensor {
         let self_data = self.data.read().unwrap();
-        let data: Vec<f64> = self_data.par_iter().map(|&x| -x).collect();
+        let len = self_data.len();
+        let data: Vec<f64> = if len >= PAR_THRESHOLD {
+            self_data.par_iter().map(|&x| -x).collect()
+        } else {
+            self_data.iter().map(|&x| -x).collect()
+        };
         let parents = vec![self.clone()];
         Tensor {
             data: Arc::new(RwLock::new(data)),
-            grad: Arc::new(RwLock::new(vec![0.0; self_data.len()])),
+            grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(|grad_out, parents| {
                     let mut inp_grad = parents[0].grad.write().unwrap();
-                    inp_grad
-                        .par_iter_mut()
-                        .zip(grad_out.par_iter())
-                        .for_each(|(ig, &g)| *ig -= g);
+                    let len = grad_out.len();
+                    if len >= PAR_THRESHOLD {
+                        inp_grad
+                            .par_iter_mut()
+                            .zip(grad_out.par_iter())
+                            .for_each(|(ig, &g)| *ig -= g);
+                    } else {
+                        for i in 0..len {
+                            inp_grad[i] -= grad_out[i];
+                        }
+                    }
                 }),
             })),
         }

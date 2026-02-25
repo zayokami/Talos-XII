@@ -11,7 +11,6 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use rayon::prelude::*;
 use rand::seq::SliceRandom;
-
 use serde::{Deserialize, Serialize};
 
 // --- PPO Components ---
@@ -229,6 +228,37 @@ unsafe fn normalize_slice_neon(values: &[f64], out: &mut [f64], mean: f64, std: 
     }
 }
 
+// Softmax + categorical sample over fixed ACTION_SPACE logits.
+// Returns (action_index, log_prob_of_action).
+#[inline]
+fn softmax_sample(logits: &[f64]) -> (usize, f64) {
+    let mut max_l = f64::NEG_INFINITY;
+    for &v in logits {
+        if v > max_l {
+            max_l = v;
+        }
+    }
+    let mut sum_exp = 0.0;
+    let mut probs = [0.0; ACTION_SPACE];
+    for (i, prob) in probs.iter_mut().enumerate() {
+        *prob = (logits[i] - max_l).exp();
+        sum_exp += *prob;
+    }
+    for prob in probs.iter_mut() {
+        *prob /= sum_exp;
+    }
+    let mut r = rand::random::<f64>();
+    let mut idx = ACTION_SPACE - 1;
+    for (i, &p) in probs.iter().enumerate() {
+        if r < p {
+            idx = i;
+            break;
+        }
+        r -= p;
+    }
+    (idx, probs[idx].ln())
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ActorCritic {
     pub backbone: LuckTransformer,
@@ -334,39 +364,9 @@ impl ActorCritic {
     // Returns (action_idx, log_prob, value)
     pub fn step(&self, state: &Tensor, pity: &[usize]) -> (usize, f64, f64) {
         let (logits, value) = self.forward_actor_critic(state, pity);
-
-        // Softmax
         let logits_data = logits.data.read().unwrap();
-        let mut max_l = -1e9;
-        for &v in logits_data.iter() {
-            if v > max_l {
-                max_l = v;
-            }
-        }
-        let mut sum_exp = 0.0;
-        let mut probs = [0.0; ACTION_SPACE];
-        for (i, prob) in probs.iter_mut().enumerate() {
-            *prob = (logits_data[i] - max_l).exp();
-            sum_exp += *prob;
-        }
-        for prob in probs.iter_mut() {
-            *prob /= sum_exp;
-        }
-
-        // Sample
-        let mut r = rand::random::<f64>();
-        let mut action_idx = ACTION_SPACE - 1;
-        for (i, prob) in probs.iter().enumerate() {
-            if r < *prob {
-                action_idx = i;
-                break;
-            }
-            r -= *prob;
-        }
-
-        let log_prob = probs[action_idx].ln();
+        let (action_idx, log_prob) = softmax_sample(&logits_data);
         let val = value.data.read().unwrap()[0];
-
         (action_idx, log_prob, val)
     }
 
@@ -375,35 +375,7 @@ impl ActorCritic {
         let seq = self.backbone.forward_inference(state);
         let last = self.backbone.last_token_inference(&seq);
         let logits = self.actor_head.forward_inference(&last);
-
-        // Softmax
-        let mut max_l = -1e9;
-        for &v in logits.iter() {
-            if v > max_l {
-                max_l = v;
-            }
-        }
-        let mut sum_exp = 0.0;
-        let mut probs = [0.0; ACTION_SPACE];
-        for (i, prob) in probs.iter_mut().enumerate() {
-            *prob = (logits[i] - max_l).exp();
-            sum_exp += *prob;
-        }
-        for prob in probs.iter_mut() {
-            *prob /= sum_exp;
-        }
-
-        // Sample
-        let mut r = rand::random::<f64>();
-        let mut action_idx = ACTION_SPACE - 1;
-        for (i, prob) in probs.iter().enumerate() {
-            if r < *prob {
-                action_idx = i;
-                break;
-            }
-            r -= *prob;
-        }
-        action_idx
+        softmax_sample(&logits).0
     }
 
     pub fn step_inference_cached_with_value(
@@ -417,35 +389,8 @@ impl ActorCritic {
             .forward_inference_step(state, kv_cache, start_pos);
         let logits = self.actor_head.forward_inference(&last);
         let value = self.critic_head.forward_inference(&last);
-
-        let mut max_l = -1e9;
-        for &v in logits.iter() {
-            if v > max_l {
-                max_l = v;
-            }
-        }
-        let mut sum_exp = 0.0;
-        let mut probs = [0.0; ACTION_SPACE];
-        for (i, prob) in probs.iter_mut().enumerate() {
-            *prob = (logits[i] - max_l).exp();
-            sum_exp += *prob;
-        }
-        for prob in probs.iter_mut() {
-            *prob /= sum_exp;
-        }
-
-        let mut r = rand::random::<f64>();
-        let mut action_idx = ACTION_SPACE - 1;
-        for (i, prob) in probs.iter().enumerate() {
-            if r < *prob {
-                action_idx = i;
-                break;
-            }
-            r -= *prob;
-        }
-        let log_prob = probs[action_idx].ln();
-        let val = value[0];
-        (action_idx, log_prob, val)
+        let (action_idx, log_prob) = softmax_sample(&logits);
+        (action_idx, log_prob, value[0])
     }
 
     pub fn step_inference_cached(
@@ -458,35 +403,7 @@ impl ActorCritic {
             .backbone
             .forward_inference_step(state, kv_cache, start_pos);
         let logits = self.actor_head.forward_inference(&last);
-
-        // Softmax
-        let mut max_l = -1e9;
-        for &v in logits.iter() {
-            if v > max_l {
-                max_l = v;
-            }
-        }
-        let mut sum_exp = 0.0;
-        let mut probs = [0.0; ACTION_SPACE];
-        for (i, prob) in probs.iter_mut().enumerate() {
-            *prob = (logits[i] - max_l).exp();
-            sum_exp += *prob;
-        }
-        for prob in probs.iter_mut() {
-            *prob /= sum_exp;
-        }
-
-        // Sample
-        let mut r = rand::random::<f64>();
-        let mut action_idx = ACTION_SPACE - 1;
-        for (i, prob) in probs.iter().enumerate() {
-            if r < *prob {
-                action_idx = i;
-                break;
-            }
-            r -= *prob;
-        }
-        action_idx
+        softmax_sample(&logits).0
     }
 
     pub fn prune_cache(&self, kv_cache: &mut KVCache, max_len: usize) {
@@ -583,15 +500,34 @@ impl Adam {
 
     fn step(&mut self) {
         self.t += 1;
+
+        // Global gradient clipping (max_norm = 1.0)
+        let mut total_norm = 0.0;
+        for param in &self.params {
+            let grad = param.grad.read().unwrap();
+            for &g in grad.iter() {
+                total_norm += g * g;
+            }
+        }
+        total_norm = total_norm.sqrt();
+        let clip_coef = if total_norm > 1.0 {
+            1.0 / total_norm
+        } else {
+            1.0
+        };
+
+        let bias_correction1 = 1.0 - self.beta1.powi(self.t as i32);
+        let bias_correction2 = 1.0 - self.beta2.powi(self.t as i32);
+
         for (i, param) in self.params.iter_mut().enumerate() {
             let grad = param.grad.read().unwrap();
             let mut data = param.data.write().unwrap();
             for j in 0..data.len() {
-                let g = grad[j];
+                let g = grad[j] * clip_coef;
                 self.m[i][j] = self.beta1 * self.m[i][j] + (1.0 - self.beta1) * g;
                 self.v[i][j] = self.beta2 * self.v[i][j] + (1.0 - self.beta2) * g * g;
-                let m_hat = self.m[i][j] / (1.0 - self.beta1.powi(self.t as i32));
-                let v_hat = self.v[i][j] / (1.0 - self.beta2.powi(self.t as i32));
+                let m_hat = self.m[i][j] / bias_correction1;
+                let v_hat = self.v[i][j] / bias_correction2;
                 data[j] -= self.lr * m_hat / (v_hat.sqrt() + self.eps);
             }
         }
@@ -756,7 +692,7 @@ impl Ppo {
         let update_every = Duration::from_millis(500);
         let mut update_batches_done = 0usize;
         for epoch_idx in 0..self.k_epochs {
-            indices.shuffle(&mut rand::thread_rng());
+            indices.shuffle(&mut rand::rng());
             let mut approx_kl = 0.0;
             let mut batch_count = 0.0;
             let mut early_stop = false;

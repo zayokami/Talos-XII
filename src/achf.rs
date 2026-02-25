@@ -1,4 +1,4 @@
-use crate::autograd::Tensor;
+use crate::autograd::{Tensor, TensorReadGuard};
 use crate::config::AchfConfig;
 use crate::nn::{Linear, Module};
 use crate::simd::add_scaled_row;
@@ -640,8 +640,10 @@ impl AchfLayer {
         let in_dim = down.in_features;
         let rank = down.out_features;
         let out_dim = up.out_features;
-        let down_data = down.weight.data.read().unwrap();
-        let up_data = up.weight.data.read().unwrap();
+        // Use batch lock for better performance
+        let guards = TensorReadGuard::new(&[&down.weight, &up.weight]);
+        let down_data = guards.get(0);
+        let up_data = guards.get(1);
         let mut dense = vec![0.0; in_dim * out_dim];
         for i in 0..in_dim {
             let down_row = &down_data[i * rank..(i + 1) * rank];

@@ -1,4 +1,5 @@
-use rand_core::{Error, RngCore};
+use rand::TryRng;
+use std::convert::Infallible;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // --- Pseudo-Random Number Generator (Hand-rolled) ---
@@ -50,9 +51,15 @@ impl Rng {
         Self::from_seed(seed)
     }
 
-    // Generate next u64 using xoshiro256**
+    // Public method to generate next u64
     #[inline]
     pub fn next_u64(&mut self) -> u64 {
+        self.gen_u64()
+    }
+
+    // Generate next u64 using xoshiro256** (internal)
+    #[inline]
+    fn gen_u64(&mut self) -> u64 {
         let result = self.state[1].wrapping_mul(5).rotate_left(7).wrapping_mul(9);
 
         let t = self.state[1] << 17;
@@ -73,7 +80,7 @@ impl Rng {
     // Standard conversion: (u64 >> 11) * 2^-53
     #[inline]
     pub fn next_f64(&mut self) -> f64 {
-        let v = self.next_u64() >> 11;
+        let v = self.gen_u64() >> 11;
         (v as f64) * (1.0 / 9007199254740992.0)
     }
 
@@ -109,7 +116,7 @@ impl Rng {
     pub fn next_u64_bounded(&mut self, range: u64) -> u64 {
         let threshold = (0u64.wrapping_sub(range)) % range;
         loop {
-            let x = self.next_u64();
+            let x = self.gen_u64();
             if x >= threshold {
                 return x % range;
             }
@@ -117,28 +124,26 @@ impl Rng {
     }
 }
 
-impl RngCore for Rng {
-    fn next_u32(&mut self) -> u32 {
-        self.next_u64() as u32
+impl TryRng for Rng {
+    type Error = Infallible;
+
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        Ok(self.gen_u64() as u32)
     }
 
-    fn next_u64(&mut self) -> u64 {
-        self.next_u64()
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        Ok(self.gen_u64())
     }
 
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
         let mut i = 0;
         while i < dest.len() {
-            let v = self.next_u64();
+            let v = self.gen_u64();
             let bytes = v.to_le_bytes();
             let n = std::cmp::min(dest.len() - i, 8);
             dest[i..i + n].copy_from_slice(&bytes[..n]);
             i += n;
         }
-    }
-
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Error> {
-        self.fill_bytes(dest);
         Ok(())
     }
 }

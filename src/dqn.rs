@@ -1,5 +1,5 @@
 use crate::achf::AchfLayer;
-use crate::autograd::Tensor;
+use crate::autograd::{Tensor, TensorReadGuard};
 use crate::config::{AchfConfig, Config};
 use crate::dbn::Dbn;
 use crate::neural::{NeuralLuckOptimizer, DIM};
@@ -256,7 +256,7 @@ impl Adam {
 
     fn step(&mut self) {
         self.t += 1;
-        // Global gradient clipping
+        // Global gradient clipping (max_norm = 1.0)
         let mut total_norm = 0.0;
         for param in &self.params {
             let grad = param.grad.read().unwrap();
@@ -271,18 +271,19 @@ impl Adam {
             1.0
         };
 
+        let bias_correction1 = 1.0 - self.beta1.powi(self.t as i32);
+        let bias_correction2 = 1.0 - self.beta2.powi(self.t as i32);
+
         for (i, param) in self.params.iter_mut().enumerate() {
             let grad = param.grad.read().unwrap();
             let mut data = param.data.write().unwrap();
 
             for j in 0..data.len() {
-                let g = grad[j] * clip_coef; // Apply clipping
+                let g = grad[j] * clip_coef;
                 self.m[i][j] = self.beta1 * self.m[i][j] + (1.0 - self.beta1) * g;
                 self.v[i][j] = self.beta2 * self.v[i][j] + (1.0 - self.beta2) * g * g;
-
-                let m_hat = self.m[i][j] / (1.0 - self.beta1.powi(self.t as i32));
-                let v_hat = self.v[i][j] / (1.0 - self.beta2.powi(self.t as i32));
-
+                let m_hat = self.m[i][j] / bias_correction1;
+                let v_hat = self.v[i][j] / bias_correction2;
                 data[j] -= self.lr * m_hat / (v_hat.sqrt() + self.eps);
             }
         }
@@ -572,11 +573,14 @@ pub fn train_dqn(
             // 3. Compute Targets (Double DQN)
             // Select action using Policy Net
             let q_next_eval = policy_net.forward(&batch_next_state); // (B, 5)
-            let q_next_eval_data = q_next_eval.data.read().unwrap();
 
             // Evaluate value using Target Net
             let q_next_target = target_net.forward(&batch_next_state); // (B, 5)
-            let q_next_target_data = q_next_target.data.read().unwrap();
+
+            // Use batch lock for better performance
+            let guards = TensorReadGuard::new(&[&q_next_eval, &q_next_target]);
+            let q_next_eval_data = guards.get(0);
+            let q_next_target_data = guards.get(1);
 
             let mut target_vals = Vec::with_capacity(BATCH_SIZE);
 
@@ -778,9 +782,12 @@ impl OnlineDqnTrainer {
         let q_actions = (q_values * batch_mask).matmul(&ones_5_1);
 
         let q_next_eval = self.policy.forward(&batch_next_state);
-        let q_next_eval_data = q_next_eval.data.read().unwrap();
         let q_next_target = self.target.forward(&batch_next_state);
-        let q_next_target_data = q_next_target.data.read().unwrap();
+
+        // Use batch lock for better performance
+        let guards = TensorReadGuard::new(&[&q_next_eval, &q_next_target]);
+        let q_next_eval_data = guards.get(0);
+        let q_next_target_data = guards.get(1);
 
         let mut target_vals = Vec::with_capacity(BATCH_SIZE);
         for i in 0..BATCH_SIZE {
