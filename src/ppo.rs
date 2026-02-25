@@ -39,11 +39,14 @@ fn sum_f64(values: &[f64]) -> f64 {
             return sum_f64_neon(values);
         }
     }
-    let mut sum = 0.0;
-    for &v in values {
-        sum += v;
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut sum = 0.0;
+        for &v in values {
+            sum += v;
+        }
+        sum
     }
-    sum
 }
 
 #[inline(always)]
@@ -56,12 +59,21 @@ fn sum_sq_diff(values: &[f64], mean: f64) -> f64 {
             }
         }
     }
-    let mut sum = 0.0;
-    for &v in values {
-        let d = v - mean;
-        sum += d * d;
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            return sum_sq_diff_neon(values, mean);
+        }
     }
-    sum
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut sum = 0.0;
+        for &v in values {
+            let d = v - mean;
+            sum += d * d;
+        }
+        sum
+    }
 }
 
 #[inline(always)]
@@ -84,10 +96,13 @@ fn normalize_slice(values: &[f64], mean: f64, std: f64) -> Vec<f64> {
         }
         return out;
     }
-    for i in 0..len {
-        out[i] = (values[i] - mean) / std;
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for i in 0..len {
+            out[i] = (values[i] - mean) / std;
+        }
+        out
     }
-    out
 }
 
 #[cfg(target_arch = "x86_64")]

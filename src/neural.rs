@@ -23,7 +23,6 @@ fn tensor_relu(t: &Tensor) -> Tensor {
 
 #[inline(always)]
 fn add_scaled_row(output: &mut Tensor, row: &[f64], scale: f64) {
-    let len = output.len();
     #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") {
@@ -40,8 +39,12 @@ fn add_scaled_row(output: &mut Tensor, row: &[f64], scale: f64) {
         }
         return;
     }
-    for i in 0..len {
-        output[i] += scale * row[i];
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let len = output.len();
+        for i in 0..len {
+            output[i] += scale * row[i];
+        }
     }
 }
 

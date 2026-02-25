@@ -77,12 +77,14 @@ pub fn add_scaled_row(output: &mut [f64], row: &[f64], scale: f64) {
         unsafe {
             add_scaled_row_neon(output, row, scale);
         }
-        return;
     }
-
-    add_scaled_row_scalar(output, row, scale);
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        add_scaled_row_scalar(output, row, scale);
+    }
 }
 
+#[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
 fn add_scaled_row_scalar(output: &mut [f64], row: &[f64], scale: f64) {
     for i in 0..output.len() {
@@ -120,10 +122,13 @@ pub fn dot_product(a: &[f64], b: &[f64]) -> f64 {
             return dot_product_neon(a, b);
         }
     }
-
-    dot_product_scalar(a, b)
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        dot_product_scalar(a, b)
+    }
 }
 
+#[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
 fn dot_product_scalar(a: &[f64], b: &[f64]) -> f64 {
     let mut sum = 0.0;
@@ -165,11 +170,12 @@ pub fn vector_fma(dst: &mut [f64], a: &[f64], b: &[f64]) {
         unsafe {
             vector_fma_neon(dst, a, b);
         }
-        return;
     }
-
-    for i in 0..len {
-        dst[i] += a[i] * b[i];
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for i in 0..len {
+            dst[i] += a[i] * b[i];
+        }
     }
 }
 
