@@ -13,10 +13,28 @@ use std::sync::{Arc, RwLock};
 
 #[derive(Clone)]
 pub struct Tensor {
-    pub data: Arc<RwLock<Vec<f64>>>, // Kept as Vec<f64> for now to minimize refactoring pain, but we can load from mmap
+    pub data: Arc<RwLock<Vec<f64>>>, // Read-write access (backward pass needs write)
     pub grad: Arc<RwLock<Vec<f64>>>,
     pub shape: Vec<usize>,
     pub _ctx: Option<Arc<Context>>, // Keeps the graph alive
+}
+
+/// Batch lock acquisition helper for reducing lock overhead in parallel operations
+pub struct TensorReadGuard<'a> {
+    guards: Vec<std::sync::RwLockReadGuard<'a, Vec<f64>>>,
+}
+
+impl<'a> TensorReadGuard<'a> {
+    /// Acquire read locks for multiple tensors at once
+    pub fn new(tensors: &[&'a Tensor]) -> Self {
+        let guards: Vec<_> = tensors.iter().map(|t| t.data.read().unwrap()).collect();
+        TensorReadGuard { guards }
+    }
+
+    /// Get data by index
+    pub fn get(&self, idx: usize) -> &Vec<f64> {
+        &self.guards[idx]
+    }
 }
 
 impl Serialize for Tensor {
@@ -71,9 +89,7 @@ impl Tensor {
 
         // Zero-copy cast (unsafe but fast)
         let slice = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f64, len) };
-        let data = slice.to_vec(); // We still copy to Vec because RwLock needs ownership.
-                                   // True zero-copy requires changing Tensor.data to Cow<'a, [f64]> or similar which is a huge refactor.
-                                   // But mmap loading is still much faster than JSON parsing!
+        let data = slice.to_vec(); // Copy to Vec (mmap loading is still faster than JSON parsing!)
 
         Ok(Tensor {
             data: Arc::new(RwLock::new(data)),
@@ -212,9 +228,11 @@ impl Tensor {
 
         let mut out_data = vec![0.0; m * n];
 
+        // Use batch lock acquisition to reduce lock overhead
         {
-            let lhs_data = self.data.read().unwrap();
-            let rhs_data = other.data.read().unwrap();
+            let guards = TensorReadGuard::new(&[self, other]);
+            let lhs_data = guards.get(0);
+            let rhs_data = guards.get(1);
 
             // Heuristic for parallelization overhead
             // A simple matmul has M*N*K ops.
@@ -1642,8 +1660,9 @@ impl Add for Tensor {
     type Output = Tensor;
     fn add(self, rhs: Tensor) -> Tensor {
         assert_eq!(self.shape, rhs.shape, "Add shape mismatch");
-        let self_data = self.data.read().unwrap();
-        let rhs_data = rhs.data.read().unwrap();
+        let guards = TensorReadGuard::new(&[&self, &rhs]);
+        let self_data = guards.get(0);
+        let rhs_data = guards.get(1);
         let data: Vec<f64> = self_data
             .par_iter()
             .zip(rhs_data.par_iter())
@@ -1690,8 +1709,9 @@ impl Sub for Tensor {
     type Output = Tensor;
     fn sub(self, rhs: Tensor) -> Tensor {
         assert_eq!(self.shape, rhs.shape, "Sub shape mismatch");
-        let self_data = self.data.read().unwrap();
-        let rhs_data = rhs.data.read().unwrap();
+        let guards = TensorReadGuard::new(&[&self, &rhs]);
+        let self_data = guards.get(0);
+        let rhs_data = guards.get(1);
         let data: Vec<f64> = self_data
             .par_iter()
             .zip(rhs_data.par_iter())
@@ -1740,8 +1760,9 @@ impl Mul for Tensor {
         // Broadcast support? For now assuming same shape or scalar broadcast
         // Simplifying to same shape for now to avoid complexity
         assert_eq!(self.shape, rhs.shape, "Mul shape mismatch");
-        let self_data = self.data.read().unwrap();
-        let rhs_data = rhs.data.read().unwrap();
+        let guards = TensorReadGuard::new(&[&self, &rhs]);
+        let self_data = guards.get(0);
+        let rhs_data = guards.get(1);
         let data: Vec<f64> = self_data
             .par_iter()
             .zip(rhs_data.par_iter())
@@ -1803,8 +1824,9 @@ impl Div for Tensor {
     type Output = Tensor;
     fn div(self, rhs: Tensor) -> Tensor {
         assert_eq!(self.shape, rhs.shape, "Div shape mismatch");
-        let self_data = self.data.read().unwrap();
-        let rhs_data = rhs.data.read().unwrap();
+        let guards = TensorReadGuard::new(&[&self, &rhs]);
+        let self_data = guards.get(0);
+        let rhs_data = guards.get(1);
         let data: Vec<f64> = self_data
             .par_iter()
             .zip(rhs_data.par_iter())

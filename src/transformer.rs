@@ -1,5 +1,5 @@
 use crate::achf::{aggregate_cache_stats_iter, AchfCacheStats, AchfLayer};
-use crate::autograd::{Context, Tensor};
+use crate::autograd::{Context, Tensor, TensorReadGuard};
 use crate::config::AchfConfig;
 use crate::nn::{Linear, Module, RMSNorm};
 use rayon::prelude::*;
@@ -1033,8 +1033,10 @@ impl MultiHeadLatentAttention {
         // out: [B, Seq, Seq]
         // out[b, i, j] = sum_d (q[b, i, d] * k[b, j, d])
 
-        let q_data = q.data.read().unwrap();
-        let k_data = k.data.read().unwrap();
+        // Use batch lock for better performance
+        let guards = TensorReadGuard::new(&[&q, &k]);
+        let q_data = guards.get(0);
+        let k_data = guards.get(1);
 
         let out_data: Vec<f64> = (0..b)
             .into_par_iter()
@@ -1067,8 +1069,10 @@ impl MultiHeadLatentAttention {
                 backward_op: Box::new(move |grad_out, parents| {
                     let q_in = &parents[0];
                     let k_in = &parents[1];
-                    let q_data = q_in.data.read().unwrap();
-                    let k_data = k_in.data.read().unwrap();
+                    // Use batch lock for data read
+                    let guards = TensorReadGuard::new(&[q_in, k_in]);
+                    let q_data = guards.get(0);
+                    let k_data = guards.get(1);
 
                     let mut q_grad = q_in.grad.write().unwrap();
                     let mut k_grad = k_in.grad.write().unwrap();
@@ -1116,8 +1120,10 @@ impl MultiHeadLatentAttention {
         // probs: [B, Seq, Seq], v: [B, Seq, DimV]
         // out[b, i, d] = sum_j (probs[b, i, j] * v[b, j, d])
 
-        let p_data = probs.data.read().unwrap();
-        let v_data = v.data.read().unwrap();
+        // Use batch lock for better performance
+        let guards = TensorReadGuard::new(&[probs, v]);
+        let p_data = guards.get(0);
+        let v_data = guards.get(1);
 
         let out_data: Vec<f64> = (0..b)
             .into_par_iter()
@@ -1157,8 +1163,10 @@ impl MultiHeadLatentAttention {
                 backward_op: Box::new(move |grad_out, parents| {
                     let p_in = &parents[0];
                     let v_in = &parents[1];
-                    let p_data = p_in.data.read().unwrap();
-                    let v_data = v_in.data.read().unwrap();
+                    // Use batch lock for data read
+                    let guards = TensorReadGuard::new(&[p_in, v_in]);
+                    let p_data = guards.get(0);
+                    let v_data = guards.get(1);
 
                     let mut p_grad = p_in.grad.write().unwrap();
                     let mut v_grad = v_in.grad.write().unwrap();
@@ -1275,8 +1283,10 @@ impl MultiHeadLatentAttention {
         let last_dim_b = shape_b[shape_b.len() - 1];
         let batch_dims = &shape_a[..shape_a.len() - 1];
 
-        let a_data = a.data.read().unwrap();
-        let b_data = b.data.read().unwrap();
+        // Use batch lock for better performance
+        let guards = TensorReadGuard::new(&[a, b]);
+        let a_data = guards.get(0);
+        let b_data = guards.get(1);
 
         let total_elements = batch_dims.iter().product::<usize>();
         let mut new_data = vec![0.0; total_elements * (last_dim_a + last_dim_b)];
