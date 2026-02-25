@@ -1,5 +1,6 @@
 mod achf;
 mod autograd;
+mod binary_codec;
 mod config;
 mod dbn;
 mod dqn;
@@ -123,11 +124,10 @@ fn save_neural_cache(path: &str, net: &NeuralLuckOptimizer) -> bool {
 }
 
 fn save_ppo_model(model: &ActorCritic, path: &str) {
-    // Try saving as binary (bincode) first for speed
     let bin_path = format!("{}.bin", path);
     if let Ok(file) = std::fs::File::create(&bin_path) {
         let writer = std::io::BufWriter::new(file);
-        if bincode::serialize_into(writer, model).is_ok() {
+        if binary_codec::serialize_into(writer, model).is_ok() {
             info!("[PPO] Model saved to {} (Binary)", bin_path);
         }
     }
@@ -146,11 +146,10 @@ fn save_ppo_model(model: &ActorCritic, path: &str) {
 }
 
 fn load_ppo_model(path: &str) -> Option<ActorCritic> {
-    // Try binary first
     let bin_path = format!("{}.bin", path);
     if let Ok(file) = std::fs::File::open(&bin_path) {
         let reader = std::io::BufReader::new(file);
-        if let Ok(model) = bincode::deserialize_from(reader) {
+        if let Ok(model) = binary_codec::deserialize_from(reader) {
             info!("[PPO] Loaded model from {} (Binary)", bin_path);
             return Some(model);
         }
