@@ -91,7 +91,7 @@
   },
   "pool_name": "热烈色彩",
   "up_six": ["伊冯"],
-  "up_rate": 0.5,
+  "up_rate": 0.75,
   "prob_6_base": 0.008,
   "prob_5_base": 0.08,
   "prob_4_base": 0.912,
@@ -118,6 +118,7 @@
     {
       "id": "char_up_20260207",
       "name": "轻飘飘的信使",
+      "is_archived": true,
       "pool_type": "character_up",
       "up_six": ["洁尔佩塔"],
       "up_rate": 0.75,

@@ -934,9 +934,14 @@ fn run_interactive(args: RunInteractiveArgs) {
     if !config.pools.is_empty() {
         println!("{}", I18n::get(lang, "init_pool_list"));
         for (idx, pool) in config.pools.iter().enumerate() {
+            let archived_tag = if pool.is_archived {
+                I18n::get(lang, "pool_archived_tag")
+            } else {
+                String::new()
+            };
             let line = I18n::get(lang, "init_pool_item")
                 .replacen("{}", &(idx + 1).to_string(), 1)
-                .replacen("{}", &pool.name, 1)
+                .replacen("{}", &format!("{}{}", pool.name, archived_tag), 1)
                 .replacen("{}", &pool_type_label(&pool.pool_type, lang), 1);
             println!("{}", line);
         }
@@ -1171,10 +1176,16 @@ fn run_interactive(args: RunInteractiveArgs) {
                         .pools
                         .iter()
                         .map(|p| {
+                            let tag = if p.is_archived {
+                                I18n::get(lang, "pool_archived_tag")
+                            } else {
+                                String::new()
+                            };
                             format!(
-                                "{}={}/{}",
+                                "{}={}{}/{}",
                                 p.id,
                                 p.name,
+                                tag,
                                 pool_type_label(&p.pool_type, lang)
                             )
                         })

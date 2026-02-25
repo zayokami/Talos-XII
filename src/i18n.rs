@@ -270,6 +270,8 @@ impl I18n {
             (Language::Cn, "init_pool_list") => "可用卡池:".to_string(),
             (Language::En, "init_pool_item") => "{}. {} ({})".to_string(),
             (Language::Cn, "init_pool_item") => "{}. {} ({})".to_string(),
+            (Language::En, "pool_archived_tag") => " [Archived]".to_string(),
+            (Language::Cn, "pool_archived_tag") => " [往期]".to_string(),
             (Language::En, "prompt_pool_select") => format!(
                 "{}",
                 "Select pool number(s) (e.g. 1 2 or 1,2, all; default {}): ".yellow()

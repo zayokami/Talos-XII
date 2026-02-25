@@ -506,6 +506,7 @@ pub struct PoolConfig {
     pub six_stars: Vec<String>,
     pub five_stars: Vec<String>,
     pub four_stars: Vec<String>,
+    pub is_archived: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1011,6 +1012,10 @@ fn parse_pool_config(pool_map: &HashMap<String, JsonValue>) -> PoolConfig {
             .get("four_stars")
             .map(|v| v.to_string_vec())
             .unwrap_or_default(),
+        is_archived: pool_map
+            .get("is_archived")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
     };
     if pool.up_rate <= 0.0 || pool.up_six.is_empty() {
         pool.up_rate = 0.0;
