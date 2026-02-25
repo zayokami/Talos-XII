@@ -457,6 +457,10 @@ pub fn roll_one(
     } else {
         true
     };
+    // Intentionally duplicated blocks: up_pity_soft and big_pity_cumulative are
+    // semantically distinct pity thresholds that happen to share the same outcome.
+    // Merging them would obscure game-mechanical intent.
+    #[allow(clippy::if_same_then_else)]
     if config.up_pity_soft > 0 && state.total_pulls_in_pool == config.up_pity_soft && big_pity_gate
     {
         rarity = 6;

@@ -1,4 +1,7 @@
-use crate::simd::{add_scaled_row, dot_product, vector_fma};
+use crate::simd::{
+    add_scaled_row, dot_product, horizontal_sum, prefetch_read_l1, vector_add, vector_fma,
+    vector_grad_acc, vector_mul, vector_relu, vector_sub,
+};
 use memmap2::Mmap;
 use rayon::prelude::*;
 use serde::ser::SerializeStruct;
@@ -239,32 +242,32 @@ impl Tensor {
             let ops = m * n * k;
 
             if ops < 32768 {
-                // Serial path for small matrices (e.g. 64x64x5)
                 for r in 0..m {
-                    let out_row_start = r * n;
+                    let out_row = &mut out_data[r * n..(r + 1) * n];
                     for i in 0..k {
                         let scale = lhs_data[r * k + i];
-                        let rhs_row_start = i * n;
-                        for c in 0..n {
-                            out_data[out_row_start + c] += scale * rhs_data[rhs_row_start + c];
+                        if scale == 0.0 { continue; }
+                        // Prefetch next RHS row into L1 while processing current
+                        if i + 2 < k {
+                            prefetch_read_l1(rhs_data[(i + 2) * n..].as_ptr());
                         }
+                        let rhs_row = &rhs_data[i * n..(i + 1) * n];
+                        add_scaled_row(out_row, rhs_row, scale);
                     }
                 }
             } else {
-                // Parallel path
                 out_data
                     .par_chunks_mut(n)
                     .enumerate()
                     .for_each(|(r, out_row)| {
-                        // Optimized Row-Accumulation (Cache Friendly)
-                        // C[r, :] += A[r, i] * B[i, :]
                         for i in 0..k {
                             let scale = lhs_data[r * k + i];
-                            let rhs_row_start = i * n;
-                            // Inner loop: sequential access on B and C -> SIMD friendly
-                            for c in 0..n {
-                                out_row[c] += scale * rhs_data[rhs_row_start + c];
+                            if scale == 0.0 { continue; }
+                            if i + 2 < k {
+                                prefetch_read_l1(rhs_data[(i + 2) * n..].as_ptr());
                             }
+                            let rhs_row = &rhs_data[i * n..(i + 1) * n];
+                            add_scaled_row(out_row, rhs_row, scale);
                         }
                     });
             }
@@ -376,17 +379,17 @@ impl Tensor {
     pub fn relu(&self) -> Tensor {
         let self_data = self.data.read().unwrap();
         let len = self_data.len();
-        let data: Vec<f64> = if len >= PAR_THRESHOLD {
-            self_data
-                .par_iter()
-                .map(|&x| if x > 0.0 { x } else { 0.0 })
-                .collect()
+        let mut data = vec![0.0; len];
+        if len >= PAR_THRESHOLD {
+            data.par_chunks_mut(PAR_THRESHOLD)
+                .enumerate()
+                .for_each(|(chunk_idx, chunk)| {
+                    let start = chunk_idx * PAR_THRESHOLD;
+                    vector_relu(chunk, &self_data[start..start + chunk.len()]);
+                });
         } else {
-            self_data
-                .iter()
-                .map(|&x| if x > 0.0 { x } else { 0.0 })
-                .collect()
-        };
+            vector_relu(&mut data, &self_data);
+        }
         let parents = vec![self.clone()];
 
         Tensor {
@@ -470,11 +473,12 @@ impl Tensor {
     pub fn exp(&self) -> Tensor {
         let self_data = self.data.read().unwrap();
         let len = self_data.len();
-        let data: Vec<f64> = if len >= PAR_THRESHOLD {
-            self_data.par_iter().map(|&x| x.exp()).collect()
+        let mut data = vec![0.0; len];
+        if len >= PAR_THRESHOLD {
+            data = self_data.par_iter().map(|&x| x.exp()).collect();
         } else {
-            self_data.iter().map(|&x| x.exp()).collect()
-        };
+            crate::simd::fast_exp_bulk(&mut data, &self_data);
+        }
         let parents = vec![self.clone()];
         // Cache forward result for backward (d/dx e^x = e^x)
         let exp_cache = Arc::new(data.clone());
@@ -512,7 +516,7 @@ impl Tensor {
         let sum_val: f64 = if len >= PAR_THRESHOLD {
             self_data.par_iter().sum()
         } else {
-            self_data.iter().sum()
+            horizontal_sum(&self_data)
         };
         let parents = vec![self.clone()];
 
@@ -1810,15 +1814,14 @@ impl Add for Tensor {
         let self_data = guards.get(0);
         let rhs_data = guards.get(1);
         let len = self_data.len();
-        let data: Vec<f64> = if len >= PAR_THRESHOLD {
-            self_data
-                .par_iter()
-                .zip(rhs_data.par_iter())
-                .map(|(a, b)| a + b)
-                .collect()
+        let mut data = vec![0.0; len];
+        if len >= PAR_THRESHOLD {
+            data.par_iter_mut()
+                .enumerate()
+                .for_each(|(i, d)| *d = self_data[i] + rhs_data[i]);
         } else {
-            self_data.iter().zip(rhs_data.iter()).map(|(a, b)| a + b).collect()
-        };
+            vector_add(&mut data, self_data, rhs_data);
+        }
         let parents = vec![self.clone(), rhs.clone()];
         Tensor {
             data: Arc::new(RwLock::new(data)),
@@ -1836,9 +1839,7 @@ impl Add for Tensor {
                                 .zip(grad_out.par_iter())
                                 .for_each(|(lg, &g)| *lg += g);
                         } else {
-                            for i in 0..len {
-                                lhs_grad[i] += grad_out[i];
-                            }
+                            vector_grad_acc(&mut lhs_grad, grad_out);
                         }
                     }
                     {
@@ -1849,9 +1850,7 @@ impl Add for Tensor {
                                 .zip(grad_out.par_iter())
                                 .for_each(|(rg, &g)| *rg += g);
                         } else {
-                            for i in 0..len {
-                                rhs_grad[i] += grad_out[i];
-                            }
+                            vector_grad_acc(&mut rhs_grad, grad_out);
                         }
                     }
                 }),
@@ -1875,15 +1874,14 @@ impl Sub for Tensor {
         let self_data = guards.get(0);
         let rhs_data = guards.get(1);
         let len = self_data.len();
-        let data: Vec<f64> = if len >= PAR_THRESHOLD {
-            self_data
-                .par_iter()
-                .zip(rhs_data.par_iter())
-                .map(|(a, b)| a - b)
-                .collect()
+        let mut data = vec![0.0; len];
+        if len >= PAR_THRESHOLD {
+            data.par_iter_mut()
+                .enumerate()
+                .for_each(|(i, d)| *d = self_data[i] - rhs_data[i]);
         } else {
-            self_data.iter().zip(rhs_data.iter()).map(|(a, b)| a - b).collect()
-        };
+            vector_sub(&mut data, self_data, rhs_data);
+        }
         let parents = vec![self.clone(), rhs.clone()];
         Tensor {
             data: Arc::new(RwLock::new(data)),
@@ -1901,9 +1899,7 @@ impl Sub for Tensor {
                                 .zip(grad_out.par_iter())
                                 .for_each(|(lg, &g)| *lg += g);
                         } else {
-                            for i in 0..len {
-                                lhs_grad[i] += grad_out[i];
-                            }
+                            vector_grad_acc(&mut lhs_grad, grad_out);
                         }
                     }
                     {
@@ -1940,15 +1936,14 @@ impl Mul for Tensor {
         let self_data = guards.get(0);
         let rhs_data = guards.get(1);
         let len = self_data.len();
-        let data: Vec<f64> = if len >= PAR_THRESHOLD {
-            self_data
-                .par_iter()
-                .zip(rhs_data.par_iter())
-                .map(|(a, b)| a * b)
-                .collect()
+        let mut data = vec![0.0; len];
+        if len >= PAR_THRESHOLD {
+            data.par_iter_mut()
+                .enumerate()
+                .for_each(|(i, d)| *d = self_data[i] * rhs_data[i]);
         } else {
-            self_data.iter().zip(rhs_data.iter()).map(|(a, b)| a * b).collect()
-        };
+            vector_mul(&mut data, self_data, rhs_data);
+        }
         let parents = vec![self.clone(), rhs.clone()];
         Tensor {
             data: Arc::new(RwLock::new(data)),
