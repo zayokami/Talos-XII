@@ -304,14 +304,50 @@ impl I18n {
             }
             (Language::Cn, "single_sim_result") => "\n单次 {} 抽结果 (耗时: {:.2?}):".to_string(),
 
-            (Language::En, "cmd_help") => {
-                "\nCommands:\n  h/help        Show commands\n  p <n>         Set default pulls\n  s <n>         Set default sims\n  w             Toggle welfare default\n  ppo           Toggle PPO\n  pool list     List pools\n  pool <id>     Switch pool\n  pool multi a,b|a b Use multiple pools\n  pool all      Use all pools\n  q             Quit\n(Enter a number to run a one-off pull count)\n"
-                    .to_string()
-            }
-            (Language::Cn, "cmd_help") => {
-                "\n指令:\n  h/help        查看指令\n  p <n>         设置默认抽数\n  s <n>         设置默认模拟次数\n  w             切换福利默认值\n  ppo           切换 PPO\n  pool list     查看卡池列表\n  pool <id>     切换卡池\n  pool multi a,b|a b 多卡池并行\n  pool all      全部卡池并行\n  q             退出\n(直接输入数字表示本次抽数)\n"
-                    .to_string()
-            }
+            (Language::En, "cmd_help") => format!(
+                "\n{}\n  {}\n    {}          {}\n    {}        {}\n    {}        {}\n    {}              {}\n    {}            {}\n  {}\n    {}    {}\n    {}      {}\n    {}      {}\n  {}\n    {}         {}\n    {}           {}\n    {}       {}\n  {}\n    {}         {}\n    {}              {}\n{}\n",
+                "═══ Commands ═══".cyan().bold(),
+                "[Simulation]".yellow().bold(),
+                "<number>".white().bold(), "Pull count for this run",
+                "p <n>".white().bold(), "Set default pulls",
+                "s <n>".white().bold(), "Set default sims",
+                "w".white().bold(), "Toggle welfare",
+                "ppo".white().bold(), "Toggle PPO brain",
+                "[Pool]".yellow().bold(),
+                "pool list".white().bold(), "List pools",
+                "pool <id>".white().bold(), "Switch pool",
+                "pool all".white().bold(), "Use all pools",
+                "[Info]".yellow().bold(),
+                "status".white().bold(), "Current state",
+                "info".white().bold(), "Pool details",
+                "history".white().bold(), "Sim history",
+                "[Other]".yellow().bold(),
+                "h/help".white().bold(), "Show this help",
+                "q".white().bold(), "Quit",
+                "═════════════════".cyan(),
+            ),
+            (Language::Cn, "cmd_help") => format!(
+                "\n{}\n  {}\n    {}          {}\n    {}        {}\n    {}        {}\n    {}              {}\n    {}            {}\n  {}\n    {}    {}\n    {}      {}\n    {}      {}\n  {}\n    {}         {}\n    {}           {}\n    {}       {}\n  {}\n    {}         {}\n    {}              {}\n{}\n",
+                "═══ 指令帮助 ═══".cyan().bold(),
+                "[模拟]".yellow().bold(),
+                "<数字>".white().bold(), "本次抽数",
+                "p <n>".white().bold(), "设置默认抽数",
+                "s <n>".white().bold(), "设置默认模拟次数",
+                "w".white().bold(), "切换福利开关",
+                "ppo".white().bold(), "切换 PPO 大脑",
+                "[卡池]".yellow().bold(),
+                "pool list".white().bold(), "查看卡池列表",
+                "pool <id>".white().bold(), "切换卡池",
+                "pool all".white().bold(), "全部卡池并行",
+                "[信息]".yellow().bold(),
+                "status".white().bold(), "查看当前状态",
+                "info".white().bold(), "查看卡池详情",
+                "history".white().bold(), "查看模拟历史",
+                "[其他]".yellow().bold(),
+                "h/help".white().bold(), "显示此帮助",
+                "q".white().bold(), "退出",
+                "═════════════════".cyan(),
+            ),
             (Language::En, "cmd_ppo_on") => "PPO enabled for simulation.".to_string(),
             (Language::Cn, "cmd_ppo_on") => "已启用 PPO 模拟。".to_string(),
             (Language::En, "cmd_ppo_off") => "PPO disabled for simulation.".to_string(),
@@ -369,6 +405,94 @@ impl I18n {
 
             (Language::En, "avg_up") => "Avg UP: {:.4}".to_string(),
             (Language::Cn, "avg_up") => "平均 UP: {:.4}".to_string(),
+
+            // === Pull Result Detail ===
+            (Language::En, "pull_list_omitted") => "... ({} more omitted)".dimmed().to_string(),
+            (Language::Cn, "pull_list_omitted") => "... (还有 {} 条省略)".dimmed().to_string(),
+
+            // === Consumption Block ===
+            (Language::En, "consumption_header") => {
+                format!("{}", "═══ Consumption ═══".cyan())
+            }
+            (Language::Cn, "consumption_header") => {
+                format!("{}", "═══ 消耗详情 ═══".cyan())
+            }
+            (Language::En, "consumption_free") => "  Free Pulls Used: {}".to_string(),
+            (Language::Cn, "consumption_free") => "  使用免费抽: {}".to_string(),
+            (Language::En, "consumption_jade") => "  Jade Spent: {} ({} pulls)".to_string(),
+            (Language::Cn, "consumption_jade") => "  合成玉消耗: {} ({} 抽)".to_string(),
+            (Language::En, "big_pity_triggered") => {
+                format!("  {}", "Big Pity Triggered!".yellow().bold())
+            }
+            (Language::Cn, "big_pity_triggered") => {
+                format!("  {}", "大保底已触发！".yellow().bold())
+            }
+            (Language::En, "consumption_footer") => {
+                format!("{}", "════════════════════".cyan())
+            }
+            (Language::Cn, "consumption_footer") => {
+                format!("{}", "════════════════════".cyan())
+            }
+
+            // === Prompt with Status ===
+            (Language::En, "prompt_pulls_status") => format!(
+                "{}",
+                "\n[{} pulls | {} sims | welfare:{}] Enter pulls (h help, q quit): ".yellow()
+            ),
+            (Language::Cn, "prompt_pulls_status") => format!(
+                "{}",
+                "\n[{}抽 | {}次模拟 | 福利:{}] 输入抽数 (h 帮助, q 退出): ".yellow()
+            ),
+            (Language::En, "label_on") => "ON".to_string(),
+            (Language::Cn, "label_on") => "开".to_string(),
+            (Language::En, "label_off") => "OFF".to_string(),
+            (Language::Cn, "label_off") => "关".to_string(),
+
+            // === Status Command ===
+            (Language::En, "cmd_status_header") => {
+                format!("{}", "═══ Current State ═══".cyan().bold())
+            }
+            (Language::Cn, "cmd_status_header") => {
+                format!("{}", "═══ 当前状态 ═══".cyan().bold())
+            }
+            (Language::En, "cmd_status_pool") => "  Pool: {}".to_string(),
+            (Language::Cn, "cmd_status_pool") => "  卡池: {}".to_string(),
+            (Language::En, "cmd_status_pulls") => "  Default Pulls: {}".to_string(),
+            (Language::Cn, "cmd_status_pulls") => "  默认抽数: {}".to_string(),
+            (Language::En, "cmd_status_sims") => "  Default Sims: {}".to_string(),
+            (Language::Cn, "cmd_status_sims") => "  默认模拟次数: {}".to_string(),
+            (Language::En, "cmd_status_welfare") => "  Welfare: {}".to_string(),
+            (Language::Cn, "cmd_status_welfare") => "  福利: {}".to_string(),
+            (Language::En, "cmd_status_ppo") => "  PPO Brain: {}".to_string(),
+            (Language::Cn, "cmd_status_ppo") => "  PPO 大脑: {}".to_string(),
+            (Language::En, "cmd_status_footer") => {
+                format!("{}", "══════════════════════".cyan())
+            }
+            (Language::Cn, "cmd_status_footer") => {
+                format!("{}", "══════════════════════".cyan())
+            }
+
+            // === History Command ===
+            (Language::En, "cmd_history_header") => {
+                format!("{}", "═══ Simulation History ═══".cyan().bold())
+            }
+            (Language::Cn, "cmd_history_header") => {
+                format!("{}", "═══ 模拟历史 ═══".cyan().bold())
+            }
+            (Language::En, "cmd_history_item") => {
+                "  #{}: {} | {} pulls x{} | Avg 6*: {:.3} UP: {:.3} | {}ms".to_string()
+            }
+            (Language::Cn, "cmd_history_item") => {
+                "  #{}: {} | {} 抽 x{} | 均6星: {:.3} UP: {:.3} | {}ms".to_string()
+            }
+            (Language::En, "cmd_history_empty") => "  No simulation history yet.".dimmed().to_string(),
+            (Language::Cn, "cmd_history_empty") => "  暂无模拟历史。".dimmed().to_string(),
+            (Language::En, "cmd_history_footer") => {
+                format!("{}", "═══════════════════════════".cyan())
+            }
+            (Language::Cn, "cmd_history_footer") => {
+                format!("{}", "═══════════════════════════".cyan())
+            }
 
             // Default fallback
             (_, k) => k.to_string(),

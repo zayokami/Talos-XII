@@ -27,6 +27,7 @@ use log::info;
 use neural::NeuralLuckOptimizer;
 use ppo::{train_ppo, ActorCritic, OnlinePpoTrainer};
 use rng::Rng;
+use colored::Colorize;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -83,6 +84,15 @@ enum Commands {
     Benchmark,
     /// Analyze F2P welfare
     F2p,
+}
+
+struct SimHistoryEntry {
+    pool_name: String,
+    pulls: usize,
+    sims: usize,
+    avg_six: f64,
+    avg_up: f64,
+    elapsed_ms: u64,
 }
 
 fn prompt_yes_no(prompt: &str, default_yes: bool) -> bool {
@@ -1123,10 +1133,21 @@ fn run_interactive(args: RunInteractiveArgs) {
     drop(neural_guard);
     drop(ppo_guard);
 
+    let mut history: std::collections::VecDeque<SimHistoryEntry> =
+        std::collections::VecDeque::with_capacity(20);
+
     loop {
+        let welfare_label = if use_welfare_default {
+            I18n::get(lang, "label_on")
+        } else {
+            I18n::get(lang, "label_off")
+        };
         print!(
             "{}",
-            I18n::get(lang, "prompt_pulls").replace("{}", &default_pulls.to_string())
+            I18n::get(lang, "prompt_pulls_status")
+                .replacen("{}", &default_pulls.to_string(), 1)
+                .replacen("{}", &default_sims.to_string(), 1)
+                .replacen("{}", &welfare_label, 1)
         );
         io::stdout().flush().unwrap();
 
@@ -1160,6 +1181,67 @@ fn run_interactive(args: RunInteractiveArgs) {
                 "cmd_welfare_off"
             };
             println!("{}", I18n::get(lang, key));
+            continue;
+        }
+        if cmd_lower == "status" || cmd_lower == "st" {
+            println!("{}", I18n::get(lang, "cmd_status_header"));
+            println!(
+                "{}",
+                I18n::get(lang, "cmd_status_pool").replace("{}", &config.pool_name)
+            );
+            println!(
+                "{}",
+                I18n::get(lang, "cmd_status_pulls").replace("{}", &default_pulls.to_string())
+            );
+            println!(
+                "{}",
+                I18n::get(lang, "cmd_status_sims").replace("{}", &default_sims.to_string())
+            );
+            let w_label = if use_welfare_default {
+                I18n::get(lang, "label_on")
+            } else {
+                I18n::get(lang, "label_off")
+            };
+            println!(
+                "{}",
+                I18n::get(lang, "cmd_status_welfare").replace("{}", &w_label)
+            );
+            let ppo_label = if use_ppo {
+                I18n::get(lang, "label_on")
+            } else {
+                I18n::get(lang, "label_off")
+            };
+            println!(
+                "{}",
+                I18n::get(lang, "cmd_status_ppo").replace("{}", &ppo_label)
+            );
+            println!("{}", I18n::get(lang, "cmd_status_footer"));
+            continue;
+        }
+        if cmd_lower == "info" {
+            print_pool_header(&config, lang);
+            continue;
+        }
+        if cmd_lower == "history" || cmd_lower == "hi" {
+            println!("{}", I18n::get(lang, "cmd_history_header"));
+            if history.is_empty() {
+                println!("{}", I18n::get(lang, "cmd_history_empty"));
+            } else {
+                for (i, entry) in history.iter().enumerate() {
+                    println!(
+                        "{}",
+                        I18n::get(lang, "cmd_history_item")
+                            .replacen("{}", &(i + 1).to_string(), 1)
+                            .replacen("{}", &entry.pool_name, 1)
+                            .replacen("{}", &entry.pulls.to_string(), 1)
+                            .replacen("{}", &entry.sims.to_string(), 1)
+                            .replacen("{:.3}", &format!("{:.3}", entry.avg_six), 1)
+                            .replacen("{:.3}", &format!("{:.3}", entry.avg_up), 1)
+                            .replacen("{}", &entry.elapsed_ms.to_string(), 1)
+                    );
+                }
+            }
+            println!("{}", I18n::get(lang, "cmd_history_footer"));
             continue;
         }
         if cmd_lower == "pool" {
@@ -1316,56 +1398,11 @@ fn run_interactive(args: RunInteractiveArgs) {
             }
         };
 
-        print!(
-            "{}",
-            I18n::get(lang, "prompt_welfare")
-                .replacen("{}", &FREE_PULLS_WELFARE.to_string(), 1)
-                .replacen("{}", if use_welfare_default { "y" } else { "n" }, 1)
-        );
-        io::stdout().flush().unwrap();
-        let mut w_input = String::new();
-        io::stdin().read_line(&mut w_input).unwrap();
-        let use_welfare = if w_input.trim().is_empty() {
-            use_welfare_default
-        } else if w_input.trim().eq_ignore_ascii_case("y") {
-            true
-        } else if w_input.trim().eq_ignore_ascii_case("n") {
-            false
-        } else {
-            println!("{}", I18n::get(lang, "invalid_input"));
-            continue;
-        };
-        let free_pulls = if use_welfare { FREE_PULLS_WELFARE } else { 0 };
-
-        print!(
-            "{}",
-            I18n::get(lang, "prompt_sim_count").replace("{}", &default_sims.to_string())
-        );
-        io::stdout().flush().unwrap();
-        let mut sim_input = String::new();
-        io::stdin().read_line(&mut sim_input).unwrap();
-        let sim_input = sim_input.trim();
-
-        let sims_n = if sim_input.is_empty() {
-            default_sims
-        } else {
-            match sim_input.parse::<usize>() {
-                Ok(val) => {
-                    if val > 1_000_000 {
-                        println!("{}", I18n::get(lang, "sim_count_too_large"));
-                        1_000_000
-                    } else {
-                        val
-                    }
-                }
-                Err(_) => {
-                    println!("{}", I18n::get(lang, "invalid_input"));
-                    continue;
-                }
-            }
-        };
+        let free_pulls = if use_welfare_default { FREE_PULLS_WELFARE } else { 0 };
+        let sims_n = default_sims;
 
         if sims_n > 1 {
+            let sim_start = Instant::now();
             let dqn_guard = dqn_shared.read().unwrap();
             let neural_guard = neural_shared.read().unwrap();
             let ppo_guard = ppo_shared.read().unwrap();
@@ -1395,6 +1432,7 @@ fn run_interactive(args: RunInteractiveArgs) {
                         simulate_stats(n, sims_n, rng.next_u64(), &ctx);
                     let s_avg = s_total as f64 / sims_n as f64;
                     let u_avg = u_total as f64 / sims_n as f64;
+                    let elapsed_ms = sim_start.elapsed().as_millis() as u64;
                     println!(
                         "{}",
                         I18n::get(lang, "sim_result_stats")
@@ -1403,6 +1441,17 @@ fn run_interactive(args: RunInteractiveArgs) {
                             .replacen("{:.3}", &format!("{:.3}", s_avg), 1)
                             .replacen("{:.3}", &format!("{:.3}", u_avg), 1)
                     );
+                    if history.len() >= 20 {
+                        history.pop_front();
+                    }
+                    history.push_back(SimHistoryEntry {
+                        pool_name: pool_config.pool_name.clone(),
+                        pulls: n,
+                        sims: sims_n,
+                        avg_six: s_avg,
+                        avg_up: u_avg,
+                        elapsed_ms,
+                    });
                 }
             } else {
                 let ctx = SimRunContext {
@@ -1419,6 +1468,7 @@ fn run_interactive(args: RunInteractiveArgs) {
                 let (s_total, u_total, _, _) = simulate_stats(n, sims_n, rng.next_u64(), &ctx);
                 let s_avg = s_total as f64 / sims_n as f64;
                 let u_avg = u_total as f64 / sims_n as f64;
+                let elapsed_ms = sim_start.elapsed().as_millis() as u64;
                 println!(
                     "{}",
                     I18n::get(lang, "sim_result_stats")
@@ -1427,6 +1477,17 @@ fn run_interactive(args: RunInteractiveArgs) {
                         .replacen("{:.3}", &format!("{:.3}", s_avg), 1)
                         .replacen("{:.3}", &format!("{:.3}", u_avg), 1)
                 );
+                if history.len() >= 20 {
+                    history.pop_front();
+                }
+                history.push_back(SimHistoryEntry {
+                    pool_name: config.pool_name.clone(),
+                    pulls: n,
+                    sims: sims_n,
+                    avg_six: s_avg,
+                    avg_up: u_avg,
+                    elapsed_ms,
+                });
             }
         } else {
             let start_time = Instant::now();
@@ -1500,41 +1561,80 @@ fn run_interactive(args: RunInteractiveArgs) {
                     .replacen("{}", &res.up_count.to_string(), 1)
             );
             let non_up_six = build_non_up_six(&config);
-            // Show first 20 details
             for (i, p) in res.pulls.iter().take(20).enumerate() {
                 let op_name = resolve_operator_name(p, &config, &non_up_six);
-                if p.is_up {
-                    println!(
-                        "{}. {} ({} {}) [UP]",
+                let star_label = I18n::get(lang, "unit_star");
+                let line = if p.is_up {
+                    format!(
+                        "{}. {} ({} {}) {}",
                         i + 1,
-                        op_name,
+                        op_name.yellow().bold(),
                         p.rarity,
-                        I18n::get(lang, "unit_star")
-                    );
+                        star_label,
+                        "[UP]".red().bold()
+                    )
                 } else {
-                    println!(
-                        "{}. {} ({} {})",
-                        i + 1,
-                        op_name,
-                        p.rarity,
-                        I18n::get(lang, "unit_star")
-                    );
-                }
+                    match p.rarity {
+                        6 => format!(
+                            "{}. {} ({} {})",
+                            i + 1,
+                            op_name.yellow().bold(),
+                            p.rarity,
+                            star_label
+                        ),
+                        5 => format!(
+                            "{}. {} ({} {})",
+                            i + 1,
+                            op_name.purple(),
+                            p.rarity,
+                            star_label
+                        ),
+                        _ => format!(
+                            "{}. {} ({} {})",
+                            i + 1,
+                            op_name.dimmed(),
+                            p.rarity,
+                            star_label
+                        ),
+                    }
+                };
+                println!("{}", line);
             }
             if res.pulls.len() > 20 {
-                println!("... ({} more omitted)", res.pulls.len() - 20);
+                println!(
+                    "{}",
+                    I18n::get(lang, "pull_list_omitted")
+                        .replace("{}", &(res.pulls.len() - 20).to_string())
+                );
             }
 
-            println!("--- Consumption ---");
-            println!("Free Pulls Used: {}", res.free_pulls_used);
+            println!("{}", I18n::get(lang, "consumption_header"));
             println!(
-                "Jade Spent: {} ({} pulls)",
-                res.cost_jade,
-                res.cost_jade / 500
+                "{}",
+                I18n::get(lang, "consumption_free")
+                    .replace("{}", &res.free_pulls_used.to_string())
+            );
+            println!(
+                "{}",
+                I18n::get(lang, "consumption_jade")
+                    .replacen("{}", &res.cost_jade.to_string(), 1)
+                    .replacen("{}", &(res.cost_jade / 500).to_string(), 1)
             );
             if res.big_pity_used {
-                println!("Big Pity Triggered!");
+                println!("{}", I18n::get(lang, "big_pity_triggered"));
             }
+            println!("{}", I18n::get(lang, "consumption_footer"));
+            if history.len() >= 20 {
+                history.pop_front();
+            }
+            history.push_back(SimHistoryEntry {
+                pool_name: config.pool_name.clone(),
+                pulls: n,
+                sims: 1,
+                avg_six: res.six_count as f64,
+                avg_up: res.up_count as f64,
+                elapsed_ms: elapsed.as_millis() as u64,
+            });
         }
     }
 
