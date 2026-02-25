@@ -1055,7 +1055,7 @@ impl MultiHeadLatentAttention {
         // out[b, i, j] = sum_d (q[b, i, d] * k[b, j, d])
 
         // Use batch lock for better performance
-        let guards = TensorReadGuard::new(&[&q, &k]);
+        let guards = TensorReadGuard::new(&[q, k]);
         let q_data = guards.get(0);
         let k_data = guards.get(1);
 
@@ -1414,18 +1414,22 @@ mod tests {
         let t_reshaped = t.reshape(vec![4]);
         assert_eq!(t_reshaped.shape, vec![4]);
 
-        // In this simple autograd implementation, reshape creates a copy.
-        // So we verify that the copy has the correct data initially.
-        let data_reshaped = t_reshaped.data.read().unwrap();
-        assert_eq!(data_reshaped[0], 1.0);
+        // Zero-copy reshape: data is shared via Arc
+        {
+            let data_reshaped = t_reshaped.data.read().unwrap();
+            assert_eq!(data_reshaped[0], 1.0);
+            assert_eq!(data_reshaped[3], 4.0);
+        }
 
-        // And verify independence if we modify original
+        // Verify data is shared (zero-copy): mutating original is visible through reshaped
         {
             let mut data = t.data.write().unwrap();
             data[0] = 10.0;
         }
-        let data_reshaped_after = t_reshaped.data.read().unwrap();
-        assert_eq!(data_reshaped_after[0], 1.0); // Should still be 1.0
+        {
+            let data_reshaped_after = t_reshaped.data.read().unwrap();
+            assert_eq!(data_reshaped_after[0], 10.0); // Shared — reflects mutation
+        }
     }
 
     #[test]
@@ -1546,5 +1550,195 @@ mod tests {
             norm_grad.iter().any(|&g| g.abs() > 0.0),
             "Norm grad missing"
         );
+    }
+
+    // Verify causal masking: changing a future token must NOT affect earlier positions' output.
+    #[test]
+    fn test_mla_causal_mask_training_path() {
+        let config = MLAConfig {
+            dim: 16,
+            num_heads: 2,
+            q_lora_rank: 0,
+            kv_lora_rank: 8,
+            qk_rope_dim: 4,
+            v_head_dim: 8,
+            max_seq_len: 10,
+        };
+        let mla = MultiHeadLatentAttention::new(config, 42);
+
+        let seq_len = 4;
+        let dim = 16;
+
+        // Run 1: input_a = [t0, t1, t2, t3]
+        let input_a = Tensor::rand(vec![1, seq_len, dim], -0.1, 0.1, 100);
+        let out_a = mla.forward(&input_a);
+        let out_a_data = out_a.data.read().unwrap().clone();
+
+        // Run 2: same t0, but t2 and t3 are different
+        let mut input_b_raw = input_a.data.read().unwrap().clone();
+        // Overwrite positions 2 and 3 (indices 2*dim .. 4*dim) with different values
+        for i in (2 * dim)..(4 * dim) {
+            input_b_raw[i] = 99.0 - input_b_raw[i];
+        }
+        let input_b = Tensor::new(input_b_raw, vec![1, seq_len, dim]);
+        let out_b = mla.forward(&input_b);
+        let out_b_data = out_b.data.read().unwrap().clone();
+
+        // Position 0 output must be identical (only sees itself)
+        for i in 0..dim {
+            assert!(
+                (out_a_data[i] - out_b_data[i]).abs() < 1e-10,
+                "Causal violation at pos 0, dim {}: {} vs {}",
+                i,
+                out_a_data[i],
+                out_b_data[i]
+            );
+        }
+
+        // Position 1 output must be identical (sees pos 0 and 1, both unchanged)
+        for i in dim..(2 * dim) {
+            assert!(
+                (out_a_data[i] - out_b_data[i]).abs() < 1e-10,
+                "Causal violation at pos 1, dim {}: {} vs {}",
+                i - dim,
+                out_a_data[i],
+                out_b_data[i]
+            );
+        }
+
+        // Position 2 or 3 output SHOULD differ (they see changed tokens)
+        let diff_pos2: f64 = (2 * dim..3 * dim)
+            .map(|i| (out_a_data[i] - out_b_data[i]).abs())
+            .sum();
+        assert!(
+            diff_pos2 > 1e-6,
+            "Position 2 should differ when its own input changes"
+        );
+    }
+
+    #[test]
+    fn test_mla_causal_mask_inference_path() {
+        let config = MLAConfig {
+            dim: 16,
+            num_heads: 2,
+            q_lora_rank: 0,
+            kv_lora_rank: 8,
+            qk_rope_dim: 4,
+            v_head_dim: 8,
+            max_seq_len: 10,
+        };
+        let mla = MultiHeadLatentAttention::new(config, 42);
+
+        let seq_len = 4;
+        let dim = 16;
+
+        // Run 1
+        let input_a: Vec<f64> = {
+            let t = Tensor::rand(vec![seq_len * dim], -0.1, 0.1, 200);
+            let v = t.data.read().unwrap().clone(); v
+        };
+        let out_a = mla.forward_inference(&input_a);
+
+        // Run 2: change positions 2 and 3
+        let mut input_b = input_a.clone();
+        for i in (2 * dim)..(4 * dim) {
+            input_b[i] = 99.0 - input_b[i];
+        }
+        let out_b = mla.forward_inference(&input_b);
+
+        // Position 0: must be identical
+        for i in 0..dim {
+            assert!(
+                (out_a[i] - out_b[i]).abs() < 1e-10,
+                "Inference causal violation at pos 0, dim {}: {} vs {}",
+                i,
+                out_a[i],
+                out_b[i]
+            );
+        }
+
+        // Position 1: must be identical
+        for i in dim..(2 * dim) {
+            assert!(
+                (out_a[i] - out_b[i]).abs() < 1e-10,
+                "Inference causal violation at pos 1, dim {}: {} vs {}",
+                i - dim,
+                out_a[i],
+                out_b[i]
+            );
+        }
+
+        // Position 2: should differ
+        let diff: f64 = (2 * dim..3 * dim)
+            .map(|i| (out_a[i] - out_b[i]).abs())
+            .sum();
+        assert!(
+            diff > 1e-6,
+            "Inference pos 2 should differ when own input changes"
+        );
+    }
+
+    #[test]
+    fn test_mla_causal_mask_cached_path() {
+        let config = MLAConfig {
+            dim: 16,
+            num_heads: 2,
+            q_lora_rank: 0,
+            kv_lora_rank: 8,
+            qk_rope_dim: 4,
+            v_head_dim: 8,
+            max_seq_len: 10,
+        };
+        let mla = MultiHeadLatentAttention::new(config.clone(), 42);
+
+        let dim = 16;
+
+        // Prefill 2 tokens, then decode token 3 with two different values
+        let prefill: Vec<f64> = {
+            let t = Tensor::rand(vec![2 * dim], -0.1, 0.1, 300);
+            let v = t.data.read().unwrap().clone(); v
+        };
+
+        // Cache A: prefill then decode token_a
+        let mut cache_a = KVCache::new(config.num_heads);
+        let _ = mla.forward_inference_cached(&prefill, &mut cache_a, 0);
+
+        let token_a: Vec<f64> = {
+            let t = Tensor::rand(vec![dim], -0.1, 0.1, 400);
+            let v = t.data.read().unwrap().clone(); v
+        };
+        let out_a = mla.forward_inference_cached(&token_a, &mut cache_a, 2);
+
+        // Cache B: same prefill, different decode token
+        let mut cache_b = KVCache::new(config.num_heads);
+        let _ = mla.forward_inference_cached(&prefill, &mut cache_b, 0);
+
+        let token_b: Vec<f64> = token_a.iter().map(|&x| 99.0 - x).collect();
+        let out_b = mla.forward_inference_cached(&token_b, &mut cache_b, 2);
+
+        // Outputs SHOULD differ (different input at position 2)
+        let diff: f64 = out_a
+            .iter()
+            .zip(out_b.iter())
+            .map(|(&a, &b)| (a - b).abs())
+            .sum();
+        assert!(
+            diff > 1e-6,
+            "Cached output should differ for different decode tokens"
+        );
+
+        // Verify prefill outputs match (same 2 tokens, same cache state)
+        let mut cache_c = KVCache::new(config.num_heads);
+        let prefill_out_c = mla.forward_inference_cached(&prefill, &mut cache_c, 0);
+        let mut cache_d = KVCache::new(config.num_heads);
+        let prefill_out_d = mla.forward_inference_cached(&prefill, &mut cache_d, 0);
+
+        for (i, (&c, &d)) in prefill_out_c.iter().zip(prefill_out_d.iter()).enumerate() {
+            assert!(
+                (c - d).abs() < 1e-12,
+                "Prefill should be deterministic at index {}",
+                i
+            );
+        }
     }
 }

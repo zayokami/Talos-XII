@@ -166,7 +166,86 @@ fn load_ppo_model(path: &str) -> Option<ActorCritic> {
     None
 }
 
+fn save_dqn_model(model: &DuelingQNetwork, path: &str) {
+    let bin_path = format!("{}.bin", path);
+    if let Ok(file) = std::fs::File::create(&bin_path) {
+        let writer = std::io::BufWriter::new(file);
+        if binary_codec::serialize_into(writer, model).is_ok() {
+            info!("[DQN] Model saved to {} (Binary)", bin_path);
+        }
+    }
+
+    if let Ok(file) = std::fs::File::create(path) {
+        let writer = std::io::BufWriter::new(file);
+        if serde_json::to_writer(writer, model).is_ok() {
+            info!("[DQN] Model saved to {} (JSON)", path);
+        } else {
+            info!("[DQN] Failed to serialize model (JSON)");
+        }
+    } else {
+        info!("[DQN] Failed to create file {}", path);
+    }
+}
+
+fn load_dqn_model(path: &str) -> Option<DuelingQNetwork> {
+    let bin_path = format!("{}.bin", path);
+    if let Ok(file) = std::fs::File::open(&bin_path) {
+        let reader = std::io::BufReader::new(file);
+        if let Ok(model) = binary_codec::deserialize_from(reader) {
+            info!("[DQN] Loaded model from {} (Binary)", bin_path);
+            return Some(model);
+        }
+    }
+
+    if let Ok(file) = std::fs::File::open(path) {
+        let reader = std::io::BufReader::new(file);
+        if let Ok(model) = serde_json::from_reader(reader) {
+            info!("[DQN] Loaded model from {} (JSON)", path);
+            return Some(model);
+        }
+    }
+    None
+}
+
 // Demo of "Crazy" Mmap loading
+/// Resolve the effective simulation count for F2P probability estimation.
+fn resolve_f2p_sim_count_prob(config: &Config) -> usize {
+    if config.f2p_sim_count_prob > 0 {
+        return config.f2p_sim_count_prob;
+    }
+    if config.f2p_sim_count > 0 {
+        return config.f2p_sim_count;
+    }
+    #[cfg(debug_assertions)]
+    {
+        if config.fast_init { 2_000 } else { 10_000 }
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        if config.fast_init { 200_000 } else { 1_000_000 }
+    }
+}
+
+/// Resolve the effective simulation count for F2P cost estimation.
+fn resolve_f2p_sim_count_cost(config: &Config, sim_count_prob: usize) -> usize {
+    if config.f2p_sim_count_cost > 0 {
+        return config.f2p_sim_count_cost;
+    }
+    if config.f2p_sim_count > 0 {
+        return config.f2p_sim_count;
+    }
+    #[cfg(debug_assertions)]
+    let threshold = 50_000;
+    #[cfg(not(debug_assertions))]
+    let threshold = 200_000;
+
+    if sim_count_prob >= threshold {
+        sim_count_prob / 2
+    } else {
+        sim_count_prob
+    }
+}
+
 fn demo_mmap_tensor() {
     println!("\n[System] Demonstrating High-Performance Tensor I/O (Mmap)...");
     let shape = vec![1000, 1000]; // 1M elements, ~8MB
@@ -310,8 +389,21 @@ fn initialize_system(
     // DQN
     let dqn_policy = if config.online_train && config.online_train_dqn {
         DuelingQNetwork::new(rng.next_u64(), &config.achf)
+    } else if !args.force {
+        if let Some(cached) = load_dqn_model("dqn.cache") {
+            info!("[DQN] Cached model loaded.");
+            cached
+        } else {
+            info!("[DQN] Training new model...");
+            let d = train_dqn(&trained_neural_opt, &mut rng, &dbn, &config);
+            save_dqn_model(&d, "dqn.cache");
+            d
+        }
     } else {
-        train_dqn(&trained_neural_opt, &mut rng, &dbn, &config)
+        info!("[DQN] Force training new model...");
+        let d = train_dqn(&trained_neural_opt, &mut rng, &dbn, &config);
+        save_dqn_model(&d, "dqn.cache");
+        d
     };
 
     // PPO
@@ -413,46 +505,8 @@ fn main() {
                 "{}",
                 I18n::get(lang, "f2p_header").replace("{}", &FREE_PULLS_WELFARE.to_string())
             );
-            #[cfg(debug_assertions)]
-            let sim_count_prob = if config.f2p_sim_count_prob > 0 {
-                config.f2p_sim_count_prob
-            } else if config.f2p_sim_count > 0 {
-                config.f2p_sim_count
-            } else if config.fast_init {
-                2_000
-            } else {
-                10_000
-            };
-            #[cfg(not(debug_assertions))]
-            let sim_count_prob = if config.f2p_sim_count_prob > 0 {
-                config.f2p_sim_count_prob
-            } else if config.f2p_sim_count > 0 {
-                config.f2p_sim_count
-            } else if config.fast_init {
-                200_000
-            } else {
-                1_000_000
-            };
-            #[cfg(debug_assertions)]
-            let sim_count_cost = if config.f2p_sim_count_cost > 0 {
-                config.f2p_sim_count_cost
-            } else if config.f2p_sim_count > 0 {
-                config.f2p_sim_count
-            } else if sim_count_prob >= 50_000 {
-                sim_count_prob / 2
-            } else {
-                sim_count_prob
-            };
-            #[cfg(not(debug_assertions))]
-            let sim_count_cost = if config.f2p_sim_count_cost > 0 {
-                config.f2p_sim_count_cost
-            } else if config.f2p_sim_count > 0 {
-                config.f2p_sim_count
-            } else if sim_count_prob >= 200_000 {
-                sim_count_prob / 2
-            } else {
-                sim_count_prob
-            };
+            let sim_count_prob = resolve_f2p_sim_count_prob(&config);
+            let sim_count_cost = resolve_f2p_sim_count_cost(&config, sim_count_prob);
 
             println!(
                 "{}",
@@ -958,47 +1012,8 @@ fn run_interactive(args: RunInteractiveArgs) {
         I18n::get(lang, "f2p_header").replace("{}", &FREE_PULLS_WELFARE.to_string())
     );
 
-    // Adjust simulation count based on build profile to prevent hanging in Debug mode
-    #[cfg(debug_assertions)]
-    let sim_count_prob = if config.f2p_sim_count_prob > 0 {
-        config.f2p_sim_count_prob
-    } else if config.f2p_sim_count > 0 {
-        config.f2p_sim_count
-    } else if config.fast_init {
-        2_000
-    } else {
-        10_000
-    };
-    #[cfg(not(debug_assertions))]
-    let sim_count_prob = if config.f2p_sim_count_prob > 0 {
-        config.f2p_sim_count_prob
-    } else if config.f2p_sim_count > 0 {
-        config.f2p_sim_count
-    } else if config.fast_init {
-        200_000
-    } else {
-        1_000_000
-    };
-    #[cfg(debug_assertions)]
-    let sim_count_cost = if config.f2p_sim_count_cost > 0 {
-        config.f2p_sim_count_cost
-    } else if config.f2p_sim_count > 0 {
-        config.f2p_sim_count
-    } else if sim_count_prob >= 50_000 {
-        sim_count_prob / 2
-    } else {
-        sim_count_prob
-    };
-    #[cfg(not(debug_assertions))]
-    let sim_count_cost = if config.f2p_sim_count_cost > 0 {
-        config.f2p_sim_count_cost
-    } else if config.f2p_sim_count > 0 {
-        config.f2p_sim_count
-    } else if sim_count_prob >= 200_000 {
-        sim_count_prob / 2
-    } else {
-        sim_count_prob
-    };
+    let sim_count_prob = resolve_f2p_sim_count_prob(&config);
+    let sim_count_cost = resolve_f2p_sim_count_cost(&config, sim_count_prob);
 
     println!(
         "{}",

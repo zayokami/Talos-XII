@@ -144,13 +144,10 @@ impl Tensor {
     }
 
     pub fn detach(&self) -> Tensor {
+        let grad_len = self.grad.read().unwrap().len();
         Tensor {
-            data: self.data.clone(), // Share data
-            grad: self.grad.clone(), // Share grad? Or new grad?
-            // Typically detach() creates a new Tensor that shares data but has NO graph history.
-            // But if we modify it, should it affect original? Yes.
-            // PyTorch detach: shares storage, requires_grad=False.
-            // Here we just want to break the graph.
+            data: self.data.clone(),
+            grad: Arc::new(RwLock::new(vec![0.0; grad_len])),
             shape: self.shape.clone(),
             _ctx: None,
         }
@@ -444,17 +441,25 @@ impl Tensor {
                     let input = &parents[0];
                     let input_data = input.data.read().unwrap();
                     let mut inp_grad = input.grad.write().unwrap();
+                    // d(ln x)/dx = 1/x; clamp denominator to avoid inf when x -> 0
+                    const LOG_GRAD_EPS: f64 = 1e-12;
                     if inp_grad.len() >= PAR_THRESHOLD {
                         inp_grad
                             .par_iter_mut()
                             .zip(grad_out.par_iter())
                             .zip(input_data.par_iter())
                             .for_each(|((ig, &g), &id)| {
-                                *ig += g / id;
+                                let safe = if id.abs() < LOG_GRAD_EPS { id.signum() * LOG_GRAD_EPS } else { id };
+                                *ig += g / safe;
                             });
                     } else {
                         for i in 0..inp_grad.len() {
-                            inp_grad[i] += grad_out[i] / input_data[i];
+                            let safe = if input_data[i].abs() < LOG_GRAD_EPS {
+                                input_data[i].signum() * LOG_GRAD_EPS
+                            } else {
+                                input_data[i]
+                            };
+                            inp_grad[i] += grad_out[i] / safe;
                         }
                     }
                 }),
@@ -905,14 +910,17 @@ impl Tensor {
     }
 
     pub fn reshape(&self, new_shape: Vec<usize>) -> Tensor {
-        let self_data = self.data.read().unwrap();
         let len: usize = new_shape.iter().product::<usize>();
-        assert_eq!(len, self_data.len(), "Reshape dimension mismatch");
+        {
+            let d = self.data.read().unwrap();
+            assert_eq!(len, d.len(), "Reshape dimension mismatch");
+        }
 
+        // Zero-copy: share the same data Arc, only change shape metadata
         let parents = vec![self.clone()];
 
         Tensor {
-            data: Arc::new(RwLock::new(self_data.clone())),
+            data: Arc::clone(&self.data),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: new_shape,
             _ctx: Some(Arc::new(Context {
@@ -1770,6 +1778,7 @@ impl Tensor {
 
         let parents = vec![total.clone(), w_sum.clone()];
         let denom_cap = denom;
+        let numerator_cap = result_val;
         Tensor {
             data: Arc::new(RwLock::new(vec![result_val])),
             grad: Arc::new(RwLock::new(vec![0.0])),
@@ -1777,9 +1786,14 @@ impl Tensor {
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
-                    // d(total/denom)/d(total) = 1/denom
+                    // f = total / w_sum
+                    // df/d(total) = 1 / w_sum
                     let mut total_grad = parents[0].grad.write().unwrap();
                     total_grad[0] += grad_out[0] / denom_cap;
+                    drop(total_grad);
+                    // df/d(w_sum) = -total / w_sum^2 = -f / w_sum
+                    let mut wsum_grad = parents[1].grad.write().unwrap();
+                    wsum_grad[0] += grad_out[0] * (-numerator_cap / denom_cap);
                 }),
             })),
         }

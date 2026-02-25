@@ -690,7 +690,7 @@ impl Ppo {
             })
             .collect();
 
-        let total_batches = (len + self.batch_size - 1) / self.batch_size;
+        let total_batches = len.div_ceil(self.batch_size);
         let mut last_update = Instant::now();
         let update_every = Duration::from_millis(500);
         let mut update_batches_done = 0usize;
@@ -1118,7 +1118,7 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
                 }
             }
             collected += num_envs;
-            if collected % heartbeat_every == 0
+            if collected.is_multiple_of(heartbeat_every)
                 && last_heartbeat.elapsed() >= Duration::from_millis(300)
             {
                 let global_step = (steps_done + collected).min(total_steps);
@@ -1147,7 +1147,7 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
                 }
             }
             collected += 1;
-            if collected % heartbeat_every == 0
+            if collected.is_multiple_of(heartbeat_every)
                 && last_heartbeat.elapsed() >= Duration::from_millis(300)
             {
                 let global_step = (steps_done + collected).min(total_steps);

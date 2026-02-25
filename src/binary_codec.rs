@@ -20,6 +20,10 @@ use serde::{de, ser, Deserialize, Serialize};
 use std::fmt;
 use std::io::{self, Read, Write};
 
+/// Hard cap on deserialized collection length to prevent OOM from corrupt data.
+/// 32M elements is generous for any realistic model payload.
+const MAX_COLLECTION_LEN: usize = 32 * 1024 * 1024;
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Error
 // ═══════════════════════════════════════════════════════════════════════════
@@ -90,7 +94,7 @@ pub fn to_vec<T: Serialize>(value: &T) -> Result<Vec<u8>, Error> {
 
 #[allow(dead_code)]
 pub fn from_slice<T: for<'de> Deserialize<'de>>(data: &[u8]) -> Result<T, Error> {
-    deserialize_from(&data[..])
+    deserialize_from(data)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -108,7 +112,7 @@ impl<W: Write> BinSerializer<W> {
     }
 }
 
-impl<'a, W: Write> ser::Serializer for &'a mut BinSerializer<W> {
+impl<W: Write> ser::Serializer for &mut BinSerializer<W> {
     type Ok = ();
     type Error = Error;
 
@@ -157,10 +161,12 @@ impl<'a, W: Write> ser::Serializer for &'a mut BinSerializer<W> {
     }
 
     fn serialize_f32(self, v: f32) -> Result<(), Error> {
+        debug_assert!(v.is_finite(), "serializing non-finite f32: {}", v);
         self.write_all(&v.to_le_bytes())
     }
 
     fn serialize_f64(self, v: f64) -> Result<(), Error> {
+        debug_assert!(v.is_finite(), "serializing non-finite f64: {}", v);
         self.write_all(&v.to_le_bytes())
     }
 
@@ -280,7 +286,7 @@ impl<'a, W: Write> ser::Serializer for &'a mut BinSerializer<W> {
 
 // --- Compound serialization trait impls ---
 
-impl<'a, W: Write> ser::SerializeSeq for &'a mut BinSerializer<W> {
+impl<W: Write> ser::SerializeSeq for &mut BinSerializer<W> {
     type Ok = ();
     type Error = Error;
 
@@ -293,7 +299,7 @@ impl<'a, W: Write> ser::SerializeSeq for &'a mut BinSerializer<W> {
     }
 }
 
-impl<'a, W: Write> ser::SerializeTuple for &'a mut BinSerializer<W> {
+impl<W: Write> ser::SerializeTuple for &mut BinSerializer<W> {
     type Ok = ();
     type Error = Error;
 
@@ -306,7 +312,7 @@ impl<'a, W: Write> ser::SerializeTuple for &'a mut BinSerializer<W> {
     }
 }
 
-impl<'a, W: Write> ser::SerializeTupleStruct for &'a mut BinSerializer<W> {
+impl<W: Write> ser::SerializeTupleStruct for &mut BinSerializer<W> {
     type Ok = ();
     type Error = Error;
 
@@ -319,7 +325,7 @@ impl<'a, W: Write> ser::SerializeTupleStruct for &'a mut BinSerializer<W> {
     }
 }
 
-impl<'a, W: Write> ser::SerializeTupleVariant for &'a mut BinSerializer<W> {
+impl<W: Write> ser::SerializeTupleVariant for &mut BinSerializer<W> {
     type Ok = ();
     type Error = Error;
 
@@ -332,7 +338,7 @@ impl<'a, W: Write> ser::SerializeTupleVariant for &'a mut BinSerializer<W> {
     }
 }
 
-impl<'a, W: Write> ser::SerializeMap for &'a mut BinSerializer<W> {
+impl<W: Write> ser::SerializeMap for &mut BinSerializer<W> {
     type Ok = ();
     type Error = Error;
 
@@ -349,7 +355,7 @@ impl<'a, W: Write> ser::SerializeMap for &'a mut BinSerializer<W> {
     }
 }
 
-impl<'a, W: Write> ser::SerializeStruct for &'a mut BinSerializer<W> {
+impl<W: Write> ser::SerializeStruct for &mut BinSerializer<W> {
     type Ok = ();
     type Error = Error;
 
@@ -366,7 +372,7 @@ impl<'a, W: Write> ser::SerializeStruct for &'a mut BinSerializer<W> {
     }
 }
 
-impl<'a, W: Write> ser::SerializeStructVariant for &'a mut BinSerializer<W> {
+impl<W: Write> ser::SerializeStructVariant for &mut BinSerializer<W> {
     type Ok = ();
     type Error = Error;
 
@@ -490,7 +496,7 @@ impl<R: Read> BinDeserializer<R> {
     }
 }
 
-impl<'de, 'a, R: Read> de::Deserializer<'de> for &'a mut BinDeserializer<R> {
+impl<'de, R: Read> de::Deserializer<'de> for &mut BinDeserializer<R> {
     type Error = Error;
 
     fn deserialize_any<V: de::Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Error> {
@@ -606,6 +612,9 @@ impl<'de, 'a, R: Read> de::Deserializer<'de> for &'a mut BinDeserializer<R> {
 
     fn deserialize_seq<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
         let len = self.read_u64()? as usize;
+        if len > MAX_COLLECTION_LEN {
+            return Err(Error::Message(format!("sequence length {} exceeds cap {}", len, MAX_COLLECTION_LEN)));
+        }
         visitor.visit_seq(SeqAccess { de: self, remaining: len })
     }
 
@@ -628,6 +637,9 @@ impl<'de, 'a, R: Read> de::Deserializer<'de> for &'a mut BinDeserializer<R> {
 
     fn deserialize_map<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
         let len = self.read_u64()? as usize;
+        if len > MAX_COLLECTION_LEN {
+            return Err(Error::Message(format!("map length {} exceeds cap {}", len, MAX_COLLECTION_LEN)));
+        }
         visitor.visit_map(MapAccess { de: self, remaining: len })
     }
 
@@ -646,10 +658,10 @@ impl<'de, 'a, R: Read> de::Deserializer<'de> for &'a mut BinDeserializer<R> {
     fn deserialize_enum<V: de::Visitor<'de>>(
         self,
         _name: &'static str,
-        _variants: &'static [&'static str],
+        variants: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Error> {
-        visitor.visit_enum(EnumAccess { de: self })
+        visitor.visit_enum(EnumAccess { de: self, num_variants: variants.len() })
     }
 
     fn deserialize_identifier<V: de::Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Error> {
@@ -727,6 +739,7 @@ impl<'de, 'a, R: Read> de::MapAccess<'de> for MapAccess<'a, R> {
 
 struct EnumAccess<'a, R: Read> {
     de: &'a mut BinDeserializer<R>,
+    num_variants: usize,
 }
 
 impl<'de, 'a, R: Read> de::EnumAccess<'de> for EnumAccess<'a, R> {
@@ -738,6 +751,9 @@ impl<'de, 'a, R: Read> de::EnumAccess<'de> for EnumAccess<'a, R> {
         seed: V,
     ) -> Result<(V::Value, Self::Variant), Error> {
         let variant_index = self.de.read_u32()?;
+        if self.num_variants > 0 && variant_index as usize >= self.num_variants {
+            return Err(Error::InvalidEnumVariant(variant_index));
+        }
         let val = seed.deserialize(VariantIndexDeserializer { index: variant_index })?;
         Ok((val, VariantAccess { de: self.de }))
     }

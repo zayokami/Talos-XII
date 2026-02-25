@@ -35,7 +35,7 @@ const ACTIONS: [f64; ACTION_SPACE] = [0.0, 0.005, 0.015, -0.005, -0.015];
 // --- Dueling Q-Network ---
 // Feature Extractor (from NeuralLuckOptimizer) -> Hidden -> Value + Advantage
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct DuelingQNetwork {
     l1: Linear,
     l2: Linear,
@@ -403,7 +403,26 @@ impl ReplayBuffer {
     /// Proportional PER sampling with importance-sampling weights.
     /// `beta` controls IS correction strength (annealed from PER_BETA_START to PER_BETA_END).
     fn sample(&self, rng: &mut Rng, batch_size: usize, beta: f64) -> PERSample {
+        assert!(batch_size > 0, "batch_size must be > 0");
+        assert!(self.tree.size > 0, "cannot sample from empty buffer");
+
         let total = self.tree.total_priority();
+
+        // If all priorities are zero (degenerate), fall back to uniform sampling
+        if total <= 0.0 {
+            let mut experiences = Vec::with_capacity(batch_size);
+            let mut indices = Vec::with_capacity(batch_size);
+            for _ in 0..batch_size {
+                let idx = rng.next_u64_bounded(self.tree.size as u64) as usize;
+                if let Some(exp) = &self.tree.data[idx] {
+                    experiences.push(exp.clone());
+                    indices.push(idx);
+                }
+            }
+            let is_weights = vec![1.0; experiences.len()];
+            return PERSample { experiences, indices, is_weights };
+        }
+
         let segment = total / batch_size as f64;
         let n = self.tree.size as f64;
 
@@ -415,20 +434,23 @@ impl ReplayBuffer {
             let lo = segment * i as f64;
             let hi = segment * (i + 1) as f64;
             let value = lo + rng.next_f64() * (hi - lo);
-            let (data_idx, priority) = self.tree.get(value);
+            let (data_idx, priority) = self.tree.get(value.min(total - 1e-12));
 
             if let Some(exp) = &self.tree.data[data_idx] {
                 experiences.push(exp.clone());
                 indices.push(data_idx);
                 priorities.push(priority);
             } else {
-                // Fallback: if slot is empty (shouldn't happen), resample randomly
-                let fallback_val = rng.next_f64() * total;
-                let (fb_idx, fb_pri) = self.tree.get(fallback_val);
-                if let Some(exp) = &self.tree.data[fb_idx] {
-                    experiences.push(exp.clone());
-                    indices.push(fb_idx);
-                    priorities.push(fb_pri);
+                // Fallback: resample up to 3 times to find a non-empty slot
+                for _ in 0..3 {
+                    let fallback_val = rng.next_f64() * total;
+                    let (fb_idx, fb_pri) = self.tree.get(fallback_val);
+                    if let Some(exp) = &self.tree.data[fb_idx] {
+                        experiences.push(exp.clone());
+                        indices.push(fb_idx);
+                        priorities.push(fb_pri);
+                        break;
+                    }
                 }
             }
         }
@@ -437,7 +459,7 @@ impl ReplayBuffer {
         let mut is_weights = Vec::with_capacity(priorities.len());
         let mut max_weight = f64::NEG_INFINITY;
         for &p in &priorities {
-            let prob = p / total;
+            let prob = (p / total).max(1e-12);
             let w = (n * prob).powf(-beta);
             if w > max_weight {
                 max_weight = w;
@@ -450,19 +472,18 @@ impl ReplayBuffer {
             }
         }
 
-        PERSample {
-            experiences,
-            indices,
-            is_weights,
-        }
+        PERSample { experiences, indices, is_weights }
     }
 
     fn update_priorities(&mut self, indices: &[usize], td_errors: &[f64]) {
+        let capacity = self.tree.capacity;
         for (&idx, &td) in indices.iter().zip(td_errors.iter()) {
-            let priority = (td.abs() + PER_EPSILON).powf(self.alpha);
+            if idx >= capacity { continue; }
+            let clipped_td = if td.is_finite() { td.abs() } else { 1.0 };
+            let priority = (clipped_td + PER_EPSILON).powf(self.alpha);
             self.tree.update(idx, priority);
-            if td.abs() + PER_EPSILON > self.max_priority {
-                self.max_priority = td.abs() + PER_EPSILON;
+            if clipped_td + PER_EPSILON > self.max_priority {
+                self.max_priority = clipped_td + PER_EPSILON;
             }
         }
     }
