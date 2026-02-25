@@ -470,6 +470,7 @@ struct Adam {
     beta1: f64,
     beta2: f64,
     eps: f64,
+    weight_decay: f64,
 }
 
 impl Adam {
@@ -491,6 +492,7 @@ impl Adam {
             beta1: 0.9,
             beta2: 0.999,
             eps: 1e-8,
+            weight_decay: 1e-4,
         }
     }
 
@@ -528,7 +530,8 @@ impl Adam {
                 self.v[i][j] = self.beta2 * self.v[i][j] + (1.0 - self.beta2) * g * g;
                 let m_hat = self.m[i][j] / bias_correction1;
                 let v_hat = self.v[i][j] / bias_correction2;
-                data[j] -= self.lr * m_hat / (v_hat.sqrt() + self.eps);
+                // AdamW: decoupled weight decay applied directly to parameters
+                data[j] -= self.lr * (m_hat / (v_hat.sqrt() + self.eps) + self.weight_decay * data[j]);
             }
         }
     }

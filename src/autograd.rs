@@ -1749,6 +1749,41 @@ impl Tensor {
         let sq = &diff * &diff;
         sq.mean()
     }
+
+    /// Weighted MSE: sum(w_i * (pred_i - target_i)^2) / sum(w_i).
+    /// `weights` shape must broadcast to self/target shape along the batch dimension.
+    /// Typical usage: pred=[B,1], target=[B,1], weights=[B,1].
+    pub fn weighted_mse_loss(&self, target: &Tensor, weights: &Tensor) -> Tensor {
+        let diff = self - target;
+        let sq = &diff * &diff;
+        let weighted = &sq * weights;
+        let total = weighted.sum();
+        let w_sum = weights.sum();
+
+        let w_sum_data = w_sum.data.read().unwrap();
+        let denom = if w_sum_data[0].abs() < 1e-12 { 1.0 } else { w_sum_data[0] };
+        drop(w_sum_data);
+
+        let total_data = total.data.read().unwrap();
+        let result_val = total_data[0] / denom;
+        drop(total_data);
+
+        let parents = vec![total.clone(), w_sum.clone()];
+        let denom_cap = denom;
+        Tensor {
+            data: Arc::new(RwLock::new(vec![result_val])),
+            grad: Arc::new(RwLock::new(vec![0.0])),
+            shape: vec![1],
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    // d(total/denom)/d(total) = 1/denom
+                    let mut total_grad = parents[0].grad.write().unwrap();
+                    total_grad[0] += grad_out[0] / denom_cap;
+                }),
+            })),
+        }
+    }
 }
 
 // Operator overloads

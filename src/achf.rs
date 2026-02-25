@@ -693,24 +693,27 @@ impl AchfLayer {
     }
 
     fn choose_inference_path(&self, x: &[f64]) -> InferencePath {
-        self.record_call();
         if !self.is_low_rank() {
-            self.record_dense_path();
+            let mut cache = self.cache.write().unwrap();
+            cache.calls += 1;
+            cache.dense_paths += 1;
             return InferencePath::Dense;
         }
         let (use_cache, skip_cache, has_cache) = self.should_use_cache(x);
+        let mut cache = self.cache.write().unwrap();
+        cache.calls += 1;
         if use_cache {
-            self.record_cache_hit();
+            cache.cache_hits += 1;
             return InferencePath::Cached;
         }
         if has_cache {
             if skip_cache {
-                self.record_cache_skip();
+                cache.cache_skips += 1;
             } else {
-                self.record_cache_miss();
+                cache.cache_misses += 1;
             }
         }
-        self.record_low_rank_path();
+        cache.low_rank_paths += 1;
         InferencePath::LowRank
     }
 
@@ -772,36 +775,6 @@ impl AchfLayer {
         } else {
             nonzero as f64 / total as f64
         }
-    }
-
-    fn record_call(&self) {
-        let mut cache = self.cache.write().unwrap();
-        cache.calls += 1;
-    }
-
-    fn record_cache_hit(&self) {
-        let mut cache = self.cache.write().unwrap();
-        cache.cache_hits += 1;
-    }
-
-    fn record_cache_miss(&self) {
-        let mut cache = self.cache.write().unwrap();
-        cache.cache_misses += 1;
-    }
-
-    fn record_cache_skip(&self) {
-        let mut cache = self.cache.write().unwrap();
-        cache.cache_skips += 1;
-    }
-
-    fn record_low_rank_path(&self) {
-        let mut cache = self.cache.write().unwrap();
-        cache.low_rank_paths += 1;
-    }
-
-    fn record_dense_path(&self) {
-        let mut cache = self.cache.write().unwrap();
-        cache.dense_paths += 1;
     }
 
     fn record_path_latency(&self, path: InferencePath, elapsed_ns: f64) {
@@ -935,7 +908,10 @@ fn rowcol_project(w: &mut [f64], rows: usize, cols: usize) {
 
 fn sinkhorn_project(w: &mut [f64], rows: usize, cols: usize, steps: usize) {
     let eps = 1e-12;
+    let convergence_tol = 1e-6;
+
     for _ in 0..steps {
+        // Row normalization
         for r in 0..rows {
             let mut sum = 0.0;
             for c in 0..cols {
@@ -946,6 +922,7 @@ fn sinkhorn_project(w: &mut [f64], rows: usize, cols: usize, steps: usize) {
                 w[r * cols + c] /= denom;
             }
         }
+        // Column normalization
         for c in 0..cols {
             let mut sum = 0.0;
             for r in 0..rows {
@@ -955,6 +932,19 @@ fn sinkhorn_project(w: &mut [f64], rows: usize, cols: usize, steps: usize) {
             for r in 0..rows {
                 w[r * cols + c] /= denom;
             }
+        }
+
+        // Early termination: check max deviation of column sums from 1.0
+        let mut max_dev = 0.0_f64;
+        for c in 0..cols {
+            let mut sum = 0.0;
+            for r in 0..rows {
+                sum += w[r * cols + c].abs();
+            }
+            max_dev = max_dev.max((sum - 1.0).abs());
+        }
+        if max_dev < convergence_tol {
+            break;
         }
     }
 }

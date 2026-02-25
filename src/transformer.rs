@@ -344,33 +344,31 @@ impl Module for LuckTransformer {
 pub struct RoPE {
     pub dim: usize,
     pub base: f64,
-    pub cos_cache: Vec<f64>,
-    pub sin_cache: Vec<f64>,
+    pub cos_cache: Arc<Vec<f64>>,
+    pub sin_cache: Arc<Vec<f64>>,
 }
 
 impl RoPE {
     pub fn new(dim: usize, max_len: usize) -> Self {
-        let mut rope = Self {
-            dim,
-            base: 10000.0,
-            cos_cache: vec![],
-            sin_cache: vec![],
-        };
-        rope.precompute(max_len);
-        rope
-    }
-
-    fn precompute(&mut self, max_len: usize) {
-        self.cos_cache = Vec::with_capacity(max_len * (self.dim / 2));
-        self.sin_cache = Vec::with_capacity(max_len * (self.dim / 2));
+        let base: f64 = 10000.0;
+        let half = dim / 2;
+        let mut cos_cache = Vec::with_capacity(max_len * half);
+        let mut sin_cache = Vec::with_capacity(max_len * half);
 
         for pos in 0..max_len {
-            for i in 0..self.dim / 2 {
-                let theta = 1.0 / self.base.powf((2 * i) as f64 / self.dim as f64);
+            for i in 0..half {
+                let theta = 1.0 / base.powf((2 * i) as f64 / dim as f64);
                 let angle = pos as f64 * theta;
-                self.cos_cache.push(angle.cos());
-                self.sin_cache.push(angle.sin());
+                cos_cache.push(angle.cos());
+                sin_cache.push(angle.sin());
             }
+        }
+
+        Self {
+            dim,
+            base,
+            cos_cache: Arc::new(cos_cache),
+            sin_cache: Arc::new(sin_cache),
         }
     }
 
@@ -415,8 +413,8 @@ impl RoPE {
         }
 
         let parents = vec![x.clone()];
-        let cos_cache = self.cos_cache.clone();
-        let sin_cache = self.sin_cache.clone();
+        let cos_cache = Arc::clone(&self.cos_cache);
+        let sin_cache = Arc::clone(&self.sin_cache);
         let dim = self.dim;
         let start_pos_cap = start_pos;
 
@@ -666,8 +664,11 @@ impl MultiHeadLatentAttention {
         let scale = 1.0 / (total_dim as f64).sqrt();
         let att_scores_scaled = self.scale_tensor(&att_scores, scale);
 
+        // Causal mask: prevent attending to future positions
+        let att_scores_masked = self.apply_causal_mask(&att_scores_scaled, seq_len);
+
         // Softmax (along last dim)
-        let att_probs = self.softmax(&att_scores_scaled, seq_len);
+        let att_probs = self.softmax(&att_scores_masked, seq_len);
 
         // Output: probs [BH, Seq, Seq] * v [BH, Seq, DimV] -> [BH, Seq, DimV]
         let att_out_flat =
@@ -770,6 +771,15 @@ impl MultiHeadLatentAttention {
 
                     let dot = dot_product(q_slice, k_slice);
                     att_scores[h * (seq_len * seq_len) + i * seq_len + j] = dot * scale;
+                }
+            }
+        }
+
+        // Apply causal mask before softmax
+        for h in 0..num_heads {
+            for i in 0..seq_len {
+                for j in (i + 1)..seq_len {
+                    att_scores[h * (seq_len * seq_len) + i * seq_len + j] = f64::NEG_INFINITY;
                 }
             }
         }
@@ -948,6 +958,17 @@ impl MultiHeadLatentAttention {
                     let k_vec = &k_cache_head[j * total_head_dim..(j + 1) * total_head_dim];
                     let score = dot_product(q_vec, k_vec) * scale;
                     att_scores[h * (seq_len * cached_len) + i * cached_len + j] = score;
+                }
+            }
+        }
+
+        // Causal mask: token at query position i (absolute pos = start_pos + i) 
+        // must not attend to cache position j where j > start_pos + i
+        for h in 0..num_heads {
+            for i in 0..seq_len {
+                let abs_pos = start_pos + i;
+                for j in (abs_pos + 1)..cached_len {
+                    att_scores[h * (seq_len * cached_len) + i * cached_len + j] = f64::NEG_INFINITY;
                 }
             }
         }
@@ -1199,6 +1220,48 @@ impl MultiHeadLatentAttention {
                                 }
                             }
                         });
+                }),
+            })),
+        }
+    }
+
+    // Apply causal mask: set positions where j > i to -inf (upper triangle excluding diagonal).
+    // Input shape: [BH, Seq, Seq]. Backward zeroes out masked gradient positions.
+    fn apply_causal_mask(&self, t: &Tensor, seq_len: usize) -> Tensor {
+        let data = t.data.read().unwrap();
+        let bh = data.len() / (seq_len * seq_len);
+        let mut new_data = data.clone();
+
+        for b in 0..bh {
+            for i in 0..seq_len {
+                for j in (i + 1)..seq_len {
+                    new_data[b * seq_len * seq_len + i * seq_len + j] = f64::NEG_INFINITY;
+                }
+            }
+        }
+
+        let parents = vec![t.clone()];
+        Tensor {
+            data: Arc::new(RwLock::new(new_data)),
+            grad: Arc::new(RwLock::new(vec![0.0; data.len()])),
+            shape: t.shape.clone(),
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    let mut inp_grad = parents[0].grad.write().unwrap();
+                    let bh = inp_grad.len() / (seq_len * seq_len);
+                    for (idx, (&g, ig)) in
+                        grad_out.iter().zip(inp_grad.iter_mut()).enumerate()
+                    {
+                        let local = idx % (seq_len * seq_len);
+                        let i = local / seq_len;
+                        let j = local % seq_len;
+                        if j <= i {
+                            *ig += g;
+                        }
+                        // masked positions (j > i): gradient is zero, skip
+                    }
+                    let _ = bh;
                 }),
             })),
         }

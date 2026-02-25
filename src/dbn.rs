@@ -115,7 +115,7 @@ impl Rbm {
             hidden_size: hidden,
             visible_type: v_type,
             hidden_type: h_type,
-            weights: weights.clone(),
+            weights,
             vbias: vec![0.0; visible],
             hbias: vec![0.0; hidden],
             d_weights: Matrix::new(visible, hidden),

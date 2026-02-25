@@ -825,7 +825,6 @@ fn record_training_samples(inputs: TrainingSampleInputs<'_>) {
             reward,
             next_state: next_state.to_vec(),
             done,
-            td_error: 1.0,
         });
     }
 

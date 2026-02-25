@@ -6,6 +6,7 @@ use crate::neural::{NeuralLuckOptimizer, DIM};
 use crate::nn::{Linear, Module};
 use crate::rng::Rng;
 use crate::sim::{build_features, dbn_env, prob_6, PullState};
+use std::collections::VecDeque;
 
 // DQN Hyperparameters
 const GAMMA: f64 = 0.99;
@@ -15,8 +16,14 @@ const EPSILON_START: f64 = 1.0;
 const EPSILON_END: f64 = 0.1;
 const EPSILON_DECAY: usize = 50000;
 const LEARNING_RATE: f64 = 0.001;
-const TRAIN_FREQ: usize = 10; // Train every 10 steps to improve performance
-const LOG_FREQ: usize = 100; // Log every 100 steps
+const TRAIN_FREQ: usize = 10;
+const LOG_FREQ: usize = 100;
+
+// PER Hyperparameters (Schaul et al. 2016)
+const PER_ALPHA: f64 = 0.6;
+const PER_BETA_START: f64 = 0.4;
+const PER_BETA_END: f64 = 1.0;
+const PER_EPSILON: f64 = 1e-6;
 
 // Actions
 const ACTION_SPACE: usize = 5;
@@ -110,14 +117,10 @@ impl DuelingQNetwork {
         } else {
             // Single Mode
             let mean_adv_scalar = adv.mean(); // (1)
-            let mean_adv = mean_adv_scalar.broadcast(vec![ACTION_SPACE]); // (5)
-
             let val_expanded = val.broadcast(vec![ACTION_SPACE]); // (5)
+            let mean_adv_broadcast = mean_adv_scalar.broadcast(vec![ACTION_SPACE]); // (5)
 
-            let zero = Tensor::zeros(vec![ACTION_SPACE]);
-            let neg_mean_adv = zero - mean_adv;
-
-            val_expanded + adv + neg_mean_adv
+            val_expanded + adv - mean_adv_broadcast
         }
     }
 
@@ -229,11 +232,11 @@ struct Adam {
     beta1: f64,
     beta2: f64,
     eps: f64,
+    weight_decay: f64,
 }
 
 impl Adam {
     fn new(params: Vec<Tensor>, lr: f64) -> Self {
-        // We need to read the data length, so we lock
         let m = params
             .iter()
             .map(|p| vec![0.0; p.data.read().unwrap().len()])
@@ -251,6 +254,7 @@ impl Adam {
             beta1: 0.9,
             beta2: 0.999,
             eps: 1e-8,
+            weight_decay: 1e-4,
         }
     }
 
@@ -284,7 +288,8 @@ impl Adam {
                 self.v[i][j] = self.beta2 * self.v[i][j] + (1.0 - self.beta2) * g * g;
                 let m_hat = self.m[i][j] / bias_correction1;
                 let v_hat = self.v[i][j] / bias_correction2;
-                data[j] -= self.lr * m_hat / (v_hat.sqrt() + self.eps);
+                // AdamW: decoupled weight decay applied directly to parameters
+                data[j] -= self.lr * (m_hat / (v_hat.sqrt() + self.eps) + self.weight_decay * data[j]);
             }
         }
     }
@@ -296,7 +301,69 @@ impl Adam {
     }
 }
 
-// --- Replay Buffer ---
+// --- SumTree for O(log N) proportional PER sampling ---
+
+struct SumTree {
+    capacity: usize,
+    tree: Vec<f64>,
+    data: Vec<Option<Experience>>,
+    write_pos: usize,
+    size: usize,
+}
+
+impl SumTree {
+    fn new(capacity: usize) -> Self {
+        SumTree {
+            capacity,
+            tree: vec![0.0; 2 * capacity],
+            data: (0..capacity).map(|_| None).collect(),
+            write_pos: 0,
+            size: 0,
+        }
+    }
+
+    fn total_priority(&self) -> f64 {
+        self.tree[1]
+    }
+
+    fn add(&mut self, priority: f64, exp: Experience) {
+        let idx = self.write_pos;
+        self.data[idx] = Some(exp);
+        self.update(idx, priority);
+        self.write_pos = (self.write_pos + 1) % self.capacity;
+        if self.size < self.capacity {
+            self.size += 1;
+        }
+    }
+
+    fn update(&mut self, data_idx: usize, priority: f64) {
+        let mut tree_idx = data_idx + self.capacity;
+        self.tree[tree_idx] = priority;
+        while tree_idx > 1 {
+            tree_idx >>= 1;
+            self.tree[tree_idx] = self.tree[tree_idx * 2] + self.tree[tree_idx * 2 + 1];
+        }
+    }
+
+    // Retrieve the leaf whose cumulative sum covers `value`.
+    fn get(&self, mut value: f64) -> (usize, f64) {
+        let mut idx = 1;
+        while idx < self.capacity {
+            let left = idx * 2;
+            let right = left + 1;
+            if value <= self.tree[left] {
+                idx = left;
+            } else {
+                value -= self.tree[left];
+                idx = right;
+            }
+        }
+        let data_idx = idx - self.capacity;
+        (data_idx, self.tree[idx])
+    }
+}
+
+// --- Replay Buffer (SumTree-backed PER) ---
 
 #[derive(Clone)]
 pub struct Experience {
@@ -305,84 +372,103 @@ pub struct Experience {
     pub reward: f64,
     pub next_state: Vec<f64>,
     pub done: bool,
-    pub td_error: f64,
+}
+
+struct PERSample {
+    experiences: Vec<Experience>,
+    indices: Vec<usize>,
+    is_weights: Vec<f64>,
 }
 
 struct ReplayBuffer {
-    buffer: Vec<Experience>,
-    position: usize,
-    #[allow(dead_code)]
-    alpha: f64, // Priority exponent
+    tree: SumTree,
+    alpha: f64,
+    max_priority: f64,
 }
 
 impl ReplayBuffer {
     fn new(capacity: usize) -> Self {
         ReplayBuffer {
-            buffer: Vec::with_capacity(capacity),
-            position: 0,
-            alpha: 0.6,
+            tree: SumTree::new(capacity),
+            alpha: PER_ALPHA,
+            max_priority: 1.0,
         }
     }
 
     fn push(&mut self, exp: Experience) {
-        if self.buffer.len() < self.buffer.capacity() {
-            self.buffer.push(exp);
-        } else {
-            self.buffer[self.position] = exp;
-        }
-        self.position = (self.position + 1) % self.buffer.capacity();
+        let priority = self.max_priority.powf(self.alpha);
+        self.tree.add(priority, exp);
     }
 
-    // Naive PER: Sort/Probabilistic sample (Simplified for speed)
-    // Full PER with SumTree is O(log N), here we use a simpler stochastic acceptance or just pure random for now to avoid complexity
-    // Let's implement a simple variant: Stochastic Prioritized Sampling
-    // Or just stick to uniform for now if performance is critical, but the task asked for PER.
-    // Let's do a "Rank-based" approximation or just weighted sampling.
-    fn sample(&self, rng: &mut Rng, batch_size: usize) -> Vec<Experience> {
-        let len = self.buffer.len();
-        let mut batch = Vec::with_capacity(batch_size);
+    /// Proportional PER sampling with importance-sampling weights.
+    /// `beta` controls IS correction strength (annealed from PER_BETA_START to PER_BETA_END).
+    fn sample(&self, rng: &mut Rng, batch_size: usize, beta: f64) -> PERSample {
+        let total = self.tree.total_priority();
+        let segment = total / batch_size as f64;
+        let n = self.tree.size as f64;
 
-        // Simple Weighted Sampling
-        // P(i) = p_i^alpha / sum(p_k^alpha)
-        // p_i = |td_error| + epsilon
+        let mut experiences = Vec::with_capacity(batch_size);
+        let mut indices = Vec::with_capacity(batch_size);
+        let mut priorities = Vec::with_capacity(batch_size);
 
-        // Optimization: Just sample uniform for now but use TD error to update priorities later?
-        // Implementing full PER is complex without a SumTree.
-        // Let's implement a "Greedy" + Random approach or just standard random for speed if the buffer is large.
-        // Given constraints, let's stick to Uniform for speed but keep the field for future.
-        // Wait, the user ASKED for Prioritized Replay.
-        // Let's do a simplified version: Sample 2*BatchSize candidates, pick BatchSize with highest TD error.
+        for i in 0..batch_size {
+            let lo = segment * i as f64;
+            let hi = segment * (i + 1) as f64;
+            let value = lo + rng.next_f64() * (hi - lo);
+            let (data_idx, priority) = self.tree.get(value);
 
-        let candidates_count = (batch_size * 2).min(len);
-        let mut candidates = Vec::with_capacity(candidates_count);
-        for _ in 0..candidates_count {
-            let idx = rng.next_u64_bounded(len as u64) as usize;
-            candidates.push(self.buffer[idx].clone());
+            if let Some(exp) = &self.tree.data[data_idx] {
+                experiences.push(exp.clone());
+                indices.push(data_idx);
+                priorities.push(priority);
+            } else {
+                // Fallback: if slot is empty (shouldn't happen), resample randomly
+                let fallback_val = rng.next_f64() * total;
+                let (fb_idx, fb_pri) = self.tree.get(fallback_val);
+                if let Some(exp) = &self.tree.data[fb_idx] {
+                    experiences.push(exp.clone());
+                    indices.push(fb_idx);
+                    priorities.push(fb_pri);
+                }
+            }
         }
 
-        // Sort by TD error descending
-        candidates.sort_by(|a, b| b.td_error.partial_cmp(&a.td_error).unwrap());
-
-        // Take top batch_size
-        for candidate in candidates.iter().take(batch_size.min(candidates.len())) {
-            batch.push(candidate.clone());
+        // IS weights: w_i = (N * P(i))^{-beta}, normalized by max(w)
+        let mut is_weights = Vec::with_capacity(priorities.len());
+        let mut max_weight = f64::NEG_INFINITY;
+        for &p in &priorities {
+            let prob = p / total;
+            let w = (n * prob).powf(-beta);
+            if w > max_weight {
+                max_weight = w;
+            }
+            is_weights.push(w);
+        }
+        if max_weight > 0.0 {
+            for w in &mut is_weights {
+                *w /= max_weight;
+            }
         }
 
-        batch
+        PERSample {
+            experiences,
+            indices,
+            is_weights,
+        }
+    }
+
+    fn update_priorities(&mut self, indices: &[usize], td_errors: &[f64]) {
+        for (&idx, &td) in indices.iter().zip(td_errors.iter()) {
+            let priority = (td.abs() + PER_EPSILON).powf(self.alpha);
+            self.tree.update(idx, priority);
+            if td.abs() + PER_EPSILON > self.max_priority {
+                self.max_priority = td.abs() + PER_EPSILON;
+            }
+        }
     }
 
     fn len(&self) -> usize {
-        self.buffer.len()
-    }
-
-    #[allow(dead_code)]
-    fn update_priorities(&mut self, _indices: &[usize], _td_errors: &[f64]) {
-        // In a full implementation, we would update priorities here.
-        // Since we copy experiences into the buffer, we'd need to track original indices.
-        // For the simplified "Sample & Sort" method, we don't strictly need persistent index updates if we just use the stored TD error.
-        // But we DO need to update the stored TD error for the *next* time.
-        // Current simplified implementation doesn't support easy updates because we clone out.
-        // We will skip this for now to avoid O(N) search.
+        self.tree.size
     }
 }
 
@@ -418,7 +504,9 @@ pub fn train_dqn(
 
     let mut episode_reward = 0.0;
     let mut episode_count = 0;
-    let mut recent_rewards = Vec::new();
+    let mut recent_rewards: VecDeque<f64> = VecDeque::with_capacity(51);
+
+    let beta_anneal_steps = total_steps as f64;
 
     for step in 0..total_steps {
         // 1. Build State
@@ -524,28 +612,26 @@ pub fn train_dqn(
             reward,
             next_state: next_state_raw,
             done,
-            td_error: 1.0, // High priority for new experiences
         });
 
         // 4. Train
         if replay_buffer.len() > BATCH_SIZE && step % TRAIN_FREQ == 0 {
+            let beta = PER_BETA_START
+                + (PER_BETA_END - PER_BETA_START) * (step as f64 / beta_anneal_steps);
             let start_train = std::time::Instant::now();
-            let batch = replay_buffer.sample(rng, BATCH_SIZE);
+            let per_sample = replay_buffer.sample(rng, BATCH_SIZE, beta);
             let sample_time = start_train.elapsed();
 
             let start_forward = std::time::Instant::now();
             optimizer.zero_grad();
 
-            // --- Batched Processing ---
-
-            // 1. Prepare Batch Tensors
             let mut states_vec = Vec::with_capacity(BATCH_SIZE * DIM);
             let mut next_states_vec = Vec::with_capacity(BATCH_SIZE * DIM);
-            let mut actions_vec = Vec::with_capacity(BATCH_SIZE * ACTION_SPACE); // For mask
+            let mut actions_vec = Vec::with_capacity(BATCH_SIZE * ACTION_SPACE);
             let mut rewards_vec = Vec::with_capacity(BATCH_SIZE);
             let mut dones_vec = Vec::with_capacity(BATCH_SIZE);
 
-            for exp in &batch {
+            for exp in &per_sample.experiences {
                 states_vec.extend_from_slice(&exp.state);
                 next_states_vec.extend_from_slice(&exp.next_state);
 
@@ -611,8 +697,9 @@ pub fn train_dqn(
 
             let target_tensor = Tensor::new(target_vals, vec![BATCH_SIZE, 1]);
 
-            // 4. Loss
-            let mut loss = q_actions.mse_loss(&target_tensor);
+            // IS-weighted loss: w_i * (q - target)^2, normalized
+            let is_weights_tensor = Tensor::new(per_sample.is_weights.clone(), vec![BATCH_SIZE, 1]);
+            let mut loss = q_actions.weighted_mse_loss(&target_tensor, &is_weights_tensor);
             if let Some(reg) = policy_net.achf_orthogonal_penalty() {
                 loss = loss + reg;
             }
@@ -627,6 +714,18 @@ pub fn train_dqn(
             let start_opt = std::time::Instant::now();
             optimizer.step();
             let opt_time = start_opt.elapsed();
+
+            // Write back per-sample TD errors for priority update
+            {
+                let q_data = q_actions.data.read().unwrap();
+                let t_data = target_tensor.data.read().unwrap();
+                let td_errors: Vec<f64> = q_data
+                    .iter()
+                    .zip(t_data.iter())
+                    .map(|(&q, &t)| (q - t).abs())
+                    .collect();
+                replay_buffer.update_priorities(&per_sample.indices, &td_errors);
+            }
 
             // Soft Update Target Network
             target_net.soft_update(&policy_net, 0.005);
@@ -648,9 +747,9 @@ pub fn train_dqn(
 
         if done {
             episode_count += 1;
-            recent_rewards.push(episode_reward);
+            recent_rewards.push_back(episode_reward);
             if recent_rewards.len() > 50 {
-                recent_rewards.remove(0);
+                recent_rewards.pop_front();
             }
 
             state_struct = PullState {
@@ -754,7 +853,12 @@ impl OnlineDqnTrainer {
         if self.replay_buffer.len() < BATCH_SIZE {
             return false;
         }
-        let batch = self.replay_buffer.sample(rng, BATCH_SIZE);
+        // Beta anneals linearly from PER_BETA_START toward PER_BETA_END
+        let beta = (PER_BETA_START
+            + (PER_BETA_END - PER_BETA_START)
+                * (self.steps_done as f64 / EPSILON_DECAY as f64))
+            .min(PER_BETA_END);
+        let per_sample = self.replay_buffer.sample(rng, BATCH_SIZE, beta);
         self.optimizer.zero_grad();
 
         let mut states_vec = Vec::with_capacity(BATCH_SIZE * DIM);
@@ -763,7 +867,7 @@ impl OnlineDqnTrainer {
         let mut rewards_vec = Vec::with_capacity(BATCH_SIZE);
         let mut dones_vec = Vec::with_capacity(BATCH_SIZE);
 
-        for exp in &batch {
+        for exp in &per_sample.experiences {
             states_vec.extend_from_slice(&exp.state);
             next_states_vec.extend_from_slice(&exp.next_state);
             let mut mask = vec![0.0; ACTION_SPACE];
@@ -809,13 +913,27 @@ impl OnlineDqnTrainer {
             target_vals.push(target);
         }
         let target_tensor = Tensor::new(target_vals, vec![BATCH_SIZE, 1]);
-        let mut loss = q_actions.mse_loss(&target_tensor);
+        let is_weights_tensor = Tensor::new(per_sample.is_weights.clone(), vec![BATCH_SIZE, 1]);
+        let mut loss = q_actions.weighted_mse_loss(&target_tensor, &is_weights_tensor);
         if let Some(reg) = self.policy.achf_orthogonal_penalty() {
             loss = loss + reg;
         }
         loss.backward();
         self.policy.update_achf_after_backward();
         self.optimizer.step();
+
+        // Write back per-sample TD errors for priority update
+        {
+            let q_data = q_actions.data.read().unwrap();
+            let t_data = target_tensor.data.read().unwrap();
+            let td_errors: Vec<f64> = q_data
+                .iter()
+                .zip(t_data.iter())
+                .map(|(&q, &t)| (q - t).abs())
+                .collect();
+            self.replay_buffer.update_priorities(&per_sample.indices, &td_errors);
+        }
+
         self.target.soft_update(&self.policy, 0.005);
         self.steps_done += 1;
         true
