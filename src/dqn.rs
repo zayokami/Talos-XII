@@ -289,7 +289,8 @@ impl Adam {
                 let m_hat = self.m[i][j] / bias_correction1;
                 let v_hat = self.v[i][j] / bias_correction2;
                 // AdamW: decoupled weight decay applied directly to parameters
-                data[j] -= self.lr * (m_hat / (v_hat.sqrt() + self.eps) + self.weight_decay * data[j]);
+                data[j] -=
+                    self.lr * (m_hat / (v_hat.sqrt() + self.eps) + self.weight_decay * data[j]);
             }
         }
     }
@@ -420,7 +421,11 @@ impl ReplayBuffer {
                 }
             }
             let is_weights = vec![1.0; experiences.len()];
-            return PERSample { experiences, indices, is_weights };
+            return PERSample {
+                experiences,
+                indices,
+                is_weights,
+            };
         }
 
         let segment = total / batch_size as f64;
@@ -472,13 +477,19 @@ impl ReplayBuffer {
             }
         }
 
-        PERSample { experiences, indices, is_weights }
+        PERSample {
+            experiences,
+            indices,
+            is_weights,
+        }
     }
 
     fn update_priorities(&mut self, indices: &[usize], td_errors: &[f64]) {
         let capacity = self.tree.capacity;
         for (&idx, &td) in indices.iter().zip(td_errors.iter()) {
-            if idx >= capacity { continue; }
+            if idx >= capacity {
+                continue;
+            }
             let clipped_td = if td.is_finite() { td.abs() } else { 1.0 };
             let priority = (clipped_td + PER_EPSILON).powf(self.alpha);
             self.tree.update(idx, priority);
@@ -876,8 +887,7 @@ impl OnlineDqnTrainer {
         }
         // Beta anneals linearly from PER_BETA_START toward PER_BETA_END
         let beta = (PER_BETA_START
-            + (PER_BETA_END - PER_BETA_START)
-                * (self.steps_done as f64 / EPSILON_DECAY as f64))
+            + (PER_BETA_END - PER_BETA_START) * (self.steps_done as f64 / EPSILON_DECAY as f64))
             .min(PER_BETA_END);
         let per_sample = self.replay_buffer.sample(rng, BATCH_SIZE, beta);
         self.optimizer.zero_grad();
@@ -952,7 +962,8 @@ impl OnlineDqnTrainer {
                 .zip(t_data.iter())
                 .map(|(&q, &t)| (q - t).abs())
                 .collect();
-            self.replay_buffer.update_priorities(&per_sample.indices, &td_errors);
+            self.replay_buffer
+                .update_priorities(&per_sample.indices, &td_errors);
         }
 
         self.target.soft_update(&self.policy, 0.005);

@@ -492,21 +492,21 @@ pub fn roll_one(
             config,
         );
 
-    let decision = decide_policy(PolicyInputs {
-        state,
-        nn_total_pulls,
-        config,
-        neural_opt,
-        dqn_policy,
-        ppo_policy,
-        current_features: &x,
-        ppo_state_seq,
-        ppo_pity_seq,
-        fast_inference,
-        ppo_seq_data,
-        kv_cache,
-        start_pos,
-    });
+        let decision = decide_policy(PolicyInputs {
+            state,
+            nn_total_pulls,
+            config,
+            neural_opt,
+            dqn_policy,
+            ppo_policy,
+            current_features: &x,
+            ppo_state_seq,
+            ppo_pity_seq,
+            fast_inference,
+            ppo_seq_data,
+            kv_cache,
+            start_pos,
+        });
         action_used = decision.action;
         ppo_log_prob = decision.ppo_log_prob;
         ppo_value = decision.ppo_value;
@@ -530,8 +530,7 @@ pub fn roll_one(
             }
         } else {
             let force_5_star = config.always_5_star
-                || (config.five_star_pity > 0
-                    && state.streak_4_star >= config.five_star_pity - 1);
+                || (config.five_star_pity > 0 && state.streak_4_star >= config.five_star_pity - 1);
             if force_5_star || r < final_prob_6 + config.prob_5_base {
                 rarity = 5;
                 state.streak_4_star = 0;
@@ -579,8 +578,12 @@ pub fn simulate_core(
     } else {
         8
     };
-    let mut ppo_context =
-        PpoContext::new(ppo_active, context_len, ctx.ppo_policy, control.fast_inference);
+    let mut ppo_context = PpoContext::new(
+        ppo_active,
+        context_len,
+        ctx.ppo_policy,
+        control.fast_inference,
+    );
     simulate_core_with_context(control, rng, available_free_pulls, ctx, &mut ppo_context)
 }
 
@@ -628,7 +631,12 @@ fn simulate_core_with_context(
     } else {
         8
     };
-    ppo_context.reset(ppo_active, context_len, ctx.ppo_policy, control.fast_inference);
+    ppo_context.reset(
+        ppo_active,
+        context_len,
+        ctx.ppo_policy,
+        control.fast_inference,
+    );
 
     loop {
         if let Some(max_pulls) = control.max_pulls {
@@ -708,19 +716,17 @@ fn simulate_core_with_context(
             max_loss_streak = state.loss_streak;
         }
 
-        record_training_samples(
-            TrainingSampleInputs {
-                outcome: &outcome,
-                current_state: &current_state,
-                next_state: &next_state,
-                pulls_done,
-                state: &state,
-                exp_sender: ctx.exp_sender,
-                neural_sender: ctx.neural_sender,
-                ppo_sender: ctx.ppo_sender,
-                ppo_inputs: &ppo_inputs,
-            },
-        );
+        record_training_samples(TrainingSampleInputs {
+            outcome: &outcome,
+            current_state: &current_state,
+            next_state: &next_state,
+            pulls_done,
+            state: &state,
+            exp_sender: ctx.exp_sender,
+            neural_sender: ctx.neural_sender,
+            ppo_sender: ctx.ppo_sender,
+            ppo_inputs: &ppo_inputs,
+        });
 
         if let Some(ref mut pulls_vec) = pulls {
             let op_idx = match outcome.rarity {
@@ -940,13 +946,7 @@ pub fn simulate_fast(
         big_pity_requires_not_up: ctx.config.big_pity_requires_not_up,
         fast_inference: true,
     };
-    simulate_core(
-        &control,
-        rng,
-        available_free_pulls,
-        ctx,
-    )
-    .0
+    simulate_core(&control, rng, available_free_pulls, ctx).0
 }
 
 pub fn simulate_one(
@@ -964,12 +964,7 @@ pub fn simulate_one(
         big_pity_requires_not_up: ctx.config.big_pity_requires_not_up,
         fast_inference: false,
     };
-    let (stats, pulls_opt) = simulate_core(
-        &control,
-        rng,
-        available_free_pulls,
-        ctx,
-    );
+    let (stats, pulls_opt) = simulate_core(&control, rng, available_free_pulls, ctx);
     let pulls = pulls_opt.unwrap_or_default();
     SimulationResult {
         pulls,

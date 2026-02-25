@@ -246,7 +246,9 @@ impl Tensor {
                     let out_row = &mut out_data[r * n..(r + 1) * n];
                     for i in 0..k {
                         let scale = lhs_data[r * k + i];
-                        if scale == 0.0 { continue; }
+                        if scale == 0.0 {
+                            continue;
+                        }
                         // Prefetch next RHS row into L1 while processing current
                         if i + 2 < k {
                             prefetch_read_l1(rhs_data[(i + 2) * n..].as_ptr());
@@ -262,7 +264,9 @@ impl Tensor {
                     .for_each(|(r, out_row)| {
                         for i in 0..k {
                             let scale = lhs_data[r * k + i];
-                            if scale == 0.0 { continue; }
+                            if scale == 0.0 {
+                                continue;
+                            }
                             if i + 2 < k {
                                 prefetch_read_l1(rhs_data[(i + 2) * n..].as_ptr());
                             }
@@ -452,7 +456,11 @@ impl Tensor {
                             .zip(grad_out.par_iter())
                             .zip(input_data.par_iter())
                             .for_each(|((ig, &g), &id)| {
-                                let safe = if id.abs() < LOG_GRAD_EPS { id.signum() * LOG_GRAD_EPS } else { id };
+                                let safe = if id.abs() < LOG_GRAD_EPS {
+                                    id.signum() * LOG_GRAD_EPS
+                                } else {
+                                    id
+                                };
                                 *ig += g / safe;
                             });
                     } else {
@@ -793,7 +801,10 @@ impl Tensor {
         let shape = &self.shape;
         let rank = shape.len();
         assert!(dim0 < rank && dim1 < rank);
-        assert!(rank <= 8, "transpose: rank > 8 not supported by stack-allocated coords");
+        assert!(
+            rank <= 8,
+            "transpose: rank > 8 not supported by stack-allocated coords"
+        );
 
         let mut new_shape = shape.clone();
         new_shape.swap(dim0, dim1);
@@ -1773,7 +1784,11 @@ impl Tensor {
         let w_sum = weights.sum();
 
         let w_sum_data = w_sum.data.read().unwrap();
-        let denom = if w_sum_data[0].abs() < 1e-12 { 1.0 } else { w_sum_data[0] };
+        let denom = if w_sum_data[0].abs() < 1e-12 {
+            1.0
+        } else {
+            w_sum_data[0]
+        };
         drop(w_sum_data);
 
         let total_data = total.data.read().unwrap();
@@ -2031,7 +2046,11 @@ impl Div for Tensor {
                 .map(|(a, b)| a / b)
                 .collect()
         } else {
-            self_data.iter().zip(rhs_data.iter()).map(|(a, b)| a / b).collect()
+            self_data
+                .iter()
+                .zip(rhs_data.iter())
+                .map(|(a, b)| a / b)
+                .collect()
         };
         let parents = vec![self.clone(), rhs.clone()];
         Tensor {

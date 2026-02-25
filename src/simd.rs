@@ -617,7 +617,11 @@ unsafe fn vector_scale_avx512(row: &mut [f64], scale: f64) {
 }
 
 #[cfg(target_arch = "x86_64")]
-enum BinOp { Add, Sub, Mul }
+enum BinOp {
+    Add,
+    Sub,
+    Mul,
+}
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
@@ -767,13 +771,22 @@ unsafe fn vector_grad_acc_avx512(dst: &mut [f64], src: &[f64]) {
     while i + 16 <= len {
         let d_ptr = dst.as_mut_ptr().add(i);
         let s_ptr = src.as_ptr().add(i);
-        _mm512_storeu_pd(d_ptr, _mm512_add_pd(_mm512_loadu_pd(d_ptr), _mm512_loadu_pd(s_ptr)));
-        _mm512_storeu_pd(d_ptr.add(8), _mm512_add_pd(_mm512_loadu_pd(d_ptr.add(8)), _mm512_loadu_pd(s_ptr.add(8))));
+        _mm512_storeu_pd(
+            d_ptr,
+            _mm512_add_pd(_mm512_loadu_pd(d_ptr), _mm512_loadu_pd(s_ptr)),
+        );
+        _mm512_storeu_pd(
+            d_ptr.add(8),
+            _mm512_add_pd(_mm512_loadu_pd(d_ptr.add(8)), _mm512_loadu_pd(s_ptr.add(8))),
+        );
         i += 16;
     }
     while i + 8 <= len {
         let d_ptr = dst.as_mut_ptr().add(i);
-        _mm512_storeu_pd(d_ptr, _mm512_add_pd(_mm512_loadu_pd(d_ptr), _mm512_loadu_pd(src.as_ptr().add(i))));
+        _mm512_storeu_pd(
+            d_ptr,
+            _mm512_add_pd(_mm512_loadu_pd(d_ptr), _mm512_loadu_pd(src.as_ptr().add(i))),
+        );
         i += 8;
     }
     while i < len {
@@ -791,13 +804,22 @@ unsafe fn vector_grad_acc_avx2(dst: &mut [f64], src: &[f64]) {
     while i + 8 <= len {
         let d_ptr = dst.as_mut_ptr().add(i);
         let s_ptr = src.as_ptr().add(i);
-        _mm256_storeu_pd(d_ptr, _mm256_add_pd(_mm256_loadu_pd(d_ptr), _mm256_loadu_pd(s_ptr)));
-        _mm256_storeu_pd(d_ptr.add(4), _mm256_add_pd(_mm256_loadu_pd(d_ptr.add(4)), _mm256_loadu_pd(s_ptr.add(4))));
+        _mm256_storeu_pd(
+            d_ptr,
+            _mm256_add_pd(_mm256_loadu_pd(d_ptr), _mm256_loadu_pd(s_ptr)),
+        );
+        _mm256_storeu_pd(
+            d_ptr.add(4),
+            _mm256_add_pd(_mm256_loadu_pd(d_ptr.add(4)), _mm256_loadu_pd(s_ptr.add(4))),
+        );
         i += 8;
     }
     while i + 4 <= len {
         let d_ptr = dst.as_mut_ptr().add(i);
-        _mm256_storeu_pd(d_ptr, _mm256_add_pd(_mm256_loadu_pd(d_ptr), _mm256_loadu_pd(src.as_ptr().add(i))));
+        _mm256_storeu_pd(
+            d_ptr,
+            _mm256_add_pd(_mm256_loadu_pd(d_ptr), _mm256_loadu_pd(src.as_ptr().add(i))),
+        );
         i += 4;
     }
     while i < len {
@@ -834,7 +856,10 @@ unsafe fn fast_exp_avx512(x: __m512d) -> __m512d {
     const P11: f64 = 2.505210838544172e-8;
 
     // Clamp to avoid NaN from inf/underflow from -inf
-    let x = _mm512_max_pd(_mm512_min_pd(x, _mm512_set1_pd(EXP_HI)), _mm512_set1_pd(EXP_LO));
+    let x = _mm512_max_pd(
+        _mm512_min_pd(x, _mm512_set1_pd(EXP_HI)),
+        _mm512_set1_pd(EXP_LO),
+    );
 
     let log2e = _mm512_set1_pd(LOG2E);
     let ln2_hi = _mm512_set1_pd(LN2_HI);
@@ -842,7 +867,10 @@ unsafe fn fast_exp_avx512(x: __m512d) -> __m512d {
 
     let n = _mm512_roundscale_pd(_mm512_mul_pd(x, log2e), 0);
     // r = x - n*ln2 (Cody-Waite reduction for precision)
-    let r = _mm512_sub_pd(_mm512_sub_pd(x, _mm512_mul_pd(n, ln2_hi)), _mm512_mul_pd(n, ln2_lo));
+    let r = _mm512_sub_pd(
+        _mm512_sub_pd(x, _mm512_mul_pd(n, ln2_hi)),
+        _mm512_mul_pd(n, ln2_lo),
+    );
 
     // Horner evaluation: p = P11*r + P10, then p = p*r + P9, etc.
     let mut p = _mm512_set1_pd(P11);
@@ -889,14 +917,23 @@ unsafe fn fast_exp_avx2(x: __m256d) -> __m256d {
     const P11: f64 = 2.505210838544172e-8;
 
     // Clamp to avoid NaN from inf/underflow from -inf
-    let x = _mm256_max_pd(_mm256_min_pd(x, _mm256_set1_pd(EXP_HI)), _mm256_set1_pd(EXP_LO));
+    let x = _mm256_max_pd(
+        _mm256_min_pd(x, _mm256_set1_pd(EXP_HI)),
+        _mm256_set1_pd(EXP_LO),
+    );
 
     let log2e = _mm256_set1_pd(LOG2E);
     let ln2_hi = _mm256_set1_pd(LN2_HI);
     let ln2_lo = _mm256_set1_pd(LN2_LO);
 
-    let n = _mm256_round_pd(_mm256_mul_pd(x, log2e), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-    let r = _mm256_sub_pd(_mm256_sub_pd(x, _mm256_mul_pd(n, ln2_hi)), _mm256_mul_pd(n, ln2_lo));
+    let n = _mm256_round_pd(
+        _mm256_mul_pd(x, log2e),
+        _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+    );
+    let r = _mm256_sub_pd(
+        _mm256_sub_pd(x, _mm256_mul_pd(n, ln2_hi)),
+        _mm256_mul_pd(n, ln2_lo),
+    );
 
     let mut p = _mm256_set1_pd(P11);
     p = _mm256_fmadd_pd(p, r, _mm256_set1_pd(P10));
@@ -974,7 +1011,9 @@ unsafe fn softmax_exp_sum_avx512(row: &mut [f64]) -> f64 {
     let mut max_val = _mm512_reduce_max_pd(vmax);
     while i < len {
         let v = *row.get_unchecked(i);
-        if v > max_val { max_val = v; }
+        if v > max_val {
+            max_val = v;
+        }
         i += 1;
     }
 
@@ -1017,7 +1056,9 @@ unsafe fn softmax_exp_sum_avx2(row: &mut [f64]) -> f64 {
     let mut max_val = tmp[0].max(tmp[1]).max(tmp[2].max(tmp[3]));
     while i < len {
         let v = *row.get_unchecked(i);
-        if v > max_val { max_val = v; }
+        if v > max_val {
+            max_val = v;
+        }
         i += 1;
     }
 
@@ -1321,7 +1362,10 @@ unsafe fn vector_scale_avx2(row: &mut [f64], scale: f64) {
     while i + 8 <= len {
         let ptr = row.as_mut_ptr().add(i);
         _mm256_storeu_pd(ptr, _mm256_mul_pd(_mm256_loadu_pd(ptr), scale_vec));
-        _mm256_storeu_pd(ptr.add(4), _mm256_mul_pd(_mm256_loadu_pd(ptr.add(4)), scale_vec));
+        _mm256_storeu_pd(
+            ptr.add(4),
+            _mm256_mul_pd(_mm256_loadu_pd(ptr.add(4)), scale_vec),
+        );
         i += 8;
     }
     while i + 4 <= len {

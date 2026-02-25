@@ -19,6 +19,7 @@ mod worker;
 
 use autograd::Tensor as AutoTensor;
 use clap::{Parser, Subcommand};
+use colored::Colorize;
 use config::Config;
 use dbn::Dbn;
 use dqn::{train_dqn, DuelingQNetwork, Experience, OnlineDqnTrainer};
@@ -27,7 +28,6 @@ use log::info;
 use neural::NeuralLuckOptimizer;
 use ppo::{train_ppo, ActorCritic, OnlinePpoTrainer};
 use rng::Rng;
-use colored::Colorize;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -39,8 +39,7 @@ use worker::GoodJobWorker;
 use sim::{
     build_non_up_six, format_avg_extra_cost_line, format_f2p_probability_line,
     resolve_operator_name, simulate_f2p_clearing, simulate_fast, simulate_one, simulate_stats,
-    NeuralSample, PpoExperience, SimModelContext, SimRunContext, COST_PER_PULL,
-    FREE_PULLS_WELFARE,
+    NeuralSample, PpoExperience, SimModelContext, SimRunContext, COST_PER_PULL, FREE_PULLS_WELFARE,
 };
 use trainer::{
     train_linear_regression, train_manifold_rl, train_neural_optimizer, OnlineNeuralTrainer,
@@ -228,11 +227,19 @@ fn resolve_f2p_sim_count_prob(config: &Config) -> usize {
     }
     #[cfg(debug_assertions)]
     {
-        if config.fast_init { 2_000 } else { 10_000 }
+        if config.fast_init {
+            2_000
+        } else {
+            10_000
+        }
     }
     #[cfg(not(debug_assertions))]
     {
-        if config.fast_init { 200_000 } else { 1_000_000 }
+        if config.fast_init {
+            200_000
+        } else {
+            1_000_000
+        }
     }
 }
 
@@ -862,10 +869,7 @@ fn run_interactive(args: RunInteractiveArgs) {
         let five_star_rule = if config.always_5_star {
             I18n::get(lang, "rule_5star_every")
         } else if config.five_star_pity > 0 {
-            I18n::get(lang, "rule_5star_pity").replace(
-                "{}",
-                &config.five_star_pity.to_string(),
-            )
+            I18n::get(lang, "rule_5star_pity").replace("{}", &config.five_star_pity.to_string())
         } else {
             I18n::get(lang, "rule_5star_off")
         };
@@ -899,8 +903,7 @@ fn run_interactive(args: RunInteractiveArgs) {
         println!(
             "{}",
             if config.up_pity_soft > 0 {
-                I18n::get(lang, "header_up_pity")
-                    .replace("{}", &config.up_pity_soft.to_string())
+                I18n::get(lang, "header_up_pity").replace("{}", &config.up_pity_soft.to_string())
             } else {
                 I18n::get(lang, "header_up_pity_off")
             }
@@ -1398,7 +1401,11 @@ fn run_interactive(args: RunInteractiveArgs) {
             }
         };
 
-        let free_pulls = if use_welfare_default { FREE_PULLS_WELFARE } else { 0 };
+        let free_pulls = if use_welfare_default {
+            FREE_PULLS_WELFARE
+        } else {
+            0
+        };
         let sims_n = default_sims;
 
         if sims_n > 1 {
@@ -1428,8 +1435,7 @@ fn run_interactive(args: RunInteractiveArgs) {
                         neural_sender: None,
                         ppo_sender: None,
                     };
-                    let (s_total, u_total, _, _) =
-                        simulate_stats(n, sims_n, rng.next_u64(), &ctx);
+                    let (s_total, u_total, _, _) = simulate_stats(n, sims_n, rng.next_u64(), &ctx);
                     let s_avg = s_total as f64 / sims_n as f64;
                     let u_avg = u_total as f64 / sims_n as f64;
                     let elapsed_ms = sim_start.elapsed().as_millis() as u64;
@@ -1516,8 +1522,7 @@ fn run_interactive(args: RunInteractiveArgs) {
                         neural_sender: None,
                         ppo_sender: None,
                     };
-                    let (s_total, u_total, _, _) =
-                        simulate_stats(n, 1, rng.next_u64(), &ctx);
+                    let (s_total, u_total, _, _) = simulate_stats(n, 1, rng.next_u64(), &ctx);
                     let s_avg = s_total as f64;
                     let u_avg = u_total as f64;
                     println!(
@@ -1541,12 +1546,7 @@ fn run_interactive(args: RunInteractiveArgs) {
                 neural_sender: neural_sender.as_ref(),
                 ppo_sender: ppo_sender.as_ref(),
             };
-            let res = simulate_one(
-                n,
-                &mut rng,
-                free_pulls,
-                &ctx,
-            );
+            let res = simulate_one(n, &mut rng, free_pulls, &ctx);
             let elapsed = start_time.elapsed();
             println!(
                 "{}",
@@ -1611,8 +1611,7 @@ fn run_interactive(args: RunInteractiveArgs) {
             println!("{}", I18n::get(lang, "consumption_header"));
             println!(
                 "{}",
-                I18n::get(lang, "consumption_free")
-                    .replace("{}", &res.free_pulls_used.to_string())
+                I18n::get(lang, "consumption_free").replace("{}", &res.free_pulls_used.to_string())
             );
             println!(
                 "{}",

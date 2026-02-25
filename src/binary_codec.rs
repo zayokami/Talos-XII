@@ -613,9 +613,15 @@ impl<'de, R: Read> de::Deserializer<'de> for &mut BinDeserializer<R> {
     fn deserialize_seq<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
         let len = self.read_u64()? as usize;
         if len > MAX_COLLECTION_LEN {
-            return Err(Error::Message(format!("sequence length {} exceeds cap {}", len, MAX_COLLECTION_LEN)));
+            return Err(Error::Message(format!(
+                "sequence length {} exceeds cap {}",
+                len, MAX_COLLECTION_LEN
+            )));
         }
-        visitor.visit_seq(SeqAccess { de: self, remaining: len })
+        visitor.visit_seq(SeqAccess {
+            de: self,
+            remaining: len,
+        })
     }
 
     fn deserialize_tuple<V: de::Visitor<'de>>(
@@ -623,7 +629,10 @@ impl<'de, R: Read> de::Deserializer<'de> for &mut BinDeserializer<R> {
         len: usize,
         visitor: V,
     ) -> Result<V::Value, Error> {
-        visitor.visit_seq(SeqAccess { de: self, remaining: len })
+        visitor.visit_seq(SeqAccess {
+            de: self,
+            remaining: len,
+        })
     }
 
     fn deserialize_tuple_struct<V: de::Visitor<'de>>(
@@ -632,15 +641,24 @@ impl<'de, R: Read> de::Deserializer<'de> for &mut BinDeserializer<R> {
         len: usize,
         visitor: V,
     ) -> Result<V::Value, Error> {
-        visitor.visit_seq(SeqAccess { de: self, remaining: len })
+        visitor.visit_seq(SeqAccess {
+            de: self,
+            remaining: len,
+        })
     }
 
     fn deserialize_map<V: de::Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
         let len = self.read_u64()? as usize;
         if len > MAX_COLLECTION_LEN {
-            return Err(Error::Message(format!("map length {} exceeds cap {}", len, MAX_COLLECTION_LEN)));
+            return Err(Error::Message(format!(
+                "map length {} exceeds cap {}",
+                len, MAX_COLLECTION_LEN
+            )));
         }
-        visitor.visit_map(MapAccess { de: self, remaining: len })
+        visitor.visit_map(MapAccess {
+            de: self,
+            remaining: len,
+        })
     }
 
     fn deserialize_struct<V: de::Visitor<'de>>(
@@ -661,7 +679,10 @@ impl<'de, R: Read> de::Deserializer<'de> for &mut BinDeserializer<R> {
         variants: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, Error> {
-        visitor.visit_enum(EnumAccess { de: self, num_variants: variants.len() })
+        visitor.visit_enum(EnumAccess {
+            de: self,
+            num_variants: variants.len(),
+        })
     }
 
     fn deserialize_identifier<V: de::Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Error> {
@@ -670,10 +691,7 @@ impl<'de, R: Read> de::Deserializer<'de> for &mut BinDeserializer<R> {
         ))
     }
 
-    fn deserialize_ignored_any<V: de::Visitor<'de>>(
-        self,
-        _visitor: V,
-    ) -> Result<V::Value, Error> {
+    fn deserialize_ignored_any<V: de::Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Error> {
         Err(Error::Message(
             "binary_codec does not support deserialize_ignored_any".into(),
         ))
@@ -727,10 +745,7 @@ impl<'de, 'a, R: Read> de::MapAccess<'de> for MapAccess<'a, R> {
         seed.deserialize(&mut *self.de).map(Some)
     }
 
-    fn next_value_seed<V: de::DeserializeSeed<'de>>(
-        &mut self,
-        seed: V,
-    ) -> Result<V::Value, Error> {
+    fn next_value_seed<V: de::DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, Error> {
         seed.deserialize(&mut *self.de)
     }
 }
@@ -754,7 +769,9 @@ impl<'de, 'a, R: Read> de::EnumAccess<'de> for EnumAccess<'a, R> {
         if self.num_variants > 0 && variant_index as usize >= self.num_variants {
             return Err(Error::InvalidEnumVariant(variant_index));
         }
-        let val = seed.deserialize(VariantIndexDeserializer { index: variant_index })?;
+        let val = seed.deserialize(VariantIndexDeserializer {
+            index: variant_index,
+        })?;
         Ok((val, VariantAccess { de: self.de }))
     }
 }
@@ -770,10 +787,7 @@ impl<'de, 'a, R: Read> de::VariantAccess<'de> for VariantAccess<'a, R> {
         Ok(())
     }
 
-    fn newtype_variant_seed<T: de::DeserializeSeed<'de>>(
-        self,
-        seed: T,
-    ) -> Result<T::Value, Error> {
+    fn newtype_variant_seed<T: de::DeserializeSeed<'de>>(self, seed: T) -> Result<T::Value, Error> {
         seed.deserialize(self.de)
     }
 
@@ -848,7 +862,7 @@ mod tests {
 
     #[test]
     fn roundtrip_vec() {
-        let v: Vec<f64> = vec![1.0, 2.0, 3.14159, -42.0, 0.0];
+        let v: Vec<f64> = vec![1.0, 2.0, std::f64::consts::PI, -42.0, 0.0];
         let buf = to_vec(&v).unwrap();
         let decoded: Vec<f64> = from_slice(&buf).unwrap();
         assert_eq!(v, decoded);

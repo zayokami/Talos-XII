@@ -962,7 +962,7 @@ impl MultiHeadLatentAttention {
             }
         }
 
-        // Causal mask: token at query position i (absolute pos = start_pos + i) 
+        // Causal mask: token at query position i (absolute pos = start_pos + i)
         // must not attend to cache position j where j > start_pos + i
         for h in 0..num_heads {
             for i in 0..seq_len {
@@ -1250,9 +1250,7 @@ impl MultiHeadLatentAttention {
                 backward_op: Box::new(move |grad_out, parents| {
                     let mut inp_grad = parents[0].grad.write().unwrap();
                     let bh = inp_grad.len() / (seq_len * seq_len);
-                    for (idx, (&g, ig)) in
-                        grad_out.iter().zip(inp_grad.iter_mut()).enumerate()
-                    {
+                    for (idx, (&g, ig)) in grad_out.iter().zip(inp_grad.iter_mut()).enumerate() {
                         let local = idx % (seq_len * seq_len);
                         let i = local / seq_len;
                         let j = local % seq_len;
@@ -1577,8 +1575,8 @@ mod tests {
         // Run 2: same t0, but t2 and t3 are different
         let mut input_b_raw = input_a.data.read().unwrap().clone();
         // Overwrite positions 2 and 3 (indices 2*dim .. 4*dim) with different values
-        for i in (2 * dim)..(4 * dim) {
-            input_b_raw[i] = 99.0 - input_b_raw[i];
+        for val in input_b_raw.iter_mut().take(4 * dim).skip(2 * dim) {
+            *val = 99.0 - *val;
         }
         let input_b = Tensor::new(input_b_raw, vec![1, seq_len, dim]);
         let out_b = mla.forward(&input_b);
@@ -1635,14 +1633,15 @@ mod tests {
         // Run 1
         let input_a: Vec<f64> = {
             let t = Tensor::rand(vec![seq_len * dim], -0.1, 0.1, 200);
-            let v = t.data.read().unwrap().clone(); v
+            let v = t.data.read().unwrap().clone();
+            v
         };
         let out_a = mla.forward_inference(&input_a);
 
         // Run 2: change positions 2 and 3
         let mut input_b = input_a.clone();
-        for i in (2 * dim)..(4 * dim) {
-            input_b[i] = 99.0 - input_b[i];
+        for val in input_b.iter_mut().take(4 * dim).skip(2 * dim) {
+            *val = 99.0 - *val;
         }
         let out_b = mla.forward_inference(&input_b);
 
@@ -1696,7 +1695,8 @@ mod tests {
         // Prefill 2 tokens, then decode token 3 with two different values
         let prefill: Vec<f64> = {
             let t = Tensor::rand(vec![2 * dim], -0.1, 0.1, 300);
-            let v = t.data.read().unwrap().clone(); v
+            let v = t.data.read().unwrap().clone();
+            v
         };
 
         // Cache A: prefill then decode token_a
@@ -1705,7 +1705,8 @@ mod tests {
 
         let token_a: Vec<f64> = {
             let t = Tensor::rand(vec![dim], -0.1, 0.1, 400);
-            let v = t.data.read().unwrap().clone(); v
+            let v = t.data.read().unwrap().clone();
+            v
         };
         let out_a = mla.forward_inference_cached(&token_a, &mut cache_a, 2);
 

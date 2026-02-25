@@ -7,11 +7,11 @@ use crate::rng::Rng;
 use crate::sim::{build_features, dbn_env, prob_6, PpoExperience, PullState};
 use crate::transformer::{KVCache, LuckTransformer};
 use crate::worker::GoodJobWorker;
+use rand::seq::SliceRandom;
+use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
-use rayon::prelude::*;
-use rand::seq::SliceRandom;
-use serde::{Deserialize, Serialize};
 
 // --- PPO Components ---
 
@@ -531,7 +531,8 @@ impl Adam {
                 let m_hat = self.m[i][j] / bias_correction1;
                 let v_hat = self.v[i][j] / bias_correction2;
                 // AdamW: decoupled weight decay applied directly to parameters
-                data[j] -= self.lr * (m_hat / (v_hat.sqrt() + self.eps) + self.weight_decay * data[j]);
+                data[j] -=
+                    self.lr * (m_hat / (v_hat.sqrt() + self.eps) + self.weight_decay * data[j]);
             }
         }
     }
@@ -1142,27 +1143,27 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
             for i in 0..remainder {
                 let idx = (start + i) % num_envs;
                 let result = envs[idx].step(&ppo.policy, dbn, config, context_len);
-            ppo.store_raw(result.experience);
-            if let Some(done_reward) = result.finished_reward {
-                _episode_count += 1;
-                recent_rewards.push_back(done_reward);
-                if recent_rewards.len() > 50 {
-                    recent_rewards.pop_front();
+                ppo.store_raw(result.experience);
+                if let Some(done_reward) = result.finished_reward {
+                    _episode_count += 1;
+                    recent_rewards.push_back(done_reward);
+                    if recent_rewards.len() > 50 {
+                        recent_rewards.pop_front();
+                    }
                 }
-            }
-            collected += 1;
-            if collected.is_multiple_of(heartbeat_every)
-                && last_heartbeat.elapsed() >= Duration::from_millis(300)
-            {
-                let global_step = (steps_done + collected).min(total_steps);
-                print!(
-                    "\r[PPO] Collecting: {}/{} | Avg Reward: {:.2} | LR: {:.6}",
-                    global_step, total_steps, envs[idx].episode_reward, current_lr
-                );
-                use std::io::Write;
-                std::io::stdout().flush().unwrap();
-                last_heartbeat = Instant::now();
-            }
+                collected += 1;
+                if collected.is_multiple_of(heartbeat_every)
+                    && last_heartbeat.elapsed() >= Duration::from_millis(300)
+                {
+                    let global_step = (steps_done + collected).min(total_steps);
+                    print!(
+                        "\r[PPO] Collecting: {}/{} | Avg Reward: {:.2} | LR: {:.6}",
+                        global_step, total_steps, envs[idx].episode_reward, current_lr
+                    );
+                    use std::io::Write;
+                    std::io::stdout().flush().unwrap();
+                    last_heartbeat = Instant::now();
+                }
             }
             remainder_offset = (remainder_offset + remainder) % num_envs;
         }

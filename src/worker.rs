@@ -91,9 +91,13 @@ mod win_platform {
 #[cfg(not(windows))]
 mod win_platform {
     pub unsafe fn set_current_thread_priority(_level: i32) {}
-    pub fn priority_from_str(_s: &str) -> i32 { 0 }
+    pub fn priority_from_str(_s: &str) -> i32 {
+        0
+    }
     pub unsafe fn pin_to_core(_core_id: usize) {}
-    pub fn get_process_affinity() -> u64 { u64::MAX }
+    pub fn get_process_affinity() -> u64 {
+        u64::MAX
+    }
     pub fn warmup_stack(_stack_bytes: usize) {}
 }
 
@@ -175,9 +179,8 @@ impl GoodJobWorker {
         // to consecutive cores starting from 0, we maximize the chance of landing
         // on P-Cores where AVX2/FMA throughput is highest.
         let affinity_mask = win_platform::get_process_affinity();
-        let available_cores: Vec<usize> = (0..64)
-            .filter(|&i| (affinity_mask >> i) & 1 == 1)
-            .collect();
+        let available_cores: Vec<usize> =
+            (0..64).filter(|&i| (affinity_mask >> i) & 1 == 1).collect();
 
         let warmup_bytes = (stack_size / 2).min(512 * 1024);
         let cores_for_info = available_cores.clone();
@@ -245,9 +248,7 @@ impl GoodJobWorker {
 
         match result {
             Ok(val) => {
-                self.metrics
-                    .tasks_completed
-                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics.tasks_completed.fetch_add(1, Ordering::Relaxed);
                 self.metrics
                     .total_exec_ns
                     .fetch_add(elapsed_ns, Ordering::Relaxed);
@@ -288,7 +289,9 @@ impl GoodJobWorker {
                     match result {
                         Ok(val) => {
                             metrics.tasks_completed.fetch_add(1, Ordering::Relaxed);
-                            metrics.total_exec_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+                            metrics
+                                .total_exec_ns
+                                .fetch_add(elapsed_ns, Ordering::Relaxed);
                             Ok(val)
                         }
                         Err(err) => {
