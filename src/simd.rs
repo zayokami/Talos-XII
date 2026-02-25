@@ -101,29 +101,27 @@ pub fn dot_product(a: &[f64], b: &[f64]) -> f64 {
     let len = a.len();
     assert_eq!(len, b.len(), "Dimension mismatch in dot_product");
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        let t = tier::get();
-        unsafe {
-            if t >= tier::AVX512 {
-                return dot_product_avx512(a, b);
-            }
-            if t >= tier::AVX2_FMA {
-                return dot_product_avx2_fma(a, b);
-            }
-            if t >= tier::AVX2 {
-                return dot_product_avx2(a, b);
-            }
-        }
-    }
     #[cfg(target_arch = "aarch64")]
-    {
-        unsafe {
-            return dot_product_neon(a, b);
-        }
+    unsafe {
+        dot_product_neon(a, b)
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let t = tier::get();
+            unsafe {
+                if t >= tier::AVX512 {
+                    return dot_product_avx512(a, b);
+                }
+                if t >= tier::AVX2_FMA {
+                    return dot_product_avx2_fma(a, b);
+                }
+                if t >= tier::AVX2 {
+                    return dot_product_avx2(a, b);
+                }
+            }
+        }
         dot_product_scalar(a, b)
     }
 }

@@ -25,22 +25,20 @@ const ENTROPY_COEF: f64 = 0.01;
 
 #[inline(always)]
 fn sum_f64(values: &[f64]) -> f64 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::is_x86_feature_detected!("avx2") {
-            unsafe {
-                return sum_f64_avx2(values);
-            }
-        }
-    }
     #[cfg(target_arch = "aarch64")]
-    {
-        unsafe {
-            return sum_f64_neon(values);
-        }
+    unsafe {
+        sum_f64_neon(values)
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                unsafe {
+                    return sum_f64_avx2(values);
+                }
+            }
+        }
         let mut sum = 0.0;
         for &v in values {
             sum += v;
@@ -51,22 +49,20 @@ fn sum_f64(values: &[f64]) -> f64 {
 
 #[inline(always)]
 fn sum_sq_diff(values: &[f64], mean: f64) -> f64 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::is_x86_feature_detected!("avx2") {
-            unsafe {
-                return sum_sq_diff_avx2(values, mean);
-            }
-        }
-    }
     #[cfg(target_arch = "aarch64")]
-    {
-        unsafe {
-            return sum_sq_diff_neon(values, mean);
-        }
+    unsafe {
+        sum_sq_diff_neon(values, mean)
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                unsafe {
+                    return sum_sq_diff_avx2(values, mean);
+                }
+            }
+        }
         let mut sum = 0.0;
         for &v in values {
             let d = v - mean;
@@ -80,29 +76,28 @@ fn sum_sq_diff(values: &[f64], mean: f64) -> f64 {
 fn normalize_slice(values: &[f64], mean: f64, std: f64) -> Vec<f64> {
     let len = values.len();
     let mut out = vec![0.0; len];
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::is_x86_feature_detected!("avx2") {
-            unsafe {
-                normalize_slice_avx2(values, &mut out, mean, std);
-            }
-            return out;
-        }
-    }
     #[cfg(target_arch = "aarch64")]
     {
         unsafe {
             normalize_slice_neon(values, &mut out, mean, std);
         }
-        return out;
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                unsafe {
+                    normalize_slice_avx2(values, &mut out, mean, std);
+                }
+                return out;
+            }
+        }
         for i in 0..len {
             out[i] = (values[i] - mean) / std;
         }
-        out
     }
+    out
 }
 
 #[cfg(target_arch = "x86_64")]

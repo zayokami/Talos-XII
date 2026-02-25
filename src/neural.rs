@@ -23,24 +23,21 @@ fn tensor_relu(t: &Tensor) -> Tensor {
 
 #[inline(always)]
 fn add_scaled_row(output: &mut Tensor, row: &[f64], scale: f64) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::is_x86_feature_detected!("avx2") {
-            unsafe {
-                add_scaled_row_avx2(output, row, scale);
-            }
-            return;
-        }
-    }
     #[cfg(target_arch = "aarch64")]
-    {
-        unsafe {
-            add_scaled_row_neon(output, row, scale);
-        }
-        return;
+    unsafe {
+        add_scaled_row_neon(output, row, scale);
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                unsafe {
+                    add_scaled_row_avx2(output, row, scale);
+                }
+                return;
+            }
+        }
         let len = output.len();
         for i in 0..len {
             output[i] += scale * row[i];
