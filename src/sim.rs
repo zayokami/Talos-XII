@@ -1377,4 +1377,103 @@ mod tests {
         }
         out
     }
+
+    #[test]
+    fn prob_6_at_boundary_values() {
+        let config = Config::load("data/config.json");
+        let below = prob_6(config.soft_pity_start - 1, &config);
+        assert!(
+            (below - config.prob_6_base).abs() < 1e-12,
+            "Below soft pity should be base rate"
+        );
+        let at_start = prob_6(config.soft_pity_start, &config);
+        assert!(
+            at_start > config.prob_6_base,
+            "At soft pity start, rate should be boosted"
+        );
+        let at_guarantee = prob_6(config.small_pity_guarantee, &config);
+        assert!(
+            (at_guarantee - 1.0).abs() < 1e-12,
+            "At guarantee should be 1.0"
+        );
+    }
+
+    #[test]
+    fn prob_6_monotonically_increases() {
+        let config = Config::load("data/config.json");
+        let mut prev = 0.0;
+        for pity in 0..=config.small_pity_guarantee {
+            let p = prob_6(pity, &config);
+            assert!(p >= prev, "Prob should be non-decreasing at pity={}", pity);
+            prev = p;
+        }
+    }
+
+    #[test]
+    fn roll_one_respects_up_rate_zero() {
+        let (mut config, _dbn, neural_opt) = build_context();
+        config.up_rate = 0.0;
+        let mut rng = Rng::from_seed(999);
+        let mut state = PullState {
+            pity_6: config.small_pity_guarantee - 1,
+            total_pulls_in_pool: 0,
+            has_obtained_up: false,
+            streak_4_star: 0,
+            loss_streak: 0,
+        };
+        let outcome = roll_one(
+            &mut state,
+            &mut rng,
+            &neural_opt,
+            None,
+            None,
+            0.0,
+            0.0,
+            &config,
+            0,
+            false,
+            None,
+            None,
+            true,
+            None,
+            &mut None,
+            0,
+        );
+        assert_eq!(outcome.rarity, 6);
+        assert!(!outcome.is_up, "With up_rate=0 should never be UP via roll");
+    }
+
+    #[test]
+    fn stop_after_total_pulls_exact_count() {
+        let (config, dbn, neural_opt) = build_context();
+        let mut rng = Rng::from_seed(42);
+        let limit = 10usize;
+        let control = SimControl {
+            max_pulls: None,
+            stop_on_up: false,
+            stop_after_total_pulls: Some(limit),
+            nn_total_pulls_one_based: false,
+            collect_details: true,
+            big_pity_requires_not_up: false,
+            fast_inference: true,
+        };
+        let ctx = SimModelContext {
+            neural_opt: &neural_opt,
+            dqn_policy: None,
+            ppo_policy: None,
+            dbn: &dbn,
+            config: &config,
+            exp_sender: None,
+            neural_sender: None,
+            ppo_sender: None,
+        };
+        let (_, pulls) = simulate_core(&control, &mut rng, 0, &ctx);
+        let pulls = pulls.unwrap();
+        assert!(
+            pulls.len() <= limit,
+            "Should not exceed limit: got {} pulls for limit {}",
+            pulls.len(),
+            limit
+        );
+    }
 }

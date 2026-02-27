@@ -1711,4 +1711,23 @@ mod tests {
         let (stats, _) = simulate_core(&control, &mut rng, FREE_PULLS_WELFARE, &ctx);
         assert!(stats.up_count > 0);
     }
+
+    #[test]
+    fn dqn_training_produces_valid_q_values() {
+        let (mut config, dbn, neural_opt) = build_context();
+        config.fast_init = true;
+        let mut rng = Rng::from_seed(7777);
+        let dqn = train_dqn(&neural_opt, &mut rng, &dbn, &config);
+        let state = AutoTensor::new(vec![0.5; 8], vec![8]);
+        let q_values = dqn.forward(&state);
+        let q_data = q_values.data.read().unwrap();
+        assert_eq!(
+            q_data.len(),
+            5,
+            "Q-values should have ACTION_SPACE=5 outputs"
+        );
+        for &v in q_data.iter() {
+            assert!(v.is_finite(), "Q-values must be finite, got {}", v);
+        }
+    }
 }
