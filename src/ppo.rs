@@ -979,7 +979,7 @@ impl PpoEnvState {
         } else if config.always_5_star
             || (config.five_star_pity > 0
                 && self.state_struct.streak_4_star >= config.five_star_pity - 1)
-            || r < final_prob_6 + config.prob_5_base
+            || r < (final_prob_6 + config.prob_5_base).min(1.0)
         {
             self.state_struct.streak_4_star = 0;
         } else {
