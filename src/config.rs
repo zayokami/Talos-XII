@@ -108,11 +108,36 @@ impl JsonParser {
     }
 
     fn skip_whitespace(&mut self) {
-        while let Some(c) = self.peek() {
-            if c.is_whitespace() {
-                self.advance();
-            } else {
-                break;
+        loop {
+            match self.peek() {
+                Some(c) if c.is_whitespace() => {
+                    self.advance();
+                }
+                Some('/') => {
+                    if self.peek_at(1) == Some('/') {
+                        while let Some(c) = self.advance() {
+                            if c == '\n' {
+                                break;
+                            }
+                        }
+                    } else if self.peek_at(1) == Some('*') {
+                        self.advance();
+                        self.advance();
+                        loop {
+                            match self.advance() {
+                                Some('*') if self.peek() == Some('/') => {
+                                    self.advance();
+                                    break;
+                                }
+                                None => break,
+                                _ => {}
+                            }
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                _ => break,
             }
         }
     }
@@ -318,6 +343,10 @@ impl JsonParser {
 
     fn peek(&self) -> Option<char> {
         self.chars.get(self.pos).copied()
+    }
+
+    fn peek_at(&self, offset: usize) -> Option<char> {
+        self.chars.get(self.pos + offset).copied()
     }
 
     fn advance(&mut self) -> Option<char> {

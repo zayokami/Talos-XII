@@ -22,6 +22,9 @@ const GAMMA: f64 = 0.99;
 const GAE_LAMBDA: f64 = 0.95;
 const VALUE_COEF: f64 = 0.5;
 const ENTROPY_COEF: f64 = 0.01;
+const EPISODE_MAX_PULLS: usize = 300;
+const EARLY_UP_BONUS_THRESHOLD_1: usize = 80;
+const EARLY_UP_BONUS_THRESHOLD_2: usize = 50;
 
 #[inline(always)]
 fn sum_f64(values: &[f64]) -> f64 {
@@ -289,8 +292,7 @@ impl ActorCritic {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn forward_actor(&self, state: &Tensor, pity: &[usize]) -> Tensor {
+    fn forward_backbone(&self, state: &Tensor, pity: &[usize]) -> Tensor {
         let x = if state.shape.len() == 1 {
             state.reshape(vec![1, 1, state.shape[0]])
         } else if state.shape.len() == 2 {
@@ -299,56 +301,33 @@ impl ActorCritic {
             state.clone()
         };
         let seq = self.backbone.forward(&x, pity);
-        let last = self.backbone.last_token(&seq);
-        let logits = self.actor_head.forward(&last);
-        if logits.shape.len() == 2 && logits.shape[0] == 1 {
-            logits.reshape(vec![logits.shape[1]])
+        self.backbone.last_token(&seq)
+    }
+
+    fn squeeze_head(t: Tensor) -> Tensor {
+        if t.shape.len() == 2 && t.shape[0] == 1 {
+            t.reshape(vec![t.shape[1]])
         } else {
-            logits
+            t
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn forward_actor(&self, state: &Tensor, pity: &[usize]) -> Tensor {
+        let last = self.forward_backbone(state, pity);
+        Self::squeeze_head(self.actor_head.forward(&last))
     }
 
     #[allow(dead_code)]
     pub fn forward_critic(&self, state: &Tensor, pity: &[usize]) -> Tensor {
-        let x = if state.shape.len() == 1 {
-            state.reshape(vec![1, 1, state.shape[0]])
-        } else if state.shape.len() == 2 {
-            state.reshape(vec![1, state.shape[0], state.shape[1]])
-        } else {
-            state.clone()
-        };
-        let seq = self.backbone.forward(&x, pity);
-        let last = self.backbone.last_token(&seq);
-        let value = self.critic_head.forward(&last);
-        if value.shape.len() == 2 && value.shape[0] == 1 {
-            value.reshape(vec![value.shape[1]])
-        } else {
-            value
-        }
+        let last = self.forward_backbone(state, pity);
+        Self::squeeze_head(self.critic_head.forward(&last))
     }
 
     pub fn forward_actor_critic(&self, state: &Tensor, pity: &[usize]) -> (Tensor, Tensor) {
-        let x = if state.shape.len() == 1 {
-            state.reshape(vec![1, 1, state.shape[0]])
-        } else if state.shape.len() == 2 {
-            state.reshape(vec![1, state.shape[0], state.shape[1]])
-        } else {
-            state.clone()
-        };
-        let seq = self.backbone.forward(&x, pity);
-        let last = self.backbone.last_token(&seq);
-        let logits = self.actor_head.forward(&last);
-        let value = self.critic_head.forward(&last);
-        let logits = if logits.shape.len() == 2 && logits.shape[0] == 1 {
-            logits.reshape(vec![logits.shape[1]])
-        } else {
-            logits
-        };
-        let value = if value.shape.len() == 2 && value.shape[0] == 1 {
-            value.reshape(vec![value.shape[1]])
-        } else {
-            value
-        };
+        let last = self.forward_backbone(state, pity);
+        let logits = Self::squeeze_head(self.actor_head.forward(&last));
+        let value = Self::squeeze_head(self.critic_head.forward(&last));
         (logits, value)
     }
 
@@ -991,10 +970,10 @@ impl PpoEnvState {
         if is_six {
             if is_up {
                 reward += 10.0;
-                if self.pulls_done < 80 {
+                if self.pulls_done < EARLY_UP_BONUS_THRESHOLD_1 {
                     reward += 5.0;
                 }
-                if self.pulls_done < 50 {
+                if self.pulls_done < EARLY_UP_BONUS_THRESHOLD_2 {
                     reward += 5.0;
                 }
             } else {
@@ -1006,7 +985,7 @@ impl PpoEnvState {
         }
         self.episode_reward += reward;
 
-        let done = is_up || self.pulls_done >= 300;
+        let done = is_up || self.pulls_done >= EPISODE_MAX_PULLS;
 
         let experience = PpoStoreRawInput {
             state: self.flat_data.clone(),

@@ -13,8 +13,9 @@ use std::sync::mpsc::Sender;
 
 // Constants
 pub const DBN_GIBBS_STEPS: usize = 10;
-pub const COST_PER_PULL: u32 = 500; // Jade equivalent
+pub const COST_PER_PULL: u32 = 500;
 pub const FREE_PULLS_WELFARE: u32 = 135;
+const EPISODE_MAX_PULLS: usize = 300;
 
 #[derive(Clone, Debug)]
 pub struct PullResult {
@@ -828,7 +829,7 @@ fn record_training_samples(inputs: TrainingSampleInputs<'_>) {
         if state.loss_streak >= 2 {
             reward -= (state.loss_streak as f64) * 0.5;
         }
-        let done = outcome.is_up || (pulls_done + 1) >= 300;
+        let done = outcome.is_up || (pulls_done + 1) >= EPISODE_MAX_PULLS;
         let _ = sender.send(Experience {
             state: current_state.to_vec(),
             action,
@@ -875,7 +876,7 @@ fn record_training_samples(inputs: TrainingSampleInputs<'_>) {
             if state.loss_streak >= 2 {
                 reward -= (state.loss_streak as f64) * 2.0;
             }
-            let done = outcome.is_up || (pulls_done + 1) >= 300;
+            let done = outcome.is_up || (pulls_done + 1) >= EPISODE_MAX_PULLS;
             let _ = sender.send(PpoExperience {
                 state: state_data.clone(),
                 seq_len: ppo_inputs.seq_len,

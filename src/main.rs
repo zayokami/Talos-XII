@@ -96,9 +96,11 @@ struct SimHistoryEntry {
 
 fn prompt_yes_no(prompt: &str, default_yes: bool) -> bool {
     print!("{}", prompt);
-    io::stdout().flush().unwrap();
+    let _ = io::stdout().flush();
     let mut input = String::new();
-    io::stdin().read_line(&mut input).unwrap();
+    if io::stdin().read_line(&mut input).is_err() {
+        return default_yes;
+    }
     let s = input.trim();
     if s.is_empty() {
         return default_yes;
@@ -132,76 +134,31 @@ fn save_neural_cache(path: &str, net: &NeuralLuckOptimizer) -> bool {
     std::fs::write(alt, &bytes).is_ok()
 }
 
-fn save_ppo_model(model: &ActorCritic, path: &str) {
+fn save_model<T: serde::Serialize>(model: &T, path: &str, label: &str) {
     let bin_path = format!("{}.bin", path);
     if let Ok(file) = std::fs::File::create(&bin_path) {
         let writer = std::io::BufWriter::new(file);
         if binary_codec::serialize_into(writer, model).is_ok() {
-            info!("[PPO] Model saved to {} (Binary)", bin_path);
+            info!("[{}] Model saved to {} (Binary)", label, bin_path);
         }
     }
 
-    // Also save as JSON for compatibility/debugging
-    if let Ok(file) = std::fs::File::create(path) {
-        let writer = std::io::BufWriter::new(file);
-        if serde_json::to_writer(writer, model).is_ok() {
-            info!("[PPO] Model saved to {} (JSON)", path);
-        } else {
-            info!("[PPO] Failed to serialize model (JSON)");
+    if cfg!(debug_assertions) {
+        if let Ok(file) = std::fs::File::create(path) {
+            let writer = std::io::BufWriter::new(file);
+            if serde_json::to_writer(writer, model).is_ok() {
+                info!("[{}] Model saved to {} (JSON)", label, path);
+            }
         }
-    } else {
-        info!("[PPO] Failed to create file {}", path);
     }
 }
 
-fn load_ppo_model(path: &str) -> Option<ActorCritic> {
+fn load_model<T: serde::de::DeserializeOwned>(path: &str, label: &str) -> Option<T> {
     let bin_path = format!("{}.bin", path);
     if let Ok(file) = std::fs::File::open(&bin_path) {
         let reader = std::io::BufReader::new(file);
         if let Ok(model) = binary_codec::deserialize_from(reader) {
-            info!("[PPO] Loaded model from {} (Binary)", bin_path);
-            return Some(model);
-        }
-    }
-
-    // Fallback to JSON
-    if let Ok(file) = std::fs::File::open(path) {
-        let reader = std::io::BufReader::new(file);
-        if let Ok(model) = serde_json::from_reader(reader) {
-            info!("[PPO] Loaded model from {} (JSON)", path);
-            return Some(model);
-        }
-    }
-    None
-}
-
-fn save_dqn_model(model: &DuelingQNetwork, path: &str) {
-    let bin_path = format!("{}.bin", path);
-    if let Ok(file) = std::fs::File::create(&bin_path) {
-        let writer = std::io::BufWriter::new(file);
-        if binary_codec::serialize_into(writer, model).is_ok() {
-            info!("[DQN] Model saved to {} (Binary)", bin_path);
-        }
-    }
-
-    if let Ok(file) = std::fs::File::create(path) {
-        let writer = std::io::BufWriter::new(file);
-        if serde_json::to_writer(writer, model).is_ok() {
-            info!("[DQN] Model saved to {} (JSON)", path);
-        } else {
-            info!("[DQN] Failed to serialize model (JSON)");
-        }
-    } else {
-        info!("[DQN] Failed to create file {}", path);
-    }
-}
-
-fn load_dqn_model(path: &str) -> Option<DuelingQNetwork> {
-    let bin_path = format!("{}.bin", path);
-    if let Ok(file) = std::fs::File::open(&bin_path) {
-        let reader = std::io::BufReader::new(file);
-        if let Ok(model) = binary_codec::deserialize_from(reader) {
-            info!("[DQN] Loaded model from {} (Binary)", bin_path);
+            info!("[{}] Loaded model from {} (Binary)", label, bin_path);
             return Some(model);
         }
     }
@@ -209,7 +166,7 @@ fn load_dqn_model(path: &str) -> Option<DuelingQNetwork> {
     if let Ok(file) = std::fs::File::open(path) {
         let reader = std::io::BufReader::new(file);
         if let Ok(model) = serde_json::from_reader(reader) {
-            info!("[DQN] Loaded model from {} (JSON)", path);
+            info!("[{}] Loaded model from {} (JSON)", label, path);
             return Some(model);
         }
     }
@@ -407,38 +364,38 @@ fn initialize_system(
     let dqn_policy = if config.online_train && config.online_train_dqn {
         DuelingQNetwork::new(rng.next_u64(), &config.achf)
     } else if !args.force {
-        if let Some(cached) = load_dqn_model("dqn.cache") {
+        if let Some(cached) = load_model::<DuelingQNetwork>("dqn.cache", "DQN") {
             info!("[DQN] Cached model loaded.");
             cached
         } else {
             info!("[DQN] Training new model...");
             let d = train_dqn(&trained_neural_opt, &mut rng, &dbn, &config);
-            save_dqn_model(&d, "dqn.cache");
+            save_model(&d, "dqn.cache", "DQN");
             d
         }
     } else {
         info!("[DQN] Force training new model...");
         let d = train_dqn(&trained_neural_opt, &mut rng, &dbn, &config);
-        save_dqn_model(&d, "dqn.cache");
+        save_model(&d, "dqn.cache", "DQN");
         d
     };
 
     // PPO
     let ppo_policy = if !args.force {
-        if let Some(cached) = load_ppo_model("ppo.cache") {
+        if let Some(cached) = load_model::<ActorCritic>("ppo.cache", "PPO") {
             cached.freeze_achf_for_inference();
             info!("[PPO] Cached model loaded.");
             cached
         } else {
             info!("[PPO] Training new model...");
             let p = train_ppo(&mut rng, &dbn, &config);
-            save_ppo_model(&p, "ppo.cache");
+            save_model(&p, "ppo.cache", "PPO");
             p
         }
     } else {
         info!("[PPO] Force training new model...");
         let p = train_ppo(&mut rng, &dbn, &config);
-        save_ppo_model(&p, "ppo.cache");
+        save_model(&p, "ppo.cache", "PPO");
         p
     };
 
@@ -567,7 +524,7 @@ fn main() {
                     "\r{}",
                     I18n::get(lang, "progress").replace("{:>3}", &format!("{:>3}", i + 1))
                 );
-                io::stdout().flush().unwrap();
+                let _ = io::stdout().flush();
             }
             println!(); // Newline after progress
 
@@ -620,7 +577,7 @@ fn main() {
                     "\r{}",
                     I18n::get(lang, "progress").replace("{:>3}", &format!("{:>3}", i + 1))
                 );
-                io::stdout().flush().unwrap();
+                let _ = io::stdout().flush();
             }
             println!();
 
@@ -969,9 +926,9 @@ fn run_interactive(args: RunInteractiveArgs) {
             "{}",
             I18n::get(lang, "prompt_pool_select").replace("{}", &default_index.to_string())
         );
-        io::stdout().flush().unwrap();
+        let _ = io::stdout().flush();
         let mut pool_input = String::new();
-        io::stdin().read_line(&mut pool_input).unwrap();
+        let _ = io::stdin().read_line(&mut pool_input);
         let pool_input = pool_input.trim();
         if pool_input.eq_ignore_ascii_case("all") {
             let all_ids: Vec<String> = config.pools.iter().map(|p| p.id.clone()).collect();
@@ -1084,7 +1041,7 @@ fn run_interactive(args: RunInteractiveArgs) {
             "\r{}",
             I18n::get(lang, "progress").replace("{:>3}", &format!("{:>3}", i + 1))
         );
-        io::stdout().flush().unwrap();
+        let _ = io::stdout().flush();
     }
     println!();
 
@@ -1135,7 +1092,7 @@ fn run_interactive(args: RunInteractiveArgs) {
             "\r{}",
             I18n::get(lang, "progress").replace("{:>3}", &format!("{:>3}", i + 1))
         );
-        io::stdout().flush().unwrap();
+        let _ = io::stdout().flush();
     }
     println!();
 
@@ -1167,10 +1124,13 @@ fn run_interactive(args: RunInteractiveArgs) {
                 .replacen("{}", &default_sims.to_string(), 1)
                 .replacen("{}", &welfare_label, 1)
         );
-        io::stdout().flush().unwrap();
+        let _ = io::stdout().flush();
 
         let mut input = String::new();
-        io::stdin().read_line(&mut input).unwrap();
+        match io::stdin().read_line(&mut input) {
+            Ok(0) | Err(_) => break,
+            _ => {}
+        }
         let input = input.trim();
 
         if input.eq_ignore_ascii_case("q") {
