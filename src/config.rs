@@ -1,408 +1,62 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::Read;
 
-// --- Simple JSON Parser (std only) ---
+pub use serde_json::Value as JsonValue;
 
-#[derive(Debug, Clone)]
-pub enum JsonValue {
-    Null,
-    #[allow(dead_code)]
-    Bool(bool),
-    Number(f64),
-    String(String),
-    Array(Vec<JsonValue>),
-    Object(HashMap<String, JsonValue>),
-}
-
-impl JsonValue {
-    fn as_str(&self) -> Option<&str> {
-        match self {
-            JsonValue::String(s) => Some(s),
-            _ => None,
-        }
-    }
-
-    fn as_f64(&self) -> Option<f64> {
-        match self {
-            JsonValue::Number(n) => Some(*n),
-            _ => None,
-        }
-    }
-
-    fn as_bool(&self) -> Option<bool> {
-        match self {
-            JsonValue::Bool(b) => Some(*b),
-            _ => None,
-        }
-    }
-
-    // Helper to extract string array
-    fn to_string_vec(&self) -> Vec<String> {
-        match self {
-            JsonValue::Array(arr) => arr
-                .iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect(),
-            _ => Vec::new(),
-        }
+fn json_to_string_vec(v: &JsonValue) -> Vec<String> {
+    match v {
+        JsonValue::Array(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
-struct JsonParser {
-    chars: Vec<char>,
-    pos: usize,
-    line: usize,
-    col: usize,
-}
+fn strip_json_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let chars: Vec<char> = input.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    let mut in_string = false;
 
-impl JsonParser {
-    fn new(input: &str) -> Self {
-        JsonParser {
-            chars: input.chars().collect(),
-            pos: 0,
-            line: 1,
-            col: 1,
-        }
-    }
-
-    fn parse(&mut self) -> Result<JsonValue, String> {
-        self.skip_whitespace();
-        if self.pos >= self.chars.len() {
-            return Ok(JsonValue::Null);
-        }
-
-        let value = self.parse_value()?;
-        self.skip_whitespace();
-        if self.pos < self.chars.len() {
-            return Err(self.error("Unexpected trailing content"));
-        }
-        Ok(value)
-    }
-
-    fn parse_value(&mut self) -> Result<JsonValue, String> {
-        self.skip_whitespace();
-        if self.peek().is_none() {
-            return Err(self.error("Unexpected EOF"));
-        }
-        match self.peek().unwrap() {
-            '{' => self.parse_object(),
-            '[' => self.parse_array(),
-            '"' => self.parse_string().map(JsonValue::String),
-            't' => {
-                self.consume("true")?;
-                Ok(JsonValue::Bool(true))
+    while i < len {
+        if in_string {
+            out.push(chars[i]);
+            if chars[i] == '\\' && i + 1 < len {
+                i += 1;
+                out.push(chars[i]);
+            } else if chars[i] == '"' {
+                in_string = false;
             }
-            'f' => {
-                self.consume("false")?;
-                Ok(JsonValue::Bool(false))
-            }
-            'n' => {
-                self.consume("null")?;
-                Ok(JsonValue::Null)
-            }
-            c if c == '-' || c.is_ascii_digit() => self.parse_number(),
-            c => Err(self.error(&format!("Unexpected character: {}", c))),
+            i += 1;
+            continue;
         }
-    }
-
-    fn skip_whitespace(&mut self) {
-        while let Some(c) = self.peek() {
-            if c.is_whitespace() {
-                self.advance();
-            } else {
-                break;
+        if chars[i] == '"' {
+            in_string = true;
+            out.push(chars[i]);
+            i += 1;
+        } else if chars[i] == '/' && i + 1 < len && chars[i + 1] == '/' {
+            while i < len && chars[i] != '\n' {
+                i += 1;
             }
-        }
-    }
-
-    fn consume(&mut self, s: &str) -> Result<(), String> {
-        for c in s.chars() {
-            if self.peek() != Some(c) {
-                return Err(self.error(&format!("Expected '{}'", s)));
+        } else if chars[i] == '/' && i + 1 < len && chars[i + 1] == '*' {
+            i += 2;
+            while i + 1 < len && !(chars[i] == '*' && chars[i + 1] == '/') {
+                i += 1;
             }
-            self.advance();
-        }
-        Ok(())
-    }
-
-    fn parse_string(&mut self) -> Result<String, String> {
-        if self.peek() != Some('"') {
-            return Err(self.error("Expected '\"' to start string"));
-        }
-        self.advance();
-        let mut s = String::new();
-        while let Some(c) = self.advance() {
-            if c == '"' {
-                return Ok(s);
+            if i + 1 < len {
+                i += 2;
             }
-            if c == '\\' {
-                let escaped = match self.advance() {
-                    Some(ch) => ch,
-                    None => return Err(self.error("Unexpected EOF in string escape")),
-                };
-                match escaped {
-                    '"' => s.push('"'),
-                    '\\' => s.push('\\'),
-                    '/' => s.push('/'),
-                    'b' => s.push('\x08'),
-                    'f' => s.push('\x0c'),
-                    'n' => s.push('\n'),
-                    'r' => s.push('\r'),
-                    't' => s.push('\t'),
-                    'u' => {
-                        let code_point = self.parse_unicode_escape()?;
-                        if let Some(ch) = std::char::from_u32(code_point) {
-                            s.push(ch);
-                        } else {
-                            return Err(self.error("Invalid Unicode code point"));
-                        }
-                    }
-                    _ => return Err(self.error(&format!("Invalid escape: \\{}", escaped))),
-                }
-            } else {
-                s.push(c);
-            }
-        }
-        Err(self.error("Unexpected EOF in string"))
-    }
-
-    fn parse_number(&mut self) -> Result<JsonValue, String> {
-        let mut s = String::new();
-        if let Some(c) = self.peek() {
-            if c == '-' {
-                s.push(c);
-                self.advance();
-            }
-        }
-
-        let mut int_digits = 0usize;
-        while let Some(c) = self.peek() {
-            if c.is_ascii_digit() {
-                s.push(c);
-                self.advance();
-                int_digits += 1;
-            } else {
-                break;
-            }
-        }
-        if int_digits == 0 {
-            return Err(self.error("Invalid number"));
-        }
-
-        if self.peek() == Some('.') {
-            s.push('.');
-            self.advance();
-            let mut frac_digits = 0usize;
-            while let Some(c) = self.peek() {
-                if c.is_ascii_digit() {
-                    s.push(c);
-                    self.advance();
-                    frac_digits += 1;
-                } else {
-                    break;
-                }
-            }
-            if frac_digits == 0 {
-                return Err(self.error("Invalid fraction"));
-            }
-        }
-
-        if let Some(c) = self.peek() {
-            if c == 'e' || c == 'E' {
-                s.push(c);
-                self.advance();
-                if let Some(sign) = self.peek() {
-                    if sign == '+' || sign == '-' {
-                        s.push(sign);
-                        self.advance();
-                    }
-                }
-                let mut exp_digits = 0usize;
-                while let Some(c) = self.peek() {
-                    if c.is_ascii_digit() {
-                        s.push(c);
-                        self.advance();
-                        exp_digits += 1;
-                    } else {
-                        break;
-                    }
-                }
-                if exp_digits == 0 {
-                    return Err(self.error("Invalid exponent"));
-                }
-            }
-        }
-
-        s.parse::<f64>()
-            .map(JsonValue::Number)
-            .map_err(|_| self.error(&format!("Invalid number: {}", s)))
-    }
-
-    fn parse_array(&mut self) -> Result<JsonValue, String> {
-        if self.peek() != Some('[') {
-            return Err(self.error("Expected '['"));
-        }
-        self.advance();
-        let mut arr = Vec::new();
-        self.skip_whitespace();
-        if self.peek() == Some(']') {
-            self.advance();
-            return Ok(JsonValue::Array(arr));
-        }
-        loop {
-            self.skip_whitespace();
-            arr.push(self.parse_value()?);
-            self.skip_whitespace();
-            if self.peek().is_none() {
-                return Err(self.error("Unexpected EOF in array"));
-            }
-            match self.peek().unwrap() {
-                ',' => {
-                    self.advance();
-                }
-                ']' => {
-                    self.advance();
-                    return Ok(JsonValue::Array(arr));
-                }
-                c => return Err(self.error(&format!("Expected ',' or ']' in array, found {}", c))),
-            }
-        }
-    }
-
-    fn parse_object(&mut self) -> Result<JsonValue, String> {
-        if self.peek() != Some('{') {
-            return Err(self.error("Expected '{'"));
-        }
-        self.advance();
-        let mut map = HashMap::new();
-        self.skip_whitespace();
-        if self.peek() == Some('}') {
-            self.advance();
-            return Ok(JsonValue::Object(map));
-        }
-        loop {
-            self.skip_whitespace();
-            if self.peek() != Some('"') {
-                return Err(self.error("Expected string key in object"));
-            }
-            let key = self.parse_string()?;
-            self.skip_whitespace();
-            if self.peek() != Some(':') {
-                return Err(self.error("Expected ':' after key"));
-            }
-            self.advance();
-            self.skip_whitespace();
-            let value = self.parse_value()?;
-            map.insert(key, value);
-
-            self.skip_whitespace();
-            if self.peek().is_none() {
-                return Err(self.error("Unexpected EOF in object"));
-            }
-            match self.peek().unwrap() {
-                ',' => {
-                    self.advance();
-                }
-                '}' => {
-                    self.advance();
-                    return Ok(JsonValue::Object(map));
-                }
-                c => {
-                    return Err(self.error(&format!("Expected ',' or '}}' in object, found {}", c)))
-                }
-            }
-        }
-    }
-
-    fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
-    }
-
-    fn advance(&mut self) -> Option<char> {
-        if self.pos >= self.chars.len() {
-            return None;
-        }
-        let c = self.chars[self.pos];
-        self.pos += 1;
-        if c == '\n' {
-            self.line += 1;
-            self.col = 1;
         } else {
-            self.col += 1;
+            out.push(chars[i]);
+            i += 1;
         }
-        Some(c)
     }
-
-    fn parse_unicode_escape(&mut self) -> Result<u32, String> {
-        let mut code: u32 = 0;
-        for _ in 0..4 {
-            let c = match self.advance() {
-                Some(ch) => ch,
-                None => return Err(self.error("Unexpected EOF in unicode escape")),
-            };
-            let digit = c
-                .to_digit(16)
-                .ok_or_else(|| self.error("Invalid unicode escape"))?;
-            code = (code << 4) | digit;
-        }
-        if (0xD800..=0xDBFF).contains(&code) {
-            let saved_pos = self.pos;
-            let saved_line = self.line;
-            let saved_col = self.col;
-            if self.peek() == Some('\\') {
-                self.advance();
-                if self.peek() == Some('u') {
-                    self.advance();
-                    let mut low: u32 = 0;
-                    for _ in 0..4 {
-                        let c = match self.advance() {
-                            Some(ch) => ch,
-                            None => return Err(self.error("Unexpected EOF in unicode escape")),
-                        };
-                        let digit = c
-                            .to_digit(16)
-                            .ok_or_else(|| self.error("Invalid unicode escape"))?;
-                        low = (low << 4) | digit;
-                    }
-                    if (0xDC00..=0xDFFF).contains(&low) {
-                        let high_ten = code - 0xD800;
-                        let low_ten = low - 0xDC00;
-                        return Ok(0x10000 + ((high_ten << 10) | low_ten));
-                    } else {
-                        return Err(self.error("Invalid unicode surrogate pair"));
-                    }
-                }
-            }
-            self.pos = saved_pos;
-            self.line = saved_line;
-            self.col = saved_col;
-            return Err(self.error("Invalid unicode surrogate pair"));
-        }
-        Ok(code)
-    }
-
-    fn error(&self, msg: &str) -> String {
-        let pos = self.pos.min(self.chars.len());
-        let mut line_start = pos;
-        while line_start > 0 && self.chars[line_start - 1] != '\n' {
-            line_start -= 1;
-        }
-        let mut line_end = pos;
-        while line_end < self.chars.len() && self.chars[line_end] != '\n' {
-            line_end += 1;
-        }
-        let line_text: String = self.chars[line_start..line_end].iter().collect();
-        let caret_pos = if self.col == 0 { 1 } else { self.col };
-        let caret = " ".repeat(caret_pos.saturating_sub(1)) + "^";
-        format!(
-            "JSON parse error at line {}, col {}: {}\n{}\n{}",
-            self.line, self.col, msg, line_text, caret
-        )
-    }
+    out
 }
-
 // --- Configuration (Data-Driven) ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -639,24 +293,24 @@ impl Config {
         file.read_to_string(&mut contents)
             .expect("Failed to read config file");
 
-        let mut parser = JsonParser::new(&contents);
-        let root = match parser.parse() {
+        let stripped = strip_json_comments(&contents);
+        let root: JsonValue = match serde_json::from_str(&stripped) {
             Ok(value) => value,
             Err(err) => {
-                eprintln!("[FATAL ERROR] {}", err);
+                eprintln!("[FATAL ERROR] JSON parse error: {}", err);
                 std::process::exit(1);
             }
         };
 
         let mut config = Config::default();
 
-        if let JsonValue::Object(map) = root {
-            warn_unknown_fields(&map);
+        if let JsonValue::Object(ref map) = root {
+            warn_unknown_fields(map);
             if let Some(v) = map.get("pool_name") {
                 config.pool_name = v.as_str().unwrap_or("").to_string();
             }
             if let Some(v) = map.get("up_six") {
-                config.up_six = v.to_string_vec();
+                config.up_six = json_to_string_vec(v);
             }
             if let Some(v) = map.get("up_rate") {
                 config.up_rate = v.as_f64().unwrap_or(0.5);
@@ -671,19 +325,19 @@ impl Config {
                 config.prob_4_base = v.as_f64().unwrap_or(0.912);
             }
             if let Some(v) = map.get("soft_pity_start") {
-                config.soft_pity_start = v.as_f64().unwrap_or(65.0) as usize;
+                config.soft_pity_start = v.as_f64().unwrap_or(65.0).round() as usize;
             }
             if let Some(v) = map.get("small_pity_guarantee") {
-                config.small_pity_guarantee = v.as_f64().unwrap_or(80.0) as usize;
+                config.small_pity_guarantee = v.as_f64().unwrap_or(80.0).round() as usize;
             }
             if let Some(v) = map.get("big_pity_cumulative") {
-                config.big_pity_cumulative = v.as_f64().unwrap_or(120.0) as usize;
+                config.big_pity_cumulative = v.as_f64().unwrap_or(120.0).round() as usize;
             }
             if let Some(v) = map.get("up_pity_soft") {
-                config.up_pity_soft = v.as_f64().unwrap_or(0.0) as usize;
+                config.up_pity_soft = v.as_f64().unwrap_or(0.0).round() as usize;
             }
             if let Some(v) = map.get("five_star_pity") {
-                config.five_star_pity = v.as_f64().unwrap_or(10.0) as usize;
+                config.five_star_pity = v.as_f64().unwrap_or(10.0).round() as usize;
             }
             if let Some(v) = map.get("always_5_star") {
                 config.always_5_star = v.as_bool().unwrap_or(false);
@@ -692,13 +346,13 @@ impl Config {
                 config.big_pity_requires_not_up = v.as_bool().unwrap_or(true);
             }
             if let Some(v) = map.get("six_stars") {
-                config.six_stars = v.to_string_vec();
+                config.six_stars = json_to_string_vec(v);
             }
             if let Some(v) = map.get("five_stars") {
-                config.five_stars = v.to_string_vec();
+                config.five_stars = json_to_string_vec(v);
             }
             if let Some(v) = map.get("four_stars") {
-                config.four_stars = v.to_string_vec();
+                config.four_stars = json_to_string_vec(v);
             }
             if let Some(v) = map.get("active_pool") {
                 config.active_pool = v.as_str().map(|s| s.to_string());
@@ -722,43 +376,43 @@ impl Config {
                 config.ppo_mode = v.as_str().unwrap_or("balanced").to_string();
             }
             if let Some(v) = map.get("ppo_total_steps") {
-                config.ppo_total_steps = v.as_f64().unwrap_or(0.0) as usize;
+                config.ppo_total_steps = v.as_f64().unwrap_or(0.0).round() as usize;
             }
             if let Some(v) = map.get("ppo_steps_per_update") {
-                config.ppo_steps_per_update = v.as_f64().unwrap_or(0.0) as usize;
+                config.ppo_steps_per_update = v.as_f64().unwrap_or(0.0).round() as usize;
             }
             if let Some(v) = map.get("ppo_k_epochs") {
-                config.ppo_k_epochs = v.as_f64().unwrap_or(0.0) as usize;
+                config.ppo_k_epochs = v.as_f64().unwrap_or(0.0).round() as usize;
             }
             if let Some(v) = map.get("ppo_batch_size") {
-                config.ppo_batch_size = v.as_f64().unwrap_or(0.0) as usize;
+                config.ppo_batch_size = v.as_f64().unwrap_or(0.0).round() as usize;
             }
             if let Some(v) = map.get("ppo_context_len") {
-                config.ppo_context_len = v.as_f64().unwrap_or(0.0) as usize;
+                config.ppo_context_len = v.as_f64().unwrap_or(0.0).round() as usize;
             }
             if let Some(v) = map.get("ppo_num_envs") {
-                config.ppo_num_envs = v.as_f64().unwrap_or(1.0) as usize;
+                config.ppo_num_envs = v.as_f64().unwrap_or(1.0).round() as usize;
             }
             if let Some(v) = map.get("worker_max_threads") {
-                config.worker_max_threads = v.as_f64().unwrap_or(0.0) as usize;
+                config.worker_max_threads = v.as_f64().unwrap_or(0.0).round() as usize;
             }
             if let Some(v) = map.get("worker_reserve_cores") {
-                config.worker_reserve_cores = v.as_f64().unwrap_or(1.0) as usize;
+                config.worker_reserve_cores = v.as_f64().unwrap_or(1.0).round() as usize;
             }
             if let Some(v) = map.get("worker_priority") {
                 config.worker_priority = v.as_str().unwrap_or("above_normal").to_string();
             }
             if let Some(v) = map.get("worker_stack_size_mb") {
-                config.worker_stack_size_mb = v.as_f64().unwrap_or(4.0) as usize;
+                config.worker_stack_size_mb = v.as_f64().unwrap_or(4.0).round() as usize;
             }
             if let Some(v) = map.get("f2p_sim_count") {
-                config.f2p_sim_count = v.as_f64().unwrap_or(0.0) as usize;
+                config.f2p_sim_count = v.as_f64().unwrap_or(0.0).round() as usize;
             }
             if let Some(v) = map.get("f2p_sim_count_prob") {
-                config.f2p_sim_count_prob = v.as_f64().unwrap_or(0.0) as usize;
+                config.f2p_sim_count_prob = v.as_f64().unwrap_or(0.0).round() as usize;
             }
             if let Some(v) = map.get("f2p_sim_count_cost") {
-                config.f2p_sim_count_cost = v.as_f64().unwrap_or(0.0) as usize;
+                config.f2p_sim_count_cost = v.as_f64().unwrap_or(0.0).round() as usize;
             }
             if let Some(v) = map.get("online_train") {
                 config.online_train = v.as_bool().unwrap_or(false);
@@ -773,10 +427,10 @@ impl Config {
                 config.online_train_ppo = v.as_bool().unwrap_or(false);
             }
             if let Some(v) = map.get("train_interval_ms") {
-                config.train_interval_ms = v.as_f64().unwrap_or(50.0) as usize;
+                config.train_interval_ms = v.as_f64().unwrap_or(50.0).round() as usize;
             }
             if let Some(v) = map.get("max_train_steps_per_tick") {
-                config.max_train_steps_per_tick = v.as_f64().unwrap_or(1.0) as usize;
+                config.max_train_steps_per_tick = v.as_f64().unwrap_or(1.0).round() as usize;
             }
             if let Some(v) = map.get("language") {
                 config.language = v.as_str().map(|s| s.to_string());
@@ -792,10 +446,10 @@ impl Config {
                     config.achf.proj_mode = v.as_str().unwrap_or("rowcol").to_string();
                 }
                 if let Some(v) = achf_map.get("proj_freq") {
-                    config.achf.proj_freq = v.as_f64().unwrap_or(8.0) as usize;
+                    config.achf.proj_freq = v.as_f64().unwrap_or(8.0).round() as usize;
                 }
                 if let Some(v) = achf_map.get("proj_steps") {
-                    config.achf.proj_steps = v.as_f64().unwrap_or(0.0) as usize;
+                    config.achf.proj_steps = v.as_f64().unwrap_or(0.0).round() as usize;
                 }
                 if let Some(v) = achf_map.get("lambda_ortho") {
                     config.achf.lambda_ortho = v.as_f64().unwrap_or(1e-3);
@@ -816,7 +470,7 @@ impl Config {
                     config.achf.g_min = v.as_f64().unwrap_or(0.2);
                 }
                 if let Some(v) = achf_map.get("gate_warmup_steps") {
-                    config.achf.gate_warmup_steps = v.as_f64().unwrap_or(0.0) as usize;
+                    config.achf.gate_warmup_steps = v.as_f64().unwrap_or(0.0).round() as usize;
                 }
                 if let Some(v) = achf_map.get("gate_k_clip") {
                     config.achf.gate_k_clip = v.as_f64().unwrap_or(0.0);
@@ -834,13 +488,14 @@ impl Config {
                     config.achf.g_min_momentum = v.as_f64().unwrap_or(0.9);
                 }
                 if let Some(v) = achf_map.get("cache_min_rows") {
-                    config.achf.cache_min_rows = v.as_f64().unwrap_or(0.0) as usize;
+                    config.achf.cache_min_rows = v.as_f64().unwrap_or(0.0).round() as usize;
                 }
                 if let Some(v) = achf_map.get("cache_min_nonzero_ratio") {
                     config.achf.cache_min_nonzero_ratio = v.as_f64().unwrap_or(0.0);
                 }
                 if let Some(v) = achf_map.get("cache_sparsity_sample_rows") {
-                    config.achf.cache_sparsity_sample_rows = v.as_f64().unwrap_or(0.0) as usize;
+                    config.achf.cache_sparsity_sample_rows =
+                        v.as_f64().unwrap_or(0.0).round() as usize;
                 }
                 if let Some(v) = achf_map.get("cache_cost_bias") {
                     config.achf.cache_cost_bias = v.as_f64().unwrap_or(1.0);
@@ -864,16 +519,18 @@ impl Config {
                     config.achf.cache_adapt_blend = v.as_f64().unwrap_or(0.5);
                 }
                 if let Some(v) = achf_map.get("cache_latency_sample_every") {
-                    config.achf.cache_latency_sample_every = v.as_f64().unwrap_or(1.0) as u64;
+                    config.achf.cache_latency_sample_every =
+                        v.as_f64().unwrap_or(1.0).round() as u64;
                 }
                 if let Some(v) = achf_map.get("cache_log_interval_steps") {
-                    config.achf.cache_log_interval_steps = v.as_f64().unwrap_or(0.0) as usize;
+                    config.achf.cache_log_interval_steps =
+                        v.as_f64().unwrap_or(0.0).round() as usize;
                 }
                 if let Some(v) = achf_map.get("cache_log_per_layer") {
                     config.achf.cache_log_per_layer = v.as_bool().unwrap_or(false);
                 }
                 if let Some(v) = achf_map.get("rank") {
-                    config.achf.rank = v.as_f64().unwrap_or(0.0) as usize;
+                    config.achf.rank = v.as_f64().unwrap_or(0.0).round() as usize;
                 }
                 if let Some(v) = achf_map.get("apply_attn") {
                     config.achf.apply_attn = v.as_bool().unwrap_or(false);
@@ -935,7 +592,7 @@ impl Config {
     }
 }
 
-fn parse_pool_config(pool_map: &HashMap<String, JsonValue>) -> PoolConfig {
+fn parse_pool_config(pool_map: &serde_json::Map<String, JsonValue>) -> PoolConfig {
     let mut pool = PoolConfig {
         id: pool_map
             .get("id")
@@ -954,7 +611,7 @@ fn parse_pool_config(pool_map: &HashMap<String, JsonValue>) -> PoolConfig {
             .to_string(),
         up_six: pool_map
             .get("up_six")
-            .map(|v| v.to_string_vec())
+            .map(json_to_string_vec)
             .unwrap_or_default(),
         up_rate: pool_map
             .get("up_rate")
@@ -975,23 +632,28 @@ fn parse_pool_config(pool_map: &HashMap<String, JsonValue>) -> PoolConfig {
         soft_pity_start: pool_map
             .get("soft_pity_start")
             .and_then(|v| v.as_f64())
-            .unwrap_or(65.0) as usize,
+            .unwrap_or(65.0)
+            .round() as usize,
         small_pity_guarantee: pool_map
             .get("small_pity_guarantee")
             .and_then(|v| v.as_f64())
-            .unwrap_or(80.0) as usize,
+            .unwrap_or(80.0)
+            .round() as usize,
         big_pity_cumulative: pool_map
             .get("big_pity_cumulative")
             .and_then(|v| v.as_f64())
-            .unwrap_or(120.0) as usize,
+            .unwrap_or(120.0)
+            .round() as usize,
         up_pity_soft: pool_map
             .get("up_pity_soft")
             .and_then(|v| v.as_f64())
-            .unwrap_or(0.0) as usize,
+            .unwrap_or(0.0)
+            .round() as usize,
         five_star_pity: pool_map
             .get("five_star_pity")
             .and_then(|v| v.as_f64())
-            .unwrap_or(10.0) as usize,
+            .unwrap_or(10.0)
+            .round() as usize,
         always_5_star: pool_map
             .get("always_5_star")
             .and_then(|v| v.as_bool())
@@ -1002,15 +664,15 @@ fn parse_pool_config(pool_map: &HashMap<String, JsonValue>) -> PoolConfig {
             .unwrap_or(true),
         six_stars: pool_map
             .get("six_stars")
-            .map(|v| v.to_string_vec())
+            .map(json_to_string_vec)
             .unwrap_or_default(),
         five_stars: pool_map
             .get("five_stars")
-            .map(|v| v.to_string_vec())
+            .map(json_to_string_vec)
             .unwrap_or_default(),
         four_stars: pool_map
             .get("four_stars")
-            .map(|v| v.to_string_vec())
+            .map(json_to_string_vec)
             .unwrap_or_default(),
         is_archived: pool_map
             .get("is_archived")
@@ -1023,7 +685,7 @@ fn parse_pool_config(pool_map: &HashMap<String, JsonValue>) -> PoolConfig {
     pool
 }
 
-fn warn_unknown_fields(map: &HashMap<String, JsonValue>) {
+fn warn_unknown_fields(map: &serde_json::Map<String, JsonValue>) {
     let known: HashSet<&'static str> = [
         "pool_name",
         "up_six",
@@ -1083,8 +745,8 @@ mod tests {
     use super::*;
 
     fn parse_ok(input: &str) -> JsonValue {
-        let mut parser = JsonParser::new(input);
-        parser.parse().unwrap()
+        let stripped = strip_json_comments(input);
+        serde_json::from_str(&stripped).unwrap()
     }
 
     #[test]

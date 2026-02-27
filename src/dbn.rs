@@ -328,8 +328,11 @@ impl Dbn {
             for epoch in 0..epochs {
                 let mut error_sum = 0.0;
 
-                // Shuffle data (optional but good practice)
-                // For now, just chunk it.
+                // Fisher–Yates shuffle for better convergence
+                for j in (1..input_data.len()).rev() {
+                    let k = rng.next_u64_bounded((j + 1) as u64) as usize;
+                    input_data.swap(j, k);
+                }
 
                 let mut batches = 0;
                 for chunk in input_data.chunks(batch_size) {

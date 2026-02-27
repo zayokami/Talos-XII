@@ -18,6 +18,7 @@ const EPSILON_DECAY: usize = 50000;
 const LEARNING_RATE: f64 = 0.001;
 const TRAIN_FREQ: usize = 10;
 const LOG_FREQ: usize = 100;
+const EPISODE_MAX_PULLS: usize = 300;
 
 // PER Hyperparameters (Schaul et al. 2016)
 const PER_ALPHA: f64 = 0.6;
@@ -597,14 +598,18 @@ pub fn train_dqn(
             is_six = true;
             state_struct.pity_6 = 0;
             state_struct.streak_4_star = 0;
-            if rng.next_f64() < 0.5 {
-                is_up = true;
-                state_struct.loss_streak = 0;
-                state_struct.has_obtained_up = true;
-            } else {
-                state_struct.loss_streak += 1;
+            if config.up_rate > 0.0 && !config.up_six.is_empty() {
+                if rng.next_f64() < config.up_rate {
+                    is_up = true;
+                    state_struct.loss_streak = 0;
+                    state_struct.has_obtained_up = true;
+                } else {
+                    state_struct.loss_streak += 1;
+                }
             }
-        } else if state_struct.streak_4_star >= 9 || r < final_prob_6 + config.prob_5_base {
+        } else if state_struct.streak_4_star >= 9
+            || r < (final_prob_6 + config.prob_5_base).min(1.0)
+        {
             state_struct.streak_4_star = 0;
         } else {
             state_struct.streak_4_star += 1;
@@ -636,7 +641,7 @@ pub fn train_dqn(
         )
         .to_vec();
 
-        let done = is_up || pulls_done >= 300;
+        let done = is_up || pulls_done >= EPISODE_MAX_PULLS;
 
         replay_buffer.push(Experience {
             state: current_state_raw,
