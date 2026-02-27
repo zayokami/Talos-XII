@@ -37,6 +37,12 @@ impl Linear {
     pub fn forward_inference(&self, input: &[f64]) -> Vec<f64> {
         let in_dim = self.in_features;
         let out_dim = self.out_features;
+        debug_assert!(
+            in_dim > 0 && input.len().is_multiple_of(in_dim),
+            "forward_inference: input length {} is not divisible by in_features {}",
+            input.len(),
+            in_dim
+        );
         let num_rows = input.len() / in_dim;
         let mut out = vec![0.0; num_rows * out_dim];
         let w_data = self.weight.data.read().unwrap();

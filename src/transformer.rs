@@ -395,7 +395,10 @@ impl RoPE {
         for b in 0..total_batches {
             for t in 0..seq_len {
                 let pos = start_pos + t;
-                let cache_idx = pos * (self.dim / 2); // Base index in cache
+                if pos * (self.dim / 2) >= self.cos_cache.len() {
+                    continue;
+                }
+                let cache_idx = pos * (self.dim / 2);
 
                 let base_idx = b * (seq_len * dim) + t * dim;
 
@@ -435,6 +438,9 @@ impl RoPE {
                     for b in 0..total_batches {
                         for t in 0..seq_len {
                             let pos = start_pos_cap + t;
+                            if pos * (dim / 2) >= cos_cache.len() {
+                                continue;
+                            }
                             let cache_idx = pos * (dim / 2);
                             let base_idx = b * (seq_len * dim) + t * dim;
 

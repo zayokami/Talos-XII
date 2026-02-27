@@ -671,19 +671,19 @@ impl Config {
                 config.prob_4_base = v.as_f64().unwrap_or(0.912);
             }
             if let Some(v) = map.get("soft_pity_start") {
-                config.soft_pity_start = v.as_f64().unwrap_or(65.0) as usize;
+                config.soft_pity_start = v.as_f64().unwrap_or(65.0).round() as usize;
             }
             if let Some(v) = map.get("small_pity_guarantee") {
-                config.small_pity_guarantee = v.as_f64().unwrap_or(80.0) as usize;
+                config.small_pity_guarantee = v.as_f64().unwrap_or(80.0).round() as usize;
             }
             if let Some(v) = map.get("big_pity_cumulative") {
-                config.big_pity_cumulative = v.as_f64().unwrap_or(120.0) as usize;
+                config.big_pity_cumulative = v.as_f64().unwrap_or(120.0).round() as usize;
             }
             if let Some(v) = map.get("up_pity_soft") {
-                config.up_pity_soft = v.as_f64().unwrap_or(0.0) as usize;
+                config.up_pity_soft = v.as_f64().unwrap_or(0.0).round() as usize;
             }
             if let Some(v) = map.get("five_star_pity") {
-                config.five_star_pity = v.as_f64().unwrap_or(10.0) as usize;
+                config.five_star_pity = v.as_f64().unwrap_or(10.0).round() as usize;
             }
             if let Some(v) = map.get("always_5_star") {
                 config.always_5_star = v.as_bool().unwrap_or(false);
@@ -722,43 +722,43 @@ impl Config {
                 config.ppo_mode = v.as_str().unwrap_or("balanced").to_string();
             }
             if let Some(v) = map.get("ppo_total_steps") {
-                config.ppo_total_steps = v.as_f64().unwrap_or(0.0) as usize;
+                config.ppo_total_steps = v.as_f64().unwrap_or(0.0).round() as usize;
             }
             if let Some(v) = map.get("ppo_steps_per_update") {
-                config.ppo_steps_per_update = v.as_f64().unwrap_or(0.0) as usize;
+                config.ppo_steps_per_update = v.as_f64().unwrap_or(0.0).round() as usize;
             }
             if let Some(v) = map.get("ppo_k_epochs") {
-                config.ppo_k_epochs = v.as_f64().unwrap_or(0.0) as usize;
+                config.ppo_k_epochs = v.as_f64().unwrap_or(0.0).round() as usize;
             }
             if let Some(v) = map.get("ppo_batch_size") {
-                config.ppo_batch_size = v.as_f64().unwrap_or(0.0) as usize;
+                config.ppo_batch_size = v.as_f64().unwrap_or(0.0).round() as usize;
             }
             if let Some(v) = map.get("ppo_context_len") {
-                config.ppo_context_len = v.as_f64().unwrap_or(0.0) as usize;
+                config.ppo_context_len = v.as_f64().unwrap_or(0.0).round() as usize;
             }
             if let Some(v) = map.get("ppo_num_envs") {
-                config.ppo_num_envs = v.as_f64().unwrap_or(1.0) as usize;
+                config.ppo_num_envs = v.as_f64().unwrap_or(1.0).round() as usize;
             }
             if let Some(v) = map.get("worker_max_threads") {
-                config.worker_max_threads = v.as_f64().unwrap_or(0.0) as usize;
+                config.worker_max_threads = v.as_f64().unwrap_or(0.0).round() as usize;
             }
             if let Some(v) = map.get("worker_reserve_cores") {
-                config.worker_reserve_cores = v.as_f64().unwrap_or(1.0) as usize;
+                config.worker_reserve_cores = v.as_f64().unwrap_or(1.0).round() as usize;
             }
             if let Some(v) = map.get("worker_priority") {
                 config.worker_priority = v.as_str().unwrap_or("above_normal").to_string();
             }
             if let Some(v) = map.get("worker_stack_size_mb") {
-                config.worker_stack_size_mb = v.as_f64().unwrap_or(4.0) as usize;
+                config.worker_stack_size_mb = v.as_f64().unwrap_or(4.0).round() as usize;
             }
             if let Some(v) = map.get("f2p_sim_count") {
-                config.f2p_sim_count = v.as_f64().unwrap_or(0.0) as usize;
+                config.f2p_sim_count = v.as_f64().unwrap_or(0.0).round() as usize;
             }
             if let Some(v) = map.get("f2p_sim_count_prob") {
-                config.f2p_sim_count_prob = v.as_f64().unwrap_or(0.0) as usize;
+                config.f2p_sim_count_prob = v.as_f64().unwrap_or(0.0).round() as usize;
             }
             if let Some(v) = map.get("f2p_sim_count_cost") {
-                config.f2p_sim_count_cost = v.as_f64().unwrap_or(0.0) as usize;
+                config.f2p_sim_count_cost = v.as_f64().unwrap_or(0.0).round() as usize;
             }
             if let Some(v) = map.get("online_train") {
                 config.online_train = v.as_bool().unwrap_or(false);
@@ -773,10 +773,10 @@ impl Config {
                 config.online_train_ppo = v.as_bool().unwrap_or(false);
             }
             if let Some(v) = map.get("train_interval_ms") {
-                config.train_interval_ms = v.as_f64().unwrap_or(50.0) as usize;
+                config.train_interval_ms = v.as_f64().unwrap_or(50.0).round() as usize;
             }
             if let Some(v) = map.get("max_train_steps_per_tick") {
-                config.max_train_steps_per_tick = v.as_f64().unwrap_or(1.0) as usize;
+                config.max_train_steps_per_tick = v.as_f64().unwrap_or(1.0).round() as usize;
             }
             if let Some(v) = map.get("language") {
                 config.language = v.as_str().map(|s| s.to_string());
@@ -792,10 +792,10 @@ impl Config {
                     config.achf.proj_mode = v.as_str().unwrap_or("rowcol").to_string();
                 }
                 if let Some(v) = achf_map.get("proj_freq") {
-                    config.achf.proj_freq = v.as_f64().unwrap_or(8.0) as usize;
+                    config.achf.proj_freq = v.as_f64().unwrap_or(8.0).round() as usize;
                 }
                 if let Some(v) = achf_map.get("proj_steps") {
-                    config.achf.proj_steps = v.as_f64().unwrap_or(0.0) as usize;
+                    config.achf.proj_steps = v.as_f64().unwrap_or(0.0).round() as usize;
                 }
                 if let Some(v) = achf_map.get("lambda_ortho") {
                     config.achf.lambda_ortho = v.as_f64().unwrap_or(1e-3);
@@ -816,7 +816,7 @@ impl Config {
                     config.achf.g_min = v.as_f64().unwrap_or(0.2);
                 }
                 if let Some(v) = achf_map.get("gate_warmup_steps") {
-                    config.achf.gate_warmup_steps = v.as_f64().unwrap_or(0.0) as usize;
+                    config.achf.gate_warmup_steps = v.as_f64().unwrap_or(0.0).round() as usize;
                 }
                 if let Some(v) = achf_map.get("gate_k_clip") {
                     config.achf.gate_k_clip = v.as_f64().unwrap_or(0.0);
@@ -834,13 +834,14 @@ impl Config {
                     config.achf.g_min_momentum = v.as_f64().unwrap_or(0.9);
                 }
                 if let Some(v) = achf_map.get("cache_min_rows") {
-                    config.achf.cache_min_rows = v.as_f64().unwrap_or(0.0) as usize;
+                    config.achf.cache_min_rows = v.as_f64().unwrap_or(0.0).round() as usize;
                 }
                 if let Some(v) = achf_map.get("cache_min_nonzero_ratio") {
                     config.achf.cache_min_nonzero_ratio = v.as_f64().unwrap_or(0.0);
                 }
                 if let Some(v) = achf_map.get("cache_sparsity_sample_rows") {
-                    config.achf.cache_sparsity_sample_rows = v.as_f64().unwrap_or(0.0) as usize;
+                    config.achf.cache_sparsity_sample_rows =
+                        v.as_f64().unwrap_or(0.0).round() as usize;
                 }
                 if let Some(v) = achf_map.get("cache_cost_bias") {
                     config.achf.cache_cost_bias = v.as_f64().unwrap_or(1.0);
@@ -864,16 +865,18 @@ impl Config {
                     config.achf.cache_adapt_blend = v.as_f64().unwrap_or(0.5);
                 }
                 if let Some(v) = achf_map.get("cache_latency_sample_every") {
-                    config.achf.cache_latency_sample_every = v.as_f64().unwrap_or(1.0) as u64;
+                    config.achf.cache_latency_sample_every =
+                        v.as_f64().unwrap_or(1.0).round() as u64;
                 }
                 if let Some(v) = achf_map.get("cache_log_interval_steps") {
-                    config.achf.cache_log_interval_steps = v.as_f64().unwrap_or(0.0) as usize;
+                    config.achf.cache_log_interval_steps =
+                        v.as_f64().unwrap_or(0.0).round() as usize;
                 }
                 if let Some(v) = achf_map.get("cache_log_per_layer") {
                     config.achf.cache_log_per_layer = v.as_bool().unwrap_or(false);
                 }
                 if let Some(v) = achf_map.get("rank") {
-                    config.achf.rank = v.as_f64().unwrap_or(0.0) as usize;
+                    config.achf.rank = v.as_f64().unwrap_or(0.0).round() as usize;
                 }
                 if let Some(v) = achf_map.get("apply_attn") {
                     config.achf.apply_attn = v.as_bool().unwrap_or(false);
@@ -975,23 +978,28 @@ fn parse_pool_config(pool_map: &HashMap<String, JsonValue>) -> PoolConfig {
         soft_pity_start: pool_map
             .get("soft_pity_start")
             .and_then(|v| v.as_f64())
-            .unwrap_or(65.0) as usize,
+            .unwrap_or(65.0)
+            .round() as usize,
         small_pity_guarantee: pool_map
             .get("small_pity_guarantee")
             .and_then(|v| v.as_f64())
-            .unwrap_or(80.0) as usize,
+            .unwrap_or(80.0)
+            .round() as usize,
         big_pity_cumulative: pool_map
             .get("big_pity_cumulative")
             .and_then(|v| v.as_f64())
-            .unwrap_or(120.0) as usize,
+            .unwrap_or(120.0)
+            .round() as usize,
         up_pity_soft: pool_map
             .get("up_pity_soft")
             .and_then(|v| v.as_f64())
-            .unwrap_or(0.0) as usize,
+            .unwrap_or(0.0)
+            .round() as usize,
         five_star_pity: pool_map
             .get("five_star_pity")
             .and_then(|v| v.as_f64())
-            .unwrap_or(10.0) as usize,
+            .unwrap_or(10.0)
+            .round() as usize,
         always_5_star: pool_map
             .get("always_5_star")
             .and_then(|v| v.as_bool())

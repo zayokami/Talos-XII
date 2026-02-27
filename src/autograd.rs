@@ -2066,6 +2066,7 @@ impl Div for Tensor {
                     let lhs_data = guards.get(0);
                     let rhs_data = guards.get(1);
                     let len = grad_out.len();
+                    const DIV_EPS: f64 = 1e-12;
                     if Arc::ptr_eq(&lhs.grad, &rhs.grad) {
                         let mut grad = lhs.grad.write().unwrap();
                         if len >= PAR_THRESHOLD {
@@ -2074,12 +2075,23 @@ impl Div for Tensor {
                                 .zip(lhs_data.par_iter())
                                 .zip(rhs_data.par_iter())
                                 .for_each(|(((g, &go), &l), &r)| {
-                                    *g += go / r - go * l / (r * r);
+                                    let safe_r = if r.abs() < DIV_EPS {
+                                        r.signum() * DIV_EPS
+                                    } else {
+                                        r
+                                    };
+                                    *g += go / safe_r - go * l / (safe_r * safe_r);
                                 });
                         } else {
                             for i in 0..len {
                                 let r = rhs_data[i];
-                                grad[i] += grad_out[i] / r - grad_out[i] * lhs_data[i] / (r * r);
+                                let safe_r = if r.abs() < DIV_EPS {
+                                    r.signum() * DIV_EPS
+                                } else {
+                                    r
+                                };
+                                grad[i] += grad_out[i] / safe_r
+                                    - grad_out[i] * lhs_data[i] / (safe_r * safe_r);
                             }
                         }
                     } else {
@@ -2090,10 +2102,23 @@ impl Div for Tensor {
                                     .par_iter_mut()
                                     .zip(grad_out.par_iter())
                                     .zip(rhs_data.par_iter())
-                                    .for_each(|((lg, &g), &r)| *lg += g / r);
+                                    .for_each(|((lg, &g), &r)| {
+                                        let safe_r = if r.abs() < DIV_EPS {
+                                            r.signum() * DIV_EPS
+                                        } else {
+                                            r
+                                        };
+                                        *lg += g / safe_r;
+                                    });
                             } else {
                                 for i in 0..len {
-                                    lhs_grad[i] += grad_out[i] / rhs_data[i];
+                                    let r = rhs_data[i];
+                                    let safe_r = if r.abs() < DIV_EPS {
+                                        r.signum() * DIV_EPS
+                                    } else {
+                                        r
+                                    };
+                                    lhs_grad[i] += grad_out[i] / safe_r;
                                 }
                             }
                         }
@@ -2105,11 +2130,23 @@ impl Div for Tensor {
                                     .zip(grad_out.par_iter())
                                     .zip(lhs_data.par_iter())
                                     .zip(rhs_data.par_iter())
-                                    .for_each(|(((rg, &g), &l), &r)| *rg -= g * l / (r * r));
+                                    .for_each(|(((rg, &g), &l), &r)| {
+                                        let safe_r = if r.abs() < DIV_EPS {
+                                            r.signum() * DIV_EPS
+                                        } else {
+                                            r
+                                        };
+                                        *rg -= g * l / (safe_r * safe_r);
+                                    });
                             } else {
                                 for i in 0..len {
                                     let r = rhs_data[i];
-                                    rhs_grad[i] -= grad_out[i] * lhs_data[i] / (r * r);
+                                    let safe_r = if r.abs() < DIV_EPS {
+                                        r.signum() * DIV_EPS
+                                    } else {
+                                        r
+                                    };
+                                    rhs_grad[i] -= grad_out[i] * lhs_data[i] / (safe_r * safe_r);
                                 }
                             }
                         }

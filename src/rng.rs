@@ -114,6 +114,7 @@ impl Rng {
     // This eliminates "Modulo Bias" which occurs when the range is not a power of 2.
     // Reference: https://lemire.me/blog/2019/06/06/nearly-divisionless-random-integer-generation-on-various-systems/
     pub fn next_u64_bounded(&mut self, range: u64) -> u64 {
+        assert!(range > 0, "next_u64_bounded: range must be > 0");
         let threshold = (0u64.wrapping_sub(range)) % range;
         loop {
             let x = self.gen_u64();

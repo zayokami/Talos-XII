@@ -531,7 +531,7 @@ pub fn roll_one(
         } else {
             let force_5_star = config.always_5_star
                 || (config.five_star_pity > 0 && state.streak_4_star >= config.five_star_pity - 1);
-            if force_5_star || r < final_prob_6 + config.prob_5_base {
+            if force_5_star || r < (final_prob_6 + config.prob_5_base).min(1.0) {
                 rarity = 5;
                 state.streak_4_star = 0;
             } else {
@@ -772,7 +772,7 @@ fn simulate_core_with_context(
         }
 
         if let Some(limit) = control.stop_after_total_pulls {
-            if state.total_pulls_in_pool > limit {
+            if state.total_pulls_in_pool >= limit {
                 break;
             }
         }

@@ -604,7 +604,9 @@ pub fn train_dqn(
             } else {
                 state_struct.loss_streak += 1;
             }
-        } else if state_struct.streak_4_star >= 9 || r < final_prob_6 + config.prob_5_base {
+        } else if state_struct.streak_4_star >= 9
+            || r < (final_prob_6 + config.prob_5_base).min(1.0)
+        {
             state_struct.streak_4_star = 0;
         } else {
             state_struct.streak_4_star += 1;
