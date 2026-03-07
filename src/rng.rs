@@ -2,6 +2,8 @@ use rand::TryRng;
 use std::convert::Infallible;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const F64_MANTISSA_RANGE: f64 = (1u64 << 53) as f64;
+
 // --- Pseudo-Random Number Generator (Hand-rolled) ---
 // Algorithm: xoshiro256** (StarStar)
 // Reference: https://prng.di.unimi.it/
@@ -81,13 +83,12 @@ impl Rng {
     #[inline]
     pub fn next_f64(&mut self) -> f64 {
         let v = self.gen_u64() >> 11;
-        (v as f64) * (1.0 / 9007199254740992.0)
+        (v as f64) * (1.0 / F64_MANTISSA_RANGE)
     }
 
     // Standard Normal Distribution using Box-Muller Transform
     // Returns a value normally distributed with mean 0.0 and std_dev 1.0
     #[inline]
-    #[allow(dead_code)]
     pub fn next_f64_normal(&mut self) -> f64 {
         // Box-Muller transform generates two independent standard normal random variables
         // from two independent uniform random variables in (0, 1].

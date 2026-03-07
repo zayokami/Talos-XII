@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+const DEFAULT_STACK_SIZE_BYTES: usize = 4 * 1024 * 1024;
+
 // ═══════════════════════════════════════════════════════════════════════════
 //  Platform: Windows thread priority and CPU affinity
 // ═══════════════════════════════════════════════════════════════════════════
@@ -140,7 +142,7 @@ impl GoodJobWorker {
         } else {
             requested_threads
         };
-        Self::build_pool(num_threads, 4 * 1024 * 1024, None, true)
+        Self::build_pool(num_threads, DEFAULT_STACK_SIZE_BYTES, None, true)
     }
 
     pub fn new_with_config(config: &Config) -> Self {
@@ -156,7 +158,7 @@ impl GoodJobWorker {
             num_threads = config.worker_max_threads;
         }
         let stack_size = if config.worker_stack_size_mb == 0 {
-            4 * 1024 * 1024
+            DEFAULT_STACK_SIZE_BYTES
         } else {
             config.worker_stack_size_mb * 1024 * 1024
         };
@@ -311,7 +313,6 @@ impl GoodJobWorker {
         })
     }
 
-    #[allow(dead_code)]
     pub fn thread_count(&self) -> usize {
         self.num_threads
     }

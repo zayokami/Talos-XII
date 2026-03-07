@@ -18,7 +18,7 @@ const EPSILON_DECAY: usize = 50000;
 const LEARNING_RATE: f64 = 0.001;
 const TRAIN_FREQ: usize = 10;
 const LOG_FREQ: usize = 100;
-const EPISODE_MAX_PULLS: usize = 300;
+use crate::utils::EPISODE_MAX_PULLS;
 
 // PER Hyperparameters (Schaul et al. 2016)
 const PER_ALPHA: f64 = 0.6;
@@ -822,7 +822,7 @@ pub fn train_dqn(
         {
             if let Some(stats) = policy_net.achf_cache_stats() {
                 if stats.calls > 0 {
-                    println!("\n{}", format_achf_stats(&stats));
+                    println!("\n{}", crate::utils::format_achf_stats(&stats));
                 }
             }
         }
@@ -830,33 +830,6 @@ pub fn train_dqn(
     println!("\n[DQN] Training Complete.");
     policy_net.freeze_achf_for_inference();
     policy_net
-}
-
-fn format_achf_stats(stats: &crate::achf::AchfCacheStats) -> String {
-    let calls = stats.calls as f64;
-    let hit_rate = if calls > 0.0 {
-        stats.cache_hits as f64 / calls
-    } else {
-        0.0
-    };
-    format!(
-        "[ACHF] Calls: {} | Hit: {:.2}% | Miss: {} | Skip: {} | LowRank: {} | Dense: {} | CachedEMA(ns): {:.1}/{:.1} | LowRankEMA(ns): {:.1}/{:.1} | DecisionEMA(ns): {:.1}/{:.1} | Bias: {:.3} | Samples: {}/{}",
-        stats.calls,
-        hit_rate * 100.0,
-        stats.cache_misses,
-        stats.cache_skips,
-        stats.low_rank_paths,
-        stats.dense_paths,
-        stats.ema_cached_ns,
-        stats.ema_cached_long_ns,
-        stats.ema_low_rank_ns,
-        stats.ema_low_rank_long_ns,
-        stats.decision_ema_ns,
-        stats.decision_ema_long_ns,
-        stats.adaptive_bias,
-        stats.latency_samples,
-        stats.decision_samples
-    )
 }
 
 pub struct OnlineDqnTrainer {

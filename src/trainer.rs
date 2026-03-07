@@ -9,8 +9,24 @@ use crate::sim::{
 use crate::simd::add_scaled_row;
 use crate::worker::GoodJobWorker;
 use rayon::prelude::*;
+use std::cmp::Ordering;
 use std::io::{self, Write};
 use std::sync::RwLock;
+
+#[allow(dead_code)]
+const LCG_MULTIPLIER: u64 = 6364136223846793005;
+
+const MANIFOLD_SIGMA_ANALYSIS_INIT: f64 = 0.02;
+const MANIFOLD_SIGMA_DECISION_INIT: f64 = 0.15;
+const MANIFOLD_L1_LAMBDA: f64 = 0.005;
+const MANIFOLD_CURVATURE_SCALE: f64 = 10.0;
+const MANIFOLD_SIGMA_ANALYSIS_RANGE: (f64, f64) = (0.001, 0.05);
+const MANIFOLD_SIGMA_DECISION_RANGE: (f64, f64) = (0.01, 0.3);
+const MANIFOLD_PRUNE_THRESHOLD: f64 = 0.01;
+
+const EVAL_RATE_ERROR_WEIGHT: f64 = 10000.0;
+const EVAL_STREAK_PENALTY_WEIGHT: f64 = 500.0;
+const EVAL_BIG_PITY_PENALTY: f64 = 200.0;
 
 pub fn train_linear_regression(
     neural_opt: &NeuralLuckOptimizer,
@@ -110,7 +126,9 @@ fn evaluate_manifold_reward(
     let rate_error = (rate_6 - target_rate).abs();
     let streak_penalty = res.max_loss_streak as f64;
     let big_pity_penalty = if res.big_pity_used { 1.0 } else { 0.0 };
-    -rate_error * 10000.0 - streak_penalty * 500.0 - big_pity_penalty * 200.0
+    -rate_error * EVAL_RATE_ERROR_WEIGHT
+        - streak_penalty * EVAL_STREAK_PENALTY_WEIGHT
+        - big_pity_penalty * EVAL_BIG_PITY_PENALTY
 }
 
 pub fn train_manifold_rl(
@@ -144,9 +162,9 @@ pub fn train_manifold_rl(
     };
 
     // Multi-Manifold Topology Mapping Hyperparameters
-    let mut sigma_analysis = 0.02; // Stiffer manifold for feature extraction
-    let mut sigma_decision = 0.15; // More flexible manifold for decision making
-    let l1_lambda = 0.005; // L1 Regularization strength for sparsity
+    let mut sigma_analysis = MANIFOLD_SIGMA_ANALYSIS_INIT; // Stiffer manifold for feature extraction
+    let mut sigma_decision = MANIFOLD_SIGMA_DECISION_INIT; // More flexible manifold for decision making
+    let l1_lambda = MANIFOLD_L1_LAMBDA; // L1 Regularization strength for sparsity
 
     let lr = if config.fast_init {
         if cfg!(debug_assertions) {
@@ -314,13 +332,20 @@ pub fn train_manifold_rl(
         // Adapt sigmas: sigma ~ Base / (1 + Scale * sqrt(v_avg))
         // This is a heuristic to inversely scale noise with gradient magnitude.
 
-        let curvature_scale = 10.0; // Tuning parameter
-        sigma_analysis = 0.02 / (1.0 + curvature_scale * v_avg_analysis.sqrt());
-        sigma_decision = 0.15 / (1.0 + curvature_scale * v_avg_decision.sqrt());
+        sigma_analysis =
+            MANIFOLD_SIGMA_ANALYSIS_INIT / (1.0 + MANIFOLD_CURVATURE_SCALE * v_avg_analysis.sqrt());
+        sigma_decision =
+            MANIFOLD_SIGMA_DECISION_INIT / (1.0 + MANIFOLD_CURVATURE_SCALE * v_avg_decision.sqrt());
 
         // Clamp to safe ranges
-        sigma_analysis = sigma_analysis.clamp(0.001, 0.05);
-        sigma_decision = sigma_decision.clamp(0.01, 0.3);
+        sigma_analysis = sigma_analysis.clamp(
+            MANIFOLD_SIGMA_ANALYSIS_RANGE.0,
+            MANIFOLD_SIGMA_ANALYSIS_RANGE.1,
+        );
+        sigma_decision = sigma_decision.clamp(
+            MANIFOLD_SIGMA_DECISION_RANGE.0,
+            MANIFOLD_SIGMA_DECISION_RANGE.1,
+        );
 
         if iter % 5 == 0 {
             // Print curvature stats
@@ -335,7 +360,7 @@ pub fn train_manifold_rl(
     println!(); // Newline
     println!("[RL] Applying Sparse Hyper-Connections (Pruning)...");
     let initial_active = current_opt.count_active_params();
-    current_opt.prune(0.01); // Prune weights < 0.01
+    current_opt.prune(MANIFOLD_PRUNE_THRESHOLD); // Prune weights < threshold
     let final_active = current_opt.count_active_params();
     let total_params = NeuralLuckOptimizer::param_count();
     let sparsity = 1.0 - (final_active as f64 / total_params as f64);
@@ -432,7 +457,7 @@ pub fn train_neural_optimizer(
         };
 
         // Sort by score descending (best first)
-        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
 
         let best_score = scores[0].1;
         let best_streak = scores[0].2;

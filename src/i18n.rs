@@ -96,10 +96,10 @@ impl I18n {
 
             // === Header ===
             (Language::En, "header_title") => {
-                format!("{}", "=== Talos-XII v0.4.0 by zayoka ===".purple().bold())
+                format!("{}", format!("=== Talos-XII v{} by zayoka ===", env!("CARGO_PKG_VERSION")).purple().bold())
             }
             (Language::Cn, "header_title") => {
-                format!("{}", "=== Talos-XII v0.4.0 by zayoka ===".purple().bold())
+                format!("{}", format!("=== Talos-XII v{} by zayoka ===", env!("CARGO_PKG_VERSION")).purple().bold())
             }
 
             (Language::En, "header_pool") => "Pool Name: {}".to_string(),

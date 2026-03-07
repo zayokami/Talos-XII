@@ -1,5 +1,5 @@
 use crate::autograd::Tensor as AutoTensor;
-use crate::config::Config;
+use crate::config::{Config, LuckMode};
 use crate::dbn::Dbn;
 use crate::dqn::{DuelingQNetwork, Experience};
 use crate::neural::{NeuralLuckOptimizer, Tensor, DIM};
@@ -15,7 +15,10 @@ use std::sync::mpsc::Sender;
 pub const DBN_GIBBS_STEPS: usize = 10;
 pub const COST_PER_PULL: u32 = 500;
 pub const FREE_PULLS_WELFARE: u32 = 135;
-const EPISODE_MAX_PULLS: usize = 300;
+use crate::utils::{
+    compute_reward_dqn, compute_reward_neural, compute_reward_ppo, DEFAULT_PPO_CONTEXT_LEN,
+    EPISODE_MAX_PULLS,
+};
 
 #[derive(Clone, Debug)]
 pub struct PullResult {
@@ -258,7 +261,7 @@ fn decide_policy(inputs: PolicyInputs<'_>) -> PolicyDecision {
         kv_cache,
         start_pos,
     } = inputs;
-    if config.luck_mode == "dqn" {
+    if config.luck_mode == LuckMode::Dqn {
         if let Some(policy) = dqn_policy {
             let tensor_x = AutoTensor::new(current_features.to_vec(), vec![DIM]);
             let (idx, modifier) = policy.predict_action(&tensor_x);
@@ -269,7 +272,7 @@ fn decide_policy(inputs: PolicyInputs<'_>) -> PolicyDecision {
                 ppo_value: None,
             };
         }
-    } else if config.luck_mode == "ppo" {
+    } else if config.luck_mode == LuckMode::Ppo {
         if let Some(policy) = ppo_policy {
             if fast_inference {
                 if let Some(cache) = kv_cache {
@@ -376,17 +379,11 @@ pub fn expected_pulls_per_six(config: &Config) -> f64 {
     let mut survival = 1.0;
     let mut expected = 0.0;
     for k in 1..=config.small_pity_guarantee {
-        let prob_6 = if k < config.soft_pity_start {
-            config.prob_6_base
-        } else if k < config.small_pity_guarantee {
-            config.prob_6_base + 0.05 * (k as f64 - (config.soft_pity_start as f64 - 1.0))
-        } else {
-            1.0
-        };
-        let prob_k = survival * prob_6;
+        let p6 = prob_6(k, config);
+        let prob_k = survival * p6;
         expected += k as f64 * prob_k;
-        survival *= 1.0 - prob_6;
-        if prob_6 >= 1.0 {
+        survival *= 1.0 - p6;
+        if p6 >= 1.0 {
             break;
         }
     }
@@ -573,11 +570,11 @@ pub fn simulate_core(
     available_free_pulls: u32,
     ctx: &SimModelContext<'_>,
 ) -> (SimStatsResult, Option<Vec<PullResult>>) {
-    let ppo_active = ctx.ppo_policy.is_some() && ctx.config.luck_mode == "ppo";
+    let ppo_active = ctx.ppo_policy.is_some() && ctx.config.luck_mode == LuckMode::Ppo;
     let context_len = if ctx.config.ppo_context_len > 0 {
         ctx.config.ppo_context_len
     } else {
-        8
+        DEFAULT_PPO_CONTEXT_LEN
     };
     let mut ppo_context = PpoContext::new(
         ppo_active,
@@ -626,11 +623,11 @@ fn simulate_core_with_context(
     };
 
     let mut pulls_done = 0usize;
-    let ppo_active = ctx.ppo_policy.is_some() && ctx.config.luck_mode == "ppo";
+    let ppo_active = ctx.ppo_policy.is_some() && ctx.config.luck_mode == LuckMode::Ppo;
     let context_len = if ctx.config.ppo_context_len > 0 {
         ctx.config.ppo_context_len
     } else {
-        8
+        DEFAULT_PPO_CONTEXT_LEN
     };
     ppo_context.reset(
         ppo_active,
@@ -818,17 +815,7 @@ fn record_training_samples(inputs: TrainingSampleInputs<'_>) {
         ppo_inputs,
     } = inputs;
     if let (Some(action), Some(sender)) = (outcome.action, exp_sender) {
-        let mut reward = -0.1;
-        if outcome.rarity == 6 {
-            if outcome.is_up {
-                reward += 10.0;
-            } else {
-                reward += 2.0;
-            }
-        }
-        if state.loss_streak >= 2 {
-            reward -= (state.loss_streak as f64) * 0.5;
-        }
+        let reward = compute_reward_dqn(outcome.rarity == 6, outcome.is_up, state.loss_streak);
         let done = outcome.is_up || (pulls_done + 1) >= EPISODE_MAX_PULLS;
         let _ = sender.send(Experience {
             state: current_state.to_vec(),
@@ -840,17 +827,7 @@ fn record_training_samples(inputs: TrainingSampleInputs<'_>) {
     }
 
     if let Some(sender) = neural_sender {
-        let mut reward = -0.1;
-        if outcome.rarity == 6 {
-            if outcome.is_up {
-                reward += 1.0;
-            } else {
-                reward += 0.2;
-            }
-        }
-        if state.loss_streak >= 2 {
-            reward -= (state.loss_streak as f64) * 0.2;
-        }
+        let reward = compute_reward_neural(outcome.rarity == 6, outcome.is_up, state.loss_streak);
         let _ = sender.send(NeuralSample {
             state: *current_state,
             reward,
@@ -865,17 +842,7 @@ fn record_training_samples(inputs: TrainingSampleInputs<'_>) {
             ppo_inputs.seq_data.as_ref(),
             ppo_inputs.pity_vec.as_ref(),
         ) {
-            let mut reward = -0.1;
-            if outcome.rarity == 6 {
-                if outcome.is_up {
-                    reward += 10.0;
-                } else {
-                    reward += 2.0;
-                }
-            }
-            if state.loss_streak >= 2 {
-                reward -= (state.loss_streak as f64) * 2.0;
-            }
+            let reward = compute_reward_ppo(outcome.rarity == 6, outcome.is_up, state.loss_streak);
             let done = outcome.is_up || (pulls_done + 1) >= EPISODE_MAX_PULLS;
             let _ = sender.send(PpoExperience {
                 state: state_data.clone(),
@@ -1261,7 +1228,7 @@ pub fn format_avg_extra_cost_line(avg_extra_cost: Option<f64>) -> String {
         Some(cost) => format!(
             "Avg Extra Jade Cost: {:.0} (Approx. {:.1} extra pulls)",
             cost,
-            cost / 500.0
+            cost / COST_PER_PULL as f64
         ),
         None => "Avg Extra Jade Cost: N/A".to_string(),
     }
