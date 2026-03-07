@@ -125,6 +125,7 @@ pub struct WorkerStats {
 //  GoodJobWorker
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Managed Rayon thread pool with platform-specific optimizations.
 pub struct GoodJobWorker {
     pool: ThreadPool,
     num_threads: usize,

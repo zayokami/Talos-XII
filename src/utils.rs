@@ -1,3 +1,5 @@
+//! Shared utility functions, constants, and SIMD-accelerated math helpers.
+
 use crate::achf::AchfCacheStats;
 
 /// Reward constants for training signal computation.

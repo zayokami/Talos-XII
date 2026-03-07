@@ -91,6 +91,7 @@ impl LuckMode {
 
 // --- Configuration (Data-Driven) ---
 
+/// Configuration for Adaptive Cache-aware Hyper-Connections (ACHF).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AchfConfig {
     pub enabled: bool,
@@ -172,6 +173,7 @@ impl AchfConfig {
     }
 }
 
+/// Per-pool configuration defining gacha rules and operator rosters.
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
     pub id: String,
@@ -195,6 +197,7 @@ pub struct PoolConfig {
     pub is_archived: bool,
 }
 
+/// Configuration for the gacha simulation, loaded from JSON.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub pool_name: String,
@@ -289,6 +292,7 @@ impl Config {
         }
     }
 
+    /// Load configuration from a JSON file path, falling back to defaults.
     pub fn load(path: &str) -> Self {
         if path == "default" {
             eprintln!("[System] Using built-in default configuration.");
@@ -598,6 +602,7 @@ impl Config {
 }
 
 impl Config {
+    /// Switch the active pool by ID, updating all pool-specific settings.
     pub fn apply_pool(&mut self, pool_id: &str) -> bool {
         let pool = match self.pools.iter().find(|p| p.id == pool_id) {
             Some(p) => p.clone(),

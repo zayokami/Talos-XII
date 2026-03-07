@@ -1,6 +1,7 @@
 use crate::config::Config;
 use colored::*;
 
+/// Supported UI languages.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Language {
     En,
@@ -31,9 +32,11 @@ impl Language {
     }
 }
 
+/// Internationalization provider for UI strings.
 pub struct I18n;
 
 impl I18n {
+    /// Get a localized string by key for the given language.
     pub fn get(lang: Language, key: &str) -> String {
         match (lang, key) {
             // === Explainability Report ===

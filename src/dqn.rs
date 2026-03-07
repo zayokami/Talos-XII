@@ -36,6 +36,7 @@ const ACTIONS: [f64; ACTION_SPACE] = [0.0, 0.005, 0.015, -0.005, -0.015];
 // --- Dueling Q-Network ---
 // Feature Extractor (from NeuralLuckOptimizer) -> Hidden -> Value + Advantage
 
+/// Dueling Q-Network for discrete luck action selection.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct DuelingQNetwork {
     l1: Linear,
@@ -367,6 +368,7 @@ impl SumTree {
 
 // --- Replay Buffer (SumTree-backed PER) ---
 
+/// Transition tuple for DQN replay buffer.
 #[derive(Clone)]
 pub struct Experience {
     pub state: Vec<f64>,
@@ -507,6 +509,7 @@ impl ReplayBuffer {
 
 // --- Training Loop ---
 
+/// Train a DQN agent using Double DQN with Prioritized Experience Replay.
 pub fn train_dqn(
     _initial_model: &NeuralLuckOptimizer,
     rng: &mut Rng,
@@ -832,6 +835,7 @@ pub fn train_dqn(
     policy_net
 }
 
+/// Incremental DQN trainer for online learning during interactive mode.
 pub struct OnlineDqnTrainer {
     policy: DuelingQNetwork,
     target: DuelingQNetwork,

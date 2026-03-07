@@ -90,6 +90,7 @@ unsafe fn add_scaled_row_neon(output: &mut [f64], row: &[f64], scale: f64) {
     }
 }
 
+/// Fully-connected neural network layer with fixed DIM input/output.
 #[derive(Clone)]
 pub struct DenseLayer {
     pub weights: [f64; DIM * DIM],
@@ -294,6 +295,7 @@ impl LayerNorm {
     }
 }
 
+/// Two-layer residual block with LayerNorm and ReLU activations.
 #[derive(Clone)]
 pub struct ResidualBlock {
     pub d1: DenseLayer,
@@ -376,6 +378,7 @@ impl ResidualBlock {
     }
 }
 
+/// Neural network that predicts a luck factor adjustment for gacha pulls.
 #[derive(Clone)]
 pub struct NeuralLuckOptimizer {
     pub res_block: ResidualBlock,
@@ -562,6 +565,8 @@ impl NeuralLuckOptimizer {
         })
     }
 
+    /// Predict the luck factor for a given feature vector.
+    /// Predict the luck factor for a given feature vector.
     #[inline(always)]
     pub fn predict(&self, x: &Tensor, dropout_seed: u64) -> f64 {
         // Dropout logic

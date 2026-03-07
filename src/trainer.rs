@@ -28,6 +28,7 @@ const EVAL_RATE_ERROR_WEIGHT: f64 = 10000.0;
 const EVAL_STREAK_PENALTY_WEIGHT: f64 = 500.0;
 const EVAL_BIG_PITY_PENALTY: f64 = 200.0;
 
+/// Train linear regression on neural optimizer outputs for initialization.
 pub fn train_linear_regression(
     neural_opt: &NeuralLuckOptimizer,
     rng: &mut Rng,
@@ -131,6 +132,7 @@ fn evaluate_manifold_reward(
         - big_pity_penalty * EVAL_BIG_PITY_PENALTY
 }
 
+/// Optimize neural weights via manifold-based evolution strategy with Adam.
 pub fn train_manifold_rl(
     base: &NeuralLuckOptimizer,
     rng: &mut Rng,
@@ -376,6 +378,8 @@ pub fn train_manifold_rl(
 }
 
 // === GENETIC ALGORITHM TRAINING ===
+
+/// Train neural luck optimizer using genetic algorithm.
 pub fn train_neural_optimizer(
     seed: u64,
     dbn: &Dbn,
@@ -497,6 +501,7 @@ pub fn train_neural_optimizer(
     population[0].clone()
 }
 
+/// Incremental neural optimizer trainer for online learning.
 pub struct OnlineNeuralTrainer {
     model: NeuralLuckOptimizer,
     ema_linear: [f64; DIM],

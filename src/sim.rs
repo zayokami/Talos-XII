@@ -13,7 +13,9 @@ use std::sync::mpsc::Sender;
 
 // Constants
 pub const DBN_GIBBS_STEPS: usize = 10;
+/// Jade cost per single pull (in-game currency).
 pub const COST_PER_PULL: u32 = 500;
+/// Number of free pulls available to F2P players per banner cycle.
 pub const FREE_PULLS_WELFARE: u32 = 135;
 use crate::utils::{
     compute_reward_dqn, compute_reward_neural, compute_reward_ppo, DEFAULT_PPO_CONTEXT_LEN,
@@ -27,6 +29,7 @@ pub struct PullResult {
     pub is_up: bool,
 }
 
+/// Full simulation result including per-pull details.
 #[derive(Clone)]
 pub struct SimulationResult {
     pub pulls: Vec<PullResult>,
@@ -37,6 +40,7 @@ pub struct SimulationResult {
     pub free_pulls_used: u32,
 }
 
+/// Lightweight simulation statistics without per-pull details.
 #[derive(Clone)]
 pub struct SimStatsResult {
     pub six_count: usize,
@@ -49,6 +53,7 @@ pub struct SimStatsResult {
     pub max_loss_streak: usize, // Tracked for neural network training
 }
 
+/// Mutable state tracked across pulls within a single simulation.
 #[derive(Clone)]
 pub struct PullState {
     pub pity_6: usize,
@@ -58,6 +63,7 @@ pub struct PullState {
     pub loss_streak: usize,
 }
 
+/// Result of a single gacha pull including rarity, UP status, and policy info.
 #[derive(Clone)]
 pub struct PullOutcome {
     pub rarity: u8,
@@ -328,12 +334,14 @@ fn decide_policy(inputs: PolicyInputs<'_>) -> PolicyDecision {
     }
 }
 
+/// Training sample for online neural optimizer.
 #[derive(Clone)]
 pub struct NeuralSample {
     pub state: Tensor,
     pub reward: f64,
 }
 
+/// Training experience for online PPO trainer.
 #[derive(Clone)]
 pub struct PpoExperience {
     pub state: Vec<f64>,
@@ -346,6 +354,7 @@ pub struct PpoExperience {
     pub value: f64,
 }
 
+/// Controls simulation behavior: max pulls, stop conditions, inference mode.
 #[derive(Clone)]
 pub struct SimControl {
     pub max_pulls: Option<usize>,
@@ -365,6 +374,7 @@ pub fn dbn_env(dbn: &Dbn, rng: &mut Rng) -> (f64, f64) {
     (mean * 2.0 - 1.0, var)
 }
 
+/// Calculate 6-star probability at a given pity count.
 pub fn prob_6(pity_6: usize, config: &Config) -> f64 {
     if pity_6 < config.soft_pity_start {
         config.prob_6_base
@@ -375,6 +385,7 @@ pub fn prob_6(pity_6: usize, config: &Config) -> f64 {
     }
 }
 
+/// Expected number of pulls for one 6-star under the current pool config.
 pub fn expected_pulls_per_six(config: &Config) -> f64 {
     let mut survival = 1.0;
     let mut expected = 0.0;
@@ -390,6 +401,7 @@ pub fn expected_pulls_per_six(config: &Config) -> f64 {
     expected
 }
 
+/// Build the 8-dimensional feature vector for neural network input.
 pub fn build_features(
     pity_6: usize,
     total_pulls: usize,
@@ -421,6 +433,7 @@ pub fn build_features(
     ]
 }
 
+/// Execute a single gacha pull, advancing state and returning the outcome.
 #[allow(clippy::too_many_arguments)]
 pub fn roll_one(
     state: &mut PullState,
@@ -553,6 +566,7 @@ pub fn roll_one(
     }
 }
 
+/// References to all ML models and training channels for a simulation run.
 pub struct SimModelContext<'a> {
     pub neural_opt: &'a NeuralLuckOptimizer,
     pub dqn_policy: Option<&'a DuelingQNetwork>,
@@ -564,6 +578,7 @@ pub struct SimModelContext<'a> {
     pub ppo_sender: Option<&'a Sender<PpoExperience>>,
 }
 
+/// Core simulation loop, executes a single gacha session.
 pub fn simulate_core(
     control: &SimControl,
     rng: &mut Rng,
@@ -899,6 +914,7 @@ pub fn resolve_operator_name<'a>(
     }
 }
 
+/// Fast simulation without per-pull details, optimized for batch runs.
 pub fn simulate_fast(
     num_pulls: usize,
     rng: &mut Rng,
@@ -917,6 +933,7 @@ pub fn simulate_fast(
     simulate_core(&control, rng, available_free_pulls, ctx).0
 }
 
+/// Single simulation with full pull details and training feedback.
 pub fn simulate_one(
     num_pulls: usize,
     rng: &mut Rng,
@@ -960,6 +977,7 @@ fn compute_chunk_size(num_sims: usize, worker: &GoodJobWorker) -> usize {
     size
 }
 
+/// Extended simulation context including the worker pool for parallel runs.
 pub struct SimRunContext<'a> {
     pub neural_opt: &'a NeuralLuckOptimizer,
     pub dqn_policy: Option<&'a DuelingQNetwork>,
@@ -972,6 +990,7 @@ pub struct SimRunContext<'a> {
     pub ppo_sender: Option<&'a Sender<PpoExperience>>,
 }
 
+/// Parallel batch simulation returning aggregate statistics.
 pub fn simulate_stats(
     num_pulls: usize,
     num_sims: usize,
@@ -1051,6 +1070,7 @@ pub fn simulate_stats(
     (total_six, total_up, total_big_pity, total_with_up)
 }
 
+/// Parallel F2P clearing simulation: how many extra pulls to get first UP.
 pub fn simulate_f2p_clearing(
     num_sims: usize,
     seed: u64,

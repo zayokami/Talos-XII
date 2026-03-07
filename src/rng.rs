@@ -9,6 +9,7 @@ const F64_MANTISSA_RANGE: f64 = (1u64 << 53) as f64;
 // Reference: https://prng.di.unimi.it/
 // This is a high-quality PRNG suitable for simulations, far better than simple LCG or Xorshift.
 
+/// High-quality PRNG based on xoshiro256** (StarStar).
 pub struct Rng {
     state: [u64; 4],
 }

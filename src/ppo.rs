@@ -57,6 +57,7 @@ fn softmax_sample(logits: &[f64]) -> (usize, f64) {
     (idx, probs[idx].ln())
 }
 
+/// Actor-Critic model combining a LuckTransformer backbone with action/value heads.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ActorCritic {
     pub backbone: LuckTransformer,
@@ -342,6 +343,7 @@ pub(crate) struct PpoStoreRawInput {
     value: f64,
 }
 
+/// PPO trainer with clipped surrogate objective and GAE.
 pub struct Ppo {
     pub policy: ActorCritic,
     optimizer: Adam,
@@ -807,6 +809,7 @@ struct PpoStepResult {
     finished_reward: Option<f64>,
 }
 
+/// Train a PPO agent with multi-environment rollouts.
 pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
     println!("\n[PPO] Initializing PPO Training (Actor-Critic)...");
     let fast_mode = config.fast_init || config.ppo_mode == "fast";
@@ -987,6 +990,7 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
     ppo.policy
 }
 
+/// Incremental PPO trainer for online learning during interactive mode.
 pub struct OnlinePpoTrainer {
     ppo: Ppo,
     steps_done: usize,
