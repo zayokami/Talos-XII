@@ -1,6 +1,8 @@
 mod achf;
 mod autograd;
 mod binary_codec;
+mod calibrate;
+mod collect;
 mod config;
 mod dbn;
 mod dqn;
@@ -20,7 +22,9 @@ mod utils;
 mod worker;
 
 use autograd::Tensor as AutoTensor;
+use calibrate::{apply_calibration, run_calibration, CalibrationData};
 use clap::{Parser, Subcommand};
+use collect::{add_session_interactive, import_from_json, print_stats, PlayerDatabase};
 use colored::Colorize;
 use config::{Config, LuckMode};
 use dbn::Dbn;
@@ -85,6 +89,26 @@ enum Commands {
     Benchmark,
     /// Analyze F2P welfare
     F2p,
+    /// Collect player pull data
+    Collect {
+        #[command(subcommand)]
+        action: CollectAction,
+    },
+    /// Train/calibrate model using collected player data
+    Train,
+}
+
+#[derive(Subcommand, Clone)]
+enum CollectAction {
+    /// Interactively add a player session
+    Add,
+    /// Import player data from a JSON file
+    Import {
+        /// Path to JSON file
+        file: String,
+    },
+    /// Show statistics of collected data
+    Stats,
 }
 
 struct SimHistoryEntry {
@@ -522,9 +546,105 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
 
-    let (config, dbn, trained_neural_opt, dqn_policy, ppo_policy, worker, mut rng) =
+    if matches!(
+        args.command,
+        Some(Commands::Collect { .. }) | Some(Commands::Train)
+    ) {
+        let config = Config::load(&args.config);
+        let lang = Language::from_config(&config);
+        match args.command.clone().unwrap() {
+            Commands::Collect { action } => {
+                let mut db = PlayerDatabase::load(&config.player_data_path);
+                match action {
+                    CollectAction::Add => {
+                        if let Some(session) = add_session_interactive(&config, lang) {
+                            db.add_session(session);
+                            if db.save(&config.player_data_path) {
+                                println!(
+                                    "{}",
+                                    if lang == Language::Cn {
+                                        "✓ 数据已保存。"
+                                    } else {
+                                        "✓ Data saved."
+                                    }
+                                );
+                            }
+                        }
+                    }
+                    CollectAction::Import { file } => match import_from_json(&file) {
+                        Ok(sessions) => {
+                            let count = sessions.len();
+                            for s in sessions {
+                                db.add_session(s);
+                            }
+                            if db.save(&config.player_data_path) {
+                                println!(
+                                    "{} {} {}",
+                                    if lang == Language::Cn {
+                                        "✓ 已导入"
+                                    } else {
+                                        "✓ Imported"
+                                    },
+                                    count,
+                                    if lang == Language::Cn {
+                                        "个会话。"
+                                    } else {
+                                        "sessions."
+                                    },
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("{}", e);
+                        }
+                    },
+                    CollectAction::Stats => {
+                        print_stats(&db, &config, lang);
+                    }
+                }
+            }
+            Commands::Train => {
+                let db = PlayerDatabase::load(&config.player_data_path);
+                if db.sessions.is_empty() {
+                    println!(
+                        "{}",
+                        if lang == Language::Cn {
+                            "[校准] 没有玩家数据。请先使用 collect add 录入数据。"
+                        } else {
+                            "[Calibrate] No player data. Use 'collect add' to record data first."
+                        }
+                    );
+                } else {
+                    let cal = run_calibration(&db, &config, lang);
+                    if cal.save(&config.calibrated_path) {
+                        println!(
+                            "{}",
+                            if lang == Language::Cn {
+                                "✓ 校准参数已保存。下次模拟将自动加载。"
+                            } else {
+                                "✓ Calibrated parameters saved. Next simulation will auto-load."
+                            }
+                        );
+                    }
+                }
+            }
+            _ => unreachable!(),
+        }
+        return;
+    }
+
+    let (mut config, dbn, trained_neural_opt, dqn_policy, ppo_policy, worker, mut rng) =
         initialize_system(&args);
     let lang = Language::from_config(&config);
+
+    // Auto-load calibrated parameters if available
+    if config.use_calibrated {
+        let cal = CalibrationData::load(&config.calibrated_path);
+        if !cal.pools.is_empty() {
+            apply_calibration(&mut config, &cal);
+            info!("[Calibration] Loaded calibrated parameters.");
+        }
+    }
 
     match args.command.clone().unwrap_or(Commands::Interactive) {
         Commands::Interactive => {
@@ -612,6 +732,7 @@ fn main() {
             };
             run_f2p_analysis(&f2p_ctx, &mut rng);
         }
+        Commands::Collect { .. } | Commands::Train => unreachable!(),
     }
 }
 
