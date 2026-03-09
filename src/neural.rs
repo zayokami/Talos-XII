@@ -1,5 +1,8 @@
 use crate::rng::Rng;
 
+const LCG_MULTIPLIER: u64 = 6364136223846793005;
+const ACTIVE_PARAM_THRESHOLD: f64 = 1e-9;
+
 pub const DIM: usize = 8;
 pub type Tensor = [f64; DIM];
 
@@ -87,6 +90,7 @@ unsafe fn add_scaled_row_neon(output: &mut [f64], row: &[f64], scale: f64) {
     }
 }
 
+/// Fully-connected neural network layer with fixed DIM input/output.
 #[derive(Clone)]
 pub struct DenseLayer {
     pub weights: [f64; DIM * DIM],
@@ -101,7 +105,7 @@ impl DenseLayer {
         // Initial random weights (using simple LCG for deterministic initialization from seed)
         let mut x = rng_seed;
         let mut next_rand = || {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+            x = x.wrapping_mul(LCG_MULTIPLIER).wrapping_add(1);
             (x as f64 / u64::MAX as f64) * 0.2 - 0.1
         };
 
@@ -187,7 +191,7 @@ impl DenseLayer {
     pub fn count_active_params(&self) -> usize {
         let mut count = 0;
         for w in self.weights.iter() {
-            if w.abs() > 1e-9 {
+            if w.abs() > ACTIVE_PARAM_THRESHOLD {
                 count += 1;
             }
         }
@@ -291,6 +295,7 @@ impl LayerNorm {
     }
 }
 
+/// Two-layer residual block with LayerNorm and ReLU activations.
 #[derive(Clone)]
 pub struct ResidualBlock {
     pub d1: DenseLayer,
@@ -373,6 +378,7 @@ impl ResidualBlock {
     }
 }
 
+/// Neural network that predicts a luck factor adjustment for gacha pulls.
 #[derive(Clone)]
 pub struct NeuralLuckOptimizer {
     pub res_block: ResidualBlock,
@@ -384,7 +390,7 @@ impl NeuralLuckOptimizer {
     pub fn new(seed: u64) -> Self {
         let mut x = seed.wrapping_add(0x9e3779b97f4a7c15);
         let mut next_rand = || {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+            x = x.wrapping_mul(LCG_MULTIPLIER).wrapping_add(1);
             (x as f64 / u64::MAX as f64) * 0.02 - 0.01
         };
         let mut linear_weights = [0.0; DIM];
@@ -472,7 +478,7 @@ impl NeuralLuckOptimizer {
     pub fn count_active_params(&self) -> usize {
         let mut count = self.res_block.count_active_params();
         for w in self.linear_weights.iter() {
-            if w.abs() > 1e-9 {
+            if w.abs() > ACTIVE_PARAM_THRESHOLD {
                 count += 1;
             }
         }
@@ -559,10 +565,12 @@ impl NeuralLuckOptimizer {
         })
     }
 
+    /// Predict the luck factor for a given feature vector.
+    /// Predict the luck factor for a given feature vector.
     #[inline(always)]
     pub fn predict(&self, x: &Tensor, dropout_seed: u64) -> f64 {
         // Dropout logic
-        let dropout_val = (dropout_seed.wrapping_mul(6364136223846793005) >> 56) as f64 / 256.0;
+        let dropout_val = (dropout_seed.wrapping_mul(LCG_MULTIPLIER) >> 56) as f64 / 256.0;
 
         if dropout_val < 0.05 {
             // Reduced dropout slightly

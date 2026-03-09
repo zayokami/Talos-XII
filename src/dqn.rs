@@ -18,7 +18,7 @@ const EPSILON_DECAY: usize = 50000;
 const LEARNING_RATE: f64 = 0.001;
 const TRAIN_FREQ: usize = 10;
 const LOG_FREQ: usize = 100;
-const EPISODE_MAX_PULLS: usize = 300;
+use crate::utils::EPISODE_MAX_PULLS;
 
 // PER Hyperparameters (Schaul et al. 2016)
 const PER_ALPHA: f64 = 0.6;
@@ -36,6 +36,7 @@ const ACTIONS: [f64; ACTION_SPACE] = [0.0, 0.005, 0.015, -0.005, -0.015];
 // --- Dueling Q-Network ---
 // Feature Extractor (from NeuralLuckOptimizer) -> Hidden -> Value + Advantage
 
+/// Dueling Q-Network for discrete luck action selection.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct DuelingQNetwork {
     l1: Linear,
@@ -220,6 +221,39 @@ impl DuelingQNetwork {
         }
         (max_idx, ACTIONS[max_idx])
     }
+
+    /// Zero-allocation inference: compute Q-values from a raw feature slice
+    /// using `Linear::forward_inference`, bypassing the autograd `Tensor` graph.
+    pub fn predict_action_fast(&self, state: &[f64]) -> (usize, f64) {
+        let h1 = self.l1.forward_inference(state);
+        let mut h1_relu: Vec<f64> = h1.into_iter().map(|v| v.max(0.0)).collect();
+        let h2 = self.l2.forward_inference(&h1_relu);
+        h1_relu.clear();
+        h1_relu.extend(h2.iter().map(|v| v.max(0.0)));
+        let h2_relu = &h1_relu;
+
+        if let Some(achf) = &self.achf {
+            let residual = achf.forward_inference_residual(h2_relu);
+            for (dst, &r) in h1_relu.iter_mut().zip(residual.iter()) {
+                *dst += r;
+            }
+        }
+
+        let val = self.val_head.forward_inference(&h1_relu);
+        let adv = self.adv_head.forward_inference(&h1_relu);
+
+        let mean_adv: f64 = adv.iter().sum::<f64>() / ACTION_SPACE as f64;
+        let mut max_val = f64::NEG_INFINITY;
+        let mut max_idx = 0;
+        for (i, &a) in adv.iter().enumerate() {
+            let q = val[0] + a - mean_adv;
+            if q > max_val {
+                max_val = q;
+                max_idx = i;
+            }
+        }
+        (max_idx, ACTIONS[max_idx])
+    }
 }
 
 // --- Optimizer ---
@@ -367,6 +401,7 @@ impl SumTree {
 
 // --- Replay Buffer (SumTree-backed PER) ---
 
+/// Transition tuple for DQN replay buffer.
 #[derive(Clone)]
 pub struct Experience {
     pub state: Vec<f64>,
@@ -507,6 +542,7 @@ impl ReplayBuffer {
 
 // --- Training Loop ---
 
+/// Train a DQN agent using Double DQN with Prioritized Experience Replay.
 pub fn train_dqn(
     _initial_model: &NeuralLuckOptimizer,
     rng: &mut Rng,
@@ -822,7 +858,7 @@ pub fn train_dqn(
         {
             if let Some(stats) = policy_net.achf_cache_stats() {
                 if stats.calls > 0 {
-                    println!("\n{}", format_achf_stats(&stats));
+                    println!("\n{}", crate::utils::format_achf_stats(&stats));
                 }
             }
         }
@@ -832,33 +868,7 @@ pub fn train_dqn(
     policy_net
 }
 
-fn format_achf_stats(stats: &crate::achf::AchfCacheStats) -> String {
-    let calls = stats.calls as f64;
-    let hit_rate = if calls > 0.0 {
-        stats.cache_hits as f64 / calls
-    } else {
-        0.0
-    };
-    format!(
-        "[ACHF] Calls: {} | Hit: {:.2}% | Miss: {} | Skip: {} | LowRank: {} | Dense: {} | CachedEMA(ns): {:.1}/{:.1} | LowRankEMA(ns): {:.1}/{:.1} | DecisionEMA(ns): {:.1}/{:.1} | Bias: {:.3} | Samples: {}/{}",
-        stats.calls,
-        hit_rate * 100.0,
-        stats.cache_misses,
-        stats.cache_skips,
-        stats.low_rank_paths,
-        stats.dense_paths,
-        stats.ema_cached_ns,
-        stats.ema_cached_long_ns,
-        stats.ema_low_rank_ns,
-        stats.ema_low_rank_long_ns,
-        stats.decision_ema_ns,
-        stats.decision_ema_long_ns,
-        stats.adaptive_bias,
-        stats.latency_samples,
-        stats.decision_samples
-    )
-}
-
+/// Incremental DQN trainer for online learning during interactive mode.
 pub struct OnlineDqnTrainer {
     policy: DuelingQNetwork,
     target: DuelingQNetwork,

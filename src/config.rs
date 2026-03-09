@@ -57,8 +57,41 @@ fn strip_json_comments(input: &str) -> String {
     }
     out
 }
+/// Determines which policy drives the luck factor during simulation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LuckMode {
+    /// Default mode: neural network probability adjustment.
+    Probability,
+    /// Deep Q-Network selects discrete luck actions.
+    Dqn,
+    /// Proximal Policy Optimization (Actor-Critic) selects actions.
+    Ppo,
+}
+
+impl LuckMode {
+    /// Parse from a config string. Unrecognized values map to `Probability`.
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "dqn" => Self::Dqn,
+            "ppo" => Self::Ppo,
+            _ => Self::Probability,
+        }
+    }
+
+    /// Return the canonical string representation.
+    #[allow(dead_code)]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Probability => "probability",
+            Self::Dqn => "dqn",
+            Self::Ppo => "ppo",
+        }
+    }
+}
+
 // --- Configuration (Data-Driven) ---
 
+/// Configuration for Adaptive Cache-aware Hyper-Connections (ACHF).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AchfConfig {
     pub enabled: bool,
@@ -140,6 +173,7 @@ impl AchfConfig {
     }
 }
 
+/// Per-pool configuration defining gacha rules and operator rosters.
 #[derive(Debug, Clone)]
 pub struct PoolConfig {
     pub id: String,
@@ -163,6 +197,7 @@ pub struct PoolConfig {
     pub is_archived: bool,
 }
 
+/// Configuration for the gacha simulation, loaded from JSON.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub pool_name: String,
@@ -183,7 +218,7 @@ pub struct Config {
     pub four_stars: Vec<String>,
     pub pools: Vec<PoolConfig>,
     pub active_pool: Option<String>,
-    pub luck_mode: String, // "probability" (default) or "dqn"
+    pub luck_mode: LuckMode,
     pub fast_init: bool,
     pub ppo_mode: String,
     pub ppo_total_steps: usize,
@@ -230,7 +265,7 @@ impl Config {
             four_stars: vec![],
             pools: vec![],
             active_pool: None,
-            luck_mode: "probability".to_string(),
+            luck_mode: LuckMode::Probability,
             fast_init: false,
             ppo_mode: "balanced".to_string(),
             ppo_total_steps: 0,
@@ -257,6 +292,7 @@ impl Config {
         }
     }
 
+    /// Load configuration from a JSON file path, falling back to defaults.
     pub fn load(path: &str) -> Self {
         if path == "default" {
             eprintln!("[System] Using built-in default configuration.");
@@ -367,7 +403,7 @@ impl Config {
                     .collect();
             }
             if let Some(v) = map.get("luck_mode") {
-                config.luck_mode = v.as_str().unwrap_or("probability").to_string();
+                config.luck_mode = LuckMode::from_str(v.as_str().unwrap_or("probability"));
             }
             if let Some(v) = map.get("fast_init") {
                 config.fast_init = v.as_bool().unwrap_or(false);
@@ -566,6 +602,7 @@ impl Config {
 }
 
 impl Config {
+    /// Switch the active pool by ID, updating all pool-specific settings.
     pub fn apply_pool(&mut self, pool_id: &str) -> bool {
         let pool = match self.pools.iter().find(|p| p.id == pool_id) {
             Some(p) => p.clone(),

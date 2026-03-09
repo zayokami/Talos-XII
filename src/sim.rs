@@ -1,5 +1,5 @@
 use crate::autograd::Tensor as AutoTensor;
-use crate::config::Config;
+use crate::config::{Config, LuckMode};
 use crate::dbn::Dbn;
 use crate::dqn::{DuelingQNetwork, Experience};
 use crate::neural::{NeuralLuckOptimizer, Tensor, DIM};
@@ -13,9 +13,14 @@ use std::sync::mpsc::Sender;
 
 // Constants
 pub const DBN_GIBBS_STEPS: usize = 10;
+/// Jade cost per single pull (in-game currency).
 pub const COST_PER_PULL: u32 = 500;
+/// Number of free pulls available to F2P players per banner cycle.
 pub const FREE_PULLS_WELFARE: u32 = 135;
-const EPISODE_MAX_PULLS: usize = 300;
+use crate::utils::{
+    compute_reward_dqn, compute_reward_neural, compute_reward_ppo, DEFAULT_PPO_CONTEXT_LEN,
+    EPISODE_MAX_PULLS,
+};
 
 #[derive(Clone, Debug)]
 pub struct PullResult {
@@ -24,6 +29,7 @@ pub struct PullResult {
     pub is_up: bool,
 }
 
+/// Full simulation result including per-pull details.
 #[derive(Clone)]
 pub struct SimulationResult {
     pub pulls: Vec<PullResult>,
@@ -34,6 +40,7 @@ pub struct SimulationResult {
     pub free_pulls_used: u32,
 }
 
+/// Lightweight simulation statistics without per-pull details.
 #[derive(Clone)]
 pub struct SimStatsResult {
     pub six_count: usize,
@@ -46,6 +53,7 @@ pub struct SimStatsResult {
     pub max_loss_streak: usize, // Tracked for neural network training
 }
 
+/// Mutable state tracked across pulls within a single simulation.
 #[derive(Clone)]
 pub struct PullState {
     pub pity_6: usize,
@@ -55,6 +63,7 @@ pub struct PullState {
     pub loss_streak: usize,
 }
 
+/// Result of a single gacha pull including rarity, UP status, and policy info.
 #[derive(Clone)]
 pub struct PullOutcome {
     pub rarity: u8,
@@ -74,7 +83,6 @@ struct PolicyDecision {
 
 struct PpoInputs {
     seq_len: usize,
-    seq_data: Option<Vec<f64>>,
     seq_tensor: Option<AutoTensor>,
     pity_vec: Option<Vec<usize>>,
 }
@@ -83,7 +91,6 @@ impl PpoInputs {
     fn empty() -> Self {
         Self {
             seq_len: 0,
-            seq_data: None,
             seq_tensor: None,
             pity_vec: None,
         }
@@ -191,32 +198,28 @@ impl PpoContext {
             self.pity_buffer.pop_front();
         }
         let seq_len = self.history_buffer.len();
+
+        self.seq_data.clear();
+        for s in self.history_buffer.iter() {
+            self.seq_data.extend_from_slice(s);
+        }
+        self.pity_vec.clear();
+        self.pity_vec.extend(self.pity_buffer.iter().copied());
+
         if need_tensor {
-            self.seq_data.clear();
-            for s in self.history_buffer.iter() {
-                self.seq_data.extend_from_slice(s);
-            }
-            self.pity_vec.clear();
-            self.pity_vec.extend(self.pity_buffer.iter().copied());
             let seq_tensor = Some(AutoTensor::new(self.seq_data.clone(), vec![seq_len, DIM]));
             PpoInputs {
                 seq_len,
-                seq_data: Some(self.seq_data.clone()),
                 seq_tensor,
                 pity_vec: Some(self.pity_vec.clone()),
             }
         } else {
             PpoInputs {
                 seq_len,
-                seq_data: None,
                 seq_tensor: None,
                 pity_vec: None,
             }
         }
-    }
-
-    fn kv_cache_mut(&mut self) -> &mut Option<KVCache> {
-        &mut self.kv_cache
     }
 
     fn prune_cache(&mut self, policy: &ActorCritic) {
@@ -258,8 +261,17 @@ fn decide_policy(inputs: PolicyInputs<'_>) -> PolicyDecision {
         kv_cache,
         start_pos,
     } = inputs;
-    if config.luck_mode == "dqn" {
+    if config.luck_mode == LuckMode::Dqn {
         if let Some(policy) = dqn_policy {
+            if fast_inference {
+                let (idx, modifier) = policy.predict_action_fast(current_features);
+                return PolicyDecision {
+                    luck_factor: modifier,
+                    action: Some(idx),
+                    ppo_log_prob: None,
+                    ppo_value: None,
+                };
+            }
             let tensor_x = AutoTensor::new(current_features.to_vec(), vec![DIM]);
             let (idx, modifier) = policy.predict_action(&tensor_x);
             return PolicyDecision {
@@ -269,7 +281,7 @@ fn decide_policy(inputs: PolicyInputs<'_>) -> PolicyDecision {
                 ppo_value: None,
             };
         }
-    } else if config.luck_mode == "ppo" {
+    } else if config.luck_mode == LuckMode::Ppo {
         if let Some(policy) = ppo_policy {
             if fast_inference {
                 if let Some(cache) = kv_cache {
@@ -325,12 +337,14 @@ fn decide_policy(inputs: PolicyInputs<'_>) -> PolicyDecision {
     }
 }
 
+/// Training sample for online neural optimizer.
 #[derive(Clone)]
 pub struct NeuralSample {
     pub state: Tensor,
     pub reward: f64,
 }
 
+/// Training experience for online PPO trainer.
 #[derive(Clone)]
 pub struct PpoExperience {
     pub state: Vec<f64>,
@@ -343,6 +357,7 @@ pub struct PpoExperience {
     pub value: f64,
 }
 
+/// Controls simulation behavior: max pulls, stop conditions, inference mode.
 #[derive(Clone)]
 pub struct SimControl {
     pub max_pulls: Option<usize>,
@@ -362,6 +377,7 @@ pub fn dbn_env(dbn: &Dbn, rng: &mut Rng) -> (f64, f64) {
     (mean * 2.0 - 1.0, var)
 }
 
+/// Calculate 6-star probability at a given pity count.
 pub fn prob_6(pity_6: usize, config: &Config) -> f64 {
     if pity_6 < config.soft_pity_start {
         config.prob_6_base
@@ -372,27 +388,23 @@ pub fn prob_6(pity_6: usize, config: &Config) -> f64 {
     }
 }
 
+/// Expected number of pulls for one 6-star under the current pool config.
 pub fn expected_pulls_per_six(config: &Config) -> f64 {
     let mut survival = 1.0;
     let mut expected = 0.0;
     for k in 1..=config.small_pity_guarantee {
-        let prob_6 = if k < config.soft_pity_start {
-            config.prob_6_base
-        } else if k < config.small_pity_guarantee {
-            config.prob_6_base + 0.05 * (k as f64 - (config.soft_pity_start as f64 - 1.0))
-        } else {
-            1.0
-        };
-        let prob_k = survival * prob_6;
+        let p6 = prob_6(k, config);
+        let prob_k = survival * p6;
         expected += k as f64 * prob_k;
-        survival *= 1.0 - prob_6;
-        if prob_6 >= 1.0 {
+        survival *= 1.0 - p6;
+        if p6 >= 1.0 {
             break;
         }
     }
     expected
 }
 
+/// Build the 8-dimensional feature vector for neural network input.
 pub fn build_features(
     pity_6: usize,
     total_pulls: usize,
@@ -424,6 +436,7 @@ pub fn build_features(
     ]
 }
 
+/// Execute a single gacha pull, advancing state and returning the outcome.
 #[allow(clippy::too_many_arguments)]
 pub fn roll_one(
     state: &mut PullState,
@@ -556,6 +569,7 @@ pub fn roll_one(
     }
 }
 
+/// References to all ML models and training channels for a simulation run.
 pub struct SimModelContext<'a> {
     pub neural_opt: &'a NeuralLuckOptimizer,
     pub dqn_policy: Option<&'a DuelingQNetwork>,
@@ -567,17 +581,18 @@ pub struct SimModelContext<'a> {
     pub ppo_sender: Option<&'a Sender<PpoExperience>>,
 }
 
+/// Core simulation loop, executes a single gacha session.
 pub fn simulate_core(
     control: &SimControl,
     rng: &mut Rng,
     available_free_pulls: u32,
     ctx: &SimModelContext<'_>,
 ) -> (SimStatsResult, Option<Vec<PullResult>>) {
-    let ppo_active = ctx.ppo_policy.is_some() && ctx.config.luck_mode == "ppo";
+    let ppo_active = ctx.ppo_policy.is_some() && ctx.config.luck_mode == LuckMode::Ppo;
     let context_len = if ctx.config.ppo_context_len > 0 {
         ctx.config.ppo_context_len
     } else {
-        8
+        DEFAULT_PPO_CONTEXT_LEN
     };
     let mut ppo_context = PpoContext::new(
         ppo_active,
@@ -626,11 +641,11 @@ fn simulate_core_with_context(
     };
 
     let mut pulls_done = 0usize;
-    let ppo_active = ctx.ppo_policy.is_some() && ctx.config.luck_mode == "ppo";
+    let ppo_active = ctx.ppo_policy.is_some() && ctx.config.luck_mode == LuckMode::Ppo;
     let context_len = if ctx.config.ppo_context_len > 0 {
         ctx.config.ppo_context_len
     } else {
-        8
+        DEFAULT_PPO_CONTEXT_LEN
     };
     ppo_context.reset(
         ppo_active,
@@ -668,6 +683,8 @@ fn simulate_core_with_context(
             state.loss_streak,
             ctx.config,
         );
+        let has_any_sender =
+            ctx.exp_sender.is_some() || ctx.neural_sender.is_some() || ctx.ppo_sender.is_some();
         let need_tensor = !control.fast_inference || ctx.ppo_sender.is_some();
         let ppo_inputs = ppo_context.build_inputs(current_state, current_pity, need_tensor);
 
@@ -685,24 +702,18 @@ fn simulate_core_with_context(
             ppo_inputs.seq_tensor.as_ref(),
             ppo_inputs.pity_vec.as_deref(),
             control.fast_inference,
-            ppo_inputs.seq_data.as_deref(),
-            ppo_context.kv_cache_mut(),
+            if control.fast_inference && ppo_context.active {
+                Some(ppo_context.seq_data.as_slice())
+            } else {
+                None
+            },
+            &mut ppo_context.kv_cache,
             pulls_done,
         );
 
         if let Some(policy) = ctx.ppo_policy {
             ppo_context.prune_cache(policy);
         }
-
-        let next_state = build_features(
-            state.pity_6,
-            nn_total_pulls + 1,
-            env_noise,
-            state.streak_4_star,
-            env_bias,
-            state.loss_streak,
-            ctx.config,
-        );
 
         if outcome.big_pity_used {
             big_pity_used = true;
@@ -717,17 +728,30 @@ fn simulate_core_with_context(
             max_loss_streak = state.loss_streak;
         }
 
-        record_training_samples(TrainingSampleInputs {
-            outcome: &outcome,
-            current_state: &current_state,
-            next_state: &next_state,
-            pulls_done,
-            state: &state,
-            exp_sender: ctx.exp_sender,
-            neural_sender: ctx.neural_sender,
-            ppo_sender: ctx.ppo_sender,
-            ppo_inputs: &ppo_inputs,
-        });
+        if has_any_sender {
+            let next_state = build_features(
+                state.pity_6,
+                nn_total_pulls + 1,
+                env_noise,
+                state.streak_4_star,
+                env_bias,
+                state.loss_streak,
+                ctx.config,
+            );
+            record_training_samples(TrainingSampleInputs {
+                outcome: &outcome,
+                current_state: &current_state,
+                next_state: &next_state,
+                pulls_done,
+                state: &state,
+                exp_sender: ctx.exp_sender,
+                neural_sender: ctx.neural_sender,
+                ppo_sender: ctx.ppo_sender,
+                ppo_inputs: &ppo_inputs,
+                ppo_context_seq_data: &ppo_context.seq_data,
+                ppo_context_pity_vec: &ppo_context.pity_vec,
+            });
+        }
 
         if let Some(ref mut pulls_vec) = pulls {
             let op_idx = match outcome.rarity {
@@ -803,6 +827,8 @@ struct TrainingSampleInputs<'a> {
     neural_sender: Option<&'a Sender<NeuralSample>>,
     ppo_sender: Option<&'a Sender<PpoExperience>>,
     ppo_inputs: &'a PpoInputs,
+    ppo_context_seq_data: &'a [f64],
+    ppo_context_pity_vec: &'a [usize],
 }
 
 fn record_training_samples(inputs: TrainingSampleInputs<'_>) {
@@ -816,19 +842,11 @@ fn record_training_samples(inputs: TrainingSampleInputs<'_>) {
         neural_sender,
         ppo_sender,
         ppo_inputs,
+        ppo_context_seq_data,
+        ppo_context_pity_vec,
     } = inputs;
     if let (Some(action), Some(sender)) = (outcome.action, exp_sender) {
-        let mut reward = -0.1;
-        if outcome.rarity == 6 {
-            if outcome.is_up {
-                reward += 10.0;
-            } else {
-                reward += 2.0;
-            }
-        }
-        if state.loss_streak >= 2 {
-            reward -= (state.loss_streak as f64) * 0.5;
-        }
+        let reward = compute_reward_dqn(outcome.rarity == 6, outcome.is_up, state.loss_streak);
         let done = outcome.is_up || (pulls_done + 1) >= EPISODE_MAX_PULLS;
         let _ = sender.send(Experience {
             state: current_state.to_vec(),
@@ -840,17 +858,7 @@ fn record_training_samples(inputs: TrainingSampleInputs<'_>) {
     }
 
     if let Some(sender) = neural_sender {
-        let mut reward = -0.1;
-        if outcome.rarity == 6 {
-            if outcome.is_up {
-                reward += 1.0;
-            } else {
-                reward += 0.2;
-            }
-        }
-        if state.loss_streak >= 2 {
-            reward -= (state.loss_streak as f64) * 0.2;
-        }
+        let reward = compute_reward_neural(outcome.rarity == 6, outcome.is_up, state.loss_streak);
         let _ = sender.send(NeuralSample {
             state: *current_state,
             reward,
@@ -860,27 +868,13 @@ fn record_training_samples(inputs: TrainingSampleInputs<'_>) {
     if let (Some(log_prob), Some(value), Some(sender)) =
         (outcome.ppo_log_prob, outcome.ppo_value, ppo_sender)
     {
-        if let (Some(action), Some(state_data), Some(pity_vec)) = (
-            outcome.action,
-            ppo_inputs.seq_data.as_ref(),
-            ppo_inputs.pity_vec.as_ref(),
-        ) {
-            let mut reward = -0.1;
-            if outcome.rarity == 6 {
-                if outcome.is_up {
-                    reward += 10.0;
-                } else {
-                    reward += 2.0;
-                }
-            }
-            if state.loss_streak >= 2 {
-                reward -= (state.loss_streak as f64) * 2.0;
-            }
+        if let Some(action) = outcome.action {
+            let reward = compute_reward_ppo(outcome.rarity == 6, outcome.is_up, state.loss_streak);
             let done = outcome.is_up || (pulls_done + 1) >= EPISODE_MAX_PULLS;
             let _ = sender.send(PpoExperience {
-                state: state_data.clone(),
+                state: ppo_context_seq_data.to_vec(),
                 seq_len: ppo_inputs.seq_len,
-                pity: pity_vec.clone(),
+                pity: ppo_context_pity_vec.to_vec(),
                 action,
                 log_prob,
                 reward,
@@ -932,6 +926,7 @@ pub fn resolve_operator_name<'a>(
     }
 }
 
+/// Fast simulation without per-pull details, optimized for batch runs.
 pub fn simulate_fast(
     num_pulls: usize,
     rng: &mut Rng,
@@ -950,6 +945,7 @@ pub fn simulate_fast(
     simulate_core(&control, rng, available_free_pulls, ctx).0
 }
 
+/// Single simulation with full pull details and training feedback.
 pub fn simulate_one(
     num_pulls: usize,
     rng: &mut Rng,
@@ -993,6 +989,7 @@ fn compute_chunk_size(num_sims: usize, worker: &GoodJobWorker) -> usize {
     size
 }
 
+/// Extended simulation context including the worker pool for parallel runs.
 pub struct SimRunContext<'a> {
     pub neural_opt: &'a NeuralLuckOptimizer,
     pub dqn_policy: Option<&'a DuelingQNetwork>,
@@ -1005,6 +1002,7 @@ pub struct SimRunContext<'a> {
     pub ppo_sender: Option<&'a Sender<PpoExperience>>,
 }
 
+/// Parallel batch simulation returning aggregate statistics.
 pub fn simulate_stats(
     num_pulls: usize,
     num_sims: usize,
@@ -1084,6 +1082,7 @@ pub fn simulate_stats(
     (total_six, total_up, total_big_pity, total_with_up)
 }
 
+/// Parallel F2P clearing simulation: how many extra pulls to get first UP.
 pub fn simulate_f2p_clearing(
     num_sims: usize,
     seed: u64,
@@ -1261,7 +1260,7 @@ pub fn format_avg_extra_cost_line(avg_extra_cost: Option<f64>) -> String {
         Some(cost) => format!(
             "Avg Extra Jade Cost: {:.0} (Approx. {:.1} extra pulls)",
             cost,
-            cost / 500.0
+            cost / COST_PER_PULL as f64
         ),
         None => "Avg Extra Jade Cost: N/A".to_string(),
     }
@@ -1312,10 +1311,10 @@ mod tests {
         let mut context = PpoContext::new(true, 2, None, false);
         let inputs1 = context.build_inputs([0.0; DIM], 1, true);
         assert_eq!(inputs1.seq_len, 1);
-        assert_eq!(inputs1.seq_data.as_ref().unwrap().len(), DIM);
+        assert_eq!(context.seq_data.len(), DIM);
         let inputs2 = context.build_inputs([0.0; DIM], 2, true);
         assert_eq!(inputs2.seq_len, 2);
-        assert_eq!(inputs2.seq_data.as_ref().unwrap().len(), DIM * 2);
+        assert_eq!(context.seq_data.len(), DIM * 2);
         let inputs3 = context.build_inputs([0.0; DIM], 3, true);
         assert_eq!(inputs3.seq_len, 2);
         assert_eq!(inputs3.pity_vec.as_ref().unwrap().len(), 2);

@@ -6,6 +6,7 @@ use crate::nn::{Linear, Module};
 use crate::rng::Rng;
 use crate::sim::{build_features, dbn_env, prob_6, PpoExperience, PullState};
 use crate::transformer::{KVCache, LuckTransformer};
+use crate::utils::{normalize_slice, sum_f64, sum_sq_diff, EPISODE_MAX_PULLS};
 use crate::worker::GoodJobWorker;
 use rand::seq::SliceRandom;
 use rayon::prelude::*;
@@ -22,224 +23,8 @@ const GAMMA: f64 = 0.99;
 const GAE_LAMBDA: f64 = 0.95;
 const VALUE_COEF: f64 = 0.5;
 const ENTROPY_COEF: f64 = 0.01;
-const EPISODE_MAX_PULLS: usize = 300;
 const EARLY_UP_BONUS_THRESHOLD_1: usize = 80;
 const EARLY_UP_BONUS_THRESHOLD_2: usize = 50;
-
-#[inline(always)]
-fn sum_f64(values: &[f64]) -> f64 {
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        sum_f64_neon(values)
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if std::is_x86_feature_detected!("avx2") {
-                unsafe {
-                    return sum_f64_avx2(values);
-                }
-            }
-        }
-        let mut sum = 0.0;
-        for &v in values {
-            sum += v;
-        }
-        sum
-    }
-}
-
-#[inline(always)]
-fn sum_sq_diff(values: &[f64], mean: f64) -> f64 {
-    #[cfg(target_arch = "aarch64")]
-    unsafe {
-        sum_sq_diff_neon(values, mean)
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if std::is_x86_feature_detected!("avx2") {
-                unsafe {
-                    return sum_sq_diff_avx2(values, mean);
-                }
-            }
-        }
-        let mut sum = 0.0;
-        for &v in values {
-            let d = v - mean;
-            sum += d * d;
-        }
-        sum
-    }
-}
-
-#[inline(always)]
-fn normalize_slice(values: &[f64], mean: f64, std: f64) -> Vec<f64> {
-    let len = values.len();
-    let mut out = vec![0.0; len];
-    #[cfg(target_arch = "aarch64")]
-    {
-        unsafe {
-            normalize_slice_neon(values, &mut out, mean, std);
-        }
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if std::is_x86_feature_detected!("avx2") {
-                unsafe {
-                    normalize_slice_avx2(values, &mut out, mean, std);
-                }
-                return out;
-            }
-        }
-        for i in 0..len {
-            out[i] = (values[i] - mean) / std;
-        }
-    }
-    out
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn sum_f64_avx2(values: &[f64]) -> f64 {
-    use core::arch::x86_64::*;
-    let mut i = 0;
-    let len = values.len();
-    let mut acc = _mm256_setzero_pd();
-    while i + 4 <= len {
-        let v = _mm256_loadu_pd(values.as_ptr().add(i));
-        acc = _mm256_add_pd(acc, v);
-        i += 4;
-    }
-    let mut tmp = [0.0; 4];
-    _mm256_storeu_pd(tmp.as_mut_ptr(), acc);
-    let mut sum = tmp[0] + tmp[1] + tmp[2] + tmp[3];
-    while i < len {
-        sum += *values.get_unchecked(i);
-        i += 1;
-    }
-    sum
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn sum_sq_diff_avx2(values: &[f64], mean: f64) -> f64 {
-    use core::arch::x86_64::*;
-    let mut i = 0;
-    let len = values.len();
-    let mut acc = _mm256_setzero_pd();
-    let mean_vec = _mm256_set1_pd(mean);
-    while i + 4 <= len {
-        let v = _mm256_loadu_pd(values.as_ptr().add(i));
-        let d = _mm256_sub_pd(v, mean_vec);
-        let prod = _mm256_mul_pd(d, d);
-        acc = _mm256_add_pd(acc, prod);
-        i += 4;
-    }
-    let mut tmp = [0.0; 4];
-    _mm256_storeu_pd(tmp.as_mut_ptr(), acc);
-    let mut sum = tmp[0] + tmp[1] + tmp[2] + tmp[3];
-    while i < len {
-        let d = *values.get_unchecked(i) - mean;
-        sum += d * d;
-        i += 1;
-    }
-    sum
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn normalize_slice_avx2(values: &[f64], out: &mut [f64], mean: f64, std: f64) {
-    use core::arch::x86_64::*;
-    let mut i = 0;
-    let len = values.len();
-    let mean_vec = _mm256_set1_pd(mean);
-    let std_vec = _mm256_set1_pd(std);
-    while i + 4 <= len {
-        let v = _mm256_loadu_pd(values.as_ptr().add(i));
-        let d = _mm256_sub_pd(v, mean_vec);
-        let n = _mm256_div_pd(d, std_vec);
-        _mm256_storeu_pd(out.as_mut_ptr().add(i), n);
-        i += 4;
-    }
-    while i < len {
-        *out.get_unchecked_mut(i) = (*values.get_unchecked(i) - mean) / std;
-        i += 1;
-    }
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn sum_f64_neon(values: &[f64]) -> f64 {
-    use core::arch::aarch64::*;
-    let mut i = 0;
-    let len = values.len();
-    let mut acc = vdupq_n_f64(0.0);
-    while i + 2 <= len {
-        let v = vld1q_f64(values.as_ptr().add(i));
-        acc = vaddq_f64(acc, v);
-        i += 2;
-    }
-    let mut tmp = [0.0; 2];
-    vst1q_f64(tmp.as_mut_ptr(), acc);
-    let mut sum = tmp[0] + tmp[1];
-    while i < len {
-        sum += *values.get_unchecked(i);
-        i += 1;
-    }
-    sum
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn sum_sq_diff_neon(values: &[f64], mean: f64) -> f64 {
-    use core::arch::aarch64::*;
-    let mut i = 0;
-    let len = values.len();
-    let mut acc = vdupq_n_f64(0.0);
-    let mean_vec = vdupq_n_f64(mean);
-    while i + 2 <= len {
-        let v = vld1q_f64(values.as_ptr().add(i));
-        let d = vsubq_f64(v, mean_vec);
-        let prod = vmulq_f64(d, d);
-        acc = vaddq_f64(acc, prod);
-        i += 2;
-    }
-    let mut tmp = [0.0; 2];
-    vst1q_f64(tmp.as_mut_ptr(), acc);
-    let mut sum = tmp[0] + tmp[1];
-    while i < len {
-        let d = *values.get_unchecked(i) - mean;
-        sum += d * d;
-        i += 1;
-    }
-    sum
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-unsafe fn normalize_slice_neon(values: &[f64], out: &mut [f64], mean: f64, std: f64) {
-    use core::arch::aarch64::*;
-    let mut i = 0;
-    let len = values.len();
-    let mean_vec = vdupq_n_f64(mean);
-    let std_vec = vdupq_n_f64(std);
-    while i + 2 <= len {
-        let v = vld1q_f64(values.as_ptr().add(i));
-        let d = vsubq_f64(v, mean_vec);
-        let n = vdivq_f64(d, std_vec);
-        vst1q_f64(out.as_mut_ptr().add(i), n);
-        i += 2;
-    }
-    while i < len {
-        *out.get_unchecked_mut(i) = (*values.get_unchecked(i) - mean) / std;
-        i += 1;
-    }
-}
 
 // Softmax + categorical sample over fixed ACTION_SPACE logits.
 // Returns (action_index, log_prob_of_action).
@@ -272,6 +57,7 @@ fn softmax_sample(logits: &[f64]) -> (usize, f64) {
     (idx, probs[idx].ln())
 }
 
+/// Actor-Critic model combining a LuckTransformer backbone with action/value heads.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ActorCritic {
     pub backbone: LuckTransformer,
@@ -557,6 +343,7 @@ pub(crate) struct PpoStoreRawInput {
     value: f64,
 }
 
+/// PPO trainer with clipped surrogate objective and GAE.
 pub struct Ppo {
     pub policy: ActorCritic,
     optimizer: Adam,
@@ -898,7 +685,11 @@ impl PpoEnvState {
         }
         self.pity_vec.clear();
         self.pity_vec.extend(self.pity_buffer.iter().copied());
-        let token = self.history_buffer.back().unwrap().as_slice();
+        let token = self
+            .history_buffer
+            .back()
+            .expect("history_buffer should not be empty after push")
+            .as_slice();
         let (action_idx, log_prob, val) =
             policy.step_inference_cached_with_value(token, &mut self.kv_cache, seq_len - 1);
 
@@ -1018,6 +809,7 @@ struct PpoStepResult {
     finished_reward: Option<f64>,
 }
 
+/// Train a PPO agent with multi-environment rollouts.
 pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
     println!("\n[PPO] Initializing PPO Training (Actor-Critic)...");
     let fast_mode = config.fast_init || config.ppo_mode == "fast";
@@ -1166,13 +958,17 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
             if config.achf.cache_log_per_layer {
                 for (idx, stats) in ppo.policy.achf_cache_stats_iter().enumerate() {
                     if stats.calls > 0 {
-                        println!("\n[ACHF-L{}] {}", idx, format_achf_stats(&stats));
+                        println!(
+                            "\n[ACHF-L{}] {}",
+                            idx,
+                            crate::utils::format_achf_stats(&stats)
+                        );
                     }
                 }
             } else {
                 let stats = ppo.policy.achf_cache_stats_aggregate();
                 if stats.calls > 0 {
-                    println!("\n{}", format_achf_stats(&stats));
+                    println!("\n{}", crate::utils::format_achf_stats(&stats));
                 }
             }
         }
@@ -1194,33 +990,7 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
     ppo.policy
 }
 
-fn format_achf_stats(stats: &crate::achf::AchfCacheStats) -> String {
-    let calls = stats.calls as f64;
-    let hit_rate = if calls > 0.0 {
-        stats.cache_hits as f64 / calls
-    } else {
-        0.0
-    };
-    format!(
-        "[ACHF] Calls: {} | Hit: {:.2}% | Miss: {} | Skip: {} | LowRank: {} | Dense: {} | CachedEMA(ns): {:.1}/{:.1} | LowRankEMA(ns): {:.1}/{:.1} | DecisionEMA(ns): {:.1}/{:.1} | Bias: {:.3} | Samples: {}/{}",
-        stats.calls,
-        hit_rate * 100.0,
-        stats.cache_misses,
-        stats.cache_skips,
-        stats.low_rank_paths,
-        stats.dense_paths,
-        stats.ema_cached_ns,
-        stats.ema_cached_long_ns,
-        stats.ema_low_rank_ns,
-        stats.ema_low_rank_long_ns,
-        stats.decision_ema_ns,
-        stats.decision_ema_long_ns,
-        stats.adaptive_bias,
-        stats.latency_samples,
-        stats.decision_samples
-    )
-}
-
+/// Incremental PPO trainer for online learning during interactive mode.
 pub struct OnlinePpoTrainer {
     ppo: Ppo,
     steps_done: usize,

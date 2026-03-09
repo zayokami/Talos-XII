@@ -1,6 +1,7 @@
 use crate::config::Config;
 use colored::*;
 
+/// Supported UI languages.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Language {
     En,
@@ -31,9 +32,11 @@ impl Language {
     }
 }
 
+/// Internationalization provider for UI strings.
 pub struct I18n;
 
 impl I18n {
+    /// Get a localized string by key for the given language.
     pub fn get(lang: Language, key: &str) -> String {
         match (lang, key) {
             // === Explainability Report ===
@@ -96,10 +99,10 @@ impl I18n {
 
             // === Header ===
             (Language::En, "header_title") => {
-                format!("{}", "=== Talos-XII v0.4.0 by zayoka ===".purple().bold())
+                format!("{}", format!("=== Talos-XII v{} by zayoka ===", env!("CARGO_PKG_VERSION")).purple().bold())
             }
             (Language::Cn, "header_title") => {
-                format!("{}", "=== Talos-XII v0.4.0 by zayoka ===".purple().bold())
+                format!("{}", format!("=== Talos-XII v{} by zayoka ===", env!("CARGO_PKG_VERSION")).purple().bold())
             }
 
             (Language::En, "header_pool") => "Pool Name: {}".to_string(),

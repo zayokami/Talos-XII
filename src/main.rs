@@ -16,12 +16,13 @@ mod sim;
 mod simd;
 mod trainer;
 mod transformer;
+mod utils;
 mod worker;
 
 use autograd::Tensor as AutoTensor;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use config::Config;
+use config::{Config, LuckMode};
 use dbn::Dbn;
 use dqn::{train_dqn, DuelingQNetwork, Experience, OnlineDqnTrainer};
 use i18n::{I18n, Language};
@@ -114,8 +115,11 @@ fn prompt_yes_no(prompt: &str, default_yes: bool) -> bool {
 }
 
 use model_io::{load_model, load_neural_cache, save_model, save_neural_cache};
+use utils::{
+    F2P_BATCH_COUNT, INPUT_CAP, MAX_DRAIN_PER_TICK, ONLINE_REPORT_INTERVAL_SECS, PPO_ONLINE_LR,
+    PULL_DISPLAY_LIMIT, SIM_HISTORY_CAPACITY,
+};
 
-// Demo of "Crazy" Mmap loading
 /// Resolve the effective simulation count for F2P probability estimation.
 fn resolve_f2p_sim_count_prob(config: &Config) -> usize {
     if config.f2p_sim_count_prob > 0 {
@@ -160,6 +164,168 @@ fn resolve_f2p_sim_count_cost(config: &Config, sim_count_prob: usize) -> usize {
     } else {
         sim_count_prob
     }
+}
+
+struct F2pAnalysisCtx<'a> {
+    config: &'a Config,
+    neural_opt: &'a NeuralLuckOptimizer,
+    dqn_policy: Option<&'a DuelingQNetwork>,
+    ppo_policy: Option<&'a ActorCritic>,
+    dbn: &'a Dbn,
+    worker: &'a GoodJobWorker,
+    lang: Language,
+}
+
+fn run_f2p_analysis(ctx: &F2pAnalysisCtx<'_>, rng: &mut Rng) {
+    let lang = ctx.lang;
+    println!(
+        "{}",
+        I18n::get(lang, "f2p_header").replace("{}", &FREE_PULLS_WELFARE.to_string())
+    );
+
+    let sim_count_prob = resolve_f2p_sim_count_prob(ctx.config);
+    let sim_count_cost = resolve_f2p_sim_count_cost(ctx.config, sim_count_prob);
+
+    println!(
+        "{}",
+        I18n::get(lang, "sys_run_prob").replace("{}", &sim_count_prob.to_string())
+    );
+
+    let batches: usize = F2P_BATCH_COUNT;
+    let batch_base = sim_count_prob / batches;
+    let batch_remainder = sim_count_prob % batches;
+    let mut total_up_agg = 0;
+    let mut total_with_up_agg = 0;
+
+    let start_time = Instant::now();
+    let sim_ctx = SimRunContext {
+        neural_opt: ctx.neural_opt,
+        dqn_policy: ctx.dqn_policy,
+        ppo_policy: ctx.ppo_policy,
+        dbn: ctx.dbn,
+        config: ctx.config,
+        worker: ctx.worker,
+        exp_sender: None,
+        neural_sender: None,
+        ppo_sender: None,
+    };
+
+    for i in 0..batches {
+        let this_batch = batch_base + if i < batch_remainder { 1 } else { 0 };
+        if this_batch == 0 {
+            continue;
+        }
+        let (_, total_up, _, total_with_up) = simulate_stats(
+            FREE_PULLS_WELFARE as usize,
+            this_batch,
+            rng.next_u64(),
+            &sim_ctx,
+        );
+        total_up_agg += total_up;
+        total_with_up_agg += total_with_up;
+
+        print!(
+            "\r{}",
+            I18n::get(lang, "progress").replace("{:>3}", &format!("{:>3}", i + 1))
+        );
+        let _ = io::stdout().flush();
+    }
+    println!();
+
+    let elapsed = start_time.elapsed();
+    let total_sims_run = sim_count_prob;
+
+    let prob_line = format_f2p_probability_line(total_sims_run, total_with_up_agg);
+    println!("{}", prob_line);
+    println!(
+        "{}",
+        I18n::get(lang, "expected_up").replace(
+            "{:.2}",
+            &format!("{:.2}", total_up_agg as f64 / total_sims_run as f64)
+        )
+    );
+    println!(
+        "{}",
+        I18n::get(lang, "time_taken").replace("{:.2?}", &format!("{:.2?}", elapsed))
+    );
+    println!(
+        "{}",
+        I18n::get(lang, "throughput").replace(
+            "{:.0}",
+            &format!("{:.0}", total_sims_run as f64 / elapsed.as_secs_f64())
+        )
+    );
+
+    println!("{}", I18n::get(lang, "calc_cost"));
+    println!(
+        "{}",
+        I18n::get(lang, "sys_run_cost").replace("{}", &sim_count_cost.to_string())
+    );
+
+    let cost_batch_base = sim_count_cost / batches;
+    let cost_batch_remainder = sim_count_cost % batches;
+    let mut total_extra_cost_agg = 0u64;
+    let mut extra_cost_samples_agg = 0usize;
+
+    for i in 0..batches {
+        let this_batch = cost_batch_base + if i < cost_batch_remainder { 1 } else { 0 };
+        if this_batch == 0 {
+            continue;
+        }
+        let (cost_sum, samples, _) = simulate_f2p_clearing(this_batch, rng.next_u64(), &sim_ctx);
+        total_extra_cost_agg += cost_sum;
+        extra_cost_samples_agg += samples;
+
+        print!(
+            "\r{}",
+            I18n::get(lang, "progress").replace("{:>3}", &format!("{:>3}", i + 1))
+        );
+        let _ = io::stdout().flush();
+    }
+    println!();
+
+    let avg_extra_cost = if extra_cost_samples_agg == 0 {
+        None
+    } else {
+        Some(total_extra_cost_agg as f64 / extra_cost_samples_agg as f64)
+    };
+
+    let avg_cost_line = format_avg_extra_cost_line(avg_extra_cost);
+    println!("{}", avg_cost_line);
+}
+
+fn print_explainability_report(neural_opt: &NeuralLuckOptimizer, lang: Language) {
+    println!("{}", I18n::get(lang, "insight_header"));
+    let rl_w = neural_opt.linear_weights;
+    let rl_b = neural_opt.linear_bias;
+
+    let feature_names = [
+        I18n::get(lang, "feat_pity"),
+        I18n::get(lang, "feat_total_norm"),
+        I18n::get(lang, "feat_env_noise"),
+        I18n::get(lang, "feat_loss_norm"),
+        I18n::get(lang, "feat_streak_4"),
+        I18n::get(lang, "feat_env_bias"),
+        I18n::get(lang, "feat_pity_loss"),
+        I18n::get(lang, "feat_total_sq"),
+    ];
+    for (i, name) in feature_names.iter().enumerate() {
+        let w = rl_w[i];
+        let impact = if w.abs() < 0.001 {
+            I18n::get(lang, "impact_neutral")
+        } else if w > 0.0 {
+            I18n::get(lang, "impact_boost")
+        } else {
+            I18n::get(lang, "impact_reduce")
+        };
+        println!("  - {:<25}: {:>8.4} [{}]", name, w, impact);
+    }
+    println!(
+        "  - {:<25}: {:>8.4} {}",
+        I18n::get(lang, "lbl_base_bias"),
+        rl_b,
+        I18n::get(lang, "impact_base")
+    );
 }
 
 fn demo_mmap_tensor() {
@@ -395,13 +561,31 @@ fn main() {
             );
             println!(
                 "{}",
-                I18n::get(lang, "avg_6_star")
-                    .replace("{:.4}", &format!("{:.4}", six_count as f64 / count as f64))
+                I18n::get(lang, "avg_6_star").replace(
+                    "{:.4}",
+                    &format!(
+                        "{:.4}",
+                        if count > 0 {
+                            six_count as f64 / count as f64
+                        } else {
+                            0.0
+                        }
+                    )
+                )
             );
             println!(
                 "{}",
-                I18n::get(lang, "avg_up")
-                    .replace("{:.4}", &format!("{:.4}", up_count as f64 / count as f64))
+                I18n::get(lang, "avg_up").replace(
+                    "{:.4}",
+                    &format!(
+                        "{:.4}",
+                        if count > 0 {
+                            up_count as f64 / count as f64
+                        } else {
+                            0.0
+                        }
+                    )
+                )
             );
         }
         Commands::Benchmark => {
@@ -417,120 +601,16 @@ fn main() {
             demo_mmap_tensor();
         }
         Commands::F2p => {
-            println!(
-                "{}",
-                I18n::get(lang, "f2p_header").replace("{}", &FREE_PULLS_WELFARE.to_string())
-            );
-            let sim_count_prob = resolve_f2p_sim_count_prob(&config);
-            let sim_count_cost = resolve_f2p_sim_count_cost(&config, sim_count_prob);
-
-            println!(
-                "{}",
-                I18n::get(lang, "sys_run_prob").replace("{}", &sim_count_prob.to_string())
-            );
-
-            let batches: usize = 100;
-            let batch_base = sim_count_prob / batches;
-            let batch_remainder = sim_count_prob % batches;
-            let mut total_up_agg = 0;
-            let mut total_with_up_agg = 0;
-
-            let start_time = Instant::now();
-            let ctx = SimRunContext {
+            let f2p_ctx = F2pAnalysisCtx {
+                config: &config,
                 neural_opt: &trained_neural_opt,
                 dqn_policy: Some(&dqn_policy),
                 ppo_policy: Some(&ppo_policy),
                 dbn: &dbn,
-                config: &config,
                 worker: &worker,
-                exp_sender: None,
-                neural_sender: None,
-                ppo_sender: None,
+                lang,
             };
-
-            for i in 0..batches {
-                let this_batch = batch_base + if i < batch_remainder { 1 } else { 0 };
-                if this_batch == 0 {
-                    continue;
-                }
-                let (_, total_up, _, total_with_up) = simulate_stats(
-                    FREE_PULLS_WELFARE as usize,
-                    this_batch,
-                    rng.next_u64(),
-                    &ctx,
-                );
-                total_up_agg += total_up;
-                total_with_up_agg += total_with_up;
-
-                print!(
-                    "\r{}",
-                    I18n::get(lang, "progress").replace("{:>3}", &format!("{:>3}", i + 1))
-                );
-                let _ = io::stdout().flush();
-            }
-            println!(); // Newline after progress
-
-            let elapsed = start_time.elapsed();
-            let total_sims_run = sim_count_prob;
-
-            let prob_line = format_f2p_probability_line(total_sims_run, total_with_up_agg);
-            println!("{}", prob_line);
-            println!(
-                "{}",
-                I18n::get(lang, "expected_up").replace(
-                    "{:.2}",
-                    &format!("{:.2}", total_up_agg as f64 / total_sims_run as f64)
-                )
-            );
-            println!(
-                "{}",
-                I18n::get(lang, "time_taken").replace("{:.2?}", &format!("{:.2?}", elapsed))
-            );
-            println!(
-                "{}",
-                I18n::get(lang, "throughput").replace(
-                    "{:.0}",
-                    &format!("{:.0}", total_sims_run as f64 / elapsed.as_secs_f64())
-                )
-            );
-
-            println!("{}", I18n::get(lang, "calc_cost"));
-            println!(
-                "{}",
-                I18n::get(lang, "sys_run_cost").replace("{}", &sim_count_cost.to_string())
-            );
-
-            let cost_batch_base = sim_count_cost / batches;
-            let cost_batch_remainder = sim_count_cost % batches;
-            let mut total_extra_cost_agg = 0u64;
-            let mut extra_cost_samples_agg = 0usize;
-
-            for i in 0..batches {
-                let this_batch = cost_batch_base + if i < cost_batch_remainder { 1 } else { 0 };
-                if this_batch == 0 {
-                    continue;
-                }
-                let (cost_sum, samples, _) =
-                    simulate_f2p_clearing(this_batch, rng.next_u64(), &ctx);
-                total_extra_cost_agg += cost_sum;
-                extra_cost_samples_agg += samples;
-
-                print!(
-                    "\r{}",
-                    I18n::get(lang, "progress").replace("{:>3}", &format!("{:>3}", i + 1))
-                );
-                let _ = io::stdout().flush();
-            }
-            println!();
-
-            let avg_extra_cost = if extra_cost_samples_agg == 0 {
-                None
-            } else {
-                Some(total_extra_cost_agg as f64 / extra_cost_samples_agg as f64)
-            };
-
-            let avg_cost_line = format_avg_extra_cost_line(avg_extra_cost);
-            println!("{}", avg_cost_line);
+            run_f2p_analysis(&f2p_ctx, &mut rng);
         }
     }
 }
@@ -566,7 +646,7 @@ fn run_interactive(args: RunInteractiveArgs) {
     let mut neural_sender: Option<mpsc::Sender<NeuralSample>> = None;
     let mut ppo_sender: Option<mpsc::Sender<PpoExperience>> = None;
 
-    if config.online_train && config.online_train_dqn && config.luck_mode == "dqn" {
+    if config.online_train && config.online_train_dqn && config.luck_mode == LuckMode::Dqn {
         let (tx, rx) = mpsc::channel::<Experience>();
         dqn_sender = Some(tx);
         let shared = Arc::clone(&dqn_shared);
@@ -579,7 +659,7 @@ fn run_interactive(args: RunInteractiveArgs) {
             let mut local_rng = Rng::from_seed(trainer_seed.wrapping_add(1));
             let mut last_report = Instant::now();
             let mut last_sync = Instant::now();
-            let max_drain = 2048usize;
+            let max_drain = MAX_DRAIN_PER_TICK;
             loop {
                 if stop.load(Ordering::Relaxed) || max_steps == 0 {
                     break;
@@ -603,7 +683,7 @@ fn run_interactive(args: RunInteractiveArgs) {
                 if steps > 0 && last_sync.elapsed() >= Duration::from_millis(interval_ms) {
                     trainer.sync_to(&shared);
                     last_sync = Instant::now();
-                    if last_report.elapsed().as_secs_f64() >= 2.0 {
+                    if last_report.elapsed().as_secs_f64() >= ONLINE_REPORT_INTERVAL_SECS {
                         info!(
                             "[Online DQN] steps={} buffer={}",
                             trainer.steps_done(),
@@ -628,7 +708,7 @@ fn run_interactive(args: RunInteractiveArgs) {
         online_handles.push(thread::spawn(move || {
             let mut last_report = Instant::now();
             let mut last_sync = Instant::now();
-            let max_drain = max_steps.max(1).clamp(1, 2048);
+            let max_drain = max_steps.max(1).clamp(1, MAX_DRAIN_PER_TICK);
             loop {
                 if stop.load(Ordering::Relaxed) || max_steps == 0 {
                     break;
@@ -646,7 +726,7 @@ fn run_interactive(args: RunInteractiveArgs) {
                 {
                     trainer.sync_to(&shared);
                     last_sync = Instant::now();
-                    if last_report.elapsed().as_secs_f64() >= 2.0 {
+                    if last_report.elapsed().as_secs_f64() >= ONLINE_REPORT_INTERVAL_SECS {
                         info!("[Online Neural] steps={}", trainer.steps_done());
                         last_report = Instant::now();
                     }
@@ -656,7 +736,7 @@ fn run_interactive(args: RunInteractiveArgs) {
         }));
     }
 
-    if config.online_train && config.online_train_ppo && config.luck_mode == "ppo" {
+    if config.online_train && config.online_train_ppo && config.luck_mode == LuckMode::Ppo {
         let (tx, rx) = mpsc::channel::<PpoExperience>();
         ppo_sender = Some(tx);
         let shared = Arc::clone(&ppo_shared);
@@ -669,7 +749,7 @@ fn run_interactive(args: RunInteractiveArgs) {
         online_handles.push(thread::spawn(move || {
             let mut last_report = Instant::now();
             let mut last_sync = Instant::now();
-            let max_drain = 2048usize;
+            let max_drain = MAX_DRAIN_PER_TICK;
             loop {
                 if stop.load(Ordering::Relaxed) || max_steps == 0 {
                     break;
@@ -684,7 +764,7 @@ fn run_interactive(args: RunInteractiveArgs) {
                 }
                 let mut steps = 0usize;
                 while steps < max_steps {
-                    if trainer.train_step(0.0003) {
+                    if trainer.train_step(PPO_ONLINE_LR) {
                         steps += 1;
                     } else {
                         break;
@@ -693,7 +773,7 @@ fn run_interactive(args: RunInteractiveArgs) {
                 if steps > 0 && last_sync.elapsed() >= Duration::from_millis(interval_ms) {
                     trainer.sync_to(&shared);
                     last_sync = Instant::now();
-                    if last_report.elapsed().as_secs_f64() >= 2.0 {
+                    if last_report.elapsed().as_secs_f64() >= ONLINE_REPORT_INTERVAL_SECS {
                         info!(
                             "[Online PPO] steps={} buffer={}",
                             trainer.steps_done(),
@@ -708,37 +788,7 @@ fn run_interactive(args: RunInteractiveArgs) {
     }
 
     // === EXPLAINABILITY REPORT ===
-    println!("{}", I18n::get(lang, "insight_header"));
-    let rl_w = trained_neural_opt.linear_weights;
-    let rl_b = trained_neural_opt.linear_bias;
-
-    let feature_names = [
-        I18n::get(lang, "feat_pity"),
-        I18n::get(lang, "feat_total_norm"),
-        I18n::get(lang, "feat_env_noise"),
-        I18n::get(lang, "feat_loss_norm"),
-        I18n::get(lang, "feat_streak_4"),
-        I18n::get(lang, "feat_env_bias"),
-        I18n::get(lang, "feat_pity_loss"),
-        I18n::get(lang, "feat_total_sq"),
-    ];
-    for (i, name) in feature_names.iter().enumerate() {
-        let w = rl_w[i];
-        let impact = if w.abs() < 0.001 {
-            I18n::get(lang, "impact_neutral")
-        } else if w > 0.0 {
-            I18n::get(lang, "impact_boost")
-        } else {
-            I18n::get(lang, "impact_reduce")
-        };
-        println!("  - {:<25}: {:>8.4} [{}]", name, w, impact);
-    }
-    println!(
-        "  - {:<25}: {:>8.4} {}",
-        I18n::get(lang, "lbl_base_bias"),
-        rl_b,
-        I18n::get(lang, "impact_base")
-    );
+    print_explainability_report(&trained_neural_opt, lang);
 
     let pool_type_label = |pool_type: &str, lang: Language| -> String {
         match (pool_type, lang) {
@@ -930,128 +980,25 @@ fn run_interactive(args: RunInteractiveArgs) {
     }
 
     // F2P Analysis
-    println!(
-        "{}",
-        I18n::get(lang, "f2p_header").replace("{}", &FREE_PULLS_WELFARE.to_string())
-    );
-
-    let sim_count_prob = resolve_f2p_sim_count_prob(&config);
-    let sim_count_cost = resolve_f2p_sim_count_cost(&config, sim_count_prob);
-
-    println!(
-        "{}",
-        I18n::get(lang, "sys_run_prob").replace("{}", &sim_count_prob.to_string())
-    );
-
-    let batches: usize = 100;
-    let batch_base = sim_count_prob / batches;
-    let batch_remainder = sim_count_prob % batches;
-    let mut total_up_agg = 0;
-    let mut total_with_up_agg = 0;
-
-    let start_time = Instant::now();
-    let dqn_guard = dqn_shared.read().unwrap();
-    let neural_guard = neural_shared.read().unwrap();
-    let ppo_guard = ppo_shared.read().unwrap();
-    let ctx = SimRunContext {
-        neural_opt: &neural_guard,
-        dqn_policy: Some(&dqn_guard),
-        ppo_policy: Some(&ppo_guard),
-        dbn: &dbn,
-        config: &config,
-        worker: &worker,
-        exp_sender: None,
-        neural_sender: None,
-        ppo_sender: None,
-    };
-
-    for i in 0..batches {
-        let this_batch = batch_base + if i < batch_remainder { 1 } else { 0 };
-        if this_batch == 0 {
-            continue;
-        }
-        let (_, total_up, _, total_with_up) = simulate_stats(
-            FREE_PULLS_WELFARE as usize,
-            this_batch,
-            rng.next_u64(),
-            &ctx,
-        );
-        total_up_agg += total_up;
-        total_with_up_agg += total_with_up;
-
-        print!(
-            "\r{}",
-            I18n::get(lang, "progress").replace("{:>3}", &format!("{:>3}", i + 1))
-        );
-        let _ = io::stdout().flush();
+    {
+        let dqn_guard = dqn_shared.read().unwrap();
+        let neural_guard = neural_shared.read().unwrap();
+        let ppo_guard = ppo_shared.read().unwrap();
+        let f2p_ctx = F2pAnalysisCtx {
+            config: &config,
+            neural_opt: &neural_guard,
+            dqn_policy: Some(&*dqn_guard),
+            ppo_policy: Some(&*ppo_guard),
+            dbn: &dbn,
+            worker: &worker,
+            lang,
+        };
+        run_f2p_analysis(&f2p_ctx, &mut rng);
     }
-    println!();
-
-    let elapsed = start_time.elapsed();
-    let total_sims_run = sim_count_prob;
-    let prob_line = format_f2p_probability_line(total_sims_run, total_with_up_agg);
-    println!("{}", prob_line);
-    println!(
-        "{}",
-        I18n::get(lang, "expected_up").replace(
-            "{:.2}",
-            &format!("{:.2}", total_up_agg as f64 / total_sims_run as f64)
-        )
-    );
-    println!(
-        "{}",
-        I18n::get(lang, "time_taken").replace("{:.2?}", &format!("{:.2?}", elapsed))
-    );
-    println!(
-        "{}",
-        I18n::get(lang, "throughput").replace(
-            "{:.0}",
-            &format!("{:.0}", total_sims_run as f64 / elapsed.as_secs_f64())
-        )
-    );
-
-    println!("{}", I18n::get(lang, "calc_cost"));
-    println!(
-        "{}",
-        I18n::get(lang, "sys_run_cost").replace("{}", &sim_count_cost.to_string())
-    );
-
-    let cost_batch_base = sim_count_cost / batches;
-    let cost_batch_remainder = sim_count_cost % batches;
-    let mut total_extra_cost_agg = 0u64;
-    let mut extra_cost_samples_agg = 0usize;
-
-    for i in 0..batches {
-        let this_cost_batch = cost_batch_base + if i < cost_batch_remainder { 1 } else { 0 };
-        if this_cost_batch == 0 {
-            continue;
-        }
-        let (cost_sum, samples, _) = simulate_f2p_clearing(this_cost_batch, rng.next_u64(), &ctx);
-        total_extra_cost_agg += cost_sum;
-        extra_cost_samples_agg += samples;
-
-        print!(
-            "\r{}",
-            I18n::get(lang, "progress").replace("{:>3}", &format!("{:>3}", i + 1))
-        );
-        let _ = io::stdout().flush();
-    }
-    println!();
-
-    let avg_extra_cost = if extra_cost_samples_agg == 0 {
-        None
-    } else {
-        Some(total_extra_cost_agg as f64 / extra_cost_samples_agg as f64)
-    };
-    let avg_cost_line = format_avg_extra_cost_line(avg_extra_cost);
-    println!("{}", avg_cost_line);
     println!("{}", I18n::get(lang, "total_value"));
-    drop(dqn_guard);
-    drop(neural_guard);
-    drop(ppo_guard);
 
     let mut history: std::collections::VecDeque<SimHistoryEntry> =
-        std::collections::VecDeque::with_capacity(20);
+        std::collections::VecDeque::with_capacity(SIM_HISTORY_CAPACITY);
 
     loop {
         let welfare_label = if use_welfare_default {
@@ -1260,8 +1207,8 @@ fn run_interactive(args: RunInteractiveArgs) {
             if let Some(value) = parts.next() {
                 match value.parse::<usize>() {
                     Ok(val) if val > 0 => {
-                        default_pulls = val.min(1_000_000);
-                        if val > 1_000_000 {
+                        default_pulls = val.min(INPUT_CAP);
+                        if val > INPUT_CAP {
                             println!("{}", I18n::get(lang, "input_too_large"));
                         }
                         println!(
@@ -1281,8 +1228,8 @@ fn run_interactive(args: RunInteractiveArgs) {
             if let Some(value) = parts.next() {
                 match value.parse::<usize>() {
                     Ok(val) if val > 0 => {
-                        default_sims = val.min(1_000_000);
-                        if val > 1_000_000 {
+                        default_sims = val.min(INPUT_CAP);
+                        if val > INPUT_CAP {
                             println!("{}", I18n::get(lang, "sim_count_too_large"));
                         }
                         println!(
@@ -1304,9 +1251,9 @@ fn run_interactive(args: RunInteractiveArgs) {
         } else {
             match input.parse::<usize>() {
                 Ok(val) => {
-                    if val > 1_000_000 {
+                    if val > INPUT_CAP {
                         println!("{}", I18n::get(lang, "input_too_large"));
-                        1_000_000
+                        INPUT_CAP
                     } else {
                         val
                     }
@@ -1364,7 +1311,7 @@ fn run_interactive(args: RunInteractiveArgs) {
                             .replacen("{:.3}", &format!("{:.3}", s_avg), 1)
                             .replacen("{:.3}", &format!("{:.3}", u_avg), 1)
                     );
-                    if history.len() >= 20 {
+                    if history.len() >= SIM_HISTORY_CAPACITY {
                         history.pop_front();
                     }
                     history.push_back(SimHistoryEntry {
@@ -1401,7 +1348,7 @@ fn run_interactive(args: RunInteractiveArgs) {
                         .replacen("{:.3}", &format!("{:.3}", s_avg), 1)
                         .replacen("{:.3}", &format!("{:.3}", u_avg), 1)
                 );
-                if history.len() >= 20 {
+                if history.len() >= SIM_HISTORY_CAPACITY {
                     history.pop_front();
                 }
                 history.push_back(SimHistoryEntry {
@@ -1479,7 +1426,7 @@ fn run_interactive(args: RunInteractiveArgs) {
                     .replacen("{}", &res.up_count.to_string(), 1)
             );
             let non_up_six = build_non_up_six(&config);
-            for (i, p) in res.pulls.iter().take(20).enumerate() {
+            for (i, p) in res.pulls.iter().take(PULL_DISPLAY_LIMIT).enumerate() {
                 let op_name = resolve_operator_name(p, &config, &non_up_six);
                 let star_label = I18n::get(lang, "unit_star");
                 let line = if p.is_up {
@@ -1518,11 +1465,11 @@ fn run_interactive(args: RunInteractiveArgs) {
                 };
                 println!("{}", line);
             }
-            if res.pulls.len() > 20 {
+            if res.pulls.len() > PULL_DISPLAY_LIMIT {
                 println!(
                     "{}",
                     I18n::get(lang, "pull_list_omitted")
-                        .replace("{}", &(res.pulls.len() - 20).to_string())
+                        .replace("{}", &(res.pulls.len() - PULL_DISPLAY_LIMIT).to_string())
                 );
             }
 
@@ -1541,7 +1488,7 @@ fn run_interactive(args: RunInteractiveArgs) {
                 println!("{}", I18n::get(lang, "big_pity_triggered"));
             }
             println!("{}", I18n::get(lang, "consumption_footer"));
-            if history.len() >= 20 {
+            if history.len() >= SIM_HISTORY_CAPACITY {
                 history.pop_front();
             }
             history.push_back(SimHistoryEntry {
@@ -1671,5 +1618,76 @@ mod tests {
         for &v in q_data.iter() {
             assert!(v.is_finite(), "Q-values must be finite, got {}", v);
         }
+    }
+
+    #[test]
+    fn benchmark_simulate_fast_throughput() {
+        let (config, dbn, neural_opt) = build_context();
+        let mut rng = Rng::from_seed(42);
+        let ctx = SimModelContext {
+            neural_opt: &neural_opt,
+            dqn_policy: None,
+            ppo_policy: None,
+            dbn: &dbn,
+            config: &config,
+            exp_sender: None,
+            neural_sender: None,
+            ppo_sender: None,
+        };
+        let iterations = 5000;
+        let pulls = 200;
+
+        // Warmup
+        for _ in 0..100 {
+            let _ = simulate_fast(pulls, &mut rng, 0, &ctx);
+        }
+
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = simulate_fast(pulls, &mut rng, 0, &ctx);
+        }
+        let elapsed = start.elapsed();
+        let throughput = iterations as f64 / elapsed.as_secs_f64();
+        println!(
+            "\n[PERF] simulate_fast (no senders, fast_inference=true): {} iters x {} pulls in {:.2?} ({:.0} sims/sec)",
+            iterations, pulls, elapsed, throughput
+        );
+        assert!(throughput > 100.0, "Throughput too low: {:.0}", throughput);
+    }
+
+    #[test]
+    fn benchmark_dqn_predict_action_fast() {
+        let dqn = DuelingQNetwork::new(42, &crate::config::AchfConfig::default());
+        let features = [0.5_f64; 8];
+        let iterations = 10_000;
+
+        // Warmup
+        for _ in 0..100 {
+            let _ = dqn.predict_action_fast(&features);
+        }
+
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = dqn.predict_action_fast(&features);
+        }
+        let fast_elapsed = start.elapsed();
+
+        let start2 = std::time::Instant::now();
+        for _ in 0..iterations {
+            let tensor_x = AutoTensor::new(features.to_vec(), vec![8]);
+            let _ = dqn.predict_action(&tensor_x);
+        }
+        let tensor_elapsed = start2.elapsed();
+
+        let speedup = tensor_elapsed.as_secs_f64() / fast_elapsed.as_secs_f64();
+        println!(
+            "\n[PERF] DQN predict: fast={:.2?} vs tensor={:.2?} (speedup: {:.2}x)",
+            fast_elapsed, tensor_elapsed, speedup
+        );
+        assert!(
+            speedup > 1.0,
+            "predict_action_fast should be faster, got {:.2}x",
+            speedup
+        );
     }
 }
