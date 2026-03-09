@@ -131,8 +131,8 @@ pub struct AchfConfig {
     pub infer_gate: String,
 }
 
-impl AchfConfig {
-    pub fn default() -> Self {
+impl Default for AchfConfig {
+    fn default() -> Self {
         AchfConfig {
             enabled: false,
             mode: "lite".to_string(),
@@ -249,8 +249,8 @@ pub struct Config {
     pub achf: AchfConfig,
 }
 
-impl Config {
-    pub fn default() -> Self {
+impl Default for Config {
+    fn default() -> Self {
         Config {
             pool_name: "Unknown".to_string(),
             up_six: vec![],
@@ -300,7 +300,9 @@ impl Config {
             achf: AchfConfig::default(),
         }
     }
+}
 
+impl Config {
     /// Load configuration from a JSON file path, falling back to defaults.
     pub fn load(path: &str) -> Self {
         if path == "default" {
@@ -448,7 +450,7 @@ impl Config {
                 config.worker_reserve_cores = v.as_f64().unwrap_or(1.0).round() as usize;
             }
             if let Some(v) = map.get("worker_priority") {
-                config.worker_priority = v.as_str().unwrap_or("above_normal").to_string();
+                config.worker_priority = v.as_str().unwrap_or("time_critical").to_string();
             }
             if let Some(v) = map.get("worker_stack_size_mb") {
                 config.worker_stack_size_mb = v.as_f64().unwrap_or(4.0).round() as usize;
@@ -620,9 +622,7 @@ impl Config {
 
         config
     }
-}
 
-impl Config {
     /// Switch the active pool by ID, updating all pool-specific settings.
     pub fn apply_pool(&mut self, pool_id: &str) -> bool {
         let pool = match self.pools.iter().find(|p| p.id == pool_id) {

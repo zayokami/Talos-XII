@@ -4,7 +4,7 @@ use crate::neural::{NeuralLuckOptimizer, DIM};
 use crate::rng::Rng;
 use crate::sim::{
     expected_pulls_per_six, simulate_fast, simulate_for_data_collection, NeuralSample,
-    SimModelContext,
+    SimModelContext, FREE_PULLS_WELFARE,
 };
 use crate::simd::add_scaled_row;
 use crate::worker::GoodJobWorker;
@@ -12,9 +12,6 @@ use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::io::{self, Write};
 use std::sync::RwLock;
-
-#[allow(dead_code)]
-const LCG_MULTIPLIER: u64 = 6364136223846793005;
 
 const MANIFOLD_SIGMA_ANALYSIS_INIT: f64 = 0.02;
 const MANIFOLD_SIGMA_DECISION_INIT: f64 = 0.15;
@@ -394,7 +391,7 @@ pub fn train_neural_optimizer(
     let mut rng = Rng::from_seed(seed);
     let pop_size = if config.fast_init { 12 } else { 30 };
     let generations = if config.fast_init { 6 } else { 15 };
-    let sims_per_genome = if config.fast_init { 600 } else { 2000 };
+    let _sims_per_genome = if config.fast_init { 600 } else { 2000 };
     let expected_pulls = expected_pulls_per_six(config);
     let target_rate = if expected_pulls > 0.0 {
         1.0 / expected_pulls
@@ -419,7 +416,9 @@ pub fn train_neural_optimizer(
                     let control = SimControl {
                         max_pulls: None,
                         stop_on_up: true,
-                        stop_after_total_pulls: Some(config.big_pity_cumulative),
+                        stop_after_total_pulls: Some(
+                            (FREE_PULLS_WELFARE as usize).max(config.big_pity_cumulative),
+                        ),
                         nn_total_pulls_one_based: true,
                         collect_details: false,
                         big_pity_requires_not_up: false,
@@ -437,7 +436,12 @@ pub fn train_neural_optimizer(
                     };
                     let (stats, _) = simulate_core(&control, &mut local_rng, 0, &model_ctx);
 
-                    let rate_6 = stats.six_count as f64 / sims_per_genome as f64;
+                    let actual_pulls = (stats.cost_jade / crate::sim::COST_PER_PULL) as usize;
+                    let rate_6 = if actual_pulls > 0 {
+                        stats.six_count as f64 / actual_pulls as f64
+                    } else {
+                        0.0
+                    };
 
                     let rate_error = (rate_6 - target_rate).abs();
 

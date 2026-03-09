@@ -638,13 +638,18 @@ fn main() {
     let lang = Language::from_config(&config);
 
     // Auto-load calibrated parameters if available
-    if config.use_calibrated {
+    let calibration = if config.use_calibrated {
         let cal = CalibrationData::load(&config.calibrated_path);
         if !cal.pools.is_empty() {
             apply_calibration(&mut config, &cal);
             info!("[Calibration] Loaded calibrated parameters.");
+            Some(cal)
+        } else {
+            None
         }
-    }
+    } else {
+        None
+    };
 
     match args.command.clone().unwrap_or(Commands::Interactive) {
         Commands::Interactive => {
@@ -657,6 +662,7 @@ fn main() {
                 worker,
                 rng,
                 lang,
+                calibration,
             });
         }
         Commands::Simulate { count, pulls } => {
@@ -745,6 +751,7 @@ struct RunInteractiveArgs {
     worker: GoodJobWorker,
     rng: Rng,
     lang: Language,
+    calibration: Option<CalibrationData>,
 }
 
 fn run_interactive(args: RunInteractiveArgs) {
@@ -757,6 +764,7 @@ fn run_interactive(args: RunInteractiveArgs) {
         worker,
         mut rng,
         lang,
+        calibration,
     } = args;
     let dqn_shared = Arc::new(RwLock::new(dqn_policy.clone()));
     let neural_shared = Arc::new(RwLock::new(trained_neural_opt.clone()));
@@ -1046,6 +1054,9 @@ fn run_interactive(args: RunInteractiveArgs) {
         if pool_input.eq_ignore_ascii_case("all") {
             let all_ids: Vec<String> = config.pools.iter().map(|p| p.id.clone()).collect();
             if !all_ids.is_empty() && config.apply_pool(&all_ids[0]) {
+                if let Some(cal) = &calibration {
+                    apply_calibration(&mut config, cal);
+                }
                 selected_pool_ids = all_ids;
             }
         } else {
@@ -1074,6 +1085,9 @@ fn run_interactive(args: RunInteractiveArgs) {
                     }
                 }
                 if !ids.is_empty() && config.apply_pool(&ids[0]) {
+                    if let Some(cal) = &calibration {
+                        apply_calibration(&mut config, cal);
+                    }
                     selected_pool_ids = ids;
                 }
             }
@@ -1288,6 +1302,9 @@ fn run_interactive(args: RunInteractiveArgs) {
                 } else {
                     let first = valid_ids[0].clone();
                     if config.apply_pool(&first) {
+                        if let Some(cal) = &calibration {
+                            apply_calibration(&mut config, cal);
+                        }
                         selected_pool_ids = valid_ids;
                         println!(
                             "{}",
@@ -1302,6 +1319,9 @@ fn run_interactive(args: RunInteractiveArgs) {
                 if !all_ids.is_empty() {
                     let first = all_ids[0].clone();
                     if config.apply_pool(&first) {
+                        if let Some(cal) = &calibration {
+                            apply_calibration(&mut config, cal);
+                        }
                         selected_pool_ids = all_ids;
                         println!("{}", I18n::get(lang, "cmd_pool_all_set"));
                         print_pool_header(&config, lang);
@@ -1310,6 +1330,9 @@ fn run_interactive(args: RunInteractiveArgs) {
                     println!("{}", I18n::get(lang, "cmd_pool_multi_empty"));
                 }
             } else if config.apply_pool(sub) {
+                if let Some(cal) = &calibration {
+                    apply_calibration(&mut config, cal);
+                }
                 selected_pool_ids = vec![sub.to_string()];
                 println!(
                     "{}",
@@ -1404,6 +1427,9 @@ fn run_interactive(args: RunInteractiveArgs) {
                     if !pool_config.apply_pool(pool_id) {
                         continue;
                     }
+                    if let Some(cal) = &calibration {
+                        apply_calibration(&mut pool_config, cal);
+                    }
                     println!(
                         "{}",
                         I18n::get(lang, "sim_pool_header").replace("{}", &pool_config.pool_name)
@@ -1491,6 +1517,9 @@ fn run_interactive(args: RunInteractiveArgs) {
                     let mut pool_config = config.clone();
                     if !pool_config.apply_pool(pool_id) {
                         continue;
+                    }
+                    if let Some(cal) = &calibration {
+                        apply_calibration(&mut pool_config, cal);
                     }
                     println!(
                         "{}",

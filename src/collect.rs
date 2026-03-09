@@ -51,13 +51,16 @@ pub struct PoolEmpiricalStats {
 impl PlayerDatabase {
     pub fn load(path: &str) -> Self {
         if let Ok(data) = std::fs::read_to_string(path) {
-            if let Ok(db) = serde_json::from_str(&data) {
-                return db;
+            match serde_json::from_str(&data) {
+                Ok(db) => return db,
+                Err(e) => log::warn!("[Collect] Failed to parse {}: {}", path, e),
             }
         }
-        if let Ok(data) = std::fs::read_to_string(format!("../../{}", path)) {
-            if let Ok(db) = serde_json::from_str(&data) {
-                return db;
+        let alt = format!("../../{}", path);
+        if let Ok(data) = std::fs::read_to_string(&alt) {
+            match serde_json::from_str(&data) {
+                Ok(db) => return db,
+                Err(e) => log::warn!("[Collect] Failed to parse {}: {}", alt, e),
             }
         }
         PlayerDatabase::default()

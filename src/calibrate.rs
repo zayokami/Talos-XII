@@ -40,8 +40,9 @@ pub struct CalibrationData {
 impl CalibrationData {
     pub fn load(path: &str) -> Self {
         if let Ok(data) = std::fs::read_to_string(path) {
-            if let Ok(cal) = serde_json::from_str(&data) {
-                return cal;
+            match serde_json::from_str(&data) {
+                Ok(cal) => return cal,
+                Err(e) => log::warn!("[Calibrate] Failed to parse {}: {}", path, e),
             }
         }
         CalibrationData::default()
@@ -200,15 +201,23 @@ fn estimate_base_rate(
     soft_start: usize,
 ) -> BayesianEstimate {
     let pre_soft_pulls: usize = {
-        let mut count = 0usize;
-        let total_six: usize = stats.pity_hits.iter().sum();
-        // Estimate pre-soft pulls: total_pulls - pulls_in_soft_range
-        // This is approximate; we count pulls where pity < soft_start
-        let soft_six: usize = stats.pity_hits.iter().skip(soft_start).sum();
-        if total_six > 0 {
-            count = stats.total_pulls.saturating_sub(soft_six * soft_start);
+        let total_episodes: usize = stats.pity_hits.iter().sum();
+        if total_episodes == 0 {
+            return BayesianEstimate {
+                prior_mean: config_base,
+                posterior_mean: config_base,
+                ci_lower: config_base * 0.5,
+                ci_upper: config_base * 2.0,
+                significant: false,
+            };
         }
-        count.max(1)
+        let mut surviving = total_episodes;
+        let mut total_pre_soft = 0usize;
+        for k in 1..soft_start.min(stats.pity_hits.len()) {
+            total_pre_soft += surviving;
+            surviving = surviving.saturating_sub(stats.pity_hits[k]);
+        }
+        total_pre_soft.max(1)
     };
 
     let pre_soft_six: usize = stats.pity_hits.iter().take(soft_start).sum();
