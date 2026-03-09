@@ -382,7 +382,8 @@ pub fn prob_6(pity_6: usize, config: &Config) -> f64 {
     if pity_6 < config.soft_pity_start {
         config.prob_6_base
     } else if pity_6 < config.small_pity_guarantee {
-        config.prob_6_base + 0.05 * (pity_6 as f64 - (config.soft_pity_start as f64 - 1.0))
+        config.prob_6_base
+            + config.soft_pity_slope * (pity_6 as f64 - (config.soft_pity_start as f64 - 1.0))
     } else {
         1.0
     }

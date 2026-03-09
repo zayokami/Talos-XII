@@ -29,6 +29,10 @@ neural.cache
 # Logs
 *.log
 
+# Player data and calibration (user-specific)
+data/player_data.json
+data/calibrated.json
+
 #CLAUDE
 .claude/
 CLAUDE.md

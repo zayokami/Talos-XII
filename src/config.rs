@@ -185,6 +185,7 @@ pub struct PoolConfig {
     pub prob_5_base: f64,
     pub prob_4_base: f64,
     pub soft_pity_start: usize,
+    pub soft_pity_slope: f64,
     pub small_pity_guarantee: usize,
     pub big_pity_cumulative: usize,
     pub up_pity_soft: usize,
@@ -207,6 +208,7 @@ pub struct Config {
     pub prob_5_base: f64,
     pub prob_4_base: f64,
     pub soft_pity_start: usize,
+    pub soft_pity_slope: f64,
     pub small_pity_guarantee: usize,
     pub big_pity_cumulative: usize,
     pub up_pity_soft: usize,
@@ -219,6 +221,9 @@ pub struct Config {
     pub pools: Vec<PoolConfig>,
     pub active_pool: Option<String>,
     pub luck_mode: LuckMode,
+    pub use_calibrated: bool,
+    pub calibrated_path: String,
+    pub player_data_path: String,
     pub fast_init: bool,
     pub ppo_mode: String,
     pub ppo_total_steps: usize,
@@ -254,6 +259,7 @@ impl Config {
             prob_5_base: 0.08,
             prob_4_base: 0.912,
             soft_pity_start: 65,
+            soft_pity_slope: 0.05,
             small_pity_guarantee: 80,
             big_pity_cumulative: 120,
             up_pity_soft: 0,
@@ -266,6 +272,9 @@ impl Config {
             pools: vec![],
             active_pool: None,
             luck_mode: LuckMode::Probability,
+            use_calibrated: true,
+            calibrated_path: "data/calibrated.json".to_string(),
+            player_data_path: "data/player_data.json".to_string(),
             fast_init: false,
             ppo_mode: "balanced".to_string(),
             ppo_total_steps: 0,
@@ -362,6 +371,9 @@ impl Config {
             }
             if let Some(v) = map.get("soft_pity_start") {
                 config.soft_pity_start = v.as_f64().unwrap_or(65.0).round() as usize;
+            }
+            if let Some(v) = map.get("soft_pity_slope") {
+                config.soft_pity_slope = v.as_f64().unwrap_or(0.05);
             }
             if let Some(v) = map.get("small_pity_guarantee") {
                 config.small_pity_guarantee = v.as_f64().unwrap_or(80.0).round() as usize;
@@ -470,6 +482,15 @@ impl Config {
             }
             if let Some(v) = map.get("language") {
                 config.language = v.as_str().map(|s| s.to_string());
+            }
+            if let Some(v) = map.get("use_calibrated") {
+                config.use_calibrated = v.as_bool().unwrap_or(true);
+            }
+            if let Some(v) = map.get("calibrated_path") {
+                config.calibrated_path = v.as_str().unwrap_or("data/calibrated.json").to_string();
+            }
+            if let Some(v) = map.get("player_data_path") {
+                config.player_data_path = v.as_str().unwrap_or("data/player_data.json").to_string();
             }
             if let Some(JsonValue::Object(achf_map)) = map.get("achf") {
                 if let Some(v) = achf_map.get("enabled") {
@@ -615,6 +636,7 @@ impl Config {
         self.prob_5_base = pool.prob_5_base;
         self.prob_4_base = pool.prob_4_base;
         self.soft_pity_start = pool.soft_pity_start;
+        self.soft_pity_slope = pool.soft_pity_slope;
         self.small_pity_guarantee = pool.small_pity_guarantee;
         self.big_pity_cumulative = pool.big_pity_cumulative;
         self.up_pity_soft = pool.up_pity_soft;
@@ -671,6 +693,10 @@ fn parse_pool_config(pool_map: &serde_json::Map<String, JsonValue>) -> PoolConfi
             .and_then(|v| v.as_f64())
             .unwrap_or(65.0)
             .round() as usize,
+        soft_pity_slope: pool_map
+            .get("soft_pity_slope")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.05),
         small_pity_guarantee: pool_map
             .get("small_pity_guarantee")
             .and_then(|v| v.as_f64())
@@ -766,6 +792,10 @@ fn warn_unknown_fields(map: &serde_json::Map<String, JsonValue>) {
         "max_train_steps_per_tick",
         "language",
         "achf",
+        "soft_pity_slope",
+        "use_calibrated",
+        "calibrated_path",
+        "player_data_path",
     ]
     .into_iter()
     .collect();
