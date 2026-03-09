@@ -1632,7 +1632,7 @@ fn run_interactive(args: RunInteractiveArgs) {
                 "{}",
                 I18n::get(lang, "consumption_jade")
                     .replacen("{}", &res.cost_jade.to_string(), 1)
-                    .replacen("{}", &(res.cost_jade / 500).to_string(), 1)
+                    .replacen("{}", &(res.cost_jade / COST_PER_PULL).to_string(), 1)
             );
             if res.big_pity_used {
                 println!("{}", I18n::get(lang, "big_pity_triggered"));
