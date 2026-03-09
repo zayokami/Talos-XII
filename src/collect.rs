@@ -183,18 +183,27 @@ pub fn reconstruct_from_six_star_positions(
     up_flags_str: &str,
     total_pulls: usize,
 ) -> Vec<PlayerPullRecord> {
-    let positions: Vec<usize> = positions_str
+    let raw_positions: Vec<usize> = positions_str
         .split(',')
         .filter_map(|s| s.trim().parse::<usize>().ok())
         .collect();
 
-    let up_flags: Vec<bool> = up_flags_str
+    let raw_up_flags: Vec<bool> = up_flags_str
         .split(',')
         .map(|s| {
-            let t = s.trim().to_ascii_lowercase();
+            let t = s.trim().to_lowercase();
             t == "y" || t == "yes" || t == "1" || t == "true"
         })
         .collect();
+
+    let mut paired: Vec<(usize, bool)> = raw_positions
+        .into_iter()
+        .zip(raw_up_flags.into_iter().chain(std::iter::repeat(false)))
+        .collect();
+    paired.sort_unstable_by_key(|&(pos, _)| pos);
+
+    let positions: Vec<usize> = paired.iter().map(|&(p, _)| p).collect();
+    let up_flags: Vec<bool> = paired.iter().map(|&(_, u)| u).collect();
 
     let mut pulls = Vec::with_capacity(total_pulls);
     let mut six_idx = 0;

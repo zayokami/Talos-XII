@@ -1127,7 +1127,7 @@ pub fn simulate_f2p_clearing(
                             ),
                             nn_total_pulls_one_based: true,
                             collect_details: false,
-                            big_pity_requires_not_up: false,
+                            big_pity_requires_not_up: ctx.config.big_pity_requires_not_up,
                             fast_inference: true,
                         };
                         let mut total_extra = 0u64;

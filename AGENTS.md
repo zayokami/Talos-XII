@@ -8,7 +8,7 @@ Talos-XII is a single-binary Rust CLI application (gacha pull simulator for Arkn
 
 ### Toolchain
 
-- **MSRV**: `rust-version = "1.89.0"` in `Cargo.toml`. Ensure `rustup default stable` points to >= 1.89.0.
+- **MSRV**: `rust-version = "1.90.0"` in `Cargo.toml`. Ensure `rustup default stable` points to >= 1.90.0.
 - Build flags in `.cargo/config.toml` set `-C target-cpu=native` for SIMD acceleration.
 
 ### Common commands

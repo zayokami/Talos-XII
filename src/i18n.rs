@@ -224,10 +224,10 @@ impl I18n {
             }
 
             (Language::En, "total_value") => {
-                "Total Value ~ 41000 Jade (Expected Cost for First UP)".to_string()
+                "See above for expected cost analysis based on current pool configuration.".to_string()
             }
             (Language::Cn, "total_value") => {
-                "总价值 ~ 41000 合成玉 (首次获取 UP 的期望成本)".to_string()
+                "以上为基于当前池配置的期望成本分析。".to_string()
             }
 
             // === Interactive Loop ===

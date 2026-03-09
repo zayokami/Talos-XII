@@ -885,7 +885,13 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
                         .map(|env| env.step(&ppo.policy, dbn, config, context_len))
                         .collect()
                 })
-                .unwrap_or_else(|msg| panic!("{}", msg));
+                .unwrap_or_else(|msg| {
+                    log::error!("[PPO] Worker execution failed: {}", msg);
+                    vec![]
+                });
+            if step_results.is_empty() {
+                break;
+            }
             for result in step_results {
                 ppo.store_raw(result.experience);
                 if let Some(done_reward) = result.finished_reward {

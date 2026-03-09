@@ -403,6 +403,9 @@ pub fn train_neural_optimizer(
         .map(|_| NeuralLuckOptimizer::new(rng.next_u64()))
         .collect();
 
+    let mut best_ever = population[0].clone();
+    let mut best_ever_score = f64::NEG_INFINITY;
+
     for gen in 0..generations {
         let eval_seeds: Vec<u64> = (0..pop_size).map(|_| rng.next_u64()).collect();
         let scores_result = worker.execute(|| {
@@ -460,7 +463,7 @@ pub fn train_neural_optimizer(
             Ok(val) => val,
             Err(e) => {
                 println!("[Error] Training evaluation failed: {}", e);
-                return population[0].clone();
+                return best_ever;
             }
         };
 
@@ -469,6 +472,11 @@ pub fn train_neural_optimizer(
 
         let best_score = scores[0].1;
         let best_streak = scores[0].2;
+
+        if best_score > best_ever_score {
+            best_ever_score = best_score;
+            best_ever = population[scores[0].0].clone();
+        }
 
         print!(
             "\r[Training] Gen {:>2}/{}: Best Score = {:>8.2} | Max Loss Streak = {}",
@@ -502,7 +510,7 @@ pub fn train_neural_optimizer(
     }
     println!("\n[Neural Core] Training Complete. Optimal weights loaded.");
 
-    population[0].clone()
+    best_ever
 }
 
 /// Incremental neural optimizer trainer for online learning.

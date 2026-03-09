@@ -617,8 +617,25 @@ pub fn train_dqn(
         state_struct.pity_6 += 1;
         state_struct.total_pulls_in_pool += 1;
 
-        if state_struct.total_pulls_in_pool == config.big_pity_cumulative
-            && !state_struct.has_obtained_up
+        let big_pity_gate = if config.big_pity_requires_not_up {
+            !state_struct.has_obtained_up
+        } else {
+            true
+        };
+        #[allow(clippy::if_same_then_else)]
+        if config.up_pity_soft > 0
+            && state_struct.total_pulls_in_pool == config.up_pity_soft
+            && big_pity_gate
+        {
+            is_six = true;
+            is_up = true;
+            state_struct.pity_6 = 0;
+            state_struct.streak_4_star = 0;
+            state_struct.loss_streak = 0;
+            state_struct.has_obtained_up = true;
+        } else if config.big_pity_cumulative > 0
+            && state_struct.total_pulls_in_pool == config.big_pity_cumulative
+            && big_pity_gate
         {
             is_six = true;
             is_up = true;
@@ -639,8 +656,9 @@ pub fn train_dqn(
                     state_struct.loss_streak += 1;
                 }
             }
-        } else if config.five_star_pity > 0
-            && state_struct.streak_4_star >= config.five_star_pity - 1
+        } else if config.always_5_star
+            || (config.five_star_pity > 0
+                && state_struct.streak_4_star >= config.five_star_pity - 1)
             || r < (final_prob_6 + config.prob_5_base).min(1.0)
         {
             state_struct.streak_4_star = 0;
