@@ -1619,4 +1619,75 @@ mod tests {
             assert!(v.is_finite(), "Q-values must be finite, got {}", v);
         }
     }
+
+    #[test]
+    fn benchmark_simulate_fast_throughput() {
+        let (config, dbn, neural_opt) = build_context();
+        let mut rng = Rng::from_seed(42);
+        let ctx = SimModelContext {
+            neural_opt: &neural_opt,
+            dqn_policy: None,
+            ppo_policy: None,
+            dbn: &dbn,
+            config: &config,
+            exp_sender: None,
+            neural_sender: None,
+            ppo_sender: None,
+        };
+        let iterations = 5000;
+        let pulls = 200;
+
+        // Warmup
+        for _ in 0..100 {
+            let _ = simulate_fast(pulls, &mut rng, 0, &ctx);
+        }
+
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = simulate_fast(pulls, &mut rng, 0, &ctx);
+        }
+        let elapsed = start.elapsed();
+        let throughput = iterations as f64 / elapsed.as_secs_f64();
+        println!(
+            "\n[PERF] simulate_fast (no senders, fast_inference=true): {} iters x {} pulls in {:.2?} ({:.0} sims/sec)",
+            iterations, pulls, elapsed, throughput
+        );
+        assert!(throughput > 100.0, "Throughput too low: {:.0}", throughput);
+    }
+
+    #[test]
+    fn benchmark_dqn_predict_action_fast() {
+        let dqn = DuelingQNetwork::new(42, &crate::config::AchfConfig::default());
+        let features = [0.5_f64; 8];
+        let iterations = 10_000;
+
+        // Warmup
+        for _ in 0..100 {
+            let _ = dqn.predict_action_fast(&features);
+        }
+
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = dqn.predict_action_fast(&features);
+        }
+        let fast_elapsed = start.elapsed();
+
+        let start2 = std::time::Instant::now();
+        for _ in 0..iterations {
+            let tensor_x = AutoTensor::new(features.to_vec(), vec![8]);
+            let _ = dqn.predict_action(&tensor_x);
+        }
+        let tensor_elapsed = start2.elapsed();
+
+        let speedup = tensor_elapsed.as_secs_f64() / fast_elapsed.as_secs_f64();
+        println!(
+            "\n[PERF] DQN predict: fast={:.2?} vs tensor={:.2?} (speedup: {:.2}x)",
+            fast_elapsed, tensor_elapsed, speedup
+        );
+        assert!(
+            speedup > 1.0,
+            "predict_action_fast should be faster, got {:.2}x",
+            speedup
+        );
+    }
 }

@@ -221,6 +221,39 @@ impl DuelingQNetwork {
         }
         (max_idx, ACTIONS[max_idx])
     }
+
+    /// Zero-allocation inference: compute Q-values from a raw feature slice
+    /// using `Linear::forward_inference`, bypassing the autograd `Tensor` graph.
+    pub fn predict_action_fast(&self, state: &[f64]) -> (usize, f64) {
+        let h1 = self.l1.forward_inference(state);
+        let mut h1_relu: Vec<f64> = h1.into_iter().map(|v| v.max(0.0)).collect();
+        let h2 = self.l2.forward_inference(&h1_relu);
+        h1_relu.clear();
+        h1_relu.extend(h2.iter().map(|v| v.max(0.0)));
+        let h2_relu = &h1_relu;
+
+        if let Some(achf) = &self.achf {
+            let residual = achf.forward_inference_residual(h2_relu);
+            for (dst, &r) in h1_relu.iter_mut().zip(residual.iter()) {
+                *dst += r;
+            }
+        }
+
+        let val = self.val_head.forward_inference(&h1_relu);
+        let adv = self.adv_head.forward_inference(&h1_relu);
+
+        let mean_adv: f64 = adv.iter().sum::<f64>() / ACTION_SPACE as f64;
+        let mut max_val = f64::NEG_INFINITY;
+        let mut max_idx = 0;
+        for (i, &a) in adv.iter().enumerate() {
+            let q = val[0] + a - mean_adv;
+            if q > max_val {
+                max_val = q;
+                max_idx = i;
+            }
+        }
+        (max_idx, ACTIONS[max_idx])
+    }
 }
 
 // --- Optimizer ---
