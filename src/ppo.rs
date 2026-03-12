@@ -6,7 +6,9 @@ use crate::nn::{Linear, Module};
 use crate::rng::Rng;
 use crate::sim::{build_features, dbn_env, prob_6, PpoExperience, PullState};
 use crate::transformer::{KVCache, LuckTransformer};
-use crate::utils::{normalize_slice, sum_f64, sum_sq_diff, EPISODE_MAX_PULLS};
+use crate::utils::{
+    normalize_slice, sum_f64, sum_sq_diff, ACTIONS, ACTION_SPACE, EPISODE_MAX_PULLS,
+};
 use crate::worker::GoodJobWorker;
 use rand::seq::SliceRandom;
 use rayon::prelude::*;
@@ -16,8 +18,6 @@ use std::time::{Duration, Instant};
 
 // --- PPO Components ---
 
-const ACTION_SPACE: usize = 5;
-pub const ACTIONS: [f64; ACTION_SPACE] = [0.0, 0.005, 0.015, -0.005, -0.015];
 const CLIP_EPSILON: f64 = 0.2;
 const GAMMA: f64 = 0.99;
 const GAE_LAMBDA: f64 = 0.95;
@@ -757,22 +757,15 @@ impl PpoEnvState {
         }
         self.pulls_done += 1;
 
-        let mut reward = -0.1;
-        if is_six {
-            if is_up {
-                reward += 10.0;
-                if self.pulls_done < EARLY_UP_BONUS_THRESHOLD_1 {
-                    reward += 5.0;
-                }
-                if self.pulls_done < EARLY_UP_BONUS_THRESHOLD_2 {
-                    reward += 5.0;
-                }
-            } else {
-                reward += 2.0;
+        let mut reward =
+            crate::utils::compute_reward_ppo(is_six, is_up, self.state_struct.loss_streak);
+        if is_six && is_up {
+            if self.pulls_done < EARLY_UP_BONUS_THRESHOLD_1 {
+                reward += 5.0;
             }
-        }
-        if self.state_struct.loss_streak >= 2 {
-            reward -= (self.state_struct.loss_streak as f64) * 2.0;
+            if self.pulls_done < EARLY_UP_BONUS_THRESHOLD_2 {
+                reward += 5.0;
+            }
         }
         self.episode_reward += reward;
 
@@ -892,7 +885,13 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
                         .map(|env| env.step(&ppo.policy, dbn, config, context_len))
                         .collect()
                 })
-                .unwrap_or_else(|msg| panic!("{}", msg));
+                .unwrap_or_else(|msg| {
+                    log::error!("[PPO] Worker execution failed: {}", msg);
+                    vec![]
+                });
+            if step_results.is_empty() {
+                break;
+            }
             for result in step_results {
                 ppo.store_raw(result.experience);
                 if let Some(done_reward) = result.finished_reward {

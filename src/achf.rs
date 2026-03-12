@@ -969,10 +969,12 @@ mod tests {
 
     #[test]
     fn achf_forward_and_gate_update() {
-        let mut cfg = AchfConfig::default();
-        cfg.enabled = true;
-        cfg.proj_freq = 1;
-        cfg.proj_mode = "rowcol".to_string();
+        let cfg = AchfConfig {
+            enabled: true,
+            proj_freq: 1,
+            proj_mode: "rowcol".to_string(),
+            ..Default::default()
+        };
         let layer = AchfLayer::new(4, cfg, 42);
         let x = Tensor::rand(vec![2, 4], -0.1, 0.1, 123);
         let out = layer.forward_residual(&x);
@@ -985,10 +987,12 @@ mod tests {
 
     #[test]
     fn achf_rowcol_projection_normalizes_rows() {
-        let mut cfg = AchfConfig::default();
-        cfg.enabled = true;
-        cfg.proj_freq = 1;
-        cfg.proj_mode = "rowcol".to_string();
+        let cfg = AchfConfig {
+            enabled: true,
+            proj_freq: 1,
+            proj_mode: "rowcol".to_string(),
+            ..Default::default()
+        };
         let layer = AchfLayer::new(4, cfg, 7);
         let x = Tensor::rand(vec![1, 4], -0.1, 0.1, 9);
         let _ = layer.forward_residual(&x);
@@ -1006,10 +1010,12 @@ mod tests {
 
     #[test]
     fn achf_freeze_stops_projection() {
-        let mut cfg = AchfConfig::default();
-        cfg.enabled = true;
-        cfg.proj_freq = 1;
-        cfg.proj_mode = "rowcol".to_string();
+        let cfg = AchfConfig {
+            enabled: true,
+            proj_freq: 1,
+            proj_mode: "rowcol".to_string(),
+            ..Default::default()
+        };
         let layer = AchfLayer::new(4, cfg, 11);
         let x = Tensor::rand(vec![1, 4], -0.1, 0.1, 12);
         let _ = layer.forward_residual(&x);
@@ -1023,13 +1029,15 @@ mod tests {
 
     #[test]
     fn achf_adaptive_g_min_tracks_gate_floor() {
-        let mut cfg = AchfConfig::default();
-        cfg.enabled = true;
-        cfg.g_min_adapt_rate = 0.5;
-        cfg.g_target_min = 0.5;
-        cfg.g_target_max = 0.9;
-        cfg.gate_alpha = -10.0;
-        cfg.gate_beta = 0.0;
+        let cfg = AchfConfig {
+            enabled: true,
+            g_min_adapt_rate: 0.5,
+            g_target_min: 0.5,
+            g_target_max: 0.9,
+            gate_alpha: -10.0,
+            gate_beta: 0.0,
+            ..Default::default()
+        };
         let layer = AchfLayer::new(4, cfg, 21);
         let x = Tensor::rand(vec![1, 4], -0.1, 0.1, 22);
         let _ = layer.forward_residual(&x);
@@ -1040,9 +1048,11 @@ mod tests {
 
     #[test]
     fn achf_low_rank_cache_matches_unfused() {
-        let mut cfg = AchfConfig::default();
-        cfg.enabled = true;
-        cfg.rank = 2;
+        let cfg = AchfConfig {
+            enabled: true,
+            rank: 2,
+            ..Default::default()
+        };
         let layer = AchfLayer::new(4, cfg, 31);
         let x = Tensor::rand(vec![2, 4], -0.1, 0.1, 32);
         let x_data = x.data.read().unwrap().clone();
@@ -1058,10 +1068,12 @@ mod tests {
 
     #[test]
     fn achf_cache_threshold_skips_small_batches() {
-        let mut cfg = AchfConfig::default();
-        cfg.enabled = true;
-        cfg.rank = 2;
-        cfg.cache_min_rows = 4;
+        let cfg = AchfConfig {
+            enabled: true,
+            rank: 2,
+            cache_min_rows: 4,
+            ..Default::default()
+        };
         let layer = AchfLayer::new(4, cfg, 41);
         layer.freeze_for_inference();
         let x = Tensor::rand(vec![2, 4], -0.1, 0.1, 42);
@@ -1077,10 +1089,12 @@ mod tests {
 
     #[test]
     fn achf_cache_stats_tracks_hits_and_paths() {
-        let mut cfg = AchfConfig::default();
-        cfg.enabled = true;
-        cfg.rank = 2;
-        cfg.cache_cost_bias = 0.0;
+        let cfg = AchfConfig {
+            enabled: true,
+            rank: 2,
+            cache_cost_bias: 0.0,
+            ..Default::default()
+        };
         let layer = AchfLayer::new(4, cfg, 51);
         layer.freeze_for_inference();
         let x = Tensor::rand(vec![2, 4], -0.1, 0.1, 52);
@@ -1104,11 +1118,13 @@ mod tests {
 
     #[test]
     fn achf_cache_stats_track_sparsity_skip() {
-        let mut cfg = AchfConfig::default();
-        cfg.enabled = true;
-        cfg.rank = 2;
-        cfg.cache_min_nonzero_ratio = 0.9;
-        cfg.cache_sparsity_sample_rows = 1;
+        let cfg = AchfConfig {
+            enabled: true,
+            rank: 2,
+            cache_min_nonzero_ratio: 0.9,
+            cache_sparsity_sample_rows: 1,
+            ..Default::default()
+        };
         let layer = AchfLayer::new(4, cfg, 61);
         layer.freeze_for_inference();
         let x_data = vec![0.0; 8];
@@ -1122,14 +1138,16 @@ mod tests {
 
     #[test]
     fn achf_cache_adapts_bias_with_latency() {
-        let mut cfg = AchfConfig::default();
-        cfg.enabled = true;
-        cfg.rank = 2;
-        cfg.cache_adapt_rate = 0.5;
-        cfg.cache_latency_ema = 0.0;
-        cfg.cache_bias_min = 0.5;
-        cfg.cache_bias_max = 2.0;
-        cfg.cache_cost_bias = 1.0;
+        let cfg = AchfConfig {
+            enabled: true,
+            rank: 2,
+            cache_adapt_rate: 0.5,
+            cache_latency_ema: 0.0,
+            cache_bias_min: 0.5,
+            cache_bias_max: 2.0,
+            cache_cost_bias: 1.0,
+            ..Default::default()
+        };
         let layer = AchfLayer::new(4, cfg, 71);
         layer.record_path_latency(InferencePath::LowRank, 100.0);
         layer.record_path_latency(InferencePath::Cached, 50.0);

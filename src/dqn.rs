@@ -18,17 +18,13 @@ const EPSILON_DECAY: usize = 50000;
 const LEARNING_RATE: f64 = 0.001;
 const TRAIN_FREQ: usize = 10;
 const LOG_FREQ: usize = 100;
-use crate::utils::EPISODE_MAX_PULLS;
+use crate::utils::{ACTIONS, ACTION_SPACE, EPISODE_MAX_PULLS};
 
 // PER Hyperparameters (Schaul et al. 2016)
 const PER_ALPHA: f64 = 0.6;
 const PER_BETA_START: f64 = 0.4;
 const PER_BETA_END: f64 = 1.0;
 const PER_EPSILON: f64 = 1e-6;
-
-// Actions
-const ACTION_SPACE: usize = 5;
-const ACTIONS: [f64; ACTION_SPACE] = [0.0, 0.005, 0.015, -0.005, -0.015];
 
 // --- Layers ---
 // Linear layer is now imported from crate::nn
@@ -134,7 +130,7 @@ impl DuelingQNetwork {
         self.achf
             .as_ref()
             .map(|achf| achf.config.clone())
-            .unwrap_or_else(AchfConfig::default)
+            .unwrap_or_default()
     }
 
     pub fn update_achf_after_backward(&self) {
@@ -621,8 +617,25 @@ pub fn train_dqn(
         state_struct.pity_6 += 1;
         state_struct.total_pulls_in_pool += 1;
 
-        if state_struct.total_pulls_in_pool == config.big_pity_cumulative
-            && !state_struct.has_obtained_up
+        let big_pity_gate = if config.big_pity_requires_not_up {
+            !state_struct.has_obtained_up
+        } else {
+            true
+        };
+        #[allow(clippy::if_same_then_else)]
+        if config.up_pity_soft > 0
+            && state_struct.total_pulls_in_pool == config.up_pity_soft
+            && big_pity_gate
+        {
+            is_six = true;
+            is_up = true;
+            state_struct.pity_6 = 0;
+            state_struct.streak_4_star = 0;
+            state_struct.loss_streak = 0;
+            state_struct.has_obtained_up = true;
+        } else if config.big_pity_cumulative > 0
+            && state_struct.total_pulls_in_pool == config.big_pity_cumulative
+            && big_pity_gate
         {
             is_six = true;
             is_up = true;
@@ -643,7 +656,9 @@ pub fn train_dqn(
                     state_struct.loss_streak += 1;
                 }
             }
-        } else if state_struct.streak_4_star >= 9
+        } else if config.always_5_star
+            || (config.five_star_pity > 0
+                && state_struct.streak_4_star >= config.five_star_pity - 1)
             || r < (final_prob_6 + config.prob_5_base).min(1.0)
         {
             state_struct.streak_4_star = 0;
@@ -652,17 +667,7 @@ pub fn train_dqn(
         }
         pulls_done += 1;
 
-        let mut reward = -0.1;
-        if is_six {
-            if is_up {
-                reward += 10.0;
-            } else {
-                reward += 2.0;
-            }
-        }
-        if state_struct.loss_streak >= 2 {
-            reward -= (state_struct.loss_streak as f64) * 0.5;
-        }
+        let reward = crate::utils::compute_reward_dqn(is_six, is_up, state_struct.loss_streak);
 
         episode_reward += reward;
 

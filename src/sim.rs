@@ -3,7 +3,7 @@ use crate::config::{Config, LuckMode};
 use crate::dbn::Dbn;
 use crate::dqn::{DuelingQNetwork, Experience};
 use crate::neural::{NeuralLuckOptimizer, Tensor, DIM};
-use crate::ppo::{self, ActorCritic};
+use crate::ppo::ActorCritic;
 use crate::rng::Rng;
 use crate::transformer::KVCache;
 use crate::worker::GoodJobWorker;
@@ -287,7 +287,7 @@ fn decide_policy(inputs: PolicyInputs<'_>) -> PolicyDecision {
                 if let Some(cache) = kv_cache {
                     let idx = policy.step_inference_cached(current_features, cache, start_pos);
                     return PolicyDecision {
-                        luck_factor: ppo::ACTIONS[idx],
+                        luck_factor: crate::utils::ACTIONS[idx],
                         action: Some(idx),
                         ppo_log_prob: None,
                         ppo_value: None,
@@ -296,7 +296,7 @@ fn decide_policy(inputs: PolicyInputs<'_>) -> PolicyDecision {
                 if let Some(seq_data) = ppo_seq_data {
                     let idx = policy.step_inference(seq_data);
                     return PolicyDecision {
-                        luck_factor: ppo::ACTIONS[idx],
+                        luck_factor: crate::utils::ACTIONS[idx],
                         action: Some(idx),
                         ppo_log_prob: None,
                         ppo_value: None,
@@ -317,7 +317,7 @@ fn decide_policy(inputs: PolicyInputs<'_>) -> PolicyDecision {
                     policy.step(&tensor_x, &[state.pity_6])
                 };
             return PolicyDecision {
-                luck_factor: ppo::ACTIONS[idx],
+                luck_factor: crate::utils::ACTIONS[idx],
                 action: Some(idx),
                 ppo_log_prob: Some(log_prob),
                 ppo_value: Some(value),
@@ -382,7 +382,8 @@ pub fn prob_6(pity_6: usize, config: &Config) -> f64 {
     if pity_6 < config.soft_pity_start {
         config.prob_6_base
     } else if pity_6 < config.small_pity_guarantee {
-        config.prob_6_base + 0.05 * (pity_6 as f64 - (config.soft_pity_start as f64 - 1.0))
+        config.prob_6_base
+            + config.soft_pity_slope * (pity_6 as f64 - (config.soft_pity_start as f64 - 1.0))
     } else {
         1.0
     }
@@ -414,13 +415,14 @@ pub fn build_features(
     loss_streak: usize,
     config: &Config,
 ) -> Tensor {
+    const DEFAULT_BIG_PITY_FALLBACK: f64 = 120.0;
     let pity_norm = pity_6 as f64 / config.small_pity_guarantee as f64;
     let loss_norm = loss_streak as f64 / 3.0;
-    // Use big_pity_cumulative for normalization if possible, or fallback to 100
+    // Use big_pity_cumulative for normalization if possible, or fallback
     let total_norm_base = if config.big_pity_cumulative > 0 {
         config.big_pity_cumulative as f64
     } else {
-        120.0
+        DEFAULT_BIG_PITY_FALLBACK
     };
     let total_norm = (total_pulls % total_norm_base as usize) as f64 / total_norm_base;
 
@@ -1075,7 +1077,7 @@ pub fn simulate_stats(
                 )
         })
         .unwrap_or_else(|e| {
-            println!("[Error] Simulation failed: {}", e);
+            log::error!("[Error] Simulation failed: {}", e);
             (0, 0, 0, 0)
         });
 
@@ -1125,7 +1127,7 @@ pub fn simulate_f2p_clearing(
                             ),
                             nn_total_pulls_one_based: true,
                             collect_details: false,
-                            big_pity_requires_not_up: false,
+                            big_pity_requires_not_up: ctx.config.big_pity_requires_not_up,
                             fast_inference: true,
                         };
                         let mut total_extra = 0u64;
@@ -1156,7 +1158,7 @@ pub fn simulate_f2p_clearing(
                 .reduce(|| (0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2))
         })
         .unwrap_or_else(|e| {
-            println!("[Error] Cost Analysis failed: {}", e);
+            log::error!("[Error] Cost Analysis failed: {}", e);
             (0, 0, 0)
         });
 

@@ -42,6 +42,10 @@ pub const INPUT_CAP: usize = 1_000_000;
 /// Default PPO context length when not specified.
 pub const DEFAULT_PPO_CONTEXT_LEN: usize = 8;
 
+/// Discrete luck-factor actions shared by DQN and PPO.
+pub const ACTION_SPACE: usize = 5;
+pub const ACTIONS: [f64; ACTION_SPACE] = [0.0, 0.005, 0.015, -0.005, -0.015];
+
 /// Compute DQN-style reward for experience replay.
 pub fn compute_reward_dqn(is_six: bool, is_up: bool, loss_streak: usize) -> f64 {
     let mut reward = REWARD_BASE;
