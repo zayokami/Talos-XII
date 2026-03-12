@@ -362,6 +362,9 @@ fn run_gate_curve(base_config: &Config, seed: u64) -> BenchRunResult {
     let mut cfg = base_config.clone();
     cfg.achf.enabled = true;
     cfg.fast_init = true;
+    cfg.ppo_total_steps = 0;
+    cfg.ppo_steps_per_update = 0;
+    cfg.ppo_k_epochs = 0;
 
     let (dbn, _neural_opt, _worker) = build_base_models(&cfg, &mut rng);
 
@@ -448,6 +451,9 @@ fn run_convergence(base_config: &Config, seed: u64, nt: usize) -> Vec<Aggregated
             let mut cfg = base_config.clone();
             cfg.achf.enabled = enabled;
             cfg.fast_init = true;
+            cfg.ppo_total_steps = 0;
+            cfg.ppo_steps_per_update = 0;
+            cfg.ppo_k_epochs = 0;
             let (dbn, _neural_opt, _worker) = build_base_models(&cfg, &mut rng);
             let (tx, rx) = std::sync::mpsc::channel();
             let start = Instant::now();
@@ -490,12 +496,18 @@ fn run_convergence(base_config: &Config, seed: u64, nt: usize) -> Vec<Aggregated
 
 fn train_and_measure(label: &str, config: &Config, seed: u64) -> BenchRunResult {
     let mut rng = Rng::from_seed(seed);
-    let (dbn, neural_opt, _worker) = build_base_models(config, &mut rng);
+    let mut cfg = config.clone();
+    if cfg.fast_init {
+        cfg.ppo_total_steps = 0;
+        cfg.ppo_steps_per_update = 0;
+        cfg.ppo_k_epochs = 0;
+    }
+    let (dbn, neural_opt, _worker) = build_base_models(&cfg, &mut rng);
 
     let (tx, rx) = std::sync::mpsc::channel();
     let train_start = Instant::now();
-    let dqn = train_dqn_with_metrics(&neural_opt, &mut rng, &dbn, config, None);
-    let ppo = train_ppo_with_metrics(&mut rng, &dbn, config, Some(tx));
+    let dqn = train_dqn_with_metrics(&neural_opt, &mut rng, &dbn, &cfg, None);
+    let ppo = train_ppo_with_metrics(&mut rng, &dbn, &cfg, Some(tx));
     let train_elapsed = train_start.elapsed();
 
     let snapshots: Vec<StepSnapshot> = rx.try_iter().collect();
