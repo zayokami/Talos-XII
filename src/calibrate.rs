@@ -4,7 +4,7 @@
 
 use crate::collect::{PlayerDatabase, PoolEmpiricalStats};
 use crate::config::Config;
-use crate::i18n::Language;
+use crate::i18n::{I18n, Language};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -364,24 +364,15 @@ fn estimate_soft_pity_slope(
 
 /// Run Bayesian calibration on all pools with sufficient data.
 pub fn run_calibration(db: &PlayerDatabase, config: &Config, lang: Language) -> CalibrationData {
-    let cn = lang == Language::Cn;
-
-    println!(
-        "\n{}",
-        if cn {
-            "═══ 贝叶斯校准分析 ═══"
-        } else {
-            "═══ Bayesian Calibration Analysis ═══"
-        }
-    );
+    println!("{}", I18n::get(lang, "cal_header"));
 
     let pool_stats = db.compute_pool_stats(config);
 
     println!(
         "  {}: {}    {}: {}",
-        if cn { "总样本" } else { "Total samples" },
+        I18n::get(lang, "cal_total_samples"),
         db.total_pulls(),
-        if cn { "会话数" } else { "Sessions" },
+        I18n::get(lang, "cal_sessions"),
         db.sessions.len(),
     );
 
@@ -411,27 +402,19 @@ pub fn run_calibration(db: &PlayerDatabase, config: &Config, lang: Language) -> 
             "\n  ── {} ({} {}) ──",
             ps.pool_name,
             ps.total_pulls,
-            if cn { "抽" } else { "pulls" },
+            I18n::get(lang, "cal_unit_pulls"),
         );
 
         if ps.total_pulls < CALIBRATION_MIN_PULLS {
             println!(
                 "  ⚠ {} (< {} {})",
-                if cn {
-                    "数据量不足，仅显示统计信息"
-                } else {
-                    "Insufficient data, showing stats only"
-                },
+                I18n::get(lang, "cal_insufficient"),
                 CALIBRATION_MIN_PULLS,
-                if cn { "抽" } else { "pulls" },
+                I18n::get(lang, "cal_unit_pulls"),
             );
 
             print_estimate_row(
-                if cn {
-                    "基础6★概率"
-                } else {
-                    "Base 6★ rate"
-                },
+                &I18n::get(lang, "cal_base_rate"),
                 &BayesianEstimate {
                     prior_mean: cfg_base,
                     posterior_mean: ps.observed_base_rate,
@@ -440,7 +423,7 @@ pub fn run_calibration(db: &PlayerDatabase, config: &Config, lang: Language) -> 
                     significant: false,
                 },
                 true,
-                cn,
+                lang,
             );
             continue;
         }
@@ -451,35 +434,17 @@ pub fn run_calibration(db: &PlayerDatabase, config: &Config, lang: Language) -> 
 
         println!(
             "\n  {:<20} {:>10} {:>10} {:>18} {:>6}",
-            if cn { "参数" } else { "Parameter" },
-            if cn { "公示值" } else { "Official" },
-            if cn { "校准值" } else { "Calibrated" },
-            if cn { "95% 置信区间" } else { "95% CI" },
-            if cn { "差异" } else { "Sig." },
+            I18n::get(lang, "cal_col_param"),
+            I18n::get(lang, "cal_col_official"),
+            I18n::get(lang, "cal_col_calibrated"),
+            I18n::get(lang, "cal_col_ci"),
+            I18n::get(lang, "cal_col_sig"),
         );
         println!("  {}", "-".repeat(68));
 
-        print_estimate_row(
-            if cn {
-                "基础6★概率"
-            } else {
-                "Base 6★ rate"
-            },
-            &base_est,
-            true,
-            cn,
-        );
-        print_estimate_row(
-            if cn {
-                "软保底斜率"
-            } else {
-                "Soft pity slope"
-            },
-            &slope_est,
-            false,
-            cn,
-        );
-        print_estimate_row(if cn { "UP 率" } else { "UP rate" }, &up_est, true, cn);
+        print_estimate_row(&I18n::get(lang, "cal_base_rate"), &base_est, true, lang);
+        print_estimate_row(&I18n::get(lang, "cal_slope"), &slope_est, false, lang);
+        print_estimate_row(&I18n::get(lang, "cal_up_rate"), &up_est, true, lang);
 
         let mut pool_cal = PoolCalibration {
             pool_id: ps.pool_id.clone(),
@@ -500,14 +465,7 @@ pub fn run_calibration(db: &PlayerDatabase, config: &Config, lang: Language) -> 
     }
 
     if pool_stats.is_empty() {
-        println!(
-            "\n  {}",
-            if cn {
-                "无可校准数据。请先使用 collect add 录入玩家数据。"
-            } else {
-                "No data to calibrate. Use 'collect add' to record player data first."
-            }
-        );
+        println!("\n  {}", I18n::get(lang, "cal_no_data"));
     }
 
     // Sample size guidance
@@ -516,19 +474,11 @@ pub fn run_calibration(db: &PlayerDatabase, config: &Config, lang: Language) -> 
         let needed = 400 - total_six;
         println!(
             "\n  {} ≈ {} {} 6★ {} ±3% {}",
-            if cn {
-                "提示: 当前UP率置信区间较宽。还需"
-            } else {
-                "Tip: UP rate CI still wide. Need"
-            },
+            I18n::get(lang, "cal_sample_hint"),
             needed,
-            if cn { "个" } else { "more" },
-            if cn {
-                "样本可将区间收窄到"
-            } else {
-                "samples to narrow to"
-            },
-            if cn { "精度" } else { "accuracy" },
+            I18n::get(lang, "cal_sample_hint_more"),
+            I18n::get(lang, "cal_sample_hint_narrow"),
+            I18n::get(lang, "cal_sample_hint_acc"),
         );
     }
 
@@ -536,7 +486,7 @@ pub fn run_calibration(db: &PlayerDatabase, config: &Config, lang: Language) -> 
     calibration
 }
 
-fn print_estimate_row(name: &str, est: &BayesianEstimate, as_percent: bool, cn: bool) {
+fn print_estimate_row(name: &str, est: &BayesianEstimate, as_percent: bool, lang: Language) {
     let (prior_s, post_s, ci_s) = if as_percent {
         (
             format!("{:.3}%", est.prior_mean * 100.0),
@@ -555,17 +505,9 @@ fn print_estimate_row(name: &str, est: &BayesianEstimate, as_percent: bool, cn: 
         )
     };
     let sig = if est.significant {
-        if cn {
-            "是"
-        } else {
-            "Yes"
-        }
+        I18n::get(lang, "cal_sig_yes")
     } else {
-        if cn {
-            "否"
-        } else {
-            "No"
-        }
+        I18n::get(lang, "cal_sig_no")
     };
     println!(
         "  {:<20} {:>10} {:>10} {:>18} {:>6}",

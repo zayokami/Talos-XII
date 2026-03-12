@@ -3,7 +3,7 @@
 #![allow(dead_code)] // Module API for future CLI integration (collect add/stats subcommands)
 
 use crate::config::Config;
-use crate::i18n::Language;
+use crate::i18n::{I18n, Language};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -237,120 +237,52 @@ fn prompt(msg: &str) -> String {
 
 /// Interactive session for adding player data.
 pub fn add_session_interactive(config: &Config, lang: Language) -> Option<PlayerSession> {
-    let cn = lang == Language::Cn;
-
     if config.pools.is_empty() {
-        println!(
-            "{}",
-            if cn {
-                "[数据采集] 没有可用的池子配置。"
-            } else {
-                "[Collect] No pool configurations available."
-            }
-        );
+        println!("{}", I18n::get(lang, "collect_no_pools"));
         return None;
     }
 
-    println!(
-        "{}",
-        if cn {
-            "\n═══ 数据采集: 录入玩家抽卡记录 ═══"
-        } else {
-            "\n═══ Data Collection: Record Player Pulls ═══"
-        }
-    );
-
-    println!(
-        "{}",
-        if cn {
-            "请选择池子:"
-        } else {
-            "Select pool:"
-        }
-    );
+    println!("{}", I18n::get(lang, "collect_header"));
+    println!("{}", I18n::get(lang, "collect_select_pool"));
     for (i, pool) in config.pools.iter().enumerate() {
         println!("  {}. {} ({})", i + 1, pool.name, pool.pool_type);
     }
     let pool_input = prompt("> ");
     let pool_idx = pool_input.parse::<usize>().unwrap_or(1).saturating_sub(1);
     if pool_idx >= config.pools.len() {
-        println!(
-            "{}",
-            if cn {
-                "无效选择。"
-            } else {
-                "Invalid selection."
-            }
-        );
+        println!("{}", I18n::get(lang, "collect_invalid_selection"));
         return None;
     }
     let pool = &config.pools[pool_idx];
 
-    let player_id = prompt(if cn {
-        "玩家ID (匿名标识): "
-    } else {
-        "Player ID (anonymous label): "
-    });
+    let player_id = prompt(&I18n::get(lang, "collect_player_id"));
     let player_id = if player_id.is_empty() {
         format!("player_{}", chrono_timestamp())
     } else {
         player_id
     };
 
-    println!(
-        "{}",
-        if cn {
-            "录入模式:\n  1. 逐抽录入 (格式: 星级,是否UP  例: 4,n / 6,y)\n  2. 简化录入 (只输入6★出现位置)"
-        } else {
-            "Input mode:\n  1. Full (format: rarity,isUP  e.g. 4,n / 6,y)\n  2. Simplified (only 6-star positions)"
-        }
-    );
-    let mode = prompt(if cn {
-        "选择模式 [1/2]: "
-    } else {
-        "Select mode [1/2]: "
-    });
+    println!("{}", I18n::get(lang, "collect_input_mode"));
+    let mode = prompt(&I18n::get(lang, "collect_select_mode"));
 
     let pulls = if mode.trim() == "2" {
-        let total_str = prompt(if cn { "总抽数: " } else { "Total pulls: " });
+        let total_str = prompt(&I18n::get(lang, "collect_total_pulls"));
         let total: usize = total_str.parse().unwrap_or(0);
         if total == 0 {
-            println!(
-                "{}",
-                if cn {
-                    "无效输入。"
-                } else {
-                    "Invalid input."
-                }
-            );
+            println!("{}", I18n::get(lang, "collect_invalid_input"));
             return None;
         }
 
-        let positions_str = prompt(if cn {
-            "6★出现位置 (逗号分隔, 如 78,145): "
-        } else {
-            "6-star positions (comma-separated, e.g. 78,145): "
-        });
-        let up_str = prompt(if cn {
-            "每个6★是否UP (y/n逗号分隔, 如 y,n): "
-        } else {
-            "UP for each 6-star (y/n comma-separated, e.g. y,n): "
-        });
+        let positions_str = prompt(&I18n::get(lang, "collect_six_positions"));
+        let up_str = prompt(&I18n::get(lang, "collect_up_flags"));
         reconstruct_from_six_star_positions(&positions_str, &up_str, total)
     } else {
         let mut pulls = Vec::new();
-        println!(
-            "{}",
-            if cn {
-                "逐抽录入 (输入 done 结束, undo 撤销):"
-            } else {
-                "Enter pulls (type 'done' to finish, 'undo' to undo):"
-            }
-        );
+        println!("{}", I18n::get(lang, "collect_full_mode_hint"));
         loop {
             let input = prompt(&format!(
                 "  {} #{} > ",
-                if cn { "抽" } else { "Pull" },
+                I18n::get(lang, "collect_pull_prompt"),
                 pulls.len() + 1
             ));
             if input.eq_ignore_ascii_case("done") {
@@ -358,33 +290,19 @@ pub fn add_session_interactive(config: &Config, lang: Language) -> Option<Player
             }
             if input.eq_ignore_ascii_case("undo") {
                 if pulls.pop().is_some() {
-                    println!("  ↩ {}", if cn { "已撤销" } else { "Undone" });
+                    println!("  ↩ {}", I18n::get(lang, "collect_undone"));
                 }
                 continue;
             }
             let parts: Vec<&str> = input.split(',').map(|s| s.trim()).collect();
             if parts.len() < 2 {
-                println!(
-                    "  {}",
-                    if cn {
-                        "格式: 星级,是否UP (如 4,n / 6,y)"
-                    } else {
-                        "Format: rarity,isUP (e.g. 4,n / 6,y)"
-                    }
-                );
+                println!("  {}", I18n::get(lang, "collect_format_hint"));
                 continue;
             }
             let rarity: u8 = match parts[0].parse() {
                 Ok(r) if r == 4 || r == 5 || r == 6 => r,
                 _ => {
-                    println!(
-                        "  {}",
-                        if cn {
-                            "星级必须为 4/5/6"
-                        } else {
-                            "Rarity must be 4/5/6"
-                        }
-                    );
+                    println!("  {}", I18n::get(lang, "collect_rarity_hint"));
                     continue;
                 }
             };
@@ -397,29 +315,14 @@ pub fn add_session_interactive(config: &Config, lang: Language) -> Option<Player
     };
 
     if pulls.is_empty() {
-        println!(
-            "{}",
-            if cn {
-                "没有录入任何数据。"
-            } else {
-                "No data entered."
-            }
-        );
+        println!("{}", I18n::get(lang, "collect_no_data"));
         return None;
     }
 
-    let jade_input = prompt(if cn {
-        "总花费源石 (可选, 回车跳过): "
-    } else {
-        "Total jade spent (optional, Enter to skip): "
-    });
+    let jade_input = prompt(&I18n::get(lang, "collect_jade_prompt"));
     let total_jade_spent = jade_input.parse::<u32>().ok();
 
-    let free_input = prompt(if cn {
-        "使用免费抽数 (可选, 回车跳过): "
-    } else {
-        "Free pulls used (optional, Enter to skip): "
-    });
+    let free_input = prompt(&I18n::get(lang, "collect_free_prompt"));
     let free_pulls_used = free_input.parse::<u32>().ok();
 
     let six_count = pulls.iter().filter(|p| p.rarity == 6).count();
@@ -427,11 +330,11 @@ pub fn add_session_interactive(config: &Config, lang: Language) -> Option<Player
 
     println!(
         "\n✓ {}: {} {}, {} {}, {} 6★ ({} UP)",
-        if cn { "已录入" } else { "Recorded" },
+        I18n::get(lang, "collect_recorded"),
         player_id,
         pool.name,
         pulls.len(),
-        if cn { "抽" } else { "pulls" },
+        I18n::get(lang, "collect_unit_pulls"),
         six_count,
         up_count,
     );
@@ -457,36 +360,19 @@ pub fn import_from_json(path: &str) -> Result<Vec<PlayerSession>, String> {
 
 /// Print collected data statistics.
 pub fn print_stats(db: &PlayerDatabase, config: &Config, lang: Language) {
-    let cn = lang == Language::Cn;
-
-    println!(
-        "\n{}",
-        if cn {
-            "═══ 已采集数据统计 ═══"
-        } else {
-            "═══ Collected Data Statistics ═══"
-        }
-    );
-
+    println!("{}", I18n::get(lang, "stats_header"));
     println!(
         "  {}: {}    {}: {}    {}: {}",
-        if cn { "会话数" } else { "Sessions" },
+        I18n::get(lang, "stats_sessions"),
         db.sessions.len(),
-        if cn { "总抽数" } else { "Total pulls" },
+        I18n::get(lang, "stats_total_pulls"),
         db.total_pulls(),
-        if cn { "玩家数" } else { "Players" },
+        I18n::get(lang, "stats_players"),
         db.player_count(),
     );
 
     if db.sessions.is_empty() {
-        println!(
-            "\n  {}",
-            if cn {
-                "暂无数据。使用 collect add 录入玩家数据。"
-            } else {
-                "No data yet. Use 'collect add' to record player data."
-            }
-        );
+        println!("\n  {}", I18n::get(lang, "stats_no_data"));
         return;
     }
 
@@ -494,12 +380,12 @@ pub fn print_stats(db: &PlayerDatabase, config: &Config, lang: Language) {
 
     println!(
         "\n  {:<24} {:>8} {:>6} {:>6} {:>10} {:>10}",
-        if cn { "池子" } else { "Pool" },
-        if cn { "样本抽" } else { "Pulls" },
-        if cn { "6★数" } else { "6★" },
-        if cn { "UP数" } else { "UP" },
-        if cn { "实测6★率" } else { "6★ Rate" },
-        if cn { "实测UP率" } else { "UP Rate" },
+        I18n::get(lang, "stats_col_pool"),
+        I18n::get(lang, "stats_col_pulls"),
+        I18n::get(lang, "stats_col_six"),
+        I18n::get(lang, "stats_col_up"),
+        I18n::get(lang, "stats_col_six_rate"),
+        I18n::get(lang, "stats_col_up_rate"),
     );
     println!("  {}", "-".repeat(70));
 
@@ -538,42 +424,30 @@ pub fn print_stats(db: &PlayerDatabase, config: &Config, lang: Language) {
 
         println!(
             "\n  {} ({}):",
-            if cn {
-                "Pity 分布"
-            } else {
-                "Pity distribution"
-            },
+            I18n::get(lang, "stats_pity_dist"),
             ps.pool_name
         );
         println!(
             "    0-{} {}: {} {}",
             soft_start - 1,
-            if cn { "抽出6★" } else { "pulls → 6★" },
+            I18n::get(lang, "stats_pity_six"),
             pre_soft,
-            if cn {
-                "次 (基础概率区间)"
-            } else {
-                "(base rate range)"
-            },
+            I18n::get(lang, "stats_base_range"),
         );
         println!(
             "    {}-{} {}: {} {}",
             soft_start,
             guarantee - 1,
-            if cn { "抽出6★" } else { "pulls → 6★" },
+            I18n::get(lang, "stats_pity_six"),
             in_soft,
-            if cn {
-                "次 (软保底区间)"
-            } else {
-                "(soft pity range)"
-            },
+            I18n::get(lang, "stats_soft_range"),
         );
         println!(
             "    {} {}: {} {}",
             guarantee,
-            if cn { "抽出6★" } else { "pulls → 6★" },
+            I18n::get(lang, "stats_pity_six"),
             at_guarantee,
-            if cn { "次 (硬保底)" } else { "(hard pity)" },
+            I18n::get(lang, "stats_hard_pity"),
         );
     }
 
