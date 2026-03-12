@@ -1164,7 +1164,7 @@ fn run_interactive(args: RunInteractiveArgs) {
 
         let mut parts = input.split_whitespace();
         let cmd = parts.next().unwrap_or("");
-        let cmd_lower = cmd.to_ascii_lowercase();
+        let cmd_lower = cmd.to_lowercase();
         if cmd_lower == "h" || cmd_lower == "help" {
             println!("{}", I18n::get(lang, "cmd_help"));
             continue;
