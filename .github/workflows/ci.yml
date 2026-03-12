@@ -138,13 +138,14 @@ jobs:
         with:
           targets: aarch64-unknown-linux-gnu
       - name: Install cross-compilation toolchain
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu pkg-config libfontconfig1-dev libfreetype6-dev
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu pkg-config
       - uses: Swatinem/rust-cache@v2
         with:
           key: cross-arm64
       - run: cargo check --target aarch64-unknown-linux-gnu
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          RUST_FONTCONFIG_DLOPEN: on
 
   # ─────────────────────────────────────────────────
   #  MSRV: verify minimum supported Rust version
