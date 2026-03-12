@@ -449,7 +449,7 @@ impl AchfLayer {
         };
         let wt = w.transpose2d();
         let wtw = wt.matmul(&w);
-        let dim = w.shape[0];
+        let dim = wtw.shape[0];
         let mut id_data = vec![0.0; dim * dim];
         for i in 0..dim {
             id_data[i * dim + i] = 1.0;

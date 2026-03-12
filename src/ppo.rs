@@ -1149,7 +1149,7 @@ pub fn train_ppo_with_metrics(
         }
 
         let update_loss = ppo.update(current_lr);
-        steps_done += steps_per_update;
+        steps_done = (steps_done + steps_per_update).min(total_steps);
 
         let avg_r = if recent_rewards.is_empty() {
             0.0

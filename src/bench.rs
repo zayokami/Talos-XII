@@ -325,6 +325,9 @@ fn run_path_comparison(base_config: &Config, seed: u64) -> Vec<(String, Vec<f64>
     cfg.achf.enabled = true;
     cfg.achf.rank = 16;
     cfg.fast_init = true;
+    cfg.ppo_total_steps = 0;
+    cfg.ppo_steps_per_update = 0;
+    cfg.ppo_k_epochs = 0;
 
     let (dbn, _neural_opt, _worker) = build_base_models(&cfg, &mut rng);
     let ppo = train_ppo_with_metrics(&mut rng, &dbn, &cfg, None);
