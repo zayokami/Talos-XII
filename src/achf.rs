@@ -99,7 +99,7 @@ fn default_cache() -> Arc<RwLock<AchfCache>> {
     }))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct AchfCacheStats {
     pub calls: u64,
     pub cache_hits: u64,
@@ -116,6 +116,18 @@ pub struct AchfCacheStats {
     pub adaptive_bias: f64,
     pub latency_samples: u64,
     pub decision_samples: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct AchfStateSnapshot {
+    pub gate: f64,
+    pub g_min: f64,
+    pub grad_ema: f64,
+    pub cache_hit_rate: f64,
+    pub low_rank_ratio: f64,
+    pub ema_cached_ns: f64,
+    pub ema_low_rank_ns: f64,
+    pub adaptive_bias: f64,
 }
 
 pub fn aggregate_cache_stats_iter<I>(iter: I) -> AchfCacheStats
@@ -243,6 +255,30 @@ impl AchfLayer {
         layer
     }
 
+    pub fn snapshot_state(&self) -> AchfStateSnapshot {
+        let state = self.state.read().unwrap();
+        let cache = self.cache.read().unwrap();
+        let calls = cache.calls as f64;
+        AchfStateSnapshot {
+            gate: state.last_gate,
+            g_min: state.g_min_ema,
+            grad_ema: state.grad_ema,
+            cache_hit_rate: if calls > 0.0 {
+                cache.cache_hits as f64 / calls
+            } else {
+                0.0
+            },
+            low_rank_ratio: if calls > 0.0 {
+                cache.low_rank_paths as f64 / calls
+            } else {
+                0.0
+            },
+            ema_cached_ns: cache.ema_cached_ns,
+            ema_low_rank_ns: cache.ema_low_rank_ns,
+            adaptive_bias: cache.adaptive_bias,
+        }
+    }
+
     pub fn parameters(&self) -> Vec<Tensor> {
         if self.is_low_rank() {
             let mut p = Vec::new();
@@ -322,6 +358,31 @@ impl AchfLayer {
         if elapsed_ns > 0.0 {
             self.record_path_latency(path, elapsed_ns);
         }
+        for v in out.iter_mut() {
+            *v *= g;
+        }
+        out
+    }
+
+    /// Run inference through a specific path, bypassing the automatic path selection.
+    /// `forced_path`: 0 = Cached, 1 = LowRank, 2 = Dense.
+    pub fn forward_inference_forced_path(&self, x: &[f64], forced_path: u8) -> Vec<f64> {
+        if !self.config.enabled {
+            return vec![0.0; x.len()];
+        }
+        let g = self.infer_gate_value();
+        let mut out = match forced_path {
+            0 => self
+                .forward_inference_cached(x)
+                .unwrap_or_else(|| self.weight.forward_inference(x)),
+            1 if self.is_low_rank() => {
+                let down = self.down.as_ref().unwrap();
+                let up = self.up.as_ref().unwrap();
+                let low = down.forward_inference(x);
+                up.forward_inference(&low)
+            }
+            _ => self.weight.forward_inference(x),
+        };
         for v in out.iter_mut() {
             *v *= g;
         }

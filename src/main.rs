@@ -1,7 +1,9 @@
 mod achf;
 mod autograd;
+mod bench;
 mod binary_codec;
 mod calibrate;
+mod chart;
 mod collect;
 mod config;
 mod dbn;
@@ -86,7 +88,10 @@ enum Commands {
         pulls: usize,
     },
     /// Benchmark performance
-    Benchmark,
+    Benchmark {
+        #[command(subcommand)]
+        action: Option<BenchAction>,
+    },
     /// Analyze F2P welfare
     F2p,
     /// Collect player pull data
@@ -96,6 +101,25 @@ enum Commands {
     },
     /// Train/calibrate model using collected player data
     Train,
+}
+
+#[derive(Subcommand, Clone)]
+enum BenchAction {
+    /// Run full ACHF paper benchmark suite
+    Paper {
+        /// Run only specific experiments (comma-separated: ablation,mode,path,gate,scale,apply,convergence)
+        #[arg(long)]
+        only: Option<String>,
+        /// Output directory for charts and data
+        #[arg(long, default_value = "bench_output")]
+        output_dir: String,
+        /// Chart format: svg or png
+        #[arg(long, default_value = "svg")]
+        format: String,
+        /// Number of independent trials per experiment for statistical significance
+        #[arg(long, default_value_t = 3)]
+        trials: usize,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -685,18 +709,39 @@ fn main() {
                 )
             );
         }
-        Commands::Benchmark => {
-            benchmark_simulation(
-                &mut rng,
-                &trained_neural_opt,
-                Some(&dqn_policy),
-                Some(&ppo_policy),
-                &dbn,
-                &config,
-                lang,
-            );
-            demo_mmap_tensor();
-        }
+        Commands::Benchmark { action } => match action {
+            Some(BenchAction::Paper {
+                only,
+                output_dir,
+                format,
+                trials,
+            }) => {
+                let chart_fmt = match format.as_str() {
+                    "png" => chart::ChartFormat::Png,
+                    _ => chart::ChartFormat::Svg,
+                };
+                let bench_cfg = bench::BenchConfig {
+                    output_dir,
+                    format: chart_fmt,
+                    only: only.map(|s| s.split(',').map(|x| x.trim().to_string()).collect()),
+                    num_trials: trials.max(1),
+                };
+                let seed = args.seed.unwrap_or(42);
+                bench::run_paper_benchmarks(&config, seed, &bench_cfg);
+            }
+            None => {
+                benchmark_simulation(
+                    &mut rng,
+                    &trained_neural_opt,
+                    Some(&dqn_policy),
+                    Some(&ppo_policy),
+                    &dbn,
+                    &config,
+                    lang,
+                );
+                demo_mmap_tensor();
+            }
+        },
         Commands::F2p => {
             let f2p_ctx = F2pAnalysisCtx {
                 config: &config,
@@ -1206,6 +1251,103 @@ fn run_interactive(args: RunInteractiveArgs) {
                 }
             }
             println!("{}", I18n::get(lang, "cmd_history_footer"));
+            continue;
+        }
+        if cmd_lower == "bench" || cmd_lower == "benchmark" {
+            let sub = parts.next().unwrap_or("quick");
+            let sub_lower = sub.to_lowercase();
+            match sub_lower.as_str() {
+                "quick" | "q" => {
+                    println!("\n[Bench] 运行快速基准测试...");
+                    let dqn_guard = dqn_shared.read().unwrap();
+                    let neural_guard = neural_shared.read().unwrap();
+                    let ppo_guard = ppo_shared.read().unwrap();
+                    benchmark_simulation(
+                        &mut rng,
+                        &neural_guard,
+                        Some(&dqn_guard),
+                        Some(&ppo_guard),
+                        &dbn,
+                        &config,
+                        lang,
+                    );
+                }
+                "paper" | "p" => {
+                    let mut only_filter: Option<Vec<String>> = None;
+                    let mut trials = 3usize;
+                    let mut format_str = "svg".to_string();
+                    let mut output_dir = "bench_output".to_string();
+
+                    // Parse remaining args: --only X --trials N --format F --output-dir D
+                    while let Some(arg) = parts.next() {
+                        match arg {
+                            "--only" | "-o" => {
+                                if let Some(val) = parts.next() {
+                                    only_filter = Some(
+                                        val.split(',').map(|s| s.trim().to_string()).collect(),
+                                    );
+                                }
+                            }
+                            "--trials" | "-t" => {
+                                if let Some(val) = parts.next() {
+                                    trials = val.parse().unwrap_or(3).max(1);
+                                }
+                            }
+                            "--format" | "-f" => {
+                                if let Some(val) = parts.next() {
+                                    format_str = val.to_string();
+                                }
+                            }
+                            "--output-dir" | "-d" => {
+                                if let Some(val) = parts.next() {
+                                    output_dir = val.to_string();
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    let chart_fmt = match format_str.as_str() {
+                        "png" => chart::ChartFormat::Png,
+                        _ => chart::ChartFormat::Svg,
+                    };
+                    let bench_cfg = bench::BenchConfig {
+                        output_dir,
+                        format: chart_fmt,
+                        only: only_filter,
+                        num_trials: trials,
+                    };
+                    let seed = rng.next_u64();
+                    bench::run_paper_benchmarks(&config, seed, &bench_cfg);
+                }
+                "list" | "l" => {
+                    println!("\n[Bench] 可用实验:");
+                    println!("  ablation     — ACHF 开/关消融对比");
+                    println!("  mode         — lite vs full 模式对比");
+                    println!("  path         — Cached/LowRank/Dense 推理路径延迟");
+                    println!("  gate         — 训练过程中门控动态曲线");
+                    println!("  scale        — 不同 rank 下的吞吐量");
+                    println!("  apply        — FFN/Attention/DQN 组合效果");
+                    println!("  convergence  — loss + reward 收敛曲线");
+                    println!("\n用法:");
+                    println!("  bench quick              快速基准测试");
+                    println!("  bench paper              运行全部 7 项实验（默认 3 trials）");
+                    println!("  bench paper --only ablation,gate");
+                    println!("  bench paper --trials 5 --format png");
+                    println!("  bench paper --output-dir results");
+                }
+                _ => {
+                    // Treat as a shortcut: bench <experiment_name>
+                    let chart_fmt = chart::ChartFormat::Svg;
+                    let bench_cfg = bench::BenchConfig {
+                        output_dir: "bench_output".to_string(),
+                        format: chart_fmt,
+                        only: Some(vec![sub_lower]),
+                        num_trials: 3,
+                    };
+                    let seed = rng.next_u64();
+                    bench::run_paper_benchmarks(&config, seed, &bench_cfg);
+                }
+            }
             continue;
         }
         if cmd_lower == "pool" {

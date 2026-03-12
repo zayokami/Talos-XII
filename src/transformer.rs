@@ -165,6 +165,50 @@ impl LuckTransformer {
         }
     }
 
+    pub fn snapshot_achf(&self) -> Option<crate::achf::AchfStateSnapshot> {
+        self.achf_ffn
+            .as_ref()
+            .map(|achf| achf.snapshot_state())
+            .or_else(|| self.achf_attn.as_ref().map(|achf| achf.snapshot_state()))
+    }
+
+    /// Run inference forcing a specific ACHF path (0=Cached, 1=LowRank, 2=Dense).
+    pub fn forward_inference_forced_path(&self, x: &[f64], forced_path: u8) -> Vec<f64> {
+        let h = self.embed.forward_inference(x);
+        let h_norm1 = self.norm_1.forward_inference(&h);
+        let attn_out = self.mla_layer.forward_inference(&h_norm1);
+        let mut h2 = vec![0.0; h.len()];
+        for i in 0..h.len() {
+            h2[i] = h[i] + attn_out[i];
+        }
+        if let Some(achf) = &self.achf_attn {
+            let res = achf.forward_inference_forced_path(&h, forced_path);
+            for i in 0..h2.len() {
+                h2[i] += res[i];
+            }
+        }
+        let h_norm2 = self.norm_2.forward_inference(&h2);
+        let f1 = self.ffn_1.forward_inference(&h_norm2);
+        let mut f1_relu = f1;
+        for v in f1_relu.iter_mut() {
+            if *v < 0.0 {
+                *v = 0.0;
+            }
+        }
+        let f2 = self.ffn_2.forward_inference(&f1_relu);
+        let mut h3 = vec![0.0; h2.len()];
+        for i in 0..h2.len() {
+            h3[i] = h2[i] + f2[i];
+        }
+        if let Some(achf) = &self.achf_ffn {
+            let res = achf.forward_inference_forced_path(&h2, forced_path);
+            for i in 0..h3.len() {
+                h3[i] += res[i];
+            }
+        }
+        h3
+    }
+
     pub fn achf_cache_stats_iter(&self) -> impl Iterator<Item = AchfCacheStats> + '_ {
         let stats = [
             self.achf_attn.as_ref().map(|achf| achf.cache_stats()),

@@ -33,6 +33,9 @@ neural.cache
 data/player_data.json
 data/calibrated.json
 
+# Benchmark output
+bench_output/
+
 #CLAUDE
 .claude/
 CLAUDE.md

@@ -149,6 +149,17 @@ impl DuelingQNetwork {
         self.achf.as_ref().map(|achf| achf.cache_stats())
     }
 
+    pub fn snapshot_achf(&self) -> Option<crate::achf::AchfStateSnapshot> {
+        self.achf.as_ref().map(|achf| achf.snapshot_state())
+    }
+
+    pub fn param_count(&self) -> usize {
+        self.parameters()
+            .iter()
+            .map(|p| p.shape.iter().product::<usize>())
+            .sum()
+    }
+
     pub fn achf_orthogonal_penalty(&self) -> Option<Tensor> {
         self.achf
             .as_ref()
@@ -545,6 +556,16 @@ pub fn train_dqn(
     dbn: &Dbn,
     config: &Config,
 ) -> DuelingQNetwork {
+    train_dqn_impl(_initial_model, rng, dbn, config, None)
+}
+
+fn train_dqn_impl(
+    _initial_model: &NeuralLuckOptimizer,
+    rng: &mut Rng,
+    dbn: &Dbn,
+    config: &Config,
+    metrics_tx: Option<std::sync::mpsc::Sender<crate::bench::StepSnapshot>>,
+) -> DuelingQNetwork {
     println!("\n[DQN] Initializing Double Dueling DQN Training...");
 
     let policy_net = DuelingQNetwork::new(rng.next_u64(), &config.achf);
@@ -572,6 +593,8 @@ pub fn train_dqn(
     let mut recent_rewards: VecDeque<f64> = VecDeque::with_capacity(51);
 
     let beta_anneal_steps = total_steps as f64;
+    let snapshot_every = (total_steps / 200).max(1);
+    let mut last_train_loss = 0.0_f64;
 
     for step in 0..total_steps {
         // 1. Build State
@@ -782,6 +805,7 @@ pub fn train_dqn(
                 loss = loss + reg;
             }
 
+            last_train_loss = loss.data.read().unwrap()[0];
             let forward_time = start_forward.elapsed();
 
             let start_backward = std::time::Instant::now();
@@ -858,6 +882,31 @@ pub fn train_dqn(
             std::io::stdout().flush().unwrap();
         }
 
+        if let Some(ref tx) = metrics_tx {
+            if step % snapshot_every == 0 {
+                let avg_r = if recent_rewards.is_empty() {
+                    0.0
+                } else {
+                    recent_rewards.iter().sum::<f64>() / recent_rewards.len() as f64
+                };
+                let achf_snap = policy_net.snapshot_achf();
+                let snapshot = crate::bench::StepSnapshot {
+                    step,
+                    gate_value: achf_snap.map_or(1.0, |s| s.gate),
+                    g_min: achf_snap.map_or(0.0, |s| s.g_min),
+                    grad_ema: achf_snap.map_or(0.0, |s| s.grad_ema),
+                    loss: last_train_loss,
+                    reward: avg_r,
+                    cache_hit_rate: achf_snap.map_or(0.0, |s| s.cache_hit_rate),
+                    low_rank_ratio: achf_snap.map_or(0.0, |s| s.low_rank_ratio),
+                    ema_cached_ns: achf_snap.map_or(0.0, |s| s.ema_cached_ns),
+                    ema_low_rank_ns: achf_snap.map_or(0.0, |s| s.ema_low_rank_ns),
+                    adaptive_bias: achf_snap.map_or(1.0, |s| s.adaptive_bias),
+                };
+                let _ = tx.send(snapshot);
+            }
+        }
+
         if config.achf.cache_log_interval_steps > 0
             && step % config.achf.cache_log_interval_steps == 0
         {
@@ -871,6 +920,17 @@ pub fn train_dqn(
     println!("\n[DQN] Training Complete.");
     policy_net.freeze_achf_for_inference();
     policy_net
+}
+
+/// Train a DQN agent with optional metrics collection for benchmarking.
+pub fn train_dqn_with_metrics(
+    initial_model: &NeuralLuckOptimizer,
+    rng: &mut Rng,
+    dbn: &Dbn,
+    config: &Config,
+    metrics_tx: Option<std::sync::mpsc::Sender<crate::bench::StepSnapshot>>,
+) -> DuelingQNetwork {
+    train_dqn_impl(initial_model, rng, dbn, config, metrics_tx)
 }
 
 /// Incremental DQN trainer for online learning during interactive mode.
