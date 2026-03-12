@@ -25,6 +25,11 @@ See `README.md` for full details. Quick reference:
 | Run (interactive) | `cargo run -- interactive` |
 | Run (F2P analysis) | `cargo run -- f2p` |
 | Run (benchmark) | `cargo run -- benchmark` |
+| Collect add (interactive) | `cargo run -- collect add` |
+| Collect import | `cargo run -- collect import <file>` |
+| Collect stats | `cargo run -- collect stats` |
+| Train on collected data | `cargo run -- train` |
+| Force retrain (ignore cache) | `cargo run -- -f simulate -n 100` |
 
 ### Non-obvious caveats
 

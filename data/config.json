@@ -89,8 +89,8 @@
     "apply_dqn": "是否在DQN模块应用ACHF",
     "infer_gate": "推理时门控策略，例如 g_min"
   },
-  "pool_name": "热烈色彩",
-  "up_six": ["伊冯"],
+  "pool_name": "河流的女儿",
+  "up_six": ["汤汤"],
   "up_rate": 0.75,
   "prob_6_base": 0.008,
   "prob_5_base": 0.08,
@@ -103,7 +103,7 @@
   "always_5_star": false,
   "big_pity_requires_not_up": true,
   "six_stars": [
-    "洁尔佩塔", "莱万汀", "伊冯", "余烬",
+    "汤汤", "伊冯", "洁尔佩塔", "余烬",
     "黎风", "艾尔黛拉", "别礼", "骏卫"
   ],
   "five_stars": [
@@ -113,8 +113,36 @@
   "four_stars": [
     "卡契尔", "安塔尔", "萤石", "秋栗"
   ],
-  "active_pool": "char_up_20260224",
+  "active_pool": "char_up_20260312",
   "pools": [
+    {
+      "id": "char_up_20260312",
+      "name": "河流的女儿",
+      "pool_type": "character_up",
+      "up_six": ["汤汤"],
+      "up_rate": 0.75,
+      "prob_6_base": 0.008,
+      "prob_5_base": 0.08,
+      "prob_4_base": 0.912,
+      "soft_pity_start": 65,
+      "small_pity_guarantee": 80,
+      "big_pity_cumulative": 120,
+      "up_pity_soft": 0,
+      "five_star_pity": 10,
+      "always_5_star": false,
+      "big_pity_requires_not_up": true,
+      "six_stars": [
+        "汤汤", "伊冯", "洁尔佩塔", "余烬",
+        "黎风", "艾尔黛拉", "别礼", "骏卫"
+      ],
+      "five_stars": [
+        "昼雪", "赛希", "狼卫", "佩丽卡",
+        "弧光", "阿列什", "艾维文娜", "大潘", "埃特拉"
+      ],
+      "four_stars": [
+        "卡契尔", "安塔尔", "萤石", "秋栗"
+      ]
+    },
     {
       "id": "char_up_20260207",
       "name": "轻飘飘的信使",
@@ -147,6 +175,7 @@
     {
       "id": "char_up_20260224",
       "name": "热烈色彩",
+      "is_archived": true,
       "pool_type": "character_up",
       "up_six": ["伊冯"],
       "up_rate": 0.75,
@@ -175,6 +204,7 @@
     {
       "id": "weapon_up_20260224",
       "name": "绘涂申领",
+      "is_archived": true,
       "pool_type": "weapon_up",
       "up_six": ["艺术暴君（手铳）"],
       "up_rate": 0.5,
@@ -191,6 +221,52 @@
       "six_stars": [
         "艺术暴君（手铳）", "骑士精神", "遗忘", "楔子",
         "热熔切割器", "白夜新星", "典范"
+      ],
+      "five_stars": [],
+      "four_stars": []
+    },
+    {
+      "id": "weapon_up_20260312",
+      "name": "新芽申领",
+      "pool_type": "weapon_up",
+      "up_six": ["落草（手铳）"],
+      "up_rate": 0.5,
+      "prob_6_base": 0.04,
+      "prob_5_base": 0.96,
+      "prob_4_base": 0.0,
+      "soft_pity_start": 40,
+      "small_pity_guarantee": 40,
+      "big_pity_cumulative": 180,
+      "up_pity_soft": 80,
+      "five_star_pity": 1,
+      "always_5_star": true,
+      "big_pity_requires_not_up": true,
+      "six_stars": [
+        "落草（手铳）", "同类相食（手铳）", "楔子（手铳）", "骑士精神（施术单元）",
+        "热熔切割器（单手剑）", "破碎君王（双手剑）", "J.E.T.（长柄武器）"
+      ],
+      "five_stars": [],
+      "four_stars": []
+    },
+    {
+      "id": "weapon_up_20260329",
+      "name": "绯珀申领",
+      "pool_type": "weapon_up",
+      "up_six": ["狼之绯（单手剑）"],
+      "up_rate": 0.5,
+      "prob_6_base": 0.04,
+      "prob_5_base": 0.96,
+      "prob_4_base": 0.0,
+      "soft_pity_start": 40,
+      "small_pity_guarantee": 40,
+      "big_pity_cumulative": 180,
+      "up_pity_soft": 80,
+      "five_star_pity": 1,
+      "always_5_star": true,
+      "big_pity_requires_not_up": true,
+      "six_stars": [
+        "狼之绯（单手剑）", "扶摇（单手剑）", "显赫声名（单手剑）", "楔子（手铳）",
+        "昔日精品（双手剑）", "爆破单元（施术单元）", "骁勇（长柄武器）"
       ],
       "five_stars": [],
       "four_stars": []

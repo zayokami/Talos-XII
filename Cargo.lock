@@ -537,7 +537,7 @@ dependencies = [
 
 [[package]]
 name = "talos_xii"
-version = "0.5.0"
+version = "0.5.5"
 dependencies = [
  "bytemuck",
  "clap",

@@ -1,249 +1,217 @@
 # Talos-XII（终末地抽卡模拟工具）
 
-**项目开发者**：zayoka
+**项目开发者**：zayoka · **开源协议**：MIT license
 
-**开源协议**：MIT license
+Talos-XII 是《明日方舟：终末地》的抽卡模拟与 F2P 资源规划工具，支持批量模拟、概率分析、数据采集与模型校准，帮助玩家规划嵌晶玉与寻访凭证的使用。
 
+---
 
+## 快速开始
 
-## 简介
-Talos-XII是一款《明日方舟：终末地》抽卡模拟工具。用户可自定义抽数和选择是否使用福利资源，模拟在不同策略下的资源消耗与获取情况。
+```bash
+git clone https://github.com/zayokami/Talos-XII.git
+cd Talos-XII
+cargo build --release
+./target/release/talos_xii
+```
 
-本工具旨在通过深度学习算法（如 PPO 强化学习与 DBN 深度信念网络）寻找最优抽卡策略，帮助玩家规划“嵌晶玉”与“寻访凭证”的使用。本项目采用了Rust + PPO、DQN 等强化学习和神经网络策略，结合了高效的并行计算和内存管理，确保了在大规模模拟下的快速响应和低内存占用。
+或直接运行 F2P 分析：`cargo run --release f2p`
 
+> 首次启动需加载/训练神经网络，约 30～45 秒，后续从缓存加载通常 &lt; 1 秒。
 
-
-> **注意**：由于需要加载神经网络模型并进行环境初始化，软件启动的时候需要一点时间，请耐心等待。
-
-
+---
 
 ## 功能特性
-*   **深度学习模拟**：内置 Neural Luck Optimizer，基于历史数据预测并调整模拟概率。
-*   **策略优化**：支持 PPO（近端策略优化）与 DQN（深度 Q 网络）算法，探索最优抽卡决策。
-*   **高性能计算**：底层核心使用 Rust 编写，支持 SIMD（AVX2/NEON）指令集加速，多线程并行模拟百万级局数。
-*   **F2P 友好分析**：专门针对“零氪/月卡”玩家的福利资源（如签到、活动赠送）进行模拟，计算仅靠免费资源获取 UP 角色的概率。
-*   **高度可配置**：支持自定义卡池信息（UP 干员、概率）、福利策略、硬件加速参数等。
 
+* **抽卡模拟**：交互式单抽、批量模拟，可切换卡池、福利开关与 PPO 策略。
+* **F2P 福利分析**：针对零氪/月卡玩家，计算仅靠免费资源获取 UP 角色的概率与额外成本。
+* **数据采集与校准**：支持录入玩家实战抽卡记录，基于真实数据校准模型参数。
+* **策略优化**：内置 PPO、DQN、Neural Luck Optimizer，探索最优抽卡决策。
+* **高性能计算**：Rust + SIMD（AVX2/NEON）+ 多线程，百万级模拟秒级完成。
+* **高度可配置**：卡池、概率、保底、线程数等均可在 [data/config.json](data/config.json) 中调整。
 
+---
 
 ## 使用方法
-1.  确保 `data` 目录下存在配置文件 `config.json`（程序会自动加载，若无则使用默认配置）。
-2.  运行可执行文件 `talos_xii`（Windows 下为 `talos_xii.exe`）。
-3.  等待控制台输出 "Neural Core: Online" 及系统初始化完成。
-4.  根据提示输入想要模拟的抽卡次数，或查看自动生成的 F2P 概率分析报告。
-5.  程序将输出模拟结果，包括六星获得数、UP 歪率、平均消耗资源等统计信息。
 
+### 命令行速查
 
+| 子命令 | 说明 | 示例 |
+|--------|------|------|
+| `interactive` | 交互式模拟器（默认） | `cargo run --` 或 `cargo run -- interactive` |
+| `simulate` | 批量模拟 | `cargo run -- simulate -n 1000 -p 100` |
+| `f2p` | F2P 福利分析 | `cargo run -- f2p` |
+| `benchmark` | 性能基准测试 | `cargo run -- benchmark` |
+| `collect add` | 交互式录入玩家抽卡数据 | `cargo run -- collect add` |
+| `collect import <file>` | 从 JSON 导入玩家数据 | `cargo run -- collect import data.json` |
+| `collect stats` | 查看已采集数据统计 | `cargo run -- collect stats` |
+| `train` | 基于采集数据校准/训练模型 | `cargo run -- train` |
+
+| 全局选项 | 说明 |
+|----------|------|
+| `-c, --config <path>` | 配置文件路径（默认 `data/config.json`） |
+| `-s, --seed <seed>` | 随机种子（可选） |
+| `-f, --force` | 强制重新训练模型（忽略缓存） |
+
+### 运行流程
+
+1. 确保 `data/config.json` 存在（程序会自动加载）。
+2. 运行可执行文件，等待输出 "Neural Core: Online" 及初始化完成。
+3. 按提示输入抽数，或使用 `f2p` 等子命令获取分析报告。
+
+### 交互模式指令
+
+| 指令 | 说明 |
+|------|------|
+| `<数字>` | 本次抽数 |
+| `p <n>` | 设置默认抽数 |
+| `s <n>` | 设置默认模拟次数 |
+| `w` | 切换福利开关 |
+| `ppo` | 切换 PPO 策略 |
+| `pool list` | 查看卡池列表 |
+| `pool <id>` | 切换卡池 |
+| `pool all` | 全部卡池并行 |
+| `status` | 查看当前状态 |
+| `info` | 查看卡池详情 |
+| `history` | 查看模拟历史 |
+| `h` / `help` | 显示帮助 |
+| `q` | 退出 |
+
+### 配置要点
+
+配置位于 [data/config.json](data/config.json)，`_comment` 字段中有详细说明。常用参数：
+
+| 参数 | 说明 |
+|------|------|
+| `pool_name` | 当前卡池名称 |
+| `up_six` | 当期 UP 六星列表 |
+| `active_pool` | 当前激活的池 ID（对应 `pools` 中的 `id`） |
+| `pools` | 卡池列表，含角色 UP、武器 UP、常驻池等 |
+| `six_stars` / `five_stars` / `four_stars` | 各星级可出干员列表 |
+| `prob_6_base` | 六星基础概率（默认 0.008） |
+| `soft_pity_start` / `small_pity_guarantee` / `big_pity_cumulative` | 软/小/大保底抽数 |
+| `fast_init` | 快速初始化（开发调试用） |
+| `f2p_sim_count` | F2P 分析模拟次数（0 为自动） |
+| `worker_max_threads` / `worker_reserve_cores` | 线程池与预留核心数 |
+
+---
 
 ## 开发与部署
 
 ### 环境要求
-*   **操作系统**：Windows 10/11 (x86_64) 或 Linux (x86_64/aarch64)
-*   **编译器**：Rust 1.75.0 或更高版本 (支持 `portable_simd` 特性)
-*   **内存**：建议 16GB RAM 或以上 (大规模模拟需要较大内存)
-*   **处理器**：支持 AVX2 (Intel/AMD) 或 NEON (ARM) 指令集的 CPU 推荐
 
-### 构建指南
-1.  **克隆仓库**
-    ```bash
-    git clone https://github.com/zayokami/Talos-XII.git
-    cd Talos-XII
-    ```
+* **操作系统**：Windows 10/11 (x86_64) 或 Linux (x86_64/aarch64)
+* **编译器**：Rust 1.89.0 或更高版本
+* **内存**：建议 16GB RAM 或以上（大规模模拟需较大内存）
+* **处理器**：支持 AVX2 (Intel/AMD) 或 NEON (ARM) 的 CPU 推荐
 
-2.  **编译项目**
-    *   **开发模式** (调试构建，速度较慢，含调试符号):
-        ```bash
-        cargo build
-        ```
-    *   **生产模式** (高性能优化，推荐):
-        ```bash
-        cargo build --release
-        ```
-    *   *注：构建脚本会自动检测 CPU 架构并启用相应的 SIMD 优化 (AVX2/NEON)。*
+### 构建与运行
 
-3.  **运行程序**
-    ```bash
-    cargo run --release
-    ```
-    或直接运行生成的可执行文件：
-    ```bash
-    ./target/release/talos_xii
-    ```
+```bash
+cargo build --release
+./target/release/talos_xii --help
+```
 
-### 部署配置
-项目包含一个默认配置文件 `data/config.json`，您可以根据需求修改以下参数：
-
-*   `pool_name`: 卡池名称
-*   `up_six`: 当期 UP 六星干员列表
-*   `prob_6_base`: 六星基础概率 (默认 0.008)
-*   `fast_init`: 是否启用快速初始化模式 (true/false) - 设为 `true` 可显著加快启动速度，适合开发调试
-*   `ppo_mode`: PPO 训练模式 ("auto" / "fast" / "balanced")
-*   `f2p_sim_count`: F2P 福利分析的模拟次数 (默认 0 为自动，建议设为 10000+ 以获得稳定结果)
-*   `worker_max_threads`: 线程池最大线程数 (0 为自动)
-*   `worker_reserve_cores`: 保留 CPU 核心数 (默认 1，设为 0 可最大化性能)
-
-## 性能优化
-本项目针对大规模模拟进行了深度优化，在主流硬件上可实现数百万次/秒的模拟吞吐量：
-1.  **并行计算**：基于 Rayon 实现动态任务分块，根据 CPU 核心数自动调整负载均衡。
-2.  **零拷贝优化**：热路径完全移除字符串分配，采用索引映射与位集操作，大幅降低内存带宽压力。
-3.  **内存管理**：PPO 训练与推理过程使用复用缓冲区，避免频繁堆分配带来的 GC 开销。
-4.  **SIMD 加速**：核心矩阵运算与向量操作支持 AVX2/NEON 指令集。
-
-## ACHF（Adaptive Cache-aware Hyper-Connections）
-ACHF 是本项目用于训练与推理加速的一套“自适应稀疏低秩连接”机制。它不是单一算法，而是一组可组合的策略：通过低秩投影减少算子规模，通过门控稀疏化减少无效通道，再结合缓存与延迟统计做动态调参，最终在“速度、稳定性、精度”之间找到平衡点。
-
-**它解决的问题**
-1.  **算子太重**：大型矩阵乘法在 CPU 上容易成为瓶颈。
-2.  **访存太慢**：权重访问的缓存未命中会拖慢整体吞吐。
-3.  **固定超参不鲁棒**：不同机器与负载下，最佳稀疏度/投影频率不同。
-
-**核心机制**
-1.  **低秩投影（Low-rank Projection）**：在权重矩阵上做行/列或行列联合投影（`proj_mode`），用低秩结构近似原矩阵，减少计算量与缓存压力。
-2.  **门控稀疏（Gating Sparsity）**：通过门控值控制通道是否参与计算，`g_min` 作为下限，避免过度稀疏导致不稳定。
-3.  **自适应调参（Adaptive Control）**：使用延迟 EMA 与稀疏采样统计（`cache_latency_*` / `cache_*`）调整门控与缓存策略，避免性能抖动。
-4.  **路径级开关（Path-level Toggle）**：可分别对 Attention、FFN、DQN 路径启用，避免影响对精度敏感的链路。
-
-**运行流程（简化版）**
-1.  根据 `proj_freq` 定期触发投影，建立低秩近似。
-2.  在前向计算中应用门控，过滤贡献小的通道。
-3.  采样运行时延迟，更新 EMA 统计并动态调整门控/投影策略。
-4.  将更新后的策略用于后续训练或推理阶段。
-
-**关键参数说明（常用）**
-*   `enabled`: 是否启用 ACHF。
-*   `mode`: `lite`（保守、低开销）或 `full`（激进、潜在更高收益）。
-*   `proj_mode`: `rowcol` / `row` / `col`，控制投影维度。
-*   `proj_freq`: 投影频率，数值越小投影越频繁。
-*   `g_min`: 门控下限，过低可能引入不稳定。
-*   `gate_mode`: 门控更新策略，如 `grad_ema`。
-*   `cache_latency_ema` / `cache_latency_long_ema`: 短期/长期延迟 EMA。
-*   `apply_attn` / `apply_ffn` / `apply_dqn`: 按路径启用。
-*   `infer_gate`: 推理阶段门控策略。
-
-**启用建议**
-*   训练阶段可先用 `mode=lite` 与 `apply_ffn=true`，观察吞吐提升与稳定性。
-*   如果模型震荡或收敛变慢，提高 `g_min` 或降低 `proj_freq`。
-*   对精度敏感的场景可仅开启 `apply_ffn`，保留 Attention 的完整计算。
-
-## 技术栈
-*   **编程语言**：Rust
-*   **并行计算**：Rayon (线程池与任务调度)
-*   **硬件加速**：Portable SIMD (AVX2 / NEON)
-*   **神经网络**：
-    *   Deep Belief Network (DBN) - 环境噪声模拟
-    *   Proximal Policy Optimization (PPO) - 抽卡策略代理
-    *   Transformer / Linear Layers - 特征提取与决策
-    
-    
-
-## 贡献与分支管理指南
-
-欢迎参与 Talos-XII 的开发！为确保项目质量与协作效率，请遵循以下规范。
-
-### 🤝 贡献准则 (Contributing Guidelines)
-
-#### 1. 代码提交规范
-*   **Commit Message**: 采用 [Conventional Commits](https://www.conventionalcommits.org/) 格式。
-    *   `feat: 新增功能描述` (新特性)
-    *   `fix: 修复问题描述` (Bug 修复)
-    *   `docs: 文档更新` (文档变更)
-    *   `perf: 性能优化` (代码性能改进)
-    *   `refactor: 代码重构` (不改变逻辑的重构)
-    *   `test: 测试相关` (增加或修改测试)
-    *   *示例*: `feat(ppo): implement history buffer ring queue`
-*   **代码风格**: 
-    *   Rust 代码必须通过 `cargo fmt` 格式化。
-    *   提交前请运行 `cargo clippy` 确保无严重警告。
-
-#### 2. 开发流程
-1.  **Fork 仓库**并克隆到本地。
-2.  **创建功能分支**: `git checkout -b feature/your-feature-name`。
-3.  **开发与测试**:
-    *   编写代码并添加对应的单元测试。
-    *   确保 `cargo test` 全部通过。
-    *   对于核心算法变更，需验证数值一致性。
-4.  **提交代码**: 遵循上述 Commit 规范。
-5.  **Pull Request (PR)**:
-    *   将代码推送到你的 Fork 仓库。
-    *   向本仓库的 `dev` 分支发起 PR。
-    *   PR 描述中请关联 Issue (如 `Closes #123`)。
-
-#### 3. 审查与合并
-*   所有 PR 需经过至少一次 Code Review。
-*   CI (GitHub Actions) 必须全部通过。
-*   合并策略通常采用 `Squash and Merge` 以保持主分支历史整洁。
+开发模式使用 `cargo build`，会启用 opt-level 3 以保证神经网络性能。构建时会根据 CPU 架构启用 SIMD 优化。
 
 ---
 
-### 🌿 分支使用规范 (Branch Usage Guidelines)
+## 技术栈
 
-#### 核心分支
-*   **`main` (保护分支)**: 
-    *   生产环境分支，时刻保持可发布状态。
-    *   仅允许从 `release` 或 `hotfix` 分支合并，**禁止直接 Push**。
-*   **`dev` (保护分支)**:
-    *   主要开发分支，包含最新特性。
-    *   所有 `feature` 分支开发完成后合并至此。
+* **编程语言**：Rust
+* **并行计算**：Rayon
+* **硬件加速**：Portable SIMD (AVX2 / NEON)
+* **神经网络**：DBN（环境噪声）、PPO（抽卡策略）、DQN、Transformer / Linear（特征与决策）
 
-#### 辅助分支
-*   **功能分支 (`feature/*`)**:
-    *   命名规范: `feature/<issue-id>-<brief-desc>` (例: `feature/42-add-simd-support`)
-    *   从 `dev` 检出，完成后合并回 `dev`。
-    *   合并后删除。
-*   **发布分支 (`release/*`)**:
-    *   命名规范: `release/v<version>` (例: `release/v1.0.0`)
-    *   从 `dev` 检出，进行发布前的测试与文档准备。
-    *   完成后分别合并至 `main` (打 Tag) 和 `dev`。
-*   **热修复分支 (`hotfix/*`)**:
-    *   命名规范: `hotfix/<issue-id>-<brief-desc>` (例: `hotfix/55-fix-crash-on-startup`)
-    *   从 `main` 检出，用于修复生产环境严重 Bug。
-    *   完成后分别合并至 `main` 和 `dev`。
+---
 
-### 🛠️ 常用命令示例
+## 性能与 ACHF
 
-```bash
-# 开始新功能开发
-git checkout dev
-git pull origin dev
-git checkout -b feature/new-algorithm
+本项目针对大规模模拟做了优化：Rayon 并行、零拷贝热路径、SIMD 矩阵运算，主流硬件可达百万级模拟/秒。
 
-# 提交更改
-git add .
-git commit -m "feat: implement new algorithm"
+### ACHF（Adaptive Cache-aware Hyper-Connections）是什么？
 
-# 同步上游变更 (Rebase)
-git fetch origin
-git rebase origin/dev
+ACHF 是本项目用于训练与推理加速的一套「自适应稀疏低秩连接」机制。它不是单一算法，而是一组可组合的策略：通过低秩投影减少算子规模，通过门控稀疏化减少无效通道，再结合缓存与延迟统计做动态调参，最终在速度、稳定性、精度之间取得平衡。
 
-# 推送分支
-git push -u origin feature/new-algorithm
-```
+**它解决的问题**
+
+1. **算子太重**：大型矩阵乘法在 CPU 上容易成为瓶颈。
+2. **访存太慢**：权重访问的缓存未命中会拖慢整体吞吐。
+3. **固定超参不鲁棒**：不同机器与负载下，最佳稀疏度/投影频率不同。
+
+**核心机制**
+
+1. **低秩投影（Low-rank Projection）**：在权重矩阵上做行/列或行列联合投影（`proj_mode`），用低秩结构近似原矩阵，减少计算量与缓存压力。
+2. **门控稀疏（Gating Sparsity）**：通过门控值控制通道是否参与计算，`g_min` 作为下限，避免过度稀疏导致不稳定。
+3. **自适应调参（Adaptive Control）**：使用延迟 EMA 与稀疏采样统计（`cache_latency_*` / `cache_*`）调整门控与缓存策略，避免性能抖动。
+4. **路径级开关（Path-level Toggle）**：可分别对 Attention、FFN、DQN 路径启用，避免影响对精度敏感的链路。
+
+**运行流程**：根据 `proj_freq` 定期触发投影建立低秩近似 → 在前向计算中应用门控过滤贡献小的通道 → 采样运行时延迟并更新 EMA 统计 → 将更新后的策略用于后续训练或推理。
+
+**配置**：位于 [data/config.json](data/config.json) 的 `achf` 字段。常用参数：
+
+| 参数 | 说明 |
+|------|------|
+| `enabled` | 是否启用 ACHF |
+| `mode` | `lite`（保守、低开销）或 `full`（激进、潜在更高收益） |
+| `proj_mode` | `rowcol` / `row` / `col`，投影维度 |
+| `proj_freq` | 投影频率，数值越小投影越频繁 |
+| `g_min` | 门控下限，过低可能引入不稳定 |
+| `gate_mode` | 门控更新策略，如 `grad_ema` |
+| `apply_attn` / `apply_ffn` / `apply_dqn` | 按路径启用 |
+| `infer_gate` | 推理阶段门控策略 |
+
+**启用建议**：训练阶段可先用 `mode=lite` 与 `apply_ffn=true` 观察吞吐提升与稳定性。若模型震荡或收敛变慢，提高 `g_min` 或降低 `proj_freq`。对精度敏感的场景可仅开启 `apply_ffn`，保留 Attention 的完整计算。
+
+---
+
+## 常见问题
+
+**Q：首次启动为什么较慢？**  
+A：需要训练 DBN、DQN（50k 步）、PPO（200k 步）等模型。完成后会写入 `neural.cache`、`dqn.cache.bin`、`ppo.cache.bin`，后续启动从缓存加载，通常 &lt; 1 秒。
+
+**Q：F2P 分析中 "Avg Extra Jade Cost: N/A" 是什么意思？**  
+A：表示所有模拟均在免费抽内出 UP，没有产生额外氪金样本，因此无法计算平均值。说明免费资源足够，无需额外投入。
+
+**Q：缓存文件可以删除吗？**  
+A：可以。删除 `neural.cache`、`dqn.cache.bin`、`ppo.cache.bin` 后，下次运行会重新训练。仅当保底/概率机制发生变动时建议清缓存重训。
+
+---
+
+## 贡献与分支管理
+
+欢迎参与开发，请遵循以下规范。
+
+**代码提交**：采用 [Conventional Commits](https://www.conventionalcommits.org/) 格式（`feat:`、`fix:`、`docs:` 等）。提交前运行 `cargo fmt` 与 `cargo clippy -- -D warnings`。
+
+**开发流程**：Fork → 创建 `feature/*` 分支 → 开发与测试（`cargo test`）→ 向 `dev` 发起 PR，描述中关联 Issue。PR 需通过 Code Review 与 CI。
+
+**分支规范**：
+* `main`：生产分支，仅从 `release`/`hotfix` 合并。
+* `dev`：开发分支，`feature/*` 合并目标。
+* `feature/*`：功能分支，从 `dev` 检出。
+* `release/v*`：发布分支，从 `dev` 检出，合并回 `main` 与 `dev`。
+* `hotfix/*`：热修复，从 `main` 检出，合并回 `main` 与 `dev`。
+
+---
 
 ## 引用论文
-*   *DeepSeek mHC: Manifold-Constrained Hyper-Connections* (参考了其中的流形约束超连接思想用于优化器设计)
-*   *Proximal Policy Optimization Algorithms* (OpenAI)
 
+* *DeepSeek mHC: Manifold-Constrained Hyper-Connections*（流形约束超连接，用于优化器设计）
+* *Proximal Policy Optimization Algorithms* (OpenAI)
 
+---
 
 ## 免责声明
-本项目与《明日方舟：终末地》官方和上海鹰角网络科技有限公司无任何关联。本软件仅用于模拟与学习交流，模拟结果仅供参考，不代表游戏内实际概率。
 
-本项目严禁用于宗教迷信或任何违反相关法律的行为。用户需自行承担风险。
+本项目与《明日方舟：终末地》官方及上海鹰角网络科技有限公司无任何关联。本软件仅用于模拟与学习交流，模拟结果仅供参考，不代表游戏内实际概率。严禁用于宗教迷信或任何违法用途，用户需自行承担风险。
 
-
-
+---
 
 ## 致谢
-感谢上海鹰角网络科技有限公司带来的游戏《明日方舟：终末地》。
 
-感谢开源社区提供的 Rust 生态支持。
+感谢上海鹰角网络科技有限公司带来的《明日方舟：终末地》，感谢开源社区提供的 Rust 生态支持，感谢杭州深度求索人工智能基础技术研究有限公司撰写的 *DeepSeek mHC* 论文。
 
-感谢杭州深度求索人工智能基础技术研究有限公司撰写的论文 *DeepSeek mHC: Manifold-Constrained Hyper-Connections*，为本项目的优化器设计提供了重要参考。
+**Copyright 2026 zayoka. 本项目基于 MIT 协议开源。**
 
-
-
-**Copyright 2026 zayoka. All rights reserved.**
-
-**本项目基于 MIT 协议开源，您可以在遵守协议的前提下自由使用、修改和分发本项目的代码。**
-
-如有问题请联系我：yuokai1@163.com
+如有问题请联系：yuokai1@163.com
