@@ -560,14 +560,7 @@ fn main() {
                         if let Some(session) = add_session_interactive(&config, lang) {
                             db.add_session(session);
                             if db.save(&config.player_data_path) {
-                                println!(
-                                    "{}",
-                                    if lang == Language::Cn {
-                                        "✓ 数据已保存。"
-                                    } else {
-                                        "✓ Data saved."
-                                    }
-                                );
+                                println!("{}", I18n::get(lang, "data_saved"));
                             }
                         }
                     }
@@ -580,17 +573,9 @@ fn main() {
                             if db.save(&config.player_data_path) {
                                 println!(
                                     "{} {} {}",
-                                    if lang == Language::Cn {
-                                        "✓ 已导入"
-                                    } else {
-                                        "✓ Imported"
-                                    },
+                                    I18n::get(lang, "imported"),
                                     count,
-                                    if lang == Language::Cn {
-                                        "个会话。"
-                                    } else {
-                                        "sessions."
-                                    },
+                                    I18n::get(lang, "unit_sessions")
                                 );
                             }
                         }
@@ -606,25 +591,11 @@ fn main() {
             Commands::Train => {
                 let db = PlayerDatabase::load(&config.player_data_path);
                 if db.sessions.is_empty() {
-                    println!(
-                        "{}",
-                        if lang == Language::Cn {
-                            "[校准] 没有玩家数据。请先使用 collect add 录入数据。"
-                        } else {
-                            "[Calibrate] No player data. Use 'collect add' to record data first."
-                        }
-                    );
+                    println!("{}", I18n::get(lang, "cal_no_player_data"));
                 } else {
                     let cal = run_calibration(&db, &config, lang);
                     if cal.save(&config.calibrated_path) {
-                        println!(
-                            "{}",
-                            if lang == Language::Cn {
-                                "✓ 校准参数已保存。下次模拟将自动加载。"
-                            } else {
-                                "✓ Calibrated parameters saved. Next simulation will auto-load."
-                            }
-                        );
+                        println!("{}", I18n::get(lang, "cal_params_saved"));
                     }
                 }
             }
@@ -920,27 +891,18 @@ fn run_interactive(args: RunInteractiveArgs) {
     print_explainability_report(&trained_neural_opt, lang);
 
     let pool_type_label = |pool_type: &str, lang: Language| -> String {
-        match (pool_type, lang) {
-            ("character_up", Language::Cn) => "角色 UP".to_string(),
-            ("character_up", _) => "Character UP".to_string(),
-            ("weapon_up", Language::Cn) => "武器 UP".to_string(),
-            ("weapon_up", _) => "Weapon UP".to_string(),
-            ("standard", Language::Cn) => "基础寻访".to_string(),
-            ("standard", _) => "Standard".to_string(),
-            ("beginner", Language::Cn) => "启程寻访".to_string(),
-            ("beginner", _) => "Beginner".to_string(),
-            ("permanent", Language::Cn) => "常驻".to_string(),
-            ("permanent", _) => "Permanent".to_string(),
-            (_, Language::Cn) => "未知".to_string(),
-            _ => "Unknown".to_string(),
+        match pool_type {
+            "character_up" => I18n::get(lang, "pool_type_character_up"),
+            "weapon_up" => I18n::get(lang, "pool_type_weapon_up"),
+            "standard" => I18n::get(lang, "pool_type_standard"),
+            "beginner" => I18n::get(lang, "pool_type_beginner"),
+            "permanent" => I18n::get(lang, "pool_type_permanent"),
+            _ => I18n::get(lang, "pool_type_unknown"),
         }
     };
     let print_pool_header = |config: &Config, lang: Language| {
         let up_label = if config.up_six.is_empty() {
-            match lang {
-                Language::Cn => "无".to_string(),
-                _ => "None".to_string(),
-            }
+            I18n::get(lang, "label_none")
         } else {
             config.up_six.join(", ")
         };
@@ -1250,11 +1212,7 @@ fn run_interactive(args: RunInteractiveArgs) {
             let sub = parts.next().unwrap_or("list");
             if sub.eq_ignore_ascii_case("list") {
                 let list_label = if config.pools.is_empty() {
-                    if lang == Language::Cn {
-                        "无".to_string()
-                    } else {
-                        "None".to_string()
-                    }
+                    I18n::get(lang, "label_none")
                 } else {
                     config
                         .pools
