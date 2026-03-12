@@ -38,22 +38,35 @@ pub struct CalibrationData {
 }
 
 impl CalibrationData {
+    fn resolve_path(path: &str) -> String {
+        if std::path::Path::new(path).exists() {
+            return path.to_string();
+        }
+        let alt = format!("../../{}", path);
+        if std::path::Path::new(&alt).exists() {
+            return alt;
+        }
+        path.to_string()
+    }
+
     pub fn load(path: &str) -> Self {
-        if let Ok(data) = std::fs::read_to_string(path) {
+        let resolved = Self::resolve_path(path);
+        if let Ok(data) = std::fs::read_to_string(&resolved) {
             match serde_json::from_str(&data) {
                 Ok(cal) => return cal,
-                Err(e) => log::warn!("[Calibrate] Failed to parse {}: {}", path, e),
+                Err(e) => log::warn!("[Calibrate] Failed to parse {}: {}", resolved, e),
             }
         }
         CalibrationData::default()
     }
 
     pub fn save(&self, path: &str) -> bool {
-        if let Some(parent) = std::path::Path::new(path).parent() {
+        let resolved = Self::resolve_path(path);
+        if let Some(parent) = std::path::Path::new(&resolved).parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         match serde_json::to_string_pretty(self) {
-            Ok(json) => std::fs::write(path, json).is_ok(),
+            Ok(json) => std::fs::write(&resolved, json).is_ok(),
             Err(_) => false,
         }
     }

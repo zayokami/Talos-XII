@@ -49,29 +49,36 @@ pub struct PoolEmpiricalStats {
 }
 
 impl PlayerDatabase {
-    pub fn load(path: &str) -> Self {
-        if let Ok(data) = std::fs::read_to_string(path) {
-            match serde_json::from_str(&data) {
-                Ok(db) => return db,
-                Err(e) => log::warn!("[Collect] Failed to parse {}: {}", path, e),
-            }
+    /// Resolve the actual file path, trying the given path first then a `../../` fallback.
+    fn resolve_path(path: &str) -> String {
+        if std::path::Path::new(path).exists() {
+            return path.to_string();
         }
         let alt = format!("../../{}", path);
-        if let Ok(data) = std::fs::read_to_string(&alt) {
+        if std::path::Path::new(&alt).exists() {
+            return alt;
+        }
+        path.to_string()
+    }
+
+    pub fn load(path: &str) -> Self {
+        let resolved = Self::resolve_path(path);
+        if let Ok(data) = std::fs::read_to_string(&resolved) {
             match serde_json::from_str(&data) {
                 Ok(db) => return db,
-                Err(e) => log::warn!("[Collect] Failed to parse {}: {}", alt, e),
+                Err(e) => log::warn!("[Collect] Failed to parse {}: {}", resolved, e),
             }
         }
         PlayerDatabase::default()
     }
 
     pub fn save(&self, path: &str) -> bool {
-        if let Some(parent) = std::path::Path::new(path).parent() {
+        let resolved = Self::resolve_path(path);
+        if let Some(parent) = std::path::Path::new(&resolved).parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         match serde_json::to_string_pretty(self) {
-            Ok(json) => std::fs::write(path, json).is_ok(),
+            Ok(json) => std::fs::write(&resolved, json).is_ok(),
             Err(_) => false,
         }
     }
@@ -188,17 +195,31 @@ pub fn reconstruct_from_six_star_positions(
         .filter_map(|s| s.trim().parse::<usize>().ok())
         .collect();
 
-    let raw_up_flags: Vec<bool> = up_flags_str
-        .split(',')
-        .map(|s| {
-            let t = s.trim().to_lowercase();
-            t == "y" || t == "yes" || t == "1" || t == "true"
-        })
-        .collect();
+    let raw_up_flags: Vec<bool> = if up_flags_str.trim().is_empty() {
+        Vec::new()
+    } else {
+        up_flags_str
+            .split(',')
+            .map(|s| {
+                let t = s.trim().to_lowercase();
+                t == "y" || t == "yes" || t == "1" || t == "true"
+            })
+            .collect()
+    };
+
+    if !raw_up_flags.is_empty() && raw_up_flags.len() != raw_positions.len() {
+        log::warn!(
+            "[Collect] UP flags count ({}) does not match 6-star positions count ({}). \
+             Flags will be truncated or padded with 'non-UP'.",
+            raw_up_flags.len(),
+            raw_positions.len()
+        );
+    }
 
     let mut paired: Vec<(usize, bool)> = raw_positions
         .into_iter()
-        .zip(raw_up_flags.into_iter().chain(std::iter::repeat(false)))
+        .enumerate()
+        .map(|(i, pos)| (pos, raw_up_flags.get(i).copied().unwrap_or(false)))
         .collect();
     paired.sort_unstable_by_key(|&(pos, _)| pos);
 
