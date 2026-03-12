@@ -615,6 +615,32 @@ impl I18n {
             (Language::En, "stats_hard_pity") => "(hard pity)".to_string(),
             (Language::Cn, "stats_hard_pity") => "次 (硬保底)".to_string(),
 
+            // === Main CLI ===
+            (Language::En, "data_saved") => "✓ Data saved.".to_string(),
+            (Language::Cn, "data_saved") => "✓ 数据已保存。".to_string(),
+            (Language::En, "imported") => "✓ Imported".to_string(),
+            (Language::Cn, "imported") => "✓ 已导入".to_string(),
+            (Language::En, "unit_sessions") => "sessions.".to_string(),
+            (Language::Cn, "unit_sessions") => "个会话。".to_string(),
+            (Language::En, "cal_no_player_data") => "[Calibrate] No player data. Use 'collect add' to record data first.".to_string(),
+            (Language::Cn, "cal_no_player_data") => "[校准] 没有玩家数据。请先使用 collect add 录入数据。".to_string(),
+            (Language::En, "cal_params_saved") => "✓ Calibrated parameters saved. Next simulation will auto-load.".to_string(),
+            (Language::Cn, "cal_params_saved") => "✓ 校准参数已保存。下次模拟将自动加载。".to_string(),
+            (Language::En, "pool_type_character_up") => "Character UP".to_string(),
+            (Language::Cn, "pool_type_character_up") => "角色 UP".to_string(),
+            (Language::En, "pool_type_weapon_up") => "Weapon UP".to_string(),
+            (Language::Cn, "pool_type_weapon_up") => "武器 UP".to_string(),
+            (Language::En, "pool_type_standard") => "Standard".to_string(),
+            (Language::Cn, "pool_type_standard") => "基础寻访".to_string(),
+            (Language::En, "pool_type_beginner") => "Beginner".to_string(),
+            (Language::Cn, "pool_type_beginner") => "启程寻访".to_string(),
+            (Language::En, "pool_type_permanent") => "Permanent".to_string(),
+            (Language::Cn, "pool_type_permanent") => "常驻".to_string(),
+            (Language::En, "pool_type_unknown") => "Unknown".to_string(),
+            (Language::Cn, "pool_type_unknown") => "未知".to_string(),
+            (Language::En, "label_none") => "None".to_string(),
+            (Language::Cn, "label_none") => "无".to_string(),
+
             // Default fallback
             (_, k) => k.to_string(),
         }
