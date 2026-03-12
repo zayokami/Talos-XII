@@ -480,5 +480,5 @@
     "apply_dqn": false,
     "infer_gate": "g_min"
   },
-  "language": "zh"
+  "language": "en"
 }

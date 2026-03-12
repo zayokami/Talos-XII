@@ -620,6 +620,44 @@ impl Config {
             }
         }
 
+        if config.language.as_deref() == Some("en") {
+            if let JsonValue::Object(ref map) = root {
+                if let Some(JsonValue::Array(pools_arr)) = map.get("pools") {
+                    for (i, pool_val) in pools_arr.iter().enumerate() {
+                        if let (JsonValue::Object(ref pm), Some(pool)) =
+                            (pool_val, config.pools.get_mut(i))
+                        {
+                            if let Some(s) = pm.get("name_en").and_then(|v| v.as_str()) {
+                                if !s.is_empty() {
+                                    pool.name = s.to_string();
+                                }
+                            }
+                            let swap = |field: &mut Vec<String>, key: &str| {
+                                if let Some(v) = pm.get(key) {
+                                    let en = json_to_string_vec(v);
+                                    if !en.is_empty() {
+                                        *field = en;
+                                    }
+                                }
+                            };
+                            swap(&mut pool.up_six, "up_six_en");
+                            swap(&mut pool.six_stars, "six_stars_en");
+                            swap(&mut pool.five_stars, "five_stars_en");
+                            swap(&mut pool.four_stars, "four_stars_en");
+                        }
+                    }
+                }
+                if let Some(active) = config.active_pool.clone() {
+                    config.apply_pool(&active);
+                }
+                if let Some(s) = map.get("pool_name_en").and_then(|v| v.as_str()) {
+                    if !s.is_empty() && config.active_pool.is_none() {
+                        config.pool_name = s.to_string();
+                    }
+                }
+            }
+        }
+
         config
     }
 
@@ -796,6 +834,11 @@ fn warn_unknown_fields(map: &serde_json::Map<String, JsonValue>) {
         "use_calibrated",
         "calibrated_path",
         "player_data_path",
+        "pool_name_en",
+        "up_six_en",
+        "six_stars_en",
+        "five_stars_en",
+        "four_stars_en",
     ]
     .into_iter()
     .collect();
