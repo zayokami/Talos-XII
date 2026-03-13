@@ -35,8 +35,7 @@ impl MLAConfig {
 
 // --- LuckTransformer (Transformer Backbone with MLA) ---
 #[derive(Clone, Serialize, Deserialize)]
-pub struct LuckTransformer {
-    pub embed: Linear,
+pub struct TransformerBlock {
     pub norm_1: RMSNorm,
     pub mla_layer: MultiHeadLatentAttention,
     pub achf_attn: Option<AchfLayer>,
@@ -44,6 +43,12 @@ pub struct LuckTransformer {
     pub ffn_1: Linear,
     pub ffn_2: Linear,
     pub achf_ffn: Option<AchfLayer>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct LuckTransformer {
+    pub embed: Linear,
+    pub blocks: Vec<TransformerBlock>,
     pub norm_final: RMSNorm,
     pub out_proj: Linear,
 }
@@ -53,6 +58,7 @@ impl LuckTransformer {
         in_dim: usize,
         hidden_dim: usize,
         _bias: bool,
+        num_layers: usize,
         seed: u64,
         achf: &AchfConfig,
     ) -> Self {
@@ -60,40 +66,48 @@ impl LuckTransformer {
             dim: hidden_dim,
             num_heads: 4,
             q_lora_rank: 0,
-            kv_lora_rank: 32, // Low rank for efficiency
-            qk_rope_dim: 16,
+            kv_lora_rank: 64, // Low rank for efficiency
+            qk_rope_dim: 32,
             v_head_dim: hidden_dim / 4,
             max_seq_len: 256,
         };
 
-        let achf_attn = if achf.enabled && achf.apply_attn {
-            Some(AchfLayer::new(
-                hidden_dim,
-                achf.clone(),
-                seed.wrapping_add(1000),
-            ))
-        } else {
-            None
-        };
-        let achf_ffn = if achf.enabled && achf.apply_ffn {
-            Some(AchfLayer::new(
-                hidden_dim,
-                achf.clone(),
-                seed.wrapping_add(1100),
-            ))
-        } else {
-            None
-        };
+        let num_layers = if num_layers == 0 { 2 } else { num_layers };
+        let mut blocks = Vec::with_capacity(num_layers);
+        for layer_idx in 0..num_layers {
+            let layer_seed = seed.wrapping_add((layer_idx as u64).wrapping_mul(200));
+            let achf_attn = if achf.enabled && achf.apply_attn {
+                Some(AchfLayer::new(
+                    hidden_dim,
+                    achf.clone(),
+                    layer_seed.wrapping_add(1000),
+                ))
+            } else {
+                None
+            };
+            let achf_ffn = if achf.enabled && achf.apply_ffn {
+                Some(AchfLayer::new(
+                    hidden_dim,
+                    achf.clone(),
+                    layer_seed.wrapping_add(1100),
+                ))
+            } else {
+                None
+            };
+            blocks.push(TransformerBlock {
+                norm_1: RMSNorm::new(hidden_dim, 1e-5, layer_seed + 5),
+                mla_layer: MultiHeadLatentAttention::new(mla_config.clone(), layer_seed + 10),
+                achf_attn,
+                norm_2: RMSNorm::new(hidden_dim, 1e-5, layer_seed + 15),
+                ffn_1: Linear::new(hidden_dim, hidden_dim * 2, true, layer_seed + 20),
+                ffn_2: Linear::new(hidden_dim * 2, hidden_dim, true, layer_seed + 30),
+                achf_ffn,
+            });
+        }
 
         Self {
             embed: Linear::new(in_dim, hidden_dim, true, seed),
-            norm_1: RMSNorm::new(hidden_dim, 1e-5, seed + 5),
-            mla_layer: MultiHeadLatentAttention::new(mla_config, seed + 10),
-            achf_attn,
-            norm_2: RMSNorm::new(hidden_dim, 1e-5, seed + 15),
-            ffn_1: Linear::new(hidden_dim, hidden_dim * 2, true, seed + 20),
-            ffn_2: Linear::new(hidden_dim * 2, hidden_dim, true, seed + 30),
-            achf_ffn,
+            blocks,
             norm_final: RMSNorm::new(hidden_dim, 1e-5, seed + 35),
             out_proj: Linear::new(hidden_dim, hidden_dim, true, seed + 40),
         }
@@ -102,29 +116,32 @@ impl LuckTransformer {
     pub fn forward(&self, x: &Tensor, _pity: &[usize]) -> Tensor {
         // x: [Batch, Seq, Dim]
         // Embed
-        let h = self.embed.forward(x);
+        let mut h = self.embed.forward(x);
 
-        // Block 1: MLA (Pre-Norm)
-        let h_norm1 = self.norm_1.forward(&h);
-        let attn_out = self.mla_layer.forward(&h_norm1);
-        let mut h2 = h.clone() + attn_out;
-        if let Some(achf) = &self.achf_attn {
-            let residual = achf.forward_residual(&h);
-            h2 = &h2 + &residual;
-        }
+        for block in &self.blocks {
+            // Block 1: MLA (Pre-Norm)
+            let h_norm1 = block.norm_1.forward(&h);
+            let attn_out = block.mla_layer.forward(&h_norm1);
+            let mut h2 = h.clone() + attn_out;
+            if let Some(achf) = &block.achf_attn {
+                let residual = achf.forward_residual(&h);
+                h2 = &h2 + &residual;
+            }
 
-        // Block 2: FFN (Pre-Norm)
-        let h_norm2 = self.norm_2.forward(&h2);
-        let f1 = self.ffn_1.forward(&h_norm2).relu();
-        let f2 = self.ffn_2.forward(&f1);
-        let mut h3 = h2.clone() + f2;
-        if let Some(achf) = &self.achf_ffn {
-            let residual = achf.forward_residual(&h2);
-            h3 = &h3 + &residual;
+            // Block 2: FFN (Pre-Norm)
+            let h_norm2 = block.norm_2.forward(&h2);
+            let f1 = block.ffn_1.forward(&h_norm2).relu();
+            let f2 = block.ffn_2.forward(&f1);
+            let mut h3 = h2.clone() + f2;
+            if let Some(achf) = &block.achf_ffn {
+                let residual = achf.forward_residual(&h2);
+                h3 = &h3 + &residual;
+            }
+            h = h3;
         }
 
         // Final Norm + Output
-        let h_final = self.norm_final.forward(&h3);
+        let h_final = self.norm_final.forward(&h);
         self.out_proj.forward(&h_final)
     }
 
@@ -148,148 +165,164 @@ impl LuckTransformer {
     }
 
     pub fn update_achf_after_backward(&self) {
-        if let Some(achf) = &self.achf_attn {
-            achf.update_after_backward();
-        }
-        if let Some(achf) = &self.achf_ffn {
-            achf.update_after_backward();
+        for block in &self.blocks {
+            if let Some(achf) = &block.achf_attn {
+                achf.update_after_backward();
+            }
+            if let Some(achf) = &block.achf_ffn {
+                achf.update_after_backward();
+            }
         }
     }
 
     pub fn freeze_achf_for_inference(&self) {
-        if let Some(achf) = &self.achf_attn {
-            achf.freeze_for_inference();
-        }
-        if let Some(achf) = &self.achf_ffn {
-            achf.freeze_for_inference();
+        for block in &self.blocks {
+            if let Some(achf) = &block.achf_attn {
+                achf.freeze_for_inference();
+            }
+            if let Some(achf) = &block.achf_ffn {
+                achf.freeze_for_inference();
+            }
         }
     }
 
     pub fn snapshot_achf(&self) -> Option<crate::achf::AchfStateSnapshot> {
-        self.achf_ffn
-            .as_ref()
-            .map(|achf| achf.snapshot_state())
-            .or_else(|| self.achf_attn.as_ref().map(|achf| achf.snapshot_state()))
+        for block in &self.blocks {
+            if let Some(achf) = &block.achf_ffn {
+                return Some(achf.snapshot_state());
+            }
+            if let Some(achf) = &block.achf_attn {
+                return Some(achf.snapshot_state());
+            }
+        }
+        None
     }
 
     /// Run inference forcing a specific ACHF path (0=Cached, 1=LowRank, 2=Dense).
     pub fn forward_inference_forced_path(&self, x: &[f64], forced_path: u8) -> Vec<f64> {
-        let h = self.embed.forward_inference(x);
-        let h_norm1 = self.norm_1.forward_inference(&h);
-        let attn_out = self.mla_layer.forward_inference(&h_norm1);
-        let mut h2 = vec![0.0; h.len()];
-        for i in 0..h.len() {
-            h2[i] = h[i] + attn_out[i];
-        }
-        if let Some(achf) = &self.achf_attn {
-            let res = achf.forward_inference_forced_path(&h, forced_path);
+        let mut h = self.embed.forward_inference(x);
+        for block in &self.blocks {
+            let h_norm1 = block.norm_1.forward_inference(&h);
+            let attn_out = block.mla_layer.forward_inference(&h_norm1);
+            let mut h2 = vec![0.0; h.len()];
+            for i in 0..h.len() {
+                h2[i] = h[i] + attn_out[i];
+            }
+            if let Some(achf) = &block.achf_attn {
+                let res = achf.forward_inference_forced_path(&h, forced_path);
+                for i in 0..h2.len() {
+                    h2[i] += res[i];
+                }
+            }
+            let h_norm2 = block.norm_2.forward_inference(&h2);
+            let f1 = block.ffn_1.forward_inference(&h_norm2);
+            let mut f1_relu = f1;
+            for v in f1_relu.iter_mut() {
+                if *v < 0.0 {
+                    *v = 0.0;
+                }
+            }
+            let f2 = block.ffn_2.forward_inference(&f1_relu);
+            let mut h3 = vec![0.0; h2.len()];
             for i in 0..h2.len() {
-                h2[i] += res[i];
+                h3[i] = h2[i] + f2[i];
             }
-        }
-        let h_norm2 = self.norm_2.forward_inference(&h2);
-        let f1 = self.ffn_1.forward_inference(&h_norm2);
-        let mut f1_relu = f1;
-        for v in f1_relu.iter_mut() {
-            if *v < 0.0 {
-                *v = 0.0;
+            if let Some(achf) = &block.achf_ffn {
+                let res = achf.forward_inference_forced_path(&h2, forced_path);
+                for i in 0..h3.len() {
+                    h3[i] += res[i];
+                }
             }
+            h = h3;
         }
-        let f2 = self.ffn_2.forward_inference(&f1_relu);
-        let mut h3 = vec![0.0; h2.len()];
-        for i in 0..h2.len() {
-            h3[i] = h2[i] + f2[i];
-        }
-        if let Some(achf) = &self.achf_ffn {
-            let res = achf.forward_inference_forced_path(&h2, forced_path);
-            for i in 0..h3.len() {
-                h3[i] += res[i];
-            }
-        }
-        h3
+        h
     }
 
     pub fn achf_cache_stats_iter(&self) -> impl Iterator<Item = AchfCacheStats> + '_ {
-        let stats = [
-            self.achf_attn.as_ref().map(|achf| achf.cache_stats()),
-            self.achf_ffn.as_ref().map(|achf| achf.cache_stats()),
-        ];
-        stats.into_iter().flatten()
+        self.blocks.iter().flat_map(|block| {
+            [
+                block.achf_attn.as_ref().map(|achf| achf.cache_stats()),
+                block.achf_ffn.as_ref().map(|achf| achf.cache_stats()),
+            ]
+            .into_iter()
+            .flatten()
+        })
     }
 
     pub fn achf_cache_stats_aggregate(&self) -> AchfCacheStats {
-        let stats = [
-            self.achf_attn.as_ref().map(|achf| achf.cache_stats()),
-            self.achf_ffn.as_ref().map(|achf| achf.cache_stats()),
-        ];
-        aggregate_cache_stats_iter(stats.into_iter().flatten())
+        aggregate_cache_stats_iter(self.achf_cache_stats_iter())
     }
 
     pub fn achf_orthogonal_penalty(&self) -> Option<Tensor> {
         let mut reg: Option<Tensor> = None;
-        if let Some(achf) = &self.achf_attn {
-            if let Some(val) = achf.orthogonal_penalty() {
-                reg = Some(match reg {
-                    Some(r) => r + val,
-                    None => val,
-                });
+        for block in &self.blocks {
+            if let Some(achf) = &block.achf_attn {
+                if let Some(val) = achf.orthogonal_penalty() {
+                    reg = Some(match reg {
+                        Some(r) => r + val,
+                        None => val,
+                    });
+                }
             }
-        }
-        if let Some(achf) = &self.achf_ffn {
-            if let Some(val) = achf.orthogonal_penalty() {
-                reg = Some(match reg {
-                    Some(r) => r + val,
-                    None => val,
-                });
+            if let Some(achf) = &block.achf_ffn {
+                if let Some(val) = achf.orthogonal_penalty() {
+                    reg = Some(match reg {
+                        Some(r) => r + val,
+                        None => val,
+                    });
+                }
             }
         }
         reg
     }
 
     pub fn forward_inference(&self, x: &[f64]) -> Vec<f64> {
-        let h = self.embed.forward_inference(x);
+        let mut h = self.embed.forward_inference(x);
 
-        let h_norm1 = self.norm_1.forward_inference(&h);
-        let attn_out = self.mla_layer.forward_inference(&h_norm1);
+        for block in &self.blocks {
+            let h_norm1 = block.norm_1.forward_inference(&h);
+            let attn_out = block.mla_layer.forward_inference(&h_norm1);
 
-        // Residual h + attn_out
-        let mut h2 = vec![0.0; h.len()];
-        for i in 0..h.len() {
-            h2[i] = h[i] + attn_out[i];
-        }
-        if let Some(achf) = &self.achf_attn {
-            let achf_out = achf.forward_inference_residual(&h);
+            // Residual h + attn_out
+            let mut h2 = vec![0.0; h.len()];
+            for i in 0..h.len() {
+                h2[i] = h[i] + attn_out[i];
+            }
+            if let Some(achf) = &block.achf_attn {
+                let achf_out = achf.forward_inference_residual(&h);
+                for i in 0..h2.len() {
+                    h2[i] += achf_out[i];
+                }
+            }
+
+            let h_norm2 = block.norm_2.forward_inference(&h2);
+            let f1 = block.ffn_1.forward_inference(&h_norm2);
+
+            // ReLU
+            let mut f1_relu = f1;
+            for v in f1_relu.iter_mut() {
+                if *v < 0.0 {
+                    *v = 0.0;
+                }
+            }
+
+            let f2 = block.ffn_2.forward_inference(&f1_relu);
+
+            // Residual h2 + f2
+            let mut h3 = vec![0.0; h2.len()];
             for i in 0..h2.len() {
-                h2[i] += achf_out[i];
+                h3[i] = h2[i] + f2[i];
             }
-        }
-
-        let h_norm2 = self.norm_2.forward_inference(&h2);
-        let f1 = self.ffn_1.forward_inference(&h_norm2);
-
-        // ReLU
-        let mut f1_relu = f1;
-        for v in f1_relu.iter_mut() {
-            if *v < 0.0 {
-                *v = 0.0;
+            if let Some(achf) = &block.achf_ffn {
+                let achf_out = achf.forward_inference_residual(&h2);
+                for i in 0..h3.len() {
+                    h3[i] += achf_out[i];
+                }
             }
+            h = h3;
         }
 
-        let f2 = self.ffn_2.forward_inference(&f1_relu);
-
-        // Residual h2 + f2
-        let mut h3 = vec![0.0; h2.len()];
-        for i in 0..h2.len() {
-            h3[i] = h2[i] + f2[i];
-        }
-        if let Some(achf) = &self.achf_ffn {
-            let achf_out = achf.forward_inference_residual(&h2);
-            for i in 0..h3.len() {
-                h3[i] += achf_out[i];
-            }
-        }
-
-        let h_final = self.norm_final.forward_inference(&h3);
+        let h_final = self.norm_final.forward_inference(&h);
         self.out_proj.forward_inference(&h_final)
     }
 
@@ -302,60 +335,71 @@ impl LuckTransformer {
     pub fn forward_inference_step(
         &self,
         x: &[f64],
-        kv_cache: &mut KVCache,
+        kv_caches: &mut Vec<KVCache>,
         start_pos: usize,
     ) -> Vec<f64> {
         // x: [Dim] (one token)
-        let h = self.embed.forward_inference(x);
-        let h_norm1 = self.norm_1.forward_inference(&h);
+        let mut h = self.embed.forward_inference(x);
 
-        let attn_out = self
-            .mla_layer
-            .forward_inference_cached(&h_norm1, kv_cache, start_pos);
+        let layer_count = self.blocks.len().min(kv_caches.len());
+        for i in 0..layer_count {
+            let block = &self.blocks[i];
+            let h_norm1 = block.norm_1.forward_inference(&h);
 
-        // Residual
-        let mut h2 = vec![0.0; h.len()];
-        for i in 0..h.len() {
-            h2[i] = h[i] + attn_out[i];
-        }
-        if let Some(achf) = &self.achf_attn {
-            let achf_out = achf.forward_inference_residual(&h);
-            for i in 0..h2.len() {
-                h2[i] += achf_out[i];
+            let attn_out = block
+                .mla_layer
+                .forward_inference_cached(&h_norm1, &mut kv_caches[i], start_pos);
+
+            // Residual
+            let mut h2 = vec![0.0; h.len()];
+            for j in 0..h.len() {
+                h2[j] = h[j] + attn_out[j];
             }
-        }
-
-        let h_norm2 = self.norm_2.forward_inference(&h2);
-
-        let f1 = self.ffn_1.forward_inference(&h_norm2);
-        // ReLU
-        let mut f1_relu = f1;
-        for v in f1_relu.iter_mut() {
-            if *v < 0.0 {
-                *v = 0.0;
+            if let Some(achf) = &block.achf_attn {
+                let achf_out = achf.forward_inference_residual(&h);
+                for j in 0..h2.len() {
+                    h2[j] += achf_out[j];
+                }
             }
-        }
 
-        let f2 = self.ffn_2.forward_inference(&f1_relu);
+            let h_norm2 = block.norm_2.forward_inference(&h2);
 
-        // Residual
-        let mut h3 = vec![0.0; h2.len()];
-        for i in 0..h2.len() {
-            h3[i] = h2[i] + f2[i];
-        }
-        if let Some(achf) = &self.achf_ffn {
-            let achf_out = achf.forward_inference_residual(&h2);
-            for i in 0..h3.len() {
-                h3[i] += achf_out[i];
+            let f1 = block.ffn_1.forward_inference(&h_norm2);
+            // ReLU
+            let mut f1_relu = f1;
+            for v in f1_relu.iter_mut() {
+                if *v < 0.0 {
+                    *v = 0.0;
+                }
             }
+
+            let f2 = block.ffn_2.forward_inference(&f1_relu);
+
+            // Residual
+            let mut h3 = vec![0.0; h2.len()];
+            for j in 0..h2.len() {
+                h3[j] = h2[j] + f2[j];
+            }
+            if let Some(achf) = &block.achf_ffn {
+                let achf_out = achf.forward_inference_residual(&h2);
+                for j in 0..h3.len() {
+                    h3[j] += achf_out[j];
+                }
+            }
+            h = h3;
         }
 
-        let h_final = self.norm_final.forward_inference(&h3);
+        let h_final = self.norm_final.forward_inference(&h);
         self.out_proj.forward_inference(&h_final)
     }
 
-    pub fn prune_kv_cache(&self, kv_cache: &mut KVCache, max_seq_len: usize) {
-        self.mla_layer.prune_kv_cache(kv_cache, max_seq_len);
+    pub fn prune_kv_cache(&self, kv_caches: &mut Vec<KVCache>, max_seq_len: usize) {
+        let layer_count = self.blocks.len().min(kv_caches.len());
+        for i in 0..layer_count {
+            self.blocks[i]
+                .mla_layer
+                .prune_kv_cache(&mut kv_caches[i], max_seq_len);
+        }
     }
 }
 
@@ -366,23 +410,24 @@ impl Module for LuckTransformer {
 
     fn parameters(&self) -> Vec<Tensor> {
         let mut p = self.embed.parameters();
-        p.extend(self.norm_1.parameters());
-        p.extend(self.mla_layer.parameters());
-        if let Some(achf) = &self.achf_attn {
-            p.extend(achf.parameters());
-        }
-        p.extend(self.norm_2.parameters());
-        p.extend(self.ffn_1.parameters());
-        p.extend(self.ffn_2.parameters());
-        if let Some(achf) = &self.achf_ffn {
-            p.extend(achf.parameters());
+        for block in &self.blocks {
+            p.extend(block.norm_1.parameters());
+            p.extend(block.mla_layer.parameters());
+            if let Some(achf) = &block.achf_attn {
+                p.extend(achf.parameters());
+            }
+            p.extend(block.norm_2.parameters());
+            p.extend(block.ffn_1.parameters());
+            p.extend(block.ffn_2.parameters());
+            if let Some(achf) = &block.achf_ffn {
+                p.extend(achf.parameters());
+            }
         }
         p.extend(self.norm_final.parameters());
         p.extend(self.out_proj.parameters());
         p
     }
 }
-
 // --- RoPE: Rotary Positional Embeddings ---
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RoPE {
@@ -1476,7 +1521,7 @@ mod tests {
         }
         {
             let data_reshaped_after = t_reshaped.data.read().unwrap();
-            assert_eq!(data_reshaped_after[0], 10.0); // Shared — reflects mutation
+            assert_eq!(data_reshaped_after[0], 10.0); // Shared �?reflects mutation
         }
     }
 
@@ -1574,7 +1619,7 @@ mod tests {
     fn test_luck_transformer_integration() {
         // Use small dims for test
         let achf = crate::config::AchfConfig::default();
-        let t = LuckTransformer::new(8, 8, true, 42, &achf);
+        let t = LuckTransformer::new(8, 8, true, 2, 42, &achf);
         let x = Tensor::rand(vec![1, 5, 8], -0.1, 0.1, 123);
 
         let out = t.forward(&x, &[]);
@@ -1593,7 +1638,7 @@ mod tests {
         );
 
         // Check Norm grad
-        let norm_grad = t.norm_1.weight.grad.read().unwrap();
+        let norm_grad = t.blocks[0].norm_1.weight.grad.read().unwrap();
         assert!(
             norm_grad.iter().any(|&g| g.abs() > 0.0),
             "Norm grad missing"
@@ -1793,3 +1838,4 @@ mod tests {
         }
     }
 }
+

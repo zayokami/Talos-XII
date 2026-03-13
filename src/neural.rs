@@ -3,7 +3,7 @@ use crate::rng::Rng;
 const LCG_MULTIPLIER: u64 = 6364136223846793005;
 const ACTIVE_PARAM_THRESHOLD: f64 = 1e-9;
 
-pub const DIM: usize = 8;
+pub const DIM: usize = 32;
 pub type Tensor = [f64; DIM];
 
 #[inline(always)]

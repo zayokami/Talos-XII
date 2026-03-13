@@ -62,12 +62,12 @@ impl Module for DuelingQNetwork {
 
 impl DuelingQNetwork {
     pub fn new(seed: u64, achf: &AchfConfig) -> Self {
-        let l1 = Linear::new(DIM, 64, true, seed);
-        let l2 = Linear::new(64, 64, true, seed.wrapping_add(1));
-        let val_head = Linear::new(64, 1, true, seed.wrapping_add(2));
-        let adv_head = Linear::new(64, ACTION_SPACE, true, seed.wrapping_add(3));
+        let l1 = Linear::new(DIM, 256, true, seed);
+        let l2 = Linear::new(256, 256, true, seed.wrapping_add(1));
+        let val_head = Linear::new(256, 1, true, seed.wrapping_add(2));
+        let adv_head = Linear::new(256, ACTION_SPACE, true, seed.wrapping_add(3));
         let achf_layer = if achf.enabled && achf.apply_dqn {
-            Some(AchfLayer::new(64, achf.clone(), seed.wrapping_add(500)))
+            Some(AchfLayer::new(256, achf.clone(), seed.wrapping_add(500)))
         } else {
             None
         };

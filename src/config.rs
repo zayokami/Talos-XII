@@ -113,6 +113,7 @@ pub struct AchfConfig {
     pub g_min_momentum: f64,
     pub cache_min_rows: usize,
     pub cache_min_nonzero_ratio: f64,
+    pub cache_min_reuse: usize,
     pub cache_sparsity_sample_rows: usize,
     pub cache_cost_bias: f64,
     pub cache_adapt_rate: f64,
@@ -151,8 +152,9 @@ impl Default for AchfConfig {
             g_target_max: 0.8,
             g_min_adapt_rate: 0.0,
             g_min_momentum: 0.9,
-            cache_min_rows: 0,
+            cache_min_rows: 1,
             cache_min_nonzero_ratio: 0.0,
+            cache_min_reuse: 2,
             cache_sparsity_sample_rows: 0,
             cache_cost_bias: 1.0,
             cache_adapt_rate: 0.0,
@@ -164,8 +166,8 @@ impl Default for AchfConfig {
             cache_latency_sample_every: 1,
             cache_log_interval_steps: 0,
             cache_log_per_layer: false,
-            rank: 0,
-            apply_attn: false,
+            rank: 32,
+            apply_attn: true,
             apply_ffn: true,
             apply_dqn: false,
             infer_gate: "g_min".to_string(),
@@ -547,10 +549,13 @@ impl Config {
                     config.achf.g_min_momentum = v.as_f64().unwrap_or(0.9);
                 }
                 if let Some(v) = achf_map.get("cache_min_rows") {
-                    config.achf.cache_min_rows = v.as_f64().unwrap_or(0.0).round() as usize;
+                    config.achf.cache_min_rows = v.as_f64().unwrap_or(1.0).round() as usize;
                 }
                 if let Some(v) = achf_map.get("cache_min_nonzero_ratio") {
                     config.achf.cache_min_nonzero_ratio = v.as_f64().unwrap_or(0.0);
+                }
+                if let Some(v) = achf_map.get("cache_min_reuse") {
+                    config.achf.cache_min_reuse = v.as_f64().unwrap_or(2.0).round() as usize;
                 }
                 if let Some(v) = achf_map.get("cache_sparsity_sample_rows") {
                     config.achf.cache_sparsity_sample_rows =

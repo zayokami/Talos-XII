@@ -3,6 +3,8 @@ use crate::config::AchfConfig;
 use crate::nn::{Linear, Module};
 use crate::simd::add_scaled_row;
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -62,6 +64,9 @@ pub struct AchfCache {
     pub adaptive_bias: f64,
     pub latency_samples: u64,
     pub decision_samples: u64,
+    pub last_input_hash: Option<u64>,
+    pub last_output: Option<Vec<f64>>,
+    pub last_input_count: u64,
 }
 
 fn default_state() -> Arc<RwLock<AchfState>> {
@@ -96,6 +101,9 @@ fn default_cache() -> Arc<RwLock<AchfCache>> {
         adaptive_bias: 0.0,
         latency_samples: 0,
         decision_samples: 0,
+        last_input_hash: None,
+        last_output: None,
+        last_input_count: 0,
     }))
 }
 
@@ -116,6 +124,38 @@ pub struct AchfCacheStats {
     pub adaptive_bias: f64,
     pub latency_samples: u64,
     pub decision_samples: u64,
+}
+
+impl AchfCacheStats {
+    pub fn debug_print(stats: &[AchfCacheStats]) {
+        let mut hit = 0u64;
+        let mut skip = 0u64;
+        let mut lowrank = 0u64;
+        let mut dense = 0u64;
+        for s in stats {
+            hit += s.cache_hits;
+            skip += s.cache_skips;
+            lowrank += s.low_rank_paths;
+            dense += s.dense_paths;
+        }
+        let total = hit + skip + lowrank + dense;
+        if total == 0 {
+            return;
+        }
+        let pct = |n: u64| n as f64 / total as f64 * 100.0;
+        println!(
+            "[ACHF] stats: cache_hit={:.0}% dense={:.0}% lowrank={:.0}% skip={:.0}% | hit={} skip={} lowrank={} dense={} (total={})",
+            pct(hit),
+            pct(dense),
+            pct(lowrank),
+            pct(skip),
+            hit,
+            skip,
+            lowrank,
+            dense,
+            total
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -318,6 +358,30 @@ impl AchfLayer {
         }
         self.maybe_project();
         let g = self.infer_gate_value();
+
+        if self.config.cache_min_reuse > 0 {
+            let hash = Self::input_hash(x);
+            let memo_hit = {
+                let mut cache = self.cache.write().unwrap();
+                if cache.last_input_hash == Some(hash) {
+                    cache.last_input_count = cache.last_input_count.saturating_add(1);
+                    if cache.last_input_count >= self.config.cache_min_reuse as u64 {
+                        cache.last_output.clone()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some(out) = memo_hit {
+                let mut cache = self.cache.write().unwrap();
+                cache.calls += 1;
+                cache.cache_hits += 1;
+                return out;
+            }
+        }
+
         let sample_latency = self.should_sample_latency();
         let (path, decision_ns) = if sample_latency {
             let start = Instant::now();
@@ -361,6 +425,19 @@ impl AchfLayer {
         for v in out.iter_mut() {
             *v *= g;
         }
+
+        if self.config.cache_min_reuse > 0 {
+            let hash = Self::input_hash(x);
+            let mut cache = self.cache.write().unwrap();
+            if cache.last_input_hash == Some(hash) {
+                cache.last_input_count = cache.last_input_count.saturating_add(1);
+            } else {
+                cache.last_input_hash = Some(hash);
+                cache.last_input_count = 1;
+            }
+            cache.last_output = Some(out.clone());
+        }
+
         out
     }
 
@@ -690,6 +767,30 @@ impl AchfLayer {
         cache.adaptive_bias = self.config.cache_cost_bias;
         cache.latency_samples = 0;
         cache.decision_samples = 0;
+        cache.last_input_hash = None;
+        cache.last_output = None;
+        cache.last_input_count = 0;
+    }
+
+    fn ensure_cache(&self) {
+        if !self.is_low_rank() {
+            return;
+        }
+        let need_init = {
+            let cache = self.cache.read().unwrap();
+            cache.dense.is_none()
+        };
+        if need_init {
+            self.prepare_inference_cache();
+        }
+    }
+
+    fn input_hash(x: &[f64]) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        for &v in x.iter().take(32) {
+            v.to_bits().hash(&mut hasher);
+        }
+        hasher.finish()
     }
 
     fn prepare_inference_cache(&self) {
@@ -760,6 +861,7 @@ impl AchfLayer {
             cache.dense_paths += 1;
             return InferencePath::Dense;
         }
+        self.ensure_cache();
         let (use_cache, skip_cache, has_cache) = self.should_use_cache(x);
         let mut cache = self.cache.write().unwrap();
         cache.calls += 1;
@@ -799,8 +901,9 @@ impl AchfLayer {
             return (false, true, true);
         }
         let rank = self.down.as_ref().unwrap().out_features;
-        let dense_cost = nonzero_ratio * (in_dim * out_dim) as f64;
-        let low_rank_cost = nonzero_ratio * (in_dim * rank) as f64 + (rank * out_dim) as f64;
+        // 真实 CPU 上 dense GEMM 已高度 vectorized，稀疏输入不降低 matmul 成本
+        let dense_cost = (in_dim * out_dim) as f64;
+        let low_rank_cost = (in_dim * rank + rank * out_dim) as f64;
         let bias = if self.config.cache_adapt_rate > 0.0 {
             cache.adaptive_bias
         } else {
@@ -1171,10 +1274,11 @@ mod tests {
         let _ = layer.forward_inference_residual(&x_data);
         let stats = layer.cache_stats();
         assert_eq!(stats.calls, 2);
-        assert_eq!(stats.cache_hits, 1);
+        // On the second forward, the cache is None; auto-prepare will rebuild the cache, so it is a cache hit again
+        assert_eq!(stats.cache_hits, 2);
         assert_eq!(stats.cache_misses, 0);
         assert_eq!(stats.dense_paths, 0);
-        assert_eq!(stats.low_rank_paths, 1);
+        assert_eq!(stats.low_rank_paths, 0);
     }
 
     #[test]

@@ -114,7 +114,7 @@ fn aggregate_trials(runs: &[BenchRunResult]) -> AggregatedResult {
 
 fn build_base_models(config: &Config, rng: &mut Rng) -> (Dbn, NeuralLuckOptimizer, GoodJobWorker) {
     let worker = GoodJobWorker::new_with_config(config);
-    let mut dbn = Dbn::new(&[8, 16, 8], rng);
+    let mut dbn = Dbn::new(&[32, 128, 64, 32], rng);
     let (count, epochs) = if config.fast_init {
         (256, 4)
     } else {
@@ -466,7 +466,9 @@ fn run_convergence(base_config: &Config, seed: u64, nt: usize) -> Vec<Aggregated
             let final_reward = snapshots.last().map_or(0.0, |s| s.reward);
             let final_loss = snapshots.last().map_or(0.0, |s| s.loss);
             let cache_stats = if enabled {
-                Some(ppo.achf_cache_stats_aggregate())
+                let stats = ppo.achf_cache_stats_aggregate();
+                AchfCacheStats::debug_print(&[stats]);
+                Some(stats)
             } else {
                 None
             };
@@ -529,7 +531,9 @@ fn train_and_measure(label: &str, config: &Config, seed: u64) -> BenchRunResult 
     );
 
     let cache_stats = if config.achf.enabled {
-        Some(ppo.achf_cache_stats_aggregate())
+        let stats = ppo.achf_cache_stats_aggregate();
+        AchfCacheStats::debug_print(&[stats]);
+        Some(stats)
     } else {
         None
     };

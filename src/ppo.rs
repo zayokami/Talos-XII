@@ -67,9 +67,9 @@ pub struct ActorCritic {
 
 impl ActorCritic {
     pub fn new(seed: u64, achf: &crate::config::AchfConfig) -> Self {
-        let backbone = LuckTransformer::new(DIM, 64, true, seed, achf);
-        let actor_head = Linear::new(64, ACTION_SPACE, true, seed.wrapping_add(100));
-        let critic_head = Linear::new(64, 1, true, seed.wrapping_add(200));
+        let backbone = LuckTransformer::new(DIM, 256, true, 2, seed, achf);
+        let actor_head = Linear::new(256, ACTION_SPACE, true, seed.wrapping_add(100));
+        let critic_head = Linear::new(256, 1, true, seed.wrapping_add(200));
 
         ActorCritic {
             backbone,
@@ -156,7 +156,7 @@ impl ActorCritic {
     pub fn step_inference_cached_with_value(
         &self,
         state: &[f64],
-        kv_cache: &mut KVCache,
+        kv_cache: &mut Vec<KVCache>,
         start_pos: usize,
     ) -> (usize, f64, f64) {
         let last = self
@@ -171,7 +171,7 @@ impl ActorCritic {
     pub fn step_inference_cached(
         &self,
         state: &[f64],
-        kv_cache: &mut KVCache,
+        kv_cache: &mut Vec<KVCache>,
         start_pos: usize,
     ) -> usize {
         let last = self
@@ -181,7 +181,7 @@ impl ActorCritic {
         softmax_sample(&logits).0
     }
 
-    pub fn prune_cache(&self, kv_cache: &mut KVCache, max_len: usize) {
+    pub fn prune_cache(&self, kv_cache: &mut Vec<KVCache>, max_len: usize) {
         self.backbone.prune_kv_cache(kv_cache, max_len);
     }
 
@@ -625,13 +625,13 @@ struct PpoEnvState {
     pity_buffer: VecDeque<usize>,
     flat_data: Vec<f64>,
     pity_vec: Vec<usize>,
-    kv_cache: KVCache,
+    kv_cache: Vec<KVCache>,
     episode_reward: f64,
     rng: Rng,
 }
 
 impl PpoEnvState {
-    fn new(seed: u64, dbn: &Dbn, context_len: usize, num_heads: usize) -> Self {
+    fn new(seed: u64, dbn: &Dbn, context_len: usize, num_heads: usize, num_layers: usize) -> Self {
         let mut rng = Rng::from_seed(seed);
         let (env_noise, env_bias) = dbn_env(dbn, &mut rng);
         Self {
@@ -649,7 +649,7 @@ impl PpoEnvState {
             pity_buffer: VecDeque::with_capacity(context_len),
             flat_data: Vec::with_capacity(context_len * DIM),
             pity_vec: Vec::with_capacity(context_len),
-            kv_cache: KVCache::new(num_heads),
+            kv_cache: (0..num_layers).map(|_| KVCache::new(num_heads)).collect(),
             episode_reward: 0.0,
             rng,
         }
@@ -658,7 +658,9 @@ impl PpoEnvState {
     fn reset(&mut self, dbn: &Dbn) {
         self.history_buffer.clear();
         self.pity_buffer.clear();
-        self.kv_cache.clear();
+        for cache in self.kv_cache.iter_mut() {
+            cache.clear();
+        }
         self.state_struct = PullState {
             pity_6: 0,
             total_pulls_in_pool: 0,
@@ -879,7 +881,8 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
                 seed,
                 dbn,
                 context_len,
-                ppo.policy.backbone.mla_layer.config.num_heads,
+                ppo.policy.backbone.blocks[0].mla_layer.config.num_heads,
+                ppo.policy.backbone.blocks.len(),
             )
         })
         .collect();
@@ -1071,7 +1074,8 @@ pub fn train_ppo_with_metrics(
                 seed,
                 dbn,
                 context_len,
-                ppo.policy.backbone.mla_layer.config.num_heads,
+                ppo.policy.backbone.blocks[0].mla_layer.config.num_heads,
+                ppo.policy.backbone.blocks.len(),
             )
         })
         .collect();

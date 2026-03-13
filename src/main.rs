@@ -33,7 +33,7 @@ use dbn::Dbn;
 use dqn::{train_dqn, DuelingQNetwork, Experience, OnlineDqnTrainer};
 use i18n::{I18n, Language};
 use log::info;
-use neural::NeuralLuckOptimizer;
+use neural::{NeuralLuckOptimizer, DIM};
 use ppo::{train_ppo, ActorCritic, OnlinePpoTrainer};
 use rng::Rng;
 use std::io::{self, Write};
@@ -347,7 +347,7 @@ fn print_explainability_report(neural_opt: &NeuralLuckOptimizer, lang: Language)
     let rl_w = neural_opt.linear_weights;
     let rl_b = neural_opt.linear_bias;
 
-    let feature_names = [
+    let mut feature_names = vec![
         I18n::get(lang, "feat_pity"),
         I18n::get(lang, "feat_total_norm"),
         I18n::get(lang, "feat_env_noise"),
@@ -357,7 +357,11 @@ fn print_explainability_report(neural_opt: &NeuralLuckOptimizer, lang: Language)
         I18n::get(lang, "feat_pity_loss"),
         I18n::get(lang, "feat_total_sq"),
     ];
-    for (i, name) in feature_names.iter().enumerate() {
+    while feature_names.len() < DIM {
+        feature_names.push(format!("Feature {:02}", feature_names.len() + 1));
+    }
+
+    for i in 0..DIM {
         let w = rl_w[i];
         let impact = if w.abs() < 0.001 {
             I18n::get(lang, "impact_neutral")
@@ -366,7 +370,7 @@ fn print_explainability_report(neural_opt: &NeuralLuckOptimizer, lang: Language)
         } else {
             I18n::get(lang, "impact_reduce")
         };
-        println!("  - {:<25}: {:>8.4} [{}]", name, w, impact);
+        println!("  - {:<25}: {:>8.4} [{}]", feature_names[i], w, impact);
     }
     println!(
         "  - {:<25}: {:>8.4} {}",
@@ -477,7 +481,7 @@ fn initialize_system(
 
     let worker = GoodJobWorker::new_with_config(&config);
 
-    let mut dbn = Dbn::new(&[8, 16, 8], &mut rng);
+    let mut dbn = Dbn::new(&[32, 128, 64, 32], &mut rng);
     let (dbn_data_count, dbn_epochs) = if config.fast_init {
         if cfg!(debug_assertions) {
             (64, 2)
@@ -1766,7 +1770,7 @@ mod tests {
     fn build_context() -> (Config, Dbn, NeuralLuckOptimizer) {
         let config = Config::load("data/config.json");
         let mut rng = Rng::from_seed(1234);
-        let dbn = Dbn::new(&[8, 16, 8], &mut rng);
+        let dbn = Dbn::new(&[32, 128, 64, 32], &mut rng);
         let neural_opt = NeuralLuckOptimizer::new(5678);
         (config, dbn, neural_opt)
     }
@@ -1857,7 +1861,7 @@ mod tests {
         config.fast_init = true;
         let mut rng = Rng::from_seed(7777);
         let dqn = train_dqn(&neural_opt, &mut rng, &dbn, &config);
-        let state = AutoTensor::new(vec![0.5; 8], vec![8]);
+        let state = AutoTensor::new(vec![0.5; DIM], vec![DIM]);
         let q_values = dqn.forward(&state);
         let q_data = q_values.data.read().unwrap();
         assert_eq!(
@@ -1908,7 +1912,7 @@ mod tests {
     #[test]
     fn benchmark_dqn_predict_action_fast() {
         let dqn = DuelingQNetwork::new(42, &crate::config::AchfConfig::default());
-        let features = [0.5_f64; 8];
+        let features = [0.5_f64; DIM];
         let iterations = 10_000;
 
         // Warmup
@@ -1924,7 +1928,7 @@ mod tests {
 
         let start2 = std::time::Instant::now();
         for _ in 0..iterations {
-            let tensor_x = AutoTensor::new(features.to_vec(), vec![8]);
+            let tensor_x = AutoTensor::new(features.to_vec(), vec![DIM]);
             let _ = dqn.predict_action(&tensor_x);
         }
         let tensor_elapsed = start2.elapsed();
