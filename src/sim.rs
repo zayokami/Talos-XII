@@ -177,7 +177,8 @@ impl PpoContext {
                 self.kv_cache = None;
             } else if let Some(caches) = &mut self.kv_cache {
                 if caches.len() != num_layers || caches[0].k_cache.len() != num_heads {
-                    self.kv_cache = Some((0..num_layers).map(|_| KVCache::new(num_heads)).collect());
+                    self.kv_cache =
+                        Some((0..num_layers).map(|_| KVCache::new(num_heads)).collect());
                 } else {
                     for cache in caches.iter_mut() {
                         cache.clear();
@@ -453,7 +454,11 @@ pub fn build_features(
     let cos_2 = (2.0 * std::f64::consts::PI * pity_norm).cos();
     let decay_pity = (-3.0 * pity_norm).exp();
     let decay_total = (-2.0 * total_norm).exp();
-    let is_high_pity = if pity_6 > PITY_HIGH_THRESHOLD { 1.0 } else { 0.0 };
+    let is_high_pity = if pity_6 > PITY_HIGH_THRESHOLD {
+        1.0
+    } else {
+        0.0
+    };
     let has_loss_streak = if loss_streak > 0 { 1.0 } else { 0.0 };
     let high_streak = if streak >= 10 { 1.0 } else { 0.0 };
 
@@ -1302,26 +1307,29 @@ pub fn simulate_for_data_collection(
     data
 }
 
-pub fn format_f2p_probability_line(total_episodes: usize, early_success_episodes: usize) -> String {
+pub fn format_f2p_probability_line(
+    total_episodes: usize,
+    early_success_episodes: usize,
+    lang: crate::i18n::Language,
+) -> String {
     if total_episodes == 0 || early_success_episodes == total_episodes {
-        "Probability to get UP with ONLY free resources: ≥99.99 % (all succeeded early)".to_string()
+        crate::i18n::I18n::get(lang, "f2p_prob_line_max")
     } else {
         let rate = early_success_episodes as f64 / total_episodes as f64;
-        format!(
-            "Probability to get UP with ONLY free resources: {:.2}%",
-            rate * 100.0
-        )
+        crate::i18n::I18n::get(lang, "f2p_prob_line")
+            .replace("{:.2}", &format!("{:.2}", rate * 100.0))
     }
 }
 
-pub fn format_avg_extra_cost_line(avg_extra_cost: Option<f64>) -> String {
+pub fn format_avg_extra_cost_line(
+    avg_extra_cost: Option<f64>,
+    lang: crate::i18n::Language,
+) -> String {
     match avg_extra_cost {
-        Some(cost) => format!(
-            "Avg Extra Jade Cost: {:.0} (Approx. {:.1} extra pulls)",
-            cost,
-            cost / COST_PER_PULL as f64
-        ),
-        None => "Avg Extra Jade Cost: N/A".to_string(),
+        Some(cost) => crate::i18n::I18n::get(lang, "f2p_cost_line")
+            .replace("{:.0}", &format!("{:.0}", cost))
+            .replace("{:.1}", &format!("{:.1}", cost / COST_PER_PULL as f64)),
+        None => crate::i18n::I18n::get(lang, "f2p_cost_line_na"),
     }
 }
 
@@ -1398,8 +1406,9 @@ mod tests {
 
         let num_heads = policy.backbone.blocks[0].mla_layer.config.num_heads;
         let num_layers = policy.backbone.blocks.len();
-        let mut kv: Vec<crate::transformer::KVCache> =
-            (0..num_layers).map(|_| crate::transformer::KVCache::new(num_heads)).collect();
+        let mut kv: Vec<crate::transformer::KVCache> = (0..num_layers)
+            .map(|_| crate::transformer::KVCache::new(num_heads))
+            .collect();
         for cache in kv.iter_mut() {
             cache.clear();
         }

@@ -7,10 +7,10 @@ use crate::sim::{
     SimModelContext, FREE_PULLS_WELFARE,
 };
 use crate::simd::add_scaled_row;
+use crate::utils::create_bar;
 use crate::worker::GoodJobWorker;
 use rayon::prelude::*;
 use std::cmp::Ordering;
-use std::io::{self, Write};
 use std::sync::RwLock;
 
 const MANIFOLD_SIGMA_ANALYSIS_INIT: f64 = 0.02;
@@ -197,6 +197,8 @@ pub fn train_manifold_rl(
         n_params - n_analysis
     );
 
+    let pb = create_bar(iterations as u64, "Manifold RL");
+
     for iter in 0..iterations {
         let mut noise_seeds: Vec<u64> = Vec::with_capacity(population);
         for _ in 0..population {
@@ -282,15 +284,8 @@ pub fn train_manifold_rl(
         }
         avg_reward /= population as f64;
 
-        if iter % 5 == 0 || iter == iterations - 1 {
-            print!(
-                "\r[RL] Iter {:>2}/{}: Avg Reward = {:>8.2}",
-                iter + 1,
-                iterations,
-                avg_reward
-            );
-            io::stdout().flush().unwrap();
-        }
+        pb.set_position((iter + 1) as u64);
+        pb.set_message(format!("Avg Reward: {:.2}", avg_reward));
 
         let scale = 1.0 / population as f64;
 
@@ -346,17 +341,10 @@ pub fn train_manifold_rl(
             MANIFOLD_SIGMA_DECISION_RANGE.1,
         );
 
-        if iter % 5 == 0 {
-            // Print curvature stats
-            print!(" [Sigma: A={:.4}, D={:.4}]", sigma_analysis, sigma_decision);
-            io::stdout().flush().unwrap();
-        }
-
         current_opt.set_params(&params);
     }
 
-    // Apply Pruning (Sparse Hyper-Connections)
-    println!(); // Newline
+    pb.finish_with_message("Manifold RL Complete.");
     println!("[RL] Applying Sparse Hyper-Connections (Pruning)...");
     let initial_active = current_opt.count_active_params();
     current_opt.prune(MANIFOLD_PRUNE_THRESHOLD); // Prune weights < threshold
@@ -405,6 +393,8 @@ pub fn train_neural_optimizer(
 
     let mut best_ever = population[0].clone();
     let mut best_ever_score = f64::NEG_INFINITY;
+
+    let pb = create_bar(generations as u64, "Neural Training");
 
     for gen in 0..generations {
         let eval_seeds: Vec<u64> = (0..pop_size).map(|_| rng.next_u64()).collect();
@@ -478,14 +468,8 @@ pub fn train_neural_optimizer(
             best_ever = population[scores[0].0].clone();
         }
 
-        print!(
-            "\r[Training] Gen {:>2}/{}: Best Score = {:>8.2} | Max Loss Streak = {}",
-            gen + 1,
-            generations,
-            best_score,
-            best_streak
-        );
-        io::stdout().flush().unwrap();
+        pb.set_position((gen + 1) as u64);
+        pb.set_message(format!("Best: {:.2} | Streak: {}", best_score, best_streak));
 
         // Selection & Mutation (Evolution Strategy)
         let mut new_pop = Vec::with_capacity(pop_size);
@@ -508,7 +492,7 @@ pub fn train_neural_optimizer(
         }
         population = new_pop;
     }
-    println!("\n[Neural Core] Training Complete. Optimal weights loaded.");
+    pb.finish_with_message("Neural Training Complete.");
 
     best_ever
 }

@@ -145,21 +145,29 @@ struct SimHistoryEntry {
 }
 
 fn prompt_yes_no(prompt: &str, default_yes: bool) -> bool {
-    print!("{}", prompt);
-    let _ = io::stdout().flush();
-    let mut input = String::new();
-    if io::stdin().read_line(&mut input).is_err() {
-        return default_yes;
+    for attempt in 0..3 {
+        print!("{}", prompt);
+        let _ = io::stdout().flush();
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() {
+            return default_yes;
+        }
+        let s = input.trim();
+        if s.is_empty() {
+            return default_yes;
+        }
+        if s.eq_ignore_ascii_case("y") || s.eq_ignore_ascii_case("yes") {
+            return true;
+        }
+        if s.eq_ignore_ascii_case("n") || s.eq_ignore_ascii_case("no") {
+            return false;
+        }
+        if attempt < 2 {
+            print!("{}", "  Please enter y or n: ".yellow());
+            let _ = io::stdout().flush();
+        }
     }
-    let s = input.trim();
-    if s.is_empty() {
-        return default_yes;
-    }
-    if default_yes {
-        !s.eq_ignore_ascii_case("n")
-    } else {
-        s.eq_ignore_ascii_case("y")
-    }
+    default_yes
 }
 
 use model_io::{load_model, load_neural_cache, save_model, save_neural_cache};
@@ -258,6 +266,10 @@ fn run_f2p_analysis(ctx: &F2pAnalysisCtx<'_>, rng: &mut Rng) {
         ppo_sender: None,
     };
 
+    let pb_prob = utils::create_bar(
+        batches as u64,
+        &I18n::get(lang, "sys_run_prob").replace("{}", &sim_count_prob.to_string()),
+    );
     for i in 0..batches {
         let this_batch = batch_base + if i < batch_remainder { 1 } else { 0 };
         if this_batch == 0 {
@@ -271,19 +283,14 @@ fn run_f2p_analysis(ctx: &F2pAnalysisCtx<'_>, rng: &mut Rng) {
         );
         total_up_agg += total_up;
         total_with_up_agg += total_with_up;
-
-        print!(
-            "\r{}",
-            I18n::get(lang, "progress").replace("{:>3}", &format!("{:>3}", i + 1))
-        );
-        let _ = io::stdout().flush();
+        pb_prob.inc(1);
     }
-    println!();
+    pb_prob.finish_and_clear();
 
     let elapsed = start_time.elapsed();
     let total_sims_run = sim_count_prob;
 
-    let prob_line = format_f2p_probability_line(total_sims_run, total_with_up_agg);
+    let prob_line = format_f2p_probability_line(total_sims_run, total_with_up_agg, lang);
     println!("{}", prob_line);
     println!(
         "{}",
@@ -315,6 +322,10 @@ fn run_f2p_analysis(ctx: &F2pAnalysisCtx<'_>, rng: &mut Rng) {
     let mut total_extra_cost_agg = 0u64;
     let mut extra_cost_samples_agg = 0usize;
 
+    let pb_cost = utils::create_bar(
+        batches as u64,
+        &I18n::get(lang, "sys_run_cost").replace("{}", &sim_count_cost.to_string()),
+    );
     for i in 0..batches {
         let this_batch = cost_batch_base + if i < cost_batch_remainder { 1 } else { 0 };
         if this_batch == 0 {
@@ -323,14 +334,9 @@ fn run_f2p_analysis(ctx: &F2pAnalysisCtx<'_>, rng: &mut Rng) {
         let (cost_sum, samples, _) = simulate_f2p_clearing(this_batch, rng.next_u64(), &sim_ctx);
         total_extra_cost_agg += cost_sum;
         extra_cost_samples_agg += samples;
-
-        print!(
-            "\r{}",
-            I18n::get(lang, "progress").replace("{:>3}", &format!("{:>3}", i + 1))
-        );
-        let _ = io::stdout().flush();
+        pb_cost.inc(1);
     }
-    println!();
+    pb_cost.finish_and_clear();
 
     let avg_extra_cost = if extra_cost_samples_agg == 0 {
         None
@@ -338,7 +344,7 @@ fn run_f2p_analysis(ctx: &F2pAnalysisCtx<'_>, rng: &mut Rng) {
         Some(total_extra_cost_agg as f64 / extra_cost_samples_agg as f64)
     };
 
-    let avg_cost_line = format_avg_extra_cost_line(avg_extra_cost);
+    let avg_cost_line = format_avg_extra_cost_line(avg_extra_cost, lang);
     println!("{}", avg_cost_line);
 }
 
@@ -608,7 +614,7 @@ fn main() {
                             }
                         }
                         Err(e) => {
-                            eprintln!("{}", e);
+                            eprintln!("\x1b[1;31m[Error]\x1b[0m {}", e);
                         }
                     },
                     CollectAction::Stats => {
@@ -1240,21 +1246,28 @@ fn run_interactive(args: RunInteractiveArgs) {
             if history.is_empty() {
                 println!("{}", I18n::get(lang, "cmd_history_empty"));
             } else {
+                let mut table = utils::Table::new(&[
+                    &I18n::get(lang, "tbl_hist_id"),
+                    &I18n::get(lang, "tbl_hist_pool"),
+                    &I18n::get(lang, "tbl_hist_pulls"),
+                    &I18n::get(lang, "tbl_hist_sims"),
+                    &I18n::get(lang, "tbl_hist_avg6"),
+                    &I18n::get(lang, "tbl_hist_avgup"),
+                    &I18n::get(lang, "tbl_hist_time"),
+                ]);
                 for (i, entry) in history.iter().enumerate() {
-                    println!(
-                        "{}",
-                        I18n::get(lang, "cmd_history_item")
-                            .replacen("{}", &(i + 1).to_string(), 1)
-                            .replacen("{}", &entry.pool_name, 1)
-                            .replacen("{}", &entry.pulls.to_string(), 1)
-                            .replacen("{}", &entry.sims.to_string(), 1)
-                            .replacen("{:.3}", &format!("{:.3}", entry.avg_six), 1)
-                            .replacen("{:.3}", &format!("{:.3}", entry.avg_up), 1)
-                            .replacen("{}", &entry.elapsed_ms.to_string(), 1)
-                    );
+                    table.add_row(vec![
+                        (i + 1).to_string(),
+                        entry.pool_name.clone(),
+                        entry.pulls.to_string(),
+                        entry.sims.to_string(),
+                        format!("{:.3}", entry.avg_six),
+                        format!("{:.3}", entry.avg_up),
+                        format!("{}ms", entry.elapsed_ms),
+                    ]);
                 }
+                println!("{}", table.render());
             }
-            println!("{}", I18n::get(lang, "cmd_history_footer"));
             continue;
         }
         if cmd_lower == "bench" || cmd_lower == "benchmark" {
@@ -1262,7 +1275,7 @@ fn run_interactive(args: RunInteractiveArgs) {
             let sub_lower = sub.to_lowercase();
             match sub_lower.as_str() {
                 "quick" | "q" => {
-                    println!("\n[Bench] 运行快速基准测试...");
+                    println!("{}", I18n::get(lang, "bench_quick_start"));
                     let dqn_guard = dqn_shared.read().unwrap();
                     let neural_guard = neural_shared.read().unwrap();
                     let ppo_guard = ppo_shared.read().unwrap();
@@ -1324,20 +1337,20 @@ fn run_interactive(args: RunInteractiveArgs) {
                     bench::run_paper_benchmarks(&config, seed, &bench_cfg);
                 }
                 "list" | "l" => {
-                    println!("\n[Bench] 可用实验:");
-                    println!("  ablation     — ACHF 开/关消融对比");
-                    println!("  mode         — lite vs full 模式对比");
-                    println!("  path         — Cached/LowRank/Dense 推理路径延迟");
-                    println!("  gate         — 训练过程中门控动态曲线");
-                    println!("  scale        — 不同 rank 下的吞吐量");
-                    println!("  apply        — FFN/Attention/DQN 组合效果");
-                    println!("  convergence  — loss + reward 收敛曲线");
-                    println!("\n用法:");
-                    println!("  bench quick              快速基准测试");
-                    println!("  bench paper              运行全部 7 项实验（默认 3 trials）");
-                    println!("  bench paper --only ablation,gate");
-                    println!("  bench paper --trials 5 --format png");
-                    println!("  bench paper --output-dir results");
+                    println!("{}", I18n::get(lang, "bench_list_header"));
+                    println!("  {}", I18n::get(lang, "bench_list_ablation"));
+                    println!("  {}", I18n::get(lang, "bench_list_mode"));
+                    println!("  {}", I18n::get(lang, "bench_list_path"));
+                    println!("  {}", I18n::get(lang, "bench_list_gate"));
+                    println!("  {}", I18n::get(lang, "bench_list_scale"));
+                    println!("  {}", I18n::get(lang, "bench_list_apply"));
+                    println!("  {}", I18n::get(lang, "bench_list_convergence"));
+                    println!("{}", I18n::get(lang, "bench_usage_header"));
+                    println!("{}", I18n::get(lang, "bench_usage_quick"));
+                    println!("{}", I18n::get(lang, "bench_usage_paper"));
+                    println!("{}", I18n::get(lang, "bench_usage_only"));
+                    println!("{}", I18n::get(lang, "bench_usage_trials"));
+                    println!("{}", I18n::get(lang, "bench_usage_output"));
                 }
                 _ => {
                     // Treat as a shortcut: bench <experiment_name>
@@ -1357,33 +1370,41 @@ fn run_interactive(args: RunInteractiveArgs) {
         if cmd_lower == "pool" {
             let sub = parts.next().unwrap_or("list");
             if sub.eq_ignore_ascii_case("list") {
-                let list_label = if config.pools.is_empty() {
-                    I18n::get(lang, "label_none")
+                if config.pools.is_empty() {
+                    println!(
+                        "{}",
+                        I18n::get(lang, "cmd_pool_list")
+                            .replace("{}", &I18n::get(lang, "label_none"))
+                    );
                 } else {
-                    config
-                        .pools
-                        .iter()
-                        .map(|p| {
-                            let tag = if p.is_archived {
-                                I18n::get(lang, "pool_archived_tag")
-                            } else {
-                                String::new()
-                            };
-                            format!(
-                                "{}={}{}/{}",
-                                p.id,
-                                p.name,
-                                tag,
-                                pool_type_label(&p.pool_type, lang)
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                println!(
-                    "{}",
-                    I18n::get(lang, "cmd_pool_list").replace("{}", &list_label)
-                );
+                    let mut table = utils::Table::new(&[
+                        &I18n::get(lang, "tbl_pool_id"),
+                        &I18n::get(lang, "tbl_pool_name"),
+                        &I18n::get(lang, "tbl_pool_type"),
+                        &I18n::get(lang, "tbl_pool_up"),
+                        &I18n::get(lang, "tbl_pool_status"),
+                    ]);
+                    for (idx, pool) in config.pools.iter().enumerate() {
+                        let up_label = if pool.up_six.is_empty() {
+                            I18n::get(lang, "label_none")
+                        } else {
+                            pool.up_six.join(", ")
+                        };
+                        let status = if pool.is_archived {
+                            I18n::get(lang, "pool_status_archived")
+                        } else {
+                            I18n::get(lang, "pool_status_active")
+                        };
+                        table.add_row(vec![
+                            (idx + 1).to_string(),
+                            pool.name.clone(),
+                            pool_type_label(&pool.pool_type, lang),
+                            up_label,
+                            status,
+                        ]);
+                    }
+                    println!("{}", table.render());
+                }
             } else if sub.eq_ignore_ascii_case("multi") {
                 let mut valid_ids = Vec::new();
                 let mut list_tokens = Vec::new();
@@ -1457,7 +1478,12 @@ fn run_interactive(args: RunInteractiveArgs) {
                     Ok(val) if val > 0 => {
                         default_pulls = val.min(INPUT_CAP);
                         if val > INPUT_CAP {
-                            println!("{}", I18n::get(lang, "input_too_large"));
+                            println!(
+                                "{}",
+                                I18n::get(lang, "input_capped")
+                                    .replacen("{}", &val.to_string(), 1)
+                                    .replacen("{}", &INPUT_CAP.to_string(), 1)
+                            );
                         }
                         println!(
                             "{}",
@@ -1478,7 +1504,12 @@ fn run_interactive(args: RunInteractiveArgs) {
                     Ok(val) if val > 0 => {
                         default_sims = val.min(INPUT_CAP);
                         if val > INPUT_CAP {
-                            println!("{}", I18n::get(lang, "sim_count_too_large"));
+                            println!(
+                                "{}",
+                                I18n::get(lang, "input_capped")
+                                    .replacen("{}", &val.to_string(), 1)
+                                    .replacen("{}", &INPUT_CAP.to_string(), 1)
+                            );
                         }
                         println!(
                             "{}",
@@ -1500,14 +1531,49 @@ fn run_interactive(args: RunInteractiveArgs) {
             match input.parse::<usize>() {
                 Ok(val) => {
                     if val > INPUT_CAP {
-                        println!("{}", I18n::get(lang, "input_too_large"));
+                        println!(
+                            "{}",
+                            I18n::get(lang, "input_capped")
+                                .replacen("{}", &val.to_string(), 1)
+                                .replacen("{}", &INPUT_CAP.to_string(), 1)
+                        );
                         INPUT_CAP
                     } else {
                         val
                     }
                 }
                 Err(_) => {
-                    println!("{}", I18n::get(lang, "invalid_input"));
+                    let known_commands: &[&str] = &[
+                        "h",
+                        "help",
+                        "q",
+                        "ppo",
+                        "w",
+                        "welfare",
+                        "status",
+                        "st",
+                        "info",
+                        "history",
+                        "hi",
+                        "pool",
+                        "bench",
+                        "benchmark",
+                        "p",
+                        "pulls",
+                        "s",
+                        "sims",
+                    ];
+                    if let Some(suggestion) = utils::suggest_command(&cmd_lower, known_commands, 2)
+                    {
+                        println!(
+                            "{}",
+                            I18n::get(lang, "cmd_suggest")
+                                .replacen("{}", &cmd_lower, 1)
+                                .replacen("{}", suggestion, 1)
+                        );
+                    } else {
+                        println!("{}", I18n::get(lang, "cmd_invalid_command"));
+                    }
                     continue;
                 }
             }

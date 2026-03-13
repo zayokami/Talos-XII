@@ -1,10 +1,9 @@
 use crate::autograd::{Tensor, TensorReadGuard};
 use crate::config::AchfConfig;
 use crate::nn::{Linear, Module};
-use crate::simd::add_scaled_row;
+use crate::simd::{add_scaled_row, dot_product};
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -31,6 +30,8 @@ pub struct AchfLayer {
     pub state: Arc<RwLock<AchfState>>,
     #[serde(skip, default = "default_cache")]
     pub cache: Arc<RwLock<AchfCache>>,
+    #[serde(skip, default = "default_metrics")]
+    pub metrics: Arc<AchfMetrics>,
 }
 
 #[derive(Clone)]
@@ -44,17 +45,57 @@ pub struct AchfState {
     pub freeze_projection: bool,
 }
 
+/// Lock-free atomic counters for inference hot-path stats, eliminating RwLock contention.
+pub struct AchfMetrics {
+    pub calls: AtomicU64,
+    pub cache_hits: AtomicU64,
+    pub cache_misses: AtomicU64,
+    pub cache_skips: AtomicU64,
+    pub low_rank_paths: AtomicU64,
+    pub dense_paths: AtomicU64,
+    pub latency_samples: AtomicU64,
+    pub decision_samples: AtomicU64,
+}
+
+impl Clone for AchfMetrics {
+    fn clone(&self) -> Self {
+        Self {
+            calls: AtomicU64::new(self.calls.load(Ordering::Relaxed)),
+            cache_hits: AtomicU64::new(self.cache_hits.load(Ordering::Relaxed)),
+            cache_misses: AtomicU64::new(self.cache_misses.load(Ordering::Relaxed)),
+            cache_skips: AtomicU64::new(self.cache_skips.load(Ordering::Relaxed)),
+            low_rank_paths: AtomicU64::new(self.low_rank_paths.load(Ordering::Relaxed)),
+            dense_paths: AtomicU64::new(self.dense_paths.load(Ordering::Relaxed)),
+            latency_samples: AtomicU64::new(self.latency_samples.load(Ordering::Relaxed)),
+            decision_samples: AtomicU64::new(self.decision_samples.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+impl Default for AchfMetrics {
+    fn default() -> Self {
+        Self {
+            calls: AtomicU64::new(0),
+            cache_hits: AtomicU64::new(0),
+            cache_misses: AtomicU64::new(0),
+            cache_skips: AtomicU64::new(0),
+            low_rank_paths: AtomicU64::new(0),
+            dense_paths: AtomicU64::new(0),
+            latency_samples: AtomicU64::new(0),
+            decision_samples: AtomicU64::new(0),
+        }
+    }
+}
+
+fn default_metrics() -> Arc<AchfMetrics> {
+    Arc::new(AchfMetrics::default())
+}
+
 #[derive(Clone)]
 pub struct AchfCache {
     pub dense: Option<Vec<f64>>,
     pub in_dim: usize,
     pub out_dim: usize,
-    pub calls: u64,
-    pub cache_hits: u64,
-    pub cache_misses: u64,
-    pub cache_skips: u64,
-    pub low_rank_paths: u64,
-    pub dense_paths: u64,
     pub ema_cached_ns: f64,
     pub ema_cached_long_ns: f64,
     pub ema_low_rank_ns: f64,
@@ -62,8 +103,6 @@ pub struct AchfCache {
     pub decision_ema_ns: f64,
     pub decision_ema_long_ns: f64,
     pub adaptive_bias: f64,
-    pub latency_samples: u64,
-    pub decision_samples: u64,
     pub last_input_hash: Option<u64>,
     pub last_output: Option<Vec<f64>>,
     pub last_input_count: u64,
@@ -86,12 +125,6 @@ fn default_cache() -> Arc<RwLock<AchfCache>> {
         dense: None,
         in_dim: 0,
         out_dim: 0,
-        calls: 0,
-        cache_hits: 0,
-        cache_misses: 0,
-        cache_skips: 0,
-        low_rank_paths: 0,
-        dense_paths: 0,
         ema_cached_ns: 0.0,
         ema_cached_long_ns: 0.0,
         ema_low_rank_ns: 0.0,
@@ -99,8 +132,6 @@ fn default_cache() -> Arc<RwLock<AchfCache>> {
         decision_ema_ns: 0.0,
         decision_ema_long_ns: 0.0,
         adaptive_bias: 0.0,
-        latency_samples: 0,
-        decision_samples: 0,
         last_input_hash: None,
         last_output: None,
         last_input_count: 0,
@@ -287,6 +318,7 @@ impl AchfLayer {
             config,
             state: default_state(),
             cache: default_cache(),
+            metrics: default_metrics(),
         };
         {
             let mut cache = layer.cache.write().unwrap();
@@ -298,18 +330,16 @@ impl AchfLayer {
     pub fn snapshot_state(&self) -> AchfStateSnapshot {
         let state = self.state.read().unwrap();
         let cache = self.cache.read().unwrap();
-        let calls = cache.calls as f64;
+        let calls = self.metrics.calls.load(Ordering::Relaxed) as f64;
+        let cache_hits = self.metrics.cache_hits.load(Ordering::Relaxed) as f64;
+        let low_rank_paths = self.metrics.low_rank_paths.load(Ordering::Relaxed) as f64;
         AchfStateSnapshot {
             gate: state.last_gate,
             g_min: state.g_min_ema,
             grad_ema: state.grad_ema,
-            cache_hit_rate: if calls > 0.0 {
-                cache.cache_hits as f64 / calls
-            } else {
-                0.0
-            },
+            cache_hit_rate: if calls > 0.0 { cache_hits / calls } else { 0.0 },
             low_rank_ratio: if calls > 0.0 {
-                cache.low_rank_paths as f64 / calls
+                low_rank_paths / calls
             } else {
                 0.0
             },
@@ -375,9 +405,8 @@ impl AchfLayer {
                 }
             };
             if let Some(out) = memo_hit {
-                let mut cache = self.cache.write().unwrap();
-                cache.calls += 1;
-                cache.cache_hits += 1;
+                self.metrics.calls.fetch_add(1, Ordering::Relaxed);
+                self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
                 return out;
             }
         }
@@ -552,12 +581,12 @@ impl AchfLayer {
     pub fn cache_stats(&self) -> AchfCacheStats {
         let cache = self.cache.read().unwrap();
         AchfCacheStats {
-            calls: cache.calls,
-            cache_hits: cache.cache_hits,
-            cache_misses: cache.cache_misses,
-            cache_skips: cache.cache_skips,
-            low_rank_paths: cache.low_rank_paths,
-            dense_paths: cache.dense_paths,
+            calls: self.metrics.calls.load(Ordering::Relaxed),
+            cache_hits: self.metrics.cache_hits.load(Ordering::Relaxed),
+            cache_misses: self.metrics.cache_misses.load(Ordering::Relaxed),
+            cache_skips: self.metrics.cache_skips.load(Ordering::Relaxed),
+            low_rank_paths: self.metrics.low_rank_paths.load(Ordering::Relaxed),
+            dense_paths: self.metrics.dense_paths.load(Ordering::Relaxed),
             ema_cached_ns: cache.ema_cached_ns,
             ema_cached_long_ns: cache.ema_cached_long_ns,
             ema_low_rank_ns: cache.ema_low_rank_ns,
@@ -565,8 +594,8 @@ impl AchfLayer {
             decision_ema_ns: cache.decision_ema_ns,
             decision_ema_long_ns: cache.decision_ema_long_ns,
             adaptive_bias: cache.adaptive_bias,
-            latency_samples: cache.latency_samples,
-            decision_samples: cache.decision_samples,
+            latency_samples: self.metrics.latency_samples.load(Ordering::Relaxed),
+            decision_samples: self.metrics.decision_samples.load(Ordering::Relaxed),
         }
     }
 
@@ -765,11 +794,11 @@ impl AchfLayer {
         cache.decision_ema_ns = 0.0;
         cache.decision_ema_long_ns = 0.0;
         cache.adaptive_bias = self.config.cache_cost_bias;
-        cache.latency_samples = 0;
-        cache.decision_samples = 0;
         cache.last_input_hash = None;
         cache.last_output = None;
         cache.last_input_count = 0;
+        self.metrics.latency_samples.store(0, Ordering::Relaxed);
+        self.metrics.decision_samples.store(0, Ordering::Relaxed);
     }
 
     fn ensure_cache(&self) {
@@ -786,11 +815,16 @@ impl AchfLayer {
     }
 
     fn input_hash(x: &[f64]) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        for &v in x.iter().take(32) {
-            v.to_bits().hash(&mut hasher);
+        let mut h: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
+        for &v in x {
+            let quantized = (v * 10000.0).round() as i64;
+            let bytes = quantized.to_le_bytes();
+            for &b in &bytes {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3); // FNV-1a prime
+            }
         }
-        hasher.finish()
+        h
     }
 
     fn prepare_inference_cache(&self) {
@@ -856,27 +890,25 @@ impl AchfLayer {
 
     fn choose_inference_path(&self, x: &[f64]) -> InferencePath {
         if !self.is_low_rank() {
-            let mut cache = self.cache.write().unwrap();
-            cache.calls += 1;
-            cache.dense_paths += 1;
+            self.metrics.calls.fetch_add(1, Ordering::Relaxed);
+            self.metrics.dense_paths.fetch_add(1, Ordering::Relaxed);
             return InferencePath::Dense;
         }
         self.ensure_cache();
         let (use_cache, skip_cache, has_cache) = self.should_use_cache(x);
-        let mut cache = self.cache.write().unwrap();
-        cache.calls += 1;
+        self.metrics.calls.fetch_add(1, Ordering::Relaxed);
         if use_cache {
-            cache.cache_hits += 1;
+            self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
             return InferencePath::Cached;
         }
         if has_cache {
             if skip_cache {
-                cache.cache_skips += 1;
+                self.metrics.cache_skips.fetch_add(1, Ordering::Relaxed);
             } else {
-                cache.cache_misses += 1;
+                self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
             }
         }
-        cache.low_rank_paths += 1;
+        self.metrics.low_rank_paths.fetch_add(1, Ordering::Relaxed);
         InferencePath::LowRank
     }
 
@@ -977,7 +1009,7 @@ impl AchfLayer {
             }
             InferencePath::Dense => {}
         }
-        cache.latency_samples += 1;
+        self.metrics.latency_samples.fetch_add(1, Ordering::Relaxed);
         if self.config.cache_adapt_rate > 0.0
             && cache.ema_cached_ns > 0.0
             && cache.ema_low_rank_ns > 0.0
@@ -1020,16 +1052,18 @@ impl AchfLayer {
             cache.decision_ema_long_ns =
                 ema_long * cache.decision_ema_long_ns + (1.0 - ema_long) * elapsed_ns;
         }
-        cache.decision_samples += 1;
+        self.metrics
+            .decision_samples
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn should_sample_latency(&self) -> bool {
         if self.config.cache_latency_sample_every == 0 {
             return true;
         }
-        let cache = self.cache.read().unwrap();
-        cache
+        self.metrics
             .calls
+            .load(Ordering::Relaxed)
             .is_multiple_of(self.config.cache_latency_sample_every)
     }
 }
@@ -1043,15 +1077,12 @@ enum InferencePath {
 
 fn rowcol_project(w: &mut [f64], rows: usize, cols: usize) {
     for r in 0..rows {
-        let mut sum_sq = 0.0;
-        for c in 0..cols {
-            let v = w[r * cols + c];
-            sum_sq += v * v;
-        }
+        let row = &w[r * cols..(r + 1) * cols];
+        let sum_sq = dot_product(row, row);
         if sum_sq > 0.0 {
-            let norm = sum_sq.sqrt();
+            let inv_norm = 1.0 / sum_sq.sqrt();
             for c in 0..cols {
-                w[r * cols + c] /= norm;
+                w[r * cols + c] *= inv_norm;
             }
         }
     }
@@ -1062,9 +1093,9 @@ fn rowcol_project(w: &mut [f64], rows: usize, cols: usize) {
             sum_sq += v * v;
         }
         if sum_sq > 0.0 {
-            let norm = sum_sq.sqrt();
+            let inv_norm = 1.0 / sum_sq.sqrt();
             for r in 0..rows {
-                w[r * cols + c] /= norm;
+                w[r * cols + c] *= inv_norm;
             }
         }
     }

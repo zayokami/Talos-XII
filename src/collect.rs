@@ -288,11 +288,22 @@ pub fn add_session_interactive(config: &Config, lang: Language) -> Option<Player
 
     let pulls = if mode.trim() == "2" {
         let total_str = prompt(&I18n::get(lang, "collect_total_pulls"));
-        let total: usize = total_str.parse().unwrap_or(0);
-        if total == 0 {
-            println!("{}", I18n::get(lang, "collect_invalid_input"));
-            return None;
-        }
+        let total: usize = match total_str.parse() {
+            Ok(n) if n > 0 && n <= 10000 => n,
+            Ok(n) if n > 10000 => {
+                println!(
+                    "  {}",
+                    I18n::get(lang, "input_capped")
+                        .replacen("{}", &n.to_string(), 1)
+                        .replacen("{}", "10000", 1)
+                );
+                10000
+            }
+            _ => {
+                println!("{}", I18n::get(lang, "collect_invalid_input"));
+                return None;
+            }
+        };
 
         let positions_str = prompt(&I18n::get(lang, "collect_six_positions"));
         let up_str = prompt(&I18n::get(lang, "collect_up_flags"));
@@ -327,9 +338,18 @@ pub fn add_session_interactive(config: &Config, lang: Language) -> Option<Player
                     continue;
                 }
             };
-            let is_up = parts[1].eq_ignore_ascii_case("y")
-                || parts[1].eq_ignore_ascii_case("yes")
-                || parts[1] == "1";
+            let up_str = parts[1].to_lowercase();
+            let is_up = match up_str.as_str() {
+                "y" | "yes" | "1" | "true" => true,
+                "n" | "no" | "0" | "false" => false,
+                _ => {
+                    println!(
+                        "  {} (y/n/yes/no/1/0)",
+                        I18n::get(lang, "collect_format_hint")
+                    );
+                    continue;
+                }
+            };
             pulls.push(PlayerPullRecord { rarity, is_up });
         }
         pulls

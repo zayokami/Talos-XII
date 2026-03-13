@@ -325,11 +325,15 @@ impl Config {
                         f
                     }
                     Err(_) => {
-                        eprintln!("[FATAL ERROR] Configuration file not found.");
-                        eprintln!("Looked at: './{}' and '../../{}'", path, path);
-                        eprintln!("Use --config <path> or explicitly pass --config default to use built-in defaults.");
+                        eprintln!("\x1b[1;31m[Error]\x1b[0m Configuration file not found.");
+                        eprintln!("  Looked at: './{path}' and '../../{path}'");
+                        eprintln!(
+                            "  Tip: Use --config <path> or --config default for built-in defaults."
+                        );
                         if path == "data/config.json" {
-                            eprintln!("[WARNING] Missing data/config.json. Falling back to built-in defaults for development.");
+                            eprintln!(
+                                "\x1b[33m[Warning]\x1b[0m Missing data/config.json. Falling back to built-in defaults."
+                            );
                             return Config::default();
                         }
                         std::process::exit(1);
@@ -346,7 +350,8 @@ impl Config {
         let root: JsonValue = match serde_json::from_str(&stripped) {
             Ok(value) => value,
             Err(err) => {
-                eprintln!("[FATAL ERROR] JSON parse error: {}", err);
+                eprintln!("\x1b[1;31m[Error]\x1b[0m JSON parse error: {}", err);
+                eprintln!("  Tip: Check for trailing commas, missing quotes, or invalid syntax.");
                 std::process::exit(1);
             }
         };

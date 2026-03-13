@@ -18,7 +18,7 @@ const EPSILON_DECAY: usize = 50000;
 const LEARNING_RATE: f64 = 0.001;
 const TRAIN_FREQ: usize = 10;
 const LOG_FREQ: usize = 100;
-use crate::utils::{ACTIONS, ACTION_SPACE, EPISODE_MAX_PULLS};
+use crate::utils::{create_bar, ACTIONS, ACTION_SPACE, EPISODE_MAX_PULLS};
 
 // PER Hyperparameters (Schaul et al. 2016)
 const PER_ALPHA: f64 = 0.6;
@@ -596,6 +596,8 @@ fn train_dqn_impl(
     let snapshot_every = (total_steps / 200).max(1);
     let mut last_train_loss = 0.0_f64;
 
+    let pb = create_bar(total_steps as u64, "DQN Training");
+
     for step in 0..total_steps {
         // 1. Build State
         let current_state_raw = build_features(
@@ -874,12 +876,11 @@ fn train_dqn_impl(
             } else {
                 recent_rewards.iter().sum::<f64>() / recent_rewards.len() as f64
             };
-            print!(
-                "\r[DQN] Step {:>6}/{} | Ep {:>4} | Avg R: {:>6.2} | Eps: {:.3}",
-                step, total_steps, episode_count, avg_r, epsilon
-            );
-            use std::io::Write;
-            std::io::stdout().flush().unwrap();
+            pb.set_position(step as u64);
+            pb.set_message(format!(
+                "Ep: {} | Avg R: {:.2} | Eps: {:.3}",
+                episode_count, avg_r, epsilon
+            ));
         }
 
         if let Some(ref tx) = metrics_tx {
@@ -917,7 +918,7 @@ fn train_dqn_impl(
             }
         }
     }
-    println!("\n[DQN] Training Complete.");
+    pb.finish_with_message("DQN Training Complete.");
     policy_net.freeze_achf_for_inference();
     policy_net
 }

@@ -7,7 +7,7 @@ use crate::rng::Rng;
 use crate::sim::{build_features, dbn_env, prob_6, PpoExperience, PullState};
 use crate::transformer::{KVCache, LuckTransformer};
 use crate::utils::{
-    normalize_slice, sum_f64, sum_sq_diff, ACTIONS, ACTION_SPACE, EPISODE_MAX_PULLS,
+    create_bar, normalize_slice, sum_f64, sum_sq_diff, ACTIONS, ACTION_SPACE, EPISODE_MAX_PULLS,
 };
 use crate::worker::GoodJobWorker;
 use rand::seq::SliceRandom;
@@ -156,7 +156,7 @@ impl ActorCritic {
     pub fn step_inference_cached_with_value(
         &self,
         state: &[f64],
-        kv_cache: &mut Vec<KVCache>,
+        kv_cache: &mut [KVCache],
         start_pos: usize,
     ) -> (usize, f64, f64) {
         let last = self
@@ -171,7 +171,7 @@ impl ActorCritic {
     pub fn step_inference_cached(
         &self,
         state: &[f64],
-        kv_cache: &mut Vec<KVCache>,
+        kv_cache: &mut [KVCache],
         start_pos: usize,
     ) -> usize {
         let last = self
@@ -181,7 +181,7 @@ impl ActorCritic {
         softmax_sample(&logits).0
     }
 
-    pub fn prune_cache(&self, kv_cache: &mut Vec<KVCache>, max_len: usize) {
+    pub fn prune_cache(&self, kv_cache: &mut [KVCache], max_len: usize) {
         self.backbone.prune_kv_cache(kv_cache, max_len);
     }
 
@@ -293,13 +293,11 @@ impl Adam {
     fn step(&mut self) {
         self.t += 1;
 
-        // Global gradient clipping (max_norm = 1.0)
+        // Global gradient clipping via SIMD dot_product for L2 norm
         let mut total_norm = 0.0;
         for param in &self.params {
             let grad = param.grad.read().unwrap();
-            for &g in grad.iter() {
-                total_norm += g * g;
-            }
+            total_norm += crate::simd::dot_product(&grad, &grad);
         }
         total_norm = total_norm.sqrt();
         let clip_coef = if total_norm > 1.0 {
@@ -310,19 +308,41 @@ impl Adam {
 
         let bias_correction1 = 1.0 - self.beta1.powi(self.t as i32);
         let bias_correction2 = 1.0 - self.beta2.powi(self.t as i32);
+        let b1 = self.beta1;
+        let one_minus_b1 = 1.0 - b1;
+        let b2 = self.beta2;
+        let one_minus_b2 = 1.0 - b2;
+        let lr = self.lr;
+        let eps = self.eps;
+        let wd = self.weight_decay;
 
         for (i, param) in self.params.iter_mut().enumerate() {
             let grad = param.grad.read().unwrap();
             let mut data = param.data.write().unwrap();
-            for j in 0..data.len() {
+            let m = &mut self.m[i];
+            let v = &mut self.v[i];
+            let len = data.len();
+            let mut j = 0;
+            // Process 4 elements at a time for better ILP
+            while j + 4 <= len {
+                for k in j..j + 4 {
+                    let g = grad[k] * clip_coef;
+                    m[k] = b1 * m[k] + one_minus_b1 * g;
+                    v[k] = b2 * v[k] + one_minus_b2 * g * g;
+                    let m_hat = m[k] / bias_correction1;
+                    let v_hat = v[k] / bias_correction2;
+                    data[k] -= lr * (m_hat / (v_hat.sqrt() + eps) + wd * data[k]);
+                }
+                j += 4;
+            }
+            while j < len {
                 let g = grad[j] * clip_coef;
-                self.m[i][j] = self.beta1 * self.m[i][j] + (1.0 - self.beta1) * g;
-                self.v[i][j] = self.beta2 * self.v[i][j] + (1.0 - self.beta2) * g * g;
-                let m_hat = self.m[i][j] / bias_correction1;
-                let v_hat = self.v[i][j] / bias_correction2;
-                // AdamW: decoupled weight decay applied directly to parameters
-                data[j] -=
-                    self.lr * (m_hat / (v_hat.sqrt() + self.eps) + self.weight_decay * data[j]);
+                m[j] = b1 * m[j] + one_minus_b1 * g;
+                v[j] = b2 * v[j] + one_minus_b2 * g * g;
+                let m_hat = m[j] / bias_correction1;
+                let v_hat = v[j] / bias_correction2;
+                data[j] -= lr * (m_hat / (v_hat.sqrt() + eps) + wd * data[j]);
+                j += 1;
             }
         }
     }
@@ -474,27 +494,18 @@ impl Ppo {
         // Target KL Divergence for Early Stopping
         let target_kl = 0.015;
         let mut indices: Vec<usize> = (0..len).collect();
-        let action_masks: Vec<Tensor> = (0..ACTION_SPACE)
-            .map(|idx| {
-                let mut mask_vec = vec![0.0; ACTION_SPACE];
-                mask_vec[idx] = 1.0;
-                Tensor::new(mask_vec, vec![ACTION_SPACE])
-            })
-            .collect();
+        let value_coef_tensor = Tensor::new(vec![VALUE_COEF], vec![1]);
+        let entropy_coef_tensor = Tensor::new(vec![ENTROPY_COEF], vec![1]);
 
-        let total_batches = len.div_ceil(self.batch_size);
-        let mut last_update = Instant::now();
-        let update_every = Duration::from_millis(500);
-        let mut update_batches_done = 0usize;
         let mut loss_sum = 0.0_f64;
         let mut loss_count = 0usize;
-        for epoch_idx in 0..self.k_epochs {
+        for _ in 0..self.k_epochs {
             indices.shuffle(&mut rand::rng());
             let mut approx_kl = 0.0;
             let mut batch_count = 0.0;
             let mut early_stop = false;
 
-            for (batch_idx, chunk) in indices.chunks(self.batch_size).enumerate() {
+            for chunk in indices.chunks(self.batch_size) {
                 self.optimizer.zero_grad();
 
                 let mut loss_accum = Tensor::zeros(vec![1]);
@@ -510,33 +521,17 @@ impl Ppo {
 
                     let (logits, value) = self.policy.forward_actor_critic(state, pity);
 
-                    let max_logit = logits
-                        .data
-                        .read()
-                        .unwrap()
-                        .iter()
-                        .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-                    let exp_logits = (logits.clone()
-                        + Tensor::new(vec![-max_logit; ACTION_SPACE], vec![ACTION_SPACE]))
-                    .exp();
-                    let sum_exp = exp_logits.sum();
-                    let log_sum_exp = sum_exp.log() + Tensor::new(vec![max_logit], vec![1]);
-
-                    let mask = action_masks[action_idx].clone();
-
-                    let log_probs = logits.clone() - log_sum_exp.broadcast(vec![ACTION_SPACE]);
-
-                    let log_prob = (log_probs.clone() * mask).sum();
+                    let all_log_probs = logits.log_softmax();
+                    let log_prob = all_log_probs.index_select(action_idx);
 
                     let old_log_prob_tensor = Tensor::new(vec![old_log_prob], vec![1]);
-                    // Use references to avoid moving, cleaner than explicit clones
-                    let log_ratio = &log_prob - &old_log_prob_tensor;
+                    let log_ratio = log_prob - old_log_prob_tensor;
                     let ratio = log_ratio.clone().exp();
 
-                    // Calculate KL Divergence
-                    // kl = (ratio - 1) - log_ratio
-                    let kl = (ratio.clone() - Tensor::new(vec![1.0], vec![1])) - log_ratio.clone();
-                    approx_kl += kl.data.read().unwrap()[0];
+                    // KL divergence as scalar (no autograd needed)
+                    let ratio_val = ratio.data.read().unwrap()[0];
+                    let log_ratio_val = log_ratio.data.read().unwrap()[0];
+                    approx_kl += (ratio_val - 1.0) - log_ratio_val;
                     batch_count += 1.0;
 
                     let adv_tensor = Tensor::new(vec![advantage], vec![1]);
@@ -551,11 +546,11 @@ impl Ppo {
                     let ret_tensor = Tensor::new(vec![return_val], vec![1]);
                     let v_loss = (value - ret_tensor).mse_loss(&Tensor::zeros(vec![1]));
 
-                    let p = log_probs.exp();
-                    let entropy = -(p * log_probs).sum();
+                    let p = all_log_probs.exp();
+                    let entropy = -(p * all_log_probs).sum();
 
-                    let loss = -policy_loss + v_loss * Tensor::new(vec![VALUE_COEF], vec![1])
-                        - entropy * Tensor::new(vec![ENTROPY_COEF], vec![1]);
+                    let loss = -policy_loss + v_loss * value_coef_tensor.clone()
+                        - entropy * entropy_coef_tensor.clone();
 
                     loss_accum = loss_accum + loss;
                 }
@@ -573,22 +568,6 @@ impl Ppo {
 
                 if batch_count > 0.0 && (approx_kl / batch_count) > target_kl * 1.5 {
                     early_stop = true;
-                }
-
-                update_batches_done += 1;
-                if last_update.elapsed() >= update_every {
-                    print!(
-                        "\r[PPO] Updating: {}/{} | Epoch {}/{} | Batch {}/{}",
-                        update_batches_done,
-                        total_batches * self.k_epochs,
-                        epoch_idx + 1,
-                        self.k_epochs,
-                        batch_idx + 1,
-                        total_batches
-                    );
-                    use std::io::Write;
-                    std::io::stdout().flush().unwrap();
-                    last_update = Instant::now();
                 }
 
                 if early_stop {
@@ -896,6 +875,7 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
     let heartbeat_every = if fast_mode { 128 } else { 512 };
     let mut last_heartbeat = Instant::now();
     let mut remainder_offset = 0usize;
+    let pb = create_bar(total_steps as u64, "PPO Training");
     while steps_done < total_steps {
         // Calculate LR
         let progress = steps_done as f64 / total_steps as f64;
@@ -935,12 +915,11 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
                 let global_step = (steps_done + collected).min(total_steps);
                 let avg_env_reward =
                     envs.iter().map(|e| e.episode_reward).sum::<f64>() / num_envs as f64;
-                print!(
-                    "\r[PPO] Collecting: {}/{} | Avg Reward: {:.2} | LR: {:.6}",
-                    global_step, total_steps, avg_env_reward, current_lr
-                );
-                use std::io::Write;
-                std::io::stdout().flush().unwrap();
+                pb.set_position(global_step as u64);
+                pb.set_message(format!(
+                    "Avg R: {:.2} | LR: {:.6}",
+                    avg_env_reward, current_lr
+                ));
                 last_heartbeat = Instant::now();
             }
         }
@@ -962,18 +941,21 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
                     && last_heartbeat.elapsed() >= Duration::from_millis(300)
                 {
                     let global_step = (steps_done + collected).min(total_steps);
-                    print!(
-                        "\r[PPO] Collecting: {}/{} | Avg Reward: {:.2} | LR: {:.6}",
-                        global_step, total_steps, envs[idx].episode_reward, current_lr
-                    );
-                    use std::io::Write;
-                    std::io::stdout().flush().unwrap();
+                    pb.set_position(global_step as u64);
+                    pb.set_message(format!(
+                        "Avg R: {:.2} | LR: {:.6}",
+                        envs[idx].episode_reward, current_lr
+                    ));
                     last_heartbeat = Instant::now();
                 }
             }
             remainder_offset = (remainder_offset + remainder) % num_envs;
         }
 
+        pb.set_message(format!(
+            "Updating ({} samples, {} epochs)...",
+            collected, k_epochs
+        ));
         ppo.update(current_lr);
         steps_done += steps_per_update;
 
@@ -1003,14 +985,10 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
         } else {
             recent_rewards.iter().sum::<f64>() / recent_rewards.len() as f64
         };
-        print!(
-            "\r[PPO] Steps: {}/{} | Avg Reward: {:.2} | LR: {:.6}",
-            steps_done, total_steps, avg_r, current_lr
-        );
-        use std::io::Write;
-        std::io::stdout().flush().unwrap();
+        pb.set_position(steps_done as u64);
+        pb.set_message(format!("Avg R: {:.2} | LR: {:.6}", avg_r, current_lr));
     }
-    println!("\n[PPO] Training Complete.");
+    pb.finish_with_message("PPO Training Complete.");
     ppo.policy.freeze_achf_for_inference();
     ppo.policy
 }
@@ -1087,6 +1065,7 @@ pub fn train_ppo_with_metrics(
     let mut last_heartbeat = Instant::now();
     let snapshot_every = (total_steps / 200).max(1);
     let mut remainder_offset = 0usize;
+    let pb = create_bar(total_steps as u64, "PPO Training");
 
     while steps_done < total_steps {
         let progress = steps_done as f64 / total_steps as f64;
@@ -1126,12 +1105,11 @@ pub fn train_ppo_with_metrics(
                 let global_step = (steps_done + collected).min(total_steps);
                 let avg_env_reward =
                     envs.iter().map(|e| e.episode_reward).sum::<f64>() / num_envs as f64;
-                print!(
-                    "\r[PPO] Collecting: {}/{} | Avg Reward: {:.2} | LR: {:.6}",
-                    global_step, total_steps, avg_env_reward, current_lr
-                );
-                use std::io::Write;
-                std::io::stdout().flush().unwrap();
+                pb.set_position(global_step as u64);
+                pb.set_message(format!(
+                    "Avg R: {:.2} | LR: {:.6}",
+                    avg_env_reward, current_lr
+                ));
                 last_heartbeat = Instant::now();
             }
         }
@@ -1152,6 +1130,10 @@ pub fn train_ppo_with_metrics(
             remainder_offset = (remainder_offset + remainder) % num_envs;
         }
 
+        pb.set_message(format!(
+            "Updating ({} samples, {} epochs)...",
+            steps_per_update, k_epochs
+        ));
         let update_loss = ppo.update(current_lr);
         steps_done = (steps_done + steps_per_update).min(total_steps);
 
@@ -1181,14 +1163,10 @@ pub fn train_ppo_with_metrics(
             }
         }
 
-        print!(
-            "\r[PPO] Steps: {}/{} | Avg Reward: {:.2} | LR: {:.6}",
-            steps_done, total_steps, avg_r, current_lr
-        );
-        use std::io::Write;
-        std::io::stdout().flush().unwrap();
+        pb.set_position(steps_done as u64);
+        pb.set_message(format!("Avg R: {:.2} | LR: {:.6}", avg_r, current_lr));
     }
-    println!("\n[PPO] Training Complete.");
+    pb.finish_with_message("PPO Training Complete.");
     ppo.policy.freeze_achf_for_inference();
     ppo.policy
 }

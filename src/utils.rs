@@ -1,6 +1,7 @@
 //! Shared utility functions, constants, and SIMD-accelerated math helpers.
 
 use crate::achf::AchfCacheStats;
+use indicatif::{ProgressBar, ProgressStyle};
 
 /// Reward constants for training signal computation.
 pub const REWARD_BASE: f64 = -0.1;
@@ -340,4 +341,230 @@ unsafe fn normalize_slice_neon(values: &[f64], out: &mut [f64], mean: f64, std: 
         *out.get_unchecked_mut(i) = (*values.get_unchecked(i) - mean) / std;
         i += 1;
     }
+}
+
+// ── Progress bar helper ─────────────────────────────────────────────────
+
+/// Create a styled progress bar with the given total and prefix message.
+/// Enables a background steady tick so the spinner and elapsed time keep updating
+/// even when the main thread is blocked by heavy computation.
+pub fn create_bar(total: u64, msg: &str) -> ProgressBar {
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg} [{elapsed_precise}]")
+            .unwrap()
+            .progress_chars("█▓░"),
+    );
+    pb.set_message(msg.to_string());
+    pb.enable_steady_tick(std::time::Duration::from_millis(200));
+    pb
+}
+
+/// Create a spinner (unknown total) with a message.
+#[allow(dead_code)]
+pub fn create_spinner(msg: &str) -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg} [{elapsed_precise}]")
+            .unwrap(),
+    );
+    pb.set_message(msg.to_string());
+    pb.enable_steady_tick(std::time::Duration::from_millis(120));
+    pb
+}
+
+// ── Unicode table renderer ──────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq)]
+#[allow(dead_code)]
+pub enum Align {
+    Left,
+    Right,
+}
+
+pub struct Table {
+    headers: Vec<String>,
+    rows: Vec<Vec<String>>,
+    alignments: Vec<Align>,
+}
+
+impl Table {
+    pub fn new(headers: &[&str]) -> Self {
+        let n = headers.len();
+        Self {
+            headers: headers.iter().map(|s| s.to_string()).collect(),
+            rows: Vec::new(),
+            alignments: vec![Align::Left; n],
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn align(mut self, col: usize, a: Align) -> Self {
+        if col < self.alignments.len() {
+            self.alignments[col] = a;
+        }
+        self
+    }
+
+    pub fn add_row(&mut self, row: Vec<String>) {
+        self.rows.push(row);
+    }
+
+    pub fn render(&self) -> String {
+        let cols = self.headers.len();
+        let mut widths = vec![0usize; cols];
+        for (i, h) in self.headers.iter().enumerate() {
+            widths[i] = display_width(h);
+        }
+        for row in &self.rows {
+            for (i, cell) in row.iter().enumerate() {
+                if i < cols {
+                    widths[i] = widths[i].max(display_width(cell));
+                }
+            }
+        }
+
+        let mut out = String::new();
+        render_border(&mut out, &widths, '┌', '┬', '┐');
+        render_row(&mut out, &self.headers, &widths, &self.alignments);
+        render_border(&mut out, &widths, '├', '┼', '┤');
+        for row in &self.rows {
+            render_data_row(&mut out, row, &widths, &self.alignments, cols);
+        }
+        render_border_no_newline(&mut out, &widths, '└', '┴', '┘');
+        out
+    }
+}
+
+fn render_border(out: &mut String, widths: &[usize], left: char, mid: char, right: char) {
+    out.push(left);
+    for (i, &w) in widths.iter().enumerate() {
+        for _ in 0..w + 2 {
+            out.push('─');
+        }
+        if i + 1 < widths.len() {
+            out.push(mid);
+        }
+    }
+    out.push(right);
+    out.push('\n');
+}
+
+fn render_border_no_newline(
+    out: &mut String,
+    widths: &[usize],
+    left: char,
+    mid: char,
+    right: char,
+) {
+    out.push(left);
+    for (i, &w) in widths.iter().enumerate() {
+        for _ in 0..w + 2 {
+            out.push('─');
+        }
+        if i + 1 < widths.len() {
+            out.push(mid);
+        }
+    }
+    out.push(right);
+}
+
+fn render_row(out: &mut String, cells: &[String], widths: &[usize], aligns: &[Align]) {
+    out.push('│');
+    for (i, cell) in cells.iter().enumerate() {
+        out.push(' ');
+        out.push_str(&pad_cell(
+            cell,
+            widths[i],
+            aligns.get(i).copied().unwrap_or(Align::Left),
+        ));
+        out.push(' ');
+        out.push('│');
+    }
+    out.push('\n');
+}
+
+fn render_data_row(
+    out: &mut String,
+    row: &[String],
+    widths: &[usize],
+    aligns: &[Align],
+    cols: usize,
+) {
+    out.push('│');
+    for (i, w) in widths.iter().enumerate().take(cols) {
+        let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
+        out.push(' ');
+        out.push_str(&pad_cell(
+            cell,
+            *w,
+            aligns.get(i).copied().unwrap_or(Align::Left),
+        ));
+        out.push(' ');
+        out.push('│');
+    }
+    out.push('\n');
+}
+
+/// Approximate display width accounting for CJK characters (width 2).
+fn display_width(s: &str) -> usize {
+    s.chars().map(|c| if is_wide_char(c) { 2 } else { 1 }).sum()
+}
+
+fn is_wide_char(c: char) -> bool {
+    let cp = c as u32;
+    (0x4E00..=0x9FFF).contains(&cp)
+        || (0x3400..=0x4DBF).contains(&cp)
+        || (0x3000..=0x303F).contains(&cp)
+        || (0xFF01..=0xFF60).contains(&cp)
+        || (0xFE30..=0xFE4F).contains(&cp)
+        || (0x2E80..=0x2EFF).contains(&cp)
+        || (0x3100..=0x312F).contains(&cp)
+        || (0xF900..=0xFAFF).contains(&cp)
+        || (0x20000..=0x2A6DF).contains(&cp)
+}
+
+fn pad_cell(s: &str, width: usize, align: Align) -> String {
+    let w = display_width(s);
+    if w >= width {
+        return s.to_string();
+    }
+    let diff = width - w;
+    match align {
+        Align::Left => format!("{}{}", s, " ".repeat(diff)),
+        Align::Right => format!("{}{}", " ".repeat(diff), s),
+    }
+}
+
+// ── Levenshtein distance ────────────────────────────────────────────────
+
+pub fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let (m, n) = (a.len(), b.len());
+    let mut prev = (0..=n).collect::<Vec<_>>();
+    let mut curr = vec![0; n + 1];
+    for i in 1..=m {
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
+}
+
+/// Find the closest command from a list, returning it if within distance threshold.
+pub fn suggest_command<'a>(input: &str, commands: &[&'a str], max_dist: usize) -> Option<&'a str> {
+    let mut best: Option<(&str, usize)> = None;
+    for &cmd in commands {
+        let d = levenshtein(input, cmd);
+        if d <= max_dist && (best.is_none() || d < best.unwrap().1) {
+            best = Some((cmd, d));
+        }
+    }
+    best.map(|(cmd, _)| cmd)
 }

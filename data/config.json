@@ -427,11 +427,11 @@
   "luck_mode": "ppo",
   "fast_init": false,
   "ppo_mode": "balanced",
-  "ppo_total_steps": 200000,
+  "ppo_total_steps": 20000,
   "ppo_steps_per_update": 2048,
-  "ppo_k_epochs": 8,
+  "ppo_k_epochs": 3,
   "ppo_batch_size": 256,
-  "ppo_context_len": 16,
+  "ppo_context_len": 8,
   "ppo_num_envs": 4,
   "online_train": false,
   "online_train_ppo": false,
@@ -482,5 +482,5 @@
     "apply_dqn": false,
     "infer_gate": "g_min"
   },
-  "language": "en"
+  "language": "zh"
 }

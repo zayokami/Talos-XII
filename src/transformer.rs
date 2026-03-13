@@ -335,20 +335,20 @@ impl LuckTransformer {
     pub fn forward_inference_step(
         &self,
         x: &[f64],
-        kv_caches: &mut Vec<KVCache>,
+        kv_caches: &mut [KVCache],
         start_pos: usize,
     ) -> Vec<f64> {
         // x: [Dim] (one token)
         let mut h = self.embed.forward_inference(x);
 
         let layer_count = self.blocks.len().min(kv_caches.len());
-        for i in 0..layer_count {
+        for (i, kv_cache) in kv_caches.iter_mut().enumerate().take(layer_count) {
             let block = &self.blocks[i];
             let h_norm1 = block.norm_1.forward_inference(&h);
 
             let attn_out = block
                 .mla_layer
-                .forward_inference_cached(&h_norm1, &mut kv_caches[i], start_pos);
+                .forward_inference_cached(&h_norm1, kv_cache, start_pos);
 
             // Residual
             let mut h2 = vec![0.0; h.len()];
@@ -393,12 +393,12 @@ impl LuckTransformer {
         self.out_proj.forward_inference(&h_final)
     }
 
-    pub fn prune_kv_cache(&self, kv_caches: &mut Vec<KVCache>, max_seq_len: usize) {
+    pub fn prune_kv_cache(&self, kv_caches: &mut [KVCache], max_seq_len: usize) {
         let layer_count = self.blocks.len().min(kv_caches.len());
-        for i in 0..layer_count {
+        for (i, kv_cache) in kv_caches.iter_mut().enumerate().take(layer_count) {
             self.blocks[i]
                 .mla_layer
-                .prune_kv_cache(&mut kv_caches[i], max_seq_len);
+                .prune_kv_cache(kv_cache, max_seq_len);
         }
     }
 }
@@ -1838,4 +1838,3 @@ mod tests {
         }
     }
 }
-
