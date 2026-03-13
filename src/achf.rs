@@ -55,6 +55,8 @@ pub struct AchfMetrics {
     pub dense_paths: AtomicU64,
     pub latency_samples: AtomicU64,
     pub decision_samples: AtomicU64,
+    pub memo_hash: AtomicU64,
+    pub memo_count: AtomicU64,
 }
 
 impl Clone for AchfMetrics {
@@ -68,6 +70,8 @@ impl Clone for AchfMetrics {
             dense_paths: AtomicU64::new(self.dense_paths.load(Ordering::Relaxed)),
             latency_samples: AtomicU64::new(self.latency_samples.load(Ordering::Relaxed)),
             decision_samples: AtomicU64::new(self.decision_samples.load(Ordering::Relaxed)),
+            memo_hash: AtomicU64::new(self.memo_hash.load(Ordering::Relaxed)),
+            memo_count: AtomicU64::new(self.memo_count.load(Ordering::Relaxed)),
         }
     }
 }
@@ -83,6 +87,8 @@ impl Default for AchfMetrics {
             dense_paths: AtomicU64::new(0),
             latency_samples: AtomicU64::new(0),
             decision_samples: AtomicU64::new(0),
+            memo_hash: AtomicU64::new(0),
+            memo_count: AtomicU64::new(0),
         }
     }
 }
@@ -391,23 +397,17 @@ impl AchfLayer {
 
         if self.config.cache_min_reuse > 0 {
             let hash = Self::input_hash(x);
-            let memo_hit = {
-                let mut cache = self.cache.write().unwrap();
-                if cache.last_input_hash == Some(hash) {
-                    cache.last_input_count = cache.last_input_count.saturating_add(1);
-                    if cache.last_input_count >= self.config.cache_min_reuse as u64 {
-                        cache.last_output.clone()
-                    } else {
-                        None
+            let stored_hash = self.metrics.memo_hash.load(Ordering::Relaxed);
+            if stored_hash == hash && hash != 0 {
+                let count = self.metrics.memo_count.fetch_add(1, Ordering::Relaxed) + 1;
+                if count >= self.config.cache_min_reuse as u64 {
+                    let cache = self.cache.read().unwrap();
+                    if let Some(ref out) = cache.last_output {
+                        self.metrics.calls.fetch_add(1, Ordering::Relaxed);
+                        self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
+                        return out.clone();
                     }
-                } else {
-                    None
                 }
-            };
-            if let Some(out) = memo_hit {
-                self.metrics.calls.fetch_add(1, Ordering::Relaxed);
-                self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
-                return out;
             }
         }
 
@@ -457,14 +457,16 @@ impl AchfLayer {
 
         if self.config.cache_min_reuse > 0 {
             let hash = Self::input_hash(x);
-            let mut cache = self.cache.write().unwrap();
-            if cache.last_input_hash == Some(hash) {
-                cache.last_input_count = cache.last_input_count.saturating_add(1);
+            let prev = self.metrics.memo_hash.load(Ordering::Relaxed);
+            if prev == hash {
+                self.metrics.memo_count.fetch_add(1, Ordering::Relaxed);
             } else {
-                cache.last_input_hash = Some(hash);
-                cache.last_input_count = 1;
+                self.metrics.memo_hash.store(hash, Ordering::Relaxed);
+                self.metrics.memo_count.store(1, Ordering::Relaxed);
             }
-            cache.last_output = Some(out.clone());
+            if let Ok(mut cache) = self.cache.try_write() {
+                cache.last_output = Some(out.clone());
+            }
         }
 
         out
@@ -680,6 +682,12 @@ impl AchfLayer {
         }
         if self.config.proj_freq == 0 {
             return;
+        }
+        {
+            let state = self.state.read().unwrap();
+            if state.freeze_projection {
+                return;
+            }
         }
         let mut state = self.state.write().unwrap();
         if state.freeze_projection {
@@ -977,7 +985,9 @@ impl AchfLayer {
         if elapsed_ns <= 0.0 {
             return;
         }
-        let mut cache = self.cache.write().unwrap();
+        let Ok(mut cache) = self.cache.try_write() else {
+            return;
+        };
         let ema = self.config.cache_latency_ema;
         let ema_long = self.config.cache_latency_long_ema;
         match path {
@@ -1038,7 +1048,9 @@ impl AchfLayer {
         if elapsed_ns <= 0.0 {
             return;
         }
-        let mut cache = self.cache.write().unwrap();
+        let Ok(mut cache) = self.cache.try_write() else {
+            return;
+        };
         let ema = self.config.cache_latency_ema;
         let ema_long = self.config.cache_latency_long_ema;
         if cache.decision_ema_ns == 0.0 || ema <= 0.0 {

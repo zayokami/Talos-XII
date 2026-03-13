@@ -249,13 +249,43 @@ impl Tensor {
                         if scale == 0.0 {
                             continue;
                         }
-                        // Prefetch next RHS row into L1 while processing current
                         if i + 2 < k {
                             prefetch_read_l1(rhs_data[(i + 2) * n..].as_ptr());
                         }
                         let rhs_row = &rhs_data[i * n..(i + 1) * n];
                         add_scaled_row(out_row, rhs_row, scale);
                     }
+                }
+            } else if (2..=4).contains(&m) && n >= 512 {
+                let n_chunks = rayon::current_num_threads().min(8);
+                let chunk_size = n.div_ceil(n_chunks);
+                for r in 0..m {
+                    let out_row = &mut out_data[r * n..(r + 1) * n];
+                    out_row
+                        .par_chunks_mut(chunk_size)
+                        .enumerate()
+                        .for_each(|(ci, chunk)| {
+                            let col_start = ci * chunk_size;
+                            for i in 0..k {
+                                let scale = lhs_data[r * k + i];
+                                if scale == 0.0 {
+                                    continue;
+                                }
+                                let rhs_slice =
+                                    &rhs_data[i * n + col_start..i * n + col_start + chunk.len()];
+                                add_scaled_row(chunk, rhs_slice, scale);
+                            }
+                        });
+                }
+            } else if m == 1 {
+                let out_row = &mut out_data[..n];
+                for i in 0..k {
+                    let scale = lhs_data[i];
+                    if scale == 0.0 {
+                        continue;
+                    }
+                    let rhs_row = &rhs_data[i * n..(i + 1) * n];
+                    add_scaled_row(out_row, rhs_row, scale);
                 }
             } else {
                 out_data
@@ -304,7 +334,6 @@ impl Tensor {
                         let mut lhs_grad = lhs.grad.write().unwrap();
                         let ops = m * k * n;
                         if ops < 32768 {
-                            // Serial
                             for r in 0..m {
                                 let grad_out_row_start = r * n;
                                 let lhs_grad_row_start = r * k;
@@ -316,6 +345,21 @@ impl Tensor {
                                     lhs_grad[lhs_grad_row_start + i] +=
                                         dot_product(grad_row, rhs_row);
                                 }
+                            }
+                        } else if (2..=4).contains(&m) && k >= 64 {
+                            for r in 0..m {
+                                let grad_row = &grad_out[r * n..(r + 1) * n];
+                                let lhs_row = &mut lhs_grad[r * k..(r + 1) * k];
+                                lhs_row.par_iter_mut().enumerate().for_each(|(i, val)| {
+                                    let rhs_row = &rhs_data[i * n..i * n + n];
+                                    *val += dot_product(grad_row, rhs_row);
+                                });
+                            }
+                        } else if m == 1 {
+                            let grad_row = &grad_out[..n];
+                            for i in 0..k {
+                                let rhs_row = &rhs_data[i * n..i * n + n];
+                                lhs_grad[i] += dot_product(grad_row, rhs_row);
                             }
                         } else {
                             lhs_grad

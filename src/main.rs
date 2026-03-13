@@ -46,8 +46,9 @@ use worker::GoodJobWorker;
 
 use sim::{
     build_non_up_six, format_avg_extra_cost_line, format_f2p_probability_line,
-    resolve_operator_name, simulate_f2p_clearing, simulate_fast, simulate_one, simulate_stats,
-    NeuralSample, PpoExperience, SimModelContext, SimRunContext, COST_PER_PULL, FREE_PULLS_WELFARE,
+    resolve_operator_name, simulate_f2p_clearing_with_progress, simulate_fast, simulate_one,
+    simulate_stats, simulate_stats_with_progress, NeuralSample, PpoExperience, SimModelContext,
+    SimRunContext, COST_PER_PULL, FREE_PULLS_WELFARE,
 };
 use trainer::{
     train_linear_regression, train_manifold_rl, train_neural_optimizer, OnlineNeuralTrainer,
@@ -172,8 +173,8 @@ fn prompt_yes_no(prompt: &str, default_yes: bool) -> bool {
 
 use model_io::{load_model, load_neural_cache, save_model, save_neural_cache};
 use utils::{
-    F2P_BATCH_COUNT, INPUT_CAP, MAX_DRAIN_PER_TICK, ONLINE_REPORT_INTERVAL_SECS, PPO_ONLINE_LR,
-    PULL_DISPLAY_LIMIT, SIM_HISTORY_CAPACITY,
+    INPUT_CAP, MAX_DRAIN_PER_TICK, ONLINE_REPORT_INTERVAL_SECS, PPO_ONLINE_LR, PULL_DISPLAY_LIMIT,
+    SIM_HISTORY_CAPACITY,
 };
 
 /// Resolve the effective simulation count for F2P probability estimation.
@@ -247,12 +248,6 @@ fn run_f2p_analysis(ctx: &F2pAnalysisCtx<'_>, rng: &mut Rng) {
         I18n::get(lang, "sys_run_prob").replace("{}", &sim_count_prob.to_string())
     );
 
-    let batches: usize = F2P_BATCH_COUNT;
-    let batch_base = sim_count_prob / batches;
-    let batch_remainder = sim_count_prob % batches;
-    let mut total_up_agg = 0;
-    let mut total_with_up_agg = 0;
-
     let start_time = Instant::now();
     let sim_ctx = SimRunContext {
         neural_opt: ctx.neural_opt,
@@ -267,24 +262,16 @@ fn run_f2p_analysis(ctx: &F2pAnalysisCtx<'_>, rng: &mut Rng) {
     };
 
     let pb_prob = utils::create_bar(
-        batches as u64,
+        sim_count_prob as u64,
         &I18n::get(lang, "sys_run_prob").replace("{}", &sim_count_prob.to_string()),
     );
-    for i in 0..batches {
-        let this_batch = batch_base + if i < batch_remainder { 1 } else { 0 };
-        if this_batch == 0 {
-            continue;
-        }
-        let (_, total_up, _, total_with_up) = simulate_stats(
-            FREE_PULLS_WELFARE as usize,
-            this_batch,
-            rng.next_u64(),
-            &sim_ctx,
-        );
-        total_up_agg += total_up;
-        total_with_up_agg += total_with_up;
-        pb_prob.inc(1);
-    }
+    let (_, total_up_agg, _, total_with_up_agg) = simulate_stats_with_progress(
+        FREE_PULLS_WELFARE as usize,
+        sim_count_prob,
+        rng.next_u64(),
+        &sim_ctx,
+        Some(&pb_prob),
+    );
     pb_prob.finish_and_clear();
 
     let elapsed = start_time.elapsed();
@@ -317,25 +304,16 @@ fn run_f2p_analysis(ctx: &F2pAnalysisCtx<'_>, rng: &mut Rng) {
         I18n::get(lang, "sys_run_cost").replace("{}", &sim_count_cost.to_string())
     );
 
-    let cost_batch_base = sim_count_cost / batches;
-    let cost_batch_remainder = sim_count_cost % batches;
-    let mut total_extra_cost_agg = 0u64;
-    let mut extra_cost_samples_agg = 0usize;
-
     let pb_cost = utils::create_bar(
-        batches as u64,
+        sim_count_cost as u64,
         &I18n::get(lang, "sys_run_cost").replace("{}", &sim_count_cost.to_string()),
     );
-    for i in 0..batches {
-        let this_batch = cost_batch_base + if i < cost_batch_remainder { 1 } else { 0 };
-        if this_batch == 0 {
-            continue;
-        }
-        let (cost_sum, samples, _) = simulate_f2p_clearing(this_batch, rng.next_u64(), &sim_ctx);
-        total_extra_cost_agg += cost_sum;
-        extra_cost_samples_agg += samples;
-        pb_cost.inc(1);
-    }
+    let (total_extra_cost_agg, extra_cost_samples_agg, _) = simulate_f2p_clearing_with_progress(
+        sim_count_cost,
+        rng.next_u64(),
+        &sim_ctx,
+        Some(&pb_cost),
+    );
     pb_cost.finish_and_clear();
 
     let avg_extra_cost = if extra_cost_samples_agg == 0 {
@@ -555,12 +533,14 @@ fn initialize_system(
         } else {
             info!("[PPO] Training new model...");
             let p = train_ppo(&mut rng, &dbn, &config);
+            println!("[PPO] Saving model...");
             save_model(&p, "ppo.cache", "PPO");
             p
         }
     } else {
         info!("[PPO] Force training new model...");
         let p = train_ppo(&mut rng, &dbn, &config);
+        println!("[PPO] Saving model...");
         save_model(&p, "ppo.cache", "PPO");
         p
     };

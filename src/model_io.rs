@@ -45,21 +45,9 @@ pub fn save_model<T: serde::Serialize>(model: &T, path: &str, label: &str) {
         }
     }
 
-    if cfg!(debug_assertions) {
-        match std::fs::File::create(path) {
-            Ok(file) => {
-                let writer = std::io::BufWriter::new(file);
-                if let Err(e) = serde_json::to_writer(writer, model) {
-                    log::warn!("[{}] Failed to serialize model to {}: {}", label, path, e);
-                } else {
-                    info!("[{}] Model saved to {} (JSON)", label, path);
-                }
-            }
-            Err(e) => {
-                log::warn!("[{}] Failed to create {}: {}", label, path, e);
-            }
-        }
-    }
+    // JSON debug dump disabled — binary format is authoritative and JSON serialization
+    // of large neural network models (PPO/DQN with millions of f64 weights) takes
+    // tens of seconds, causing the program to appear frozen after training.
 }
 
 pub fn load_model<T: serde::de::DeserializeOwned>(path: &str, label: &str) -> Option<T> {

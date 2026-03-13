@@ -67,9 +67,9 @@ pub struct ActorCritic {
 
 impl ActorCritic {
     pub fn new(seed: u64, achf: &crate::config::AchfConfig) -> Self {
-        let backbone = LuckTransformer::new(DIM, 256, true, 2, seed, achf);
-        let actor_head = Linear::new(256, ACTION_SPACE, true, seed.wrapping_add(100));
-        let critic_head = Linear::new(256, 1, true, seed.wrapping_add(200));
+        let backbone = LuckTransformer::new(DIM, 1024, true, 2, seed, achf);
+        let actor_head = Linear::new(1024, ACTION_SPACE, true, seed.wrapping_add(100));
+        let critic_head = Linear::new(1024, 1, true, seed.wrapping_add(200));
 
         ActorCritic {
             backbone,
@@ -510,6 +510,7 @@ impl Ppo {
 
                 let mut loss_accum = Tensor::zeros(vec![1]);
                 let batch_len = chunk.len();
+                let inv_batch = 1.0 / batch_len as f64;
 
                 for &i in chunk {
                     let state = &states[i];
@@ -524,15 +525,15 @@ impl Ppo {
                     let all_log_probs = logits.log_softmax();
                     let log_prob = all_log_probs.index_select(action_idx);
 
-                    let old_log_prob_tensor = Tensor::new(vec![old_log_prob], vec![1]);
-                    let log_ratio = log_prob - old_log_prob_tensor;
-                    let ratio = log_ratio.clone().exp();
-
-                    // KL divergence as scalar (no autograd needed)
-                    let ratio_val = ratio.data.read().unwrap()[0];
-                    let log_ratio_val = log_ratio.data.read().unwrap()[0];
+                    let log_prob_val = log_prob.data.read().unwrap()[0];
+                    let log_ratio_val = log_prob_val - old_log_prob;
+                    let ratio_val = log_ratio_val.exp();
                     approx_kl += (ratio_val - 1.0) - log_ratio_val;
                     batch_count += 1.0;
+
+                    let old_log_prob_tensor = Tensor::new(vec![old_log_prob], vec![1]);
+                    let log_ratio = log_prob - old_log_prob_tensor;
+                    let ratio = log_ratio.exp();
 
                     let adv_tensor = Tensor::new(vec![advantage], vec![1]);
                     let surr1 = ratio.clone() * adv_tensor.clone();
@@ -544,7 +545,8 @@ impl Ppo {
                     let policy_loss = if s1_val < s2_val { surr1 } else { surr2 };
 
                     let ret_tensor = Tensor::new(vec![return_val], vec![1]);
-                    let v_loss = (value - ret_tensor).mse_loss(&Tensor::zeros(vec![1]));
+                    let value_err = value - ret_tensor;
+                    let v_loss = (value_err.clone() * value_err).sum();
 
                     let p = all_log_probs.exp();
                     let entropy = -(p * all_log_probs).sum();
@@ -555,8 +557,8 @@ impl Ppo {
                     loss_accum = loss_accum + loss;
                 }
 
-                let batch_size_tensor = Tensor::new(vec![batch_len as f64], vec![1]);
-                let mut final_loss = loss_accum / batch_size_tensor;
+                let batch_size_tensor = Tensor::new(vec![inv_batch], vec![1]);
+                let mut final_loss = loss_accum * batch_size_tensor;
                 if let Some(reg) = self.policy.achf_orthogonal_penalty() {
                     final_loss = final_loss + reg;
                 }

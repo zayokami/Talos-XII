@@ -7,6 +7,7 @@ use crate::ppo::ActorCritic;
 use crate::rng::Rng;
 use crate::transformer::KVCache;
 use crate::worker::GoodJobWorker;
+use indicatif::ProgressBar;
 use rayon::prelude::*;
 use std::collections::VecDeque;
 use std::sync::mpsc::Sender;
@@ -1042,10 +1043,10 @@ fn compute_chunk_size(num_sims: usize, worker: &GoodJobWorker) -> usize {
         return 1;
     }
     let threads = worker.thread_count().max(1);
-    let target_chunks = threads.saturating_mul(8).max(1);
+    let target_chunks = threads.saturating_mul(64).max(1);
     let mut size = num_sims.div_ceil(target_chunks);
-    if size < 64 {
-        size = 64;
+    if size < 1 {
+        size = 1;
     }
     if size > num_sims {
         size = num_sims;
@@ -1072,6 +1073,17 @@ pub fn simulate_stats(
     num_sims: usize,
     seed: u64,
     ctx: &SimRunContext<'_>,
+) -> (usize, usize, usize, usize) {
+    simulate_stats_with_progress(num_pulls, num_sims, seed, ctx, None)
+}
+
+/// Like `simulate_stats` but with an optional thread-safe progress bar.
+pub fn simulate_stats_with_progress(
+    num_pulls: usize,
+    num_sims: usize,
+    seed: u64,
+    ctx: &SimRunContext<'_>,
+    pb: Option<&ProgressBar>,
 ) -> (usize, usize, usize, usize) {
     let mut master_rng = Rng::from_seed(seed);
     let base_seed = master_rng.next_u64();
@@ -1129,6 +1141,9 @@ pub fn simulate_stats(
                             if res.up_count > 0 {
                                 total_with_up += 1;
                             }
+                            if let Some(pb) = pb {
+                                pb.inc(1);
+                            }
                         }
                         (total_six, total_up, total_big_pity, total_with_up)
                     },
@@ -1147,10 +1162,21 @@ pub fn simulate_stats(
 }
 
 /// Parallel F2P clearing simulation: how many extra pulls to get first UP.
+#[allow(dead_code)]
 pub fn simulate_f2p_clearing(
     num_sims: usize,
     seed: u64,
     ctx: &SimRunContext<'_>,
+) -> (u64, usize, usize) {
+    simulate_f2p_clearing_with_progress(num_sims, seed, ctx, None)
+}
+
+/// Like `simulate_f2p_clearing` but with an optional thread-safe progress bar.
+pub fn simulate_f2p_clearing_with_progress(
+    num_sims: usize,
+    seed: u64,
+    ctx: &SimRunContext<'_>,
+    pb: Option<&ProgressBar>,
 ) -> (u64, usize, usize) {
     let mut master_rng = Rng::from_seed(seed);
     let base_seed = master_rng.next_u64();
@@ -1182,7 +1208,6 @@ pub fn simulate_f2p_clearing(
                         let control = SimControl {
                             max_pulls: None,
                             stop_on_up: true,
-                            // Fix: Ensure we use all available free pulls, covering the big pity if enough
                             stop_after_total_pulls: Some(
                                 FREE_PULLS_WELFARE.max(ctx.config.big_pity_cumulative as u32)
                                     as usize,
@@ -1213,6 +1238,9 @@ pub fn simulate_f2p_clearing(
                             total_extra += extra;
                             total_samples += extra_sample;
                             total_success += success;
+                            if let Some(pb) = pb {
+                                pb.inc(1);
+                            }
                         }
                         (total_extra, total_samples, total_success)
                     },

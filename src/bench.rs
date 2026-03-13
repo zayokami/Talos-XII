@@ -151,15 +151,24 @@ fn measure_inference_throughput(rng: &mut Rng, params: &ThroughputParams<'_>) ->
         neural_sender: None,
         ppo_sender: None,
     };
-    // Warmup: stabilize CPU cache and branch predictors
-    for _ in 0..500 {
+    let warmup = 200u64;
+    let pb = crate::utils::create_bar(warmup + params.sims as u64, "Measuring throughput");
+    for i in 0..warmup {
         let _ = simulate_fast(params.pulls, rng, 0, &ctx);
+        if i % 50 == 0 {
+            pb.set_position(i);
+        }
     }
+    pb.set_position(warmup);
     let start = Instant::now();
-    for _ in 0..params.sims {
+    for i in 0..params.sims {
         let _ = simulate_fast(params.pulls, rng, 0, &ctx);
+        if i % 500 == 0 {
+            pb.set_position(warmup + i as u64);
+        }
     }
     let elapsed = start.elapsed();
+    pb.finish_and_clear();
     params.sims as f64 / elapsed.as_secs_f64()
 }
 
@@ -525,7 +534,7 @@ fn train_and_measure(label: &str, config: &Config, seed: u64) -> BenchRunResult 
             ppo: Some(&ppo),
             dbn: &dbn,
             config,
-            sims: 5000,
+            sims: 2000,
             pulls: 200,
         },
     );

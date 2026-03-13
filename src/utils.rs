@@ -29,6 +29,7 @@ pub const ONLINE_REPORT_INTERVAL_SECS: f64 = 2.0;
 pub const PPO_ONLINE_LR: f64 = 0.0003;
 
 /// Batch count for F2P simulation progress display.
+#[allow(dead_code)]
 pub const F2P_BATCH_COUNT: usize = 100;
 
 /// History capacity for interactive simulation history.

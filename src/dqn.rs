@@ -62,12 +62,12 @@ impl Module for DuelingQNetwork {
 
 impl DuelingQNetwork {
     pub fn new(seed: u64, achf: &AchfConfig) -> Self {
-        let l1 = Linear::new(DIM, 256, true, seed);
-        let l2 = Linear::new(256, 256, true, seed.wrapping_add(1));
-        let val_head = Linear::new(256, 1, true, seed.wrapping_add(2));
-        let adv_head = Linear::new(256, ACTION_SPACE, true, seed.wrapping_add(3));
+        let l1 = Linear::new(DIM, 1024, true, seed);
+        let l2 = Linear::new(1024, 1024, true, seed.wrapping_add(1));
+        let val_head = Linear::new(1024, 1, true, seed.wrapping_add(2));
+        let adv_head = Linear::new(1024, ACTION_SPACE, true, seed.wrapping_add(3));
         let achf_layer = if achf.enabled && achf.apply_dqn {
-            Some(AchfLayer::new(256, achf.clone(), seed.wrapping_add(500)))
+            Some(AchfLayer::new(1024, achf.clone(), seed.wrapping_add(500)))
         } else {
             None
         };
@@ -575,7 +575,7 @@ fn train_dqn_impl(
     let mut optimizer = Adam::new(policy_net.parameters(), LEARNING_RATE);
     let mut replay_buffer = ReplayBuffer::new(BUFFER_CAPACITY);
 
-    let total_steps = if config.fast_init { 10_000 } else { 50_000 };
+    let total_steps = if config.fast_init { 5_000 } else { 50_000 };
     let mut epsilon = EPSILON_START;
 
     let mut state_struct = PullState {

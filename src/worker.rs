@@ -45,7 +45,7 @@ mod win_platform {
     }
 
     pub fn priority_from_str(s: &str) -> i32 {
-        match s {
+        let level = match s {
             "time_critical" => THREAD_PRIORITY_TIME_CRITICAL,
             "highest" => THREAD_PRIORITY_HIGHEST,
             "above_normal" => THREAD_PRIORITY_ABOVE_NORMAL,
@@ -53,7 +53,15 @@ mod win_platform {
             "below_normal" => THREAD_PRIORITY_BELOW_NORMAL,
             "lowest" => THREAD_PRIORITY_LOWEST,
             "idle" => THREAD_PRIORITY_IDLE,
-            _ => THREAD_PRIORITY_HIGHEST,
+            _ => THREAD_PRIORITY_ABOVE_NORMAL,
+        };
+        if level >= THREAD_PRIORITY_TIME_CRITICAL {
+            eprintln!(
+                "\x1b[33m[Warning]\x1b[0m time_critical priority can crash the system, clamping to highest"
+            );
+            THREAD_PRIORITY_HIGHEST
+        } else {
+            level
         }
     }
 

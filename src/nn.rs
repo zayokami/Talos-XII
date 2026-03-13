@@ -50,25 +50,50 @@ impl Linear {
 
         use crate::simd::add_scaled_row;
 
+        let parallel_matvec = num_rows > 1 && in_dim * out_dim >= 65536;
+
         for r in 0..num_rows {
             let row_offset_in = r * in_dim;
             let row_offset_out = r * out_dim;
 
-            // Initialize with bias if present
-            if let Some(b) = &b_data {
+            if parallel_matvec {
                 let out_row = &mut out[row_offset_out..row_offset_out + out_dim];
-                out_row.copy_from_slice(b);
-            }
+                let input_row = &input[row_offset_in..row_offset_in + in_dim];
+                let n_chunks = rayon::current_num_threads().min(8);
+                let chunk_size = out_dim.div_ceil(n_chunks);
+                out_row
+                    .par_chunks_mut(chunk_size)
+                    .enumerate()
+                    .for_each(|(ci, chunk)| {
+                        let col_start = ci * chunk_size;
+                        if let Some(b) = &b_data {
+                            chunk.copy_from_slice(&b[col_start..col_start + chunk.len()]);
+                        }
+                        for i in 0..in_dim {
+                            let scale = input_row[i];
+                            if scale == 0.0 {
+                                continue;
+                            }
+                            let w_slice = &w_data
+                                [i * out_dim + col_start..i * out_dim + col_start + chunk.len()];
+                            add_scaled_row(chunk, w_slice, scale);
+                        }
+                    });
+            } else {
+                if let Some(b) = &b_data {
+                    let out_row = &mut out[row_offset_out..row_offset_out + out_dim];
+                    out_row.copy_from_slice(b);
+                }
 
-            for i in 0..in_dim {
-                let scale = input[row_offset_in + i];
-                if scale == 0.0 {
-                    continue;
-                } // Optimization for sparse inputs (ReLU)
-
-                let w_row = &w_data[i * out_dim..(i + 1) * out_dim];
-                let out_row = &mut out[row_offset_out..row_offset_out + out_dim];
-                add_scaled_row(out_row, w_row, scale);
+                for i in 0..in_dim {
+                    let scale = input[row_offset_in + i];
+                    if scale == 0.0 {
+                        continue;
+                    }
+                    let w_row = &w_data[i * out_dim..(i + 1) * out_dim];
+                    let out_row = &mut out[row_offset_out..row_offset_out + out_dim];
+                    add_scaled_row(out_row, w_row, scale);
+                }
             }
         }
         out
