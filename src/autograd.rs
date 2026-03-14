@@ -569,21 +569,17 @@ impl Tensor {
         let len = self_data.len();
         let max_val = self_data.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
         let mut exp_shifted = vec![0.0; len];
-        let mut log_sum_exp = 0.0f64;
         for i in 0..len {
-            let e = (self_data[i] - max_val).exp();
-            exp_shifted[i] = e;
-            log_sum_exp += e;
+            exp_shifted[i] = (self_data[i] - max_val).exp();
         }
-        log_sum_exp = log_sum_exp.ln() + max_val;
+        let sum_exp: f64 = exp_shifted.iter().sum::<f64>().max(f64::MIN_POSITIVE);
+        let log_sum_exp = sum_exp.ln() + max_val;
 
         let mut data = vec![0.0; len];
         for i in 0..len {
             data[i] = self_data[i] - log_sum_exp;
         }
 
-        // Cache softmax probabilities for backward
-        let sum_exp: f64 = exp_shifted.iter().sum();
         let softmax_cache: Arc<Vec<f64>> =
             Arc::new(exp_shifted.iter().map(|&e| e / sum_exp).collect());
         let parents = vec![self.clone()];

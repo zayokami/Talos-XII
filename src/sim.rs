@@ -773,7 +773,11 @@ fn simulate_core_with_context(
                 None
             },
             &mut ppo_context.kv_cache,
-            pulls_done,
+            if let Some(policy) = ctx.ppo_policy {
+                pulls_done.min(policy.backbone.max_seq_len().saturating_sub(1))
+            } else {
+                pulls_done
+            },
         );
 
         if let Some(policy) = ctx.ppo_policy {
@@ -1043,7 +1047,7 @@ fn compute_chunk_size(num_sims: usize, worker: &GoodJobWorker) -> usize {
         return 1;
     }
     let threads = worker.thread_count().max(1);
-    let target_chunks = threads.saturating_mul(64).max(1);
+    let target_chunks = threads.saturating_mul(16).max(1);
     let mut size = num_sims.div_ceil(target_chunks);
     if size < 1 {
         size = 1;

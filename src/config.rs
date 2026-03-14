@@ -599,7 +599,8 @@ impl Config {
                     config.achf.cache_log_per_layer = v.as_bool().unwrap_or(false);
                 }
                 if let Some(v) = achf_map.get("rank") {
-                    config.achf.rank = v.as_f64().unwrap_or(0.0).round() as usize;
+                    let r = v.as_f64().unwrap_or(32.0).round() as usize;
+                    config.achf.rank = if r == 0 { 32 } else { r };
                 }
                 if let Some(v) = achf_map.get("apply_attn") {
                     config.achf.apply_attn = v.as_bool().unwrap_or(false);

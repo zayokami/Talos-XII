@@ -166,6 +166,10 @@ impl GoodJobWorker {
         if config.worker_max_threads > 0 && num_threads > config.worker_max_threads {
             num_threads = config.worker_max_threads;
         }
+        let hard_cap = cores.saturating_mul(4).max(64);
+        if num_threads > hard_cap {
+            num_threads = hard_cap;
+        }
         let stack_size = if config.worker_stack_size_mb == 0 {
             DEFAULT_STACK_SIZE_BYTES
         } else {

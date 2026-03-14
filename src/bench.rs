@@ -60,11 +60,20 @@ pub struct TrialStats {
 
 impl TrialStats {
     fn from_values(vals: &[f64]) -> Self {
+        if vals.is_empty() {
+            return TrialStats {
+                mean: 0.0,
+                std_dev: 0.0,
+                ci_low: 0.0,
+                ci_high: 0.0,
+                values: Vec::new(),
+            };
+        }
         let n = vals.len() as f64;
         let mean = vals.iter().sum::<f64>() / n;
         let variance = vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0).max(1.0);
         let std_dev = variance.sqrt();
-        let t_val = 2.776; // t-distribution 95% CI, df=4 (conservative for small n)
+        let t_val = 2.776;
         let se = std_dev / n.sqrt();
         TrialStats {
             mean,
@@ -112,8 +121,11 @@ fn aggregate_trials(runs: &[BenchRunResult]) -> AggregatedResult {
 
 // ── Helper: build neural + worker from config ───────────────────────────
 
-fn build_base_models(config: &Config, rng: &mut Rng) -> (Dbn, NeuralLuckOptimizer, GoodJobWorker) {
-    let worker = GoodJobWorker::new_with_config(config);
+fn build_base_models_with_worker(
+    config: &Config,
+    rng: &mut Rng,
+    worker: &GoodJobWorker,
+) -> (Dbn, NeuralLuckOptimizer) {
     let mut dbn = Dbn::new(&[32, 128, 64, 32], rng);
     let (count, epochs) = if config.fast_init {
         (256, 4)
@@ -122,11 +134,17 @@ fn build_base_models(config: &Config, rng: &mut Rng) -> (Dbn, NeuralLuckOptimize
     };
     dbn.train(rng, count, epochs);
 
-    let mut neural_opt = train_neural_optimizer(rng.next_u64(), &dbn, config, &worker);
+    let mut neural_opt = train_neural_optimizer(rng.next_u64(), &dbn, config, worker);
     let (w, b) = train_linear_regression(&neural_opt, rng, &dbn, config);
     neural_opt.set_linear_params(w, b);
-    neural_opt = train_manifold_rl(&neural_opt, rng, &dbn, config, &worker);
+    neural_opt = train_manifold_rl(&neural_opt, rng, &dbn, config, worker);
 
+    (dbn, neural_opt)
+}
+
+fn build_base_models(config: &Config, rng: &mut Rng) -> (Dbn, NeuralLuckOptimizer, GoodJobWorker) {
+    let worker = GoodJobWorker::new_with_config(config);
+    let (dbn, neural_opt) = build_base_models_with_worker(config, rng, &worker);
     (dbn, neural_opt, worker)
 }
 
@@ -151,20 +169,25 @@ fn measure_inference_throughput(rng: &mut Rng, params: &ThroughputParams<'_>) ->
         neural_sender: None,
         ppo_sender: None,
     };
-    let warmup = 200u64;
-    let pb = crate::utils::create_bar(warmup + params.sims as u64, "Measuring throughput");
+    let warmup = 20u64;
+    let total = warmup + params.sims as u64;
+    let pb = crate::utils::create_bar(total, "Measuring throughput");
     for i in 0..warmup {
         let _ = simulate_fast(params.pulls, rng, 0, &ctx);
-        if i % 50 == 0 {
-            pb.set_position(i);
+        pb.inc(1);
+        if i == 0 {
+            pb.set_message(format!("warmup {}/{}", i + 1, warmup));
         }
     }
-    pb.set_position(warmup);
+    pb.set_message("measuring".to_string());
     let start = Instant::now();
     for i in 0..params.sims {
         let _ = simulate_fast(params.pulls, rng, 0, &ctx);
-        if i % 500 == 0 {
-            pb.set_position(warmup + i as u64);
+        pb.inc(1);
+        if i > 0 && i % 10 == 0 {
+            let elapsed = start.elapsed().as_secs_f64();
+            let rate = i as f64 / elapsed;
+            pb.set_message(format!("{:.0} sims/s", rate));
         }
     }
     let elapsed = start.elapsed();
@@ -332,18 +355,17 @@ fn run_path_comparison(base_config: &Config, seed: u64) -> Vec<(String, Vec<f64>
     let mut rng = Rng::from_seed(seed);
     let mut cfg = base_config.clone();
     cfg.achf.enabled = true;
-    cfg.achf.rank = 16;
     cfg.fast_init = true;
-    cfg.ppo_total_steps = 0;
-    cfg.ppo_steps_per_update = 0;
-    cfg.ppo_k_epochs = 0;
+    cfg.ppo_total_steps = cfg.ppo_total_steps.min(2000);
+    cfg.ppo_steps_per_update = cfg.ppo_steps_per_update.min(256);
+    cfg.ppo_k_epochs = cfg.ppo_k_epochs.min(2);
 
     let (dbn, _neural_opt, _worker) = build_base_models(&cfg, &mut rng);
     let ppo = train_ppo_with_metrics(&mut rng, &dbn, &cfg, None);
 
-    let input_dim = 8;
+    let input_dim = crate::neural::DIM;
     let sample_input: Vec<f64> = (0..input_dim).map(|i| (i as f64) * 0.1 + 0.05).collect();
-    let iterations = 5000;
+    let iterations = 2000;
 
     let mut all_latencies: Vec<(String, Vec<f64>)> = Vec::new();
 
@@ -374,9 +396,9 @@ fn run_gate_curve(base_config: &Config, seed: u64) -> BenchRunResult {
     let mut cfg = base_config.clone();
     cfg.achf.enabled = true;
     cfg.fast_init = true;
-    cfg.ppo_total_steps = 0;
-    cfg.ppo_steps_per_update = 0;
-    cfg.ppo_k_epochs = 0;
+    cfg.ppo_total_steps = cfg.ppo_total_steps.min(4000);
+    cfg.ppo_steps_per_update = cfg.ppo_steps_per_update.min(256);
+    cfg.ppo_k_epochs = cfg.ppo_k_epochs.min(2);
 
     let (dbn, _neural_opt, _worker) = build_base_models(&cfg, &mut rng);
 
@@ -413,7 +435,7 @@ fn run_scale_test(base_config: &Config, seed: u64, nt: usize) -> Vec<AggregatedR
         let runs = run_multi_trial(label, &cfg, seed, nt);
         agg.push(aggregate_trials(&runs));
     }
-    for rank in [4, 8, 16, 32, 48] {
+    for rank in [16, 32, 64, 128, 256] {
         let label = format!("rank={}", rank);
         println!("  [{}]", label);
         let mut cfg = base_config.clone();
@@ -463,9 +485,9 @@ fn run_convergence(base_config: &Config, seed: u64, nt: usize) -> Vec<Aggregated
             let mut cfg = base_config.clone();
             cfg.achf.enabled = enabled;
             cfg.fast_init = true;
-            cfg.ppo_total_steps = 0;
-            cfg.ppo_steps_per_update = 0;
-            cfg.ppo_k_epochs = 0;
+            cfg.ppo_total_steps = cfg.ppo_total_steps.min(4000);
+            cfg.ppo_steps_per_update = cfg.ppo_steps_per_update.min(256);
+            cfg.ppo_k_epochs = cfg.ppo_k_epochs.min(2);
             let (dbn, _neural_opt, _worker) = build_base_models(&cfg, &mut rng);
             let (tx, rx) = std::sync::mpsc::channel();
             let start = Instant::now();
@@ -512,9 +534,9 @@ fn train_and_measure(label: &str, config: &Config, seed: u64) -> BenchRunResult 
     let mut rng = Rng::from_seed(seed);
     let mut cfg = config.clone();
     if cfg.fast_init {
-        cfg.ppo_total_steps = 0;
-        cfg.ppo_steps_per_update = 0;
-        cfg.ppo_k_epochs = 0;
+        cfg.ppo_total_steps = cfg.ppo_total_steps.min(2000);
+        cfg.ppo_steps_per_update = cfg.ppo_steps_per_update.min(256);
+        cfg.ppo_k_epochs = cfg.ppo_k_epochs.min(2);
     }
     let (dbn, neural_opt, _worker) = build_base_models(&cfg, &mut rng);
 
@@ -534,8 +556,8 @@ fn train_and_measure(label: &str, config: &Config, seed: u64) -> BenchRunResult 
             ppo: Some(&ppo),
             dbn: &dbn,
             config,
-            sims: 2000,
-            pulls: 200,
+            sims: 200,
+            pulls: 100,
         },
     );
 
@@ -608,9 +630,10 @@ fn chart_mode(agg: &[AggregatedResult], dir: &str, ext: &str) {
 fn chart_path_latency(latencies: &[(String, Vec<f64>)], dir: &str, ext: &str) {
     let stats: Vec<(&str, [f64; 5])> = latencies
         .iter()
+        .filter(|(_, vals)| !vals.is_empty())
         .map(|(name, vals)| {
             let mut sorted = vals.clone();
-            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let n = sorted.len();
             let q = [
                 sorted[0],
@@ -934,8 +957,11 @@ fn write_csvs(all: &[(&str, Vec<AggregatedResult>)], dir: &str) {
 }
 
 fn percentile(data: &[f64], pct: usize) -> f64 {
+    if data.is_empty() {
+        return 0.0;
+    }
     let mut sorted = data.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let idx = (pct * sorted.len() / 100).min(sorted.len() - 1);
     sorted[idx]
 }

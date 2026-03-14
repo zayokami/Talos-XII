@@ -118,7 +118,13 @@ pub fn draw_bar_chart(
         return Ok(());
     }
 
-    let y_max = bars.iter().map(|(_, v)| *v).fold(0.0_f64, f64::max) * 1.15;
+    let y_max = bars
+        .iter()
+        .map(|(_, v)| *v)
+        .filter(|v| v.is_finite())
+        .fold(0.0_f64, f64::max)
+        * 1.15;
+    let y_max = if y_max <= 0.0 { 1.0 } else { y_max };
     let n = bars.len();
 
     if path.ends_with(".svg") {
@@ -206,7 +212,13 @@ pub fn draw_bar_chart_with_error(
     if bars.is_empty() {
         return Ok(());
     }
-    let y_max = bars.iter().map(|(_, m, s)| m + s).fold(0.0_f64, f64::max) * 1.20;
+    let y_max = bars
+        .iter()
+        .map(|(_, m, s)| m + s)
+        .filter(|v| v.is_finite())
+        .fold(0.0_f64, f64::max)
+        * 1.20;
+    let y_max = if y_max <= 0.0 { 1.0 } else { y_max };
     let n = bars.len();
 
     if path.ends_with(".svg") {
@@ -307,7 +319,13 @@ pub fn draw_box_plot(
         return Ok(());
     }
 
-    let y_max = stats.iter().map(|(_, q)| q[4]).fold(0.0_f64, f64::max) * 1.15;
+    let y_max = stats
+        .iter()
+        .map(|(_, q)| q[4])
+        .filter(|v| v.is_finite())
+        .fold(0.0_f64, f64::max)
+        * 1.15;
+    let y_max = if y_max <= 0.0 { 1.0 } else { y_max };
 
     if path.ends_with(".svg") {
         let root = SVGBackend::new(path, (width, height)).into_drawing_area();
@@ -409,7 +427,11 @@ pub fn draw_dual_axis(
         .iter()
         .chain(series2.iter())
         .flat_map(|(_, d)| d.iter().map(|(x, _)| *x))
+        .filter(|v| v.is_finite())
         .collect();
+    if all_x.is_empty() {
+        return Ok(());
+    }
     let x_min = all_x.iter().cloned().fold(f64::INFINITY, f64::min);
     let x_max = all_x.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
 
@@ -507,12 +529,22 @@ fn compute_bounds<'a>(points: impl Iterator<Item = &'a (f64, f64)>) -> (f64, f64
     let mut y_max = f64::NEG_INFINITY;
 
     for (x, y) in points {
-        x_min = x_min.min(*x);
-        x_max = x_max.max(*x);
-        y_min = y_min.min(*y);
-        y_max = y_max.max(*y);
+        if x.is_finite() && y.is_finite() {
+            x_min = x_min.min(*x);
+            x_max = x_max.max(*x);
+            y_min = y_min.min(*y);
+            y_max = y_max.max(*y);
+        }
     }
 
+    if !x_min.is_finite() || !x_max.is_finite() {
+        x_min = 0.0;
+        x_max = 1.0;
+    }
+    if !y_min.is_finite() || !y_max.is_finite() {
+        y_min = 0.0;
+        y_max = 1.0;
+    }
     if x_min == x_max {
         x_max = x_min + 1.0;
     }

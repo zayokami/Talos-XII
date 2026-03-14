@@ -399,13 +399,17 @@ impl AchfLayer {
             let hash = Self::input_hash(x);
             let stored_hash = self.metrics.memo_hash.load(Ordering::Relaxed);
             if stored_hash == hash && hash != 0 {
-                let count = self.metrics.memo_count.fetch_add(1, Ordering::Relaxed) + 1;
+                let count = self.metrics.memo_count.load(Ordering::Relaxed);
                 if count >= self.config.cache_min_reuse as u64 {
-                    let cache = self.cache.read().unwrap();
-                    if let Some(ref out) = cache.last_output {
-                        self.metrics.calls.fetch_add(1, Ordering::Relaxed);
-                        self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
-                        return out.clone();
+                    if let Ok(cache) = self.cache.try_read() {
+                        let recheck = self.metrics.memo_hash.load(Ordering::Relaxed);
+                        if recheck == hash {
+                            if let Some(ref out) = cache.last_output {
+                                self.metrics.calls.fetch_add(1, Ordering::Relaxed);
+                                self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
+                                return out.clone();
+                            }
+                        }
                     }
                 }
             }
@@ -456,15 +460,15 @@ impl AchfLayer {
         }
 
         if self.config.cache_min_reuse > 0 {
-            let hash = Self::input_hash(x);
-            let prev = self.metrics.memo_hash.load(Ordering::Relaxed);
-            if prev == hash {
-                self.metrics.memo_count.fetch_add(1, Ordering::Relaxed);
-            } else {
-                self.metrics.memo_hash.store(hash, Ordering::Relaxed);
-                self.metrics.memo_count.store(1, Ordering::Relaxed);
-            }
             if let Ok(mut cache) = self.cache.try_write() {
+                let hash = Self::input_hash(x);
+                let prev = self.metrics.memo_hash.load(Ordering::Relaxed);
+                if prev == hash {
+                    self.metrics.memo_count.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.metrics.memo_hash.store(hash, Ordering::Relaxed);
+                    self.metrics.memo_count.store(1, Ordering::Relaxed);
+                }
                 cache.last_output = Some(out.clone());
             }
         }

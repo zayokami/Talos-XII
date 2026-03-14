@@ -196,9 +196,9 @@ fn resolve_f2p_sim_count_prob(config: &Config) -> usize {
     #[cfg(not(debug_assertions))]
     {
         if config.fast_init {
-            200_000
+            50_000
         } else {
-            1_000_000
+            200_000
         }
     }
 }
@@ -406,13 +406,16 @@ fn benchmark_simulation(
         neural_sender: None,
         ppo_sender: None,
     };
-    let fast_sims = 10_000usize;
-    let fast_pulls = 200usize;
+    let fast_sims = 500usize;
+    let fast_pulls = 100usize;
+    let pb_fast = utils::create_bar(fast_sims as u64, "Benchmark (fast)");
     let start_fast = Instant::now();
     for _ in 0..fast_sims {
         let _ = simulate_fast(fast_pulls, rng, 0, &ctx);
+        pb_fast.inc(1);
     }
     let fast_elapsed = start_fast.elapsed();
+    pb_fast.finish_and_clear();
     println!(
         "{}",
         I18n::get(lang, "bench_fast")
@@ -425,13 +428,16 @@ fn benchmark_simulation(
             )
     );
 
-    let one_sims = 300usize;
-    let one_pulls = 120usize;
+    let one_sims = 100usize;
+    let one_pulls = 100usize;
+    let pb_one = utils::create_bar(one_sims as u64, "Benchmark (detailed)");
     let start_one = Instant::now();
     for _ in 0..one_sims {
         let _ = simulate_one(one_pulls, rng, 0, &ctx);
+        pb_one.inc(1);
     }
     let one_elapsed = start_one.elapsed();
+    pb_one.finish_and_clear();
     println!(
         "{}",
         I18n::get(lang, "bench_one")
@@ -509,6 +515,7 @@ fn initialize_system(
         DuelingQNetwork::new(rng.next_u64(), &config.achf)
     } else if !args.force {
         if let Some(cached) = load_model::<DuelingQNetwork>("dqn.cache", "DQN") {
+            cached.freeze_achf_for_inference();
             info!("[DQN] Cached model loaded.");
             cached
         } else {

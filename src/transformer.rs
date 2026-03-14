@@ -373,6 +373,13 @@ impl LuckTransformer {
         self.out_proj.forward_inference(&h_final)
     }
 
+    pub fn max_seq_len(&self) -> usize {
+        self.blocks
+            .first()
+            .map(|b| b.mla_layer.config.max_seq_len)
+            .unwrap_or(256)
+    }
+
     pub fn prune_kv_cache(&self, kv_caches: &mut [KVCache], max_seq_len: usize) {
         let layer_count = self.blocks.len().min(kv_caches.len());
         for (i, kv_cache) in kv_caches.iter_mut().enumerate().take(layer_count) {
