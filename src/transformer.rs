@@ -607,6 +607,8 @@ pub struct KVCache {
     pub k_cache: Vec<Vec<f64>>,
     // v_cache: [num_heads][seq_len * head_dim]
     pub v_cache: Vec<Vec<f64>>,
+    scratch_scores: Vec<f64>,
+    scratch_att_out: Vec<f64>,
 }
 
 impl KVCache {
@@ -614,6 +616,8 @@ impl KVCache {
         Self {
             k_cache: vec![Vec::new(); num_heads],
             v_cache: vec![Vec::new(); num_heads],
+            scratch_scores: Vec::new(),
+            scratch_att_out: Vec::new(),
         }
     }
 
@@ -625,6 +629,8 @@ impl KVCache {
         for h in self.v_cache.iter_mut() {
             h.clear();
         }
+        self.scratch_scores.clear();
+        self.scratch_att_out.clear();
     }
 }
 
@@ -919,6 +925,10 @@ impl MultiHeadLatentAttention {
         let num_elements = x.len();
         let seq_len = num_elements / dim;
 
+        if seq_len == 1 {
+            return self.forward_inference_cached_single_token(x, kv_cache, start_pos);
+        }
+
         // 1. Projections
         let c_kv = self.w_dkv.forward_inference(x);
         let k_c = self.w_uk.forward_inference(&c_kv);
@@ -1138,6 +1148,124 @@ impl MultiHeadLatentAttention {
             }
             self.w_o.forward_inference(&att_out)
         }
+    }
+
+    fn forward_inference_cached_single_token(
+        &self,
+        x: &[f64],
+        kv_cache: &mut KVCache,
+        start_pos: usize,
+    ) -> Vec<f64> {
+        use crate::simd::{add_scaled_row, dot_product, softmax_exp_sum, vector_scale};
+
+        let dim = self.config.dim;
+        let num_heads = self.config.num_heads;
+        let head_dim = self.config.v_head_dim;
+        let rope_dim = self.config.qk_rope_dim;
+        let total_head_dim = head_dim + rope_dim;
+
+        debug_assert_eq!(x.len(), dim);
+
+        let c_kv = self.w_dkv.forward_inference(x);
+        let k_c = self.w_uk.forward_inference(&c_kv);
+        let v_c = self.w_uv.forward_inference(&c_kv);
+        let mut k_r_rot = self.w_kr.forward_inference(x);
+        let mut q_r_rot = self.w_qr.forward_inference(x);
+        let q_c = self.w_q.forward_inference(x);
+
+        let cache_offset = start_pos * (rope_dim / 2);
+        if cache_offset < self.rope.cos_cache.len() {
+            for h in 0..num_heads {
+                let base = h * rope_dim;
+                for i in 0..rope_dim / 2 {
+                    let c = self.rope.cos_cache[cache_offset + i];
+                    let s = self.rope.sin_cache[cache_offset + i];
+
+                    let idx1 = base + 2 * i;
+                    let idx2 = base + 2 * i + 1;
+
+                    let k1 = k_r_rot[idx1];
+                    let k2 = k_r_rot[idx2];
+                    k_r_rot[idx1] = k1 * c - k2 * s;
+                    k_r_rot[idx2] = k1 * s + k2 * c;
+
+                    let q1 = q_r_rot[idx1];
+                    let q2 = q_r_rot[idx2];
+                    q_r_rot[idx1] = q1 * c - q2 * s;
+                    q_r_rot[idx2] = q1 * s + q2 * c;
+                }
+            }
+        }
+
+        let target_k = self.config.max_seq_len * total_head_dim;
+        let target_v = self.config.max_seq_len * head_dim;
+        for h in 0..num_heads {
+            let k_cache = &mut kv_cache.k_cache[h];
+            if k_cache.is_empty() {
+                let cap = k_cache.capacity();
+                if cap < target_k {
+                    k_cache.reserve(target_k - cap);
+                }
+            }
+            let v_cache = &mut kv_cache.v_cache[h];
+            if v_cache.is_empty() {
+                let cap = v_cache.capacity();
+                if cap < target_v {
+                    v_cache.reserve(target_v - cap);
+                }
+            }
+
+            let content_base = h * head_dim;
+            let rope_base = h * rope_dim;
+            k_cache.extend_from_slice(&k_c[content_base..content_base + head_dim]);
+            k_cache.extend_from_slice(&k_r_rot[rope_base..rope_base + rope_dim]);
+            v_cache.extend_from_slice(&v_c[content_base..content_base + head_dim]);
+        }
+
+        let cached_len = kv_cache.k_cache[0].len() / total_head_dim;
+        kv_cache.scratch_scores.resize(cached_len, 0.0);
+        kv_cache.scratch_att_out.resize(num_heads * head_dim, 0.0);
+        kv_cache.scratch_att_out.fill(0.0);
+
+        let scale = 1.0 / (total_head_dim as f64).sqrt();
+        let (k_caches, v_caches, scratch_scores, scratch_att_out) = (
+            &kv_cache.k_cache,
+            &kv_cache.v_cache,
+            &mut kv_cache.scratch_scores,
+            &mut kv_cache.scratch_att_out,
+        );
+
+        for h in 0..num_heads {
+            let q_content = &q_c[h * head_dim..(h + 1) * head_dim];
+            let q_rope = &q_r_rot[h * rope_dim..(h + 1) * rope_dim];
+            let k_cache_head = &k_caches[h];
+
+            for (j, score) in scratch_scores.iter_mut().enumerate().take(cached_len) {
+                let base = j * total_head_dim;
+                let k_content = &k_cache_head[base..base + head_dim];
+                let k_rope = &k_cache_head[base + head_dim..base + total_head_dim];
+                *score = (dot_product(q_content, k_content) + dot_product(q_rope, k_rope)) * scale;
+            }
+
+            for score in scratch_scores.iter_mut().skip(start_pos + 1) {
+                *score = f64::NEG_INFINITY;
+            }
+
+            let sum = softmax_exp_sum(scratch_scores);
+            vector_scale(scratch_scores, 1.0 / sum);
+
+            let out_slice = &mut scratch_att_out[h * head_dim..(h + 1) * head_dim];
+            let v_cache_head = &v_caches[h];
+            for (j, &score) in scratch_scores.iter().enumerate().take(cached_len) {
+                if score.abs() < 1e-9 {
+                    continue;
+                }
+                let v_vec = &v_cache_head[j * head_dim..(j + 1) * head_dim];
+                add_scaled_row(out_slice, v_vec, score);
+            }
+        }
+
+        self.w_o.forward_inference(scratch_att_out)
     }
 
     pub fn prune_kv_cache(&self, kv_cache: &mut KVCache, max_seq_len: usize) {
@@ -1871,6 +1999,20 @@ mod tests {
                 (c - d).abs() < 1e-12,
                 "Prefill should be deterministic at index {}",
                 i
+            );
+        }
+
+        let mut full_input = prefill.clone();
+        full_input.extend_from_slice(&token_a);
+        let full_out = mla.forward_inference(&full_input);
+        let last_start = full_out.len() - dim;
+        for (i, (&cached, &full)) in out_a.iter().zip(full_out[last_start..].iter()).enumerate() {
+            assert!(
+                (cached - full).abs() < 1e-10,
+                "Cached decode mismatch at dim {}: {} vs {}",
+                i,
+                cached,
+                full
             );
         }
     }

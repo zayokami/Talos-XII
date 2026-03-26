@@ -518,7 +518,7 @@ fn run_convergence(base_config: &Config, seed: u64, nt: usize) -> Vec<Aggregated
                 throughput_sims_per_sec: 0.0,
                 final_avg_reward: final_reward,
                 final_loss,
-                param_count: 0,
+                param_count: ppo.param_count(),
                 snapshots,
                 cache_stats,
             });

@@ -1076,9 +1076,10 @@ pub fn simulate_stats(
     num_pulls: usize,
     num_sims: usize,
     seed: u64,
+    available_free_pulls: u32,
     ctx: &SimRunContext<'_>,
 ) -> (usize, usize, usize, usize) {
-    simulate_stats_with_progress(num_pulls, num_sims, seed, ctx, None)
+    simulate_stats_with_progress(num_pulls, num_sims, seed, available_free_pulls, ctx, None)
 }
 
 /// Like `simulate_stats` but with an optional thread-safe progress bar.
@@ -1086,6 +1087,7 @@ pub fn simulate_stats_with_progress(
     num_pulls: usize,
     num_sims: usize,
     seed: u64,
+    available_free_pulls: u32,
     ctx: &SimRunContext<'_>,
     pb: Option<&ProgressBar>,
 ) -> (usize, usize, usize, usize) {
@@ -1133,7 +1135,7 @@ pub fn simulate_stats_with_progress(
                             let (res, _) = simulate_core_with_context(
                                 &control,
                                 &mut local_rng,
-                                0,
+                                available_free_pulls,
                                 &model_ctx,
                                 ppo_context,
                             );
@@ -1145,9 +1147,9 @@ pub fn simulate_stats_with_progress(
                             if res.up_count > 0 {
                                 total_with_up += 1;
                             }
-                            if let Some(pb) = pb {
-                                pb.inc(1);
-                            }
+                        }
+                        if let Some(pb) = pb {
+                            pb.inc((end - start) as u64);
                         }
                         (total_six, total_up, total_big_pity, total_with_up)
                     },
@@ -1242,9 +1244,9 @@ pub fn simulate_f2p_clearing_with_progress(
                             total_extra += extra;
                             total_samples += extra_sample;
                             total_success += success;
-                            if let Some(pb) = pb {
-                                pb.inc(1);
-                            }
+                        }
+                        if let Some(pb) = pb {
+                            pb.inc((end - start) as u64);
                         }
                         (total_extra, total_samples, total_success)
                     },

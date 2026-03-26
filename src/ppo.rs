@@ -396,6 +396,10 @@ impl Ppo {
         achf: &crate::config::AchfConfig,
     ) -> Self {
         let policy = ActorCritic::new(seed, achf);
+        Self::from_policy(policy, k_epochs, batch_size)
+    }
+
+    pub fn from_policy(policy: ActorCritic, k_epochs: usize, batch_size: usize) -> Self {
         let optimizer = Adam::new(policy.parameters(), 0.0003);
         Ppo {
             policy,
@@ -1180,14 +1184,19 @@ pub struct OnlinePpoTrainer {
 }
 
 impl OnlinePpoTrainer {
+    #[allow(dead_code)]
     pub fn new(
         seed: u64,
         k_epochs: usize,
         batch_size: usize,
         achf: &crate::config::AchfConfig,
     ) -> Self {
+        Self::from_policy(ActorCritic::new(seed, achf), k_epochs, batch_size)
+    }
+
+    pub fn from_policy(policy: ActorCritic, k_epochs: usize, batch_size: usize) -> Self {
         Self {
-            ppo: Ppo::new(seed, k_epochs, batch_size, achf),
+            ppo: Ppo::from_policy(policy, k_epochs, batch_size),
             steps_done: 0,
         }
     }
@@ -1283,5 +1292,20 @@ mod tests {
         let state_3d = Tensor::new(vec![0.5; seq_len * DIM], vec![1, seq_len, DIM]);
         let _ = policy.forward_actor(&state_3d, &pity);
         let _ = policy.forward_critic(&state_3d, &pity);
+    }
+
+    #[test]
+    fn online_trainer_from_policy_preserves_initial_weights() {
+        let policy = ActorCritic::new(42, &crate::config::AchfConfig::default());
+        let expected = policy.parameters()[0].data.read().unwrap().clone();
+
+        let trainer = OnlinePpoTrainer::from_policy(policy, 2, 128);
+        let got = trainer.ppo.policy.parameters()[0]
+            .data
+            .read()
+            .unwrap()
+            .clone();
+
+        assert_eq!(got, expected);
     }
 }

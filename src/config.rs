@@ -241,6 +241,7 @@ pub struct Config {
     pub f2p_sim_count: usize,
     pub f2p_sim_count_prob: usize,
     pub f2p_sim_count_cost: usize,
+    pub f2p_luck_mode: Option<LuckMode>,
     pub online_train: bool,
     pub online_train_dqn: bool,
     pub online_train_neural: bool,
@@ -292,6 +293,7 @@ impl Default for Config {
             f2p_sim_count: 0,
             f2p_sim_count_prob: 0,
             f2p_sim_count_cost: 0,
+            f2p_luck_mode: None,
             online_train: false,
             online_train_dqn: false,
             online_train_neural: false,
@@ -470,6 +472,9 @@ impl Config {
             }
             if let Some(v) = map.get("f2p_sim_count_cost") {
                 config.f2p_sim_count_cost = v.as_f64().unwrap_or(0.0).round() as usize;
+            }
+            if let Some(v) = map.get("f2p_luck_mode") {
+                config.f2p_luck_mode = v.as_str().map(LuckMode::from_str).or(config.f2p_luck_mode);
             }
             if let Some(v) = map.get("online_train") {
                 config.online_train = v.as_bool().unwrap_or(false);
@@ -833,6 +838,7 @@ fn warn_unknown_fields(map: &serde_json::Map<String, JsonValue>) {
         "f2p_sim_count",
         "f2p_sim_count_prob",
         "f2p_sim_count_cost",
+        "f2p_luck_mode",
         "online_train",
         "online_train_dqn",
         "online_train_neural",

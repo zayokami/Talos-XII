@@ -223,6 +223,42 @@ fn resolve_f2p_sim_count_cost(config: &Config, sim_count_prob: usize) -> usize {
     }
 }
 
+fn resolve_ppo_online_train_params(config: &Config) -> (usize, usize) {
+    let fast_mode = config.fast_init || config.ppo_mode == "fast";
+    let k_epochs = if config.ppo_k_epochs > 0 {
+        config.ppo_k_epochs
+    } else if fast_mode {
+        2
+    } else {
+        3
+    };
+    let batch_size = if config.ppo_batch_size > 0 {
+        config.ppo_batch_size
+    } else {
+        128
+    };
+    (k_epochs, batch_size)
+}
+
+fn default_pool_index(config: &Config) -> usize {
+    config
+        .active_pool
+        .as_ref()
+        .and_then(|active| config.pools.iter().position(|pool| &pool.id == active))
+        .map(|idx| idx + 1)
+        .unwrap_or(1)
+}
+
+fn resolve_f2p_luck_mode(config: &Config) -> LuckMode {
+    config.f2p_luck_mode.unwrap_or({
+        if config.luck_mode == LuckMode::Ppo {
+            LuckMode::Probability
+        } else {
+            config.luck_mode
+        }
+    })
+}
+
 struct F2pAnalysisCtx<'a> {
     config: &'a Config,
     neural_opt: &'a NeuralLuckOptimizer,
@@ -235,6 +271,18 @@ struct F2pAnalysisCtx<'a> {
 
 fn run_f2p_analysis(ctx: &F2pAnalysisCtx<'_>, rng: &mut Rng) {
     let lang = ctx.lang;
+    let mut f2p_config = ctx.config.clone();
+    f2p_config.luck_mode = resolve_f2p_luck_mode(ctx.config);
+    let f2p_dqn_policy = if f2p_config.luck_mode == LuckMode::Dqn {
+        ctx.dqn_policy
+    } else {
+        None
+    };
+    let f2p_ppo_policy = if f2p_config.luck_mode == LuckMode::Ppo {
+        ctx.ppo_policy
+    } else {
+        None
+    };
     println!(
         "{}",
         I18n::get(lang, "f2p_header").replace("{}", &FREE_PULLS_WELFARE.to_string())
@@ -251,10 +299,10 @@ fn run_f2p_analysis(ctx: &F2pAnalysisCtx<'_>, rng: &mut Rng) {
     let start_time = Instant::now();
     let sim_ctx = SimRunContext {
         neural_opt: ctx.neural_opt,
-        dqn_policy: ctx.dqn_policy,
-        ppo_policy: ctx.ppo_policy,
+        dqn_policy: f2p_dqn_policy,
+        ppo_policy: f2p_ppo_policy,
         dbn: ctx.dbn,
-        config: ctx.config,
+        config: &f2p_config,
         worker: ctx.worker,
         exp_sender: None,
         neural_sender: None,
@@ -269,6 +317,7 @@ fn run_f2p_analysis(ctx: &F2pAnalysisCtx<'_>, rng: &mut Rng) {
         FREE_PULLS_WELFARE as usize,
         sim_count_prob,
         rng.next_u64(),
+        FREE_PULLS_WELFARE,
         &sim_ctx,
         Some(&pb_prob),
     );
@@ -670,7 +719,7 @@ fn main() {
                 neural_sender: None,
                 ppo_sender: None,
             };
-            let (six_count, up_count, _, _) = simulate_stats(pulls, count, rng.next_u64(), &ctx);
+            let (six_count, up_count, _, _) = simulate_stats(pulls, count, rng.next_u64(), 0, &ctx);
             println!(
                 "{}",
                 I18n::get(lang, "batch_sim_header")
@@ -885,9 +934,8 @@ fn run_interactive(args: RunInteractiveArgs) {
         let stop = Arc::clone(&stop_flag);
         let interval_ms = (config.train_interval_ms.max(1) as u64).max(5);
         let max_steps = config.max_train_steps_per_tick;
-        let trainer_seed = rng.next_u64();
-        let achf = config.achf.clone();
-        let mut trainer = OnlinePpoTrainer::new(trainer_seed, 2, 128, &achf);
+        let (k_epochs, batch_size) = resolve_ppo_online_train_params(&config);
+        let mut trainer = OnlinePpoTrainer::from_policy(ppo_policy, k_epochs, batch_size);
         online_handles.push(thread::spawn(move || {
             let mut last_report = Instant::now();
             let mut last_sync = Instant::now();
@@ -1046,7 +1094,7 @@ fn run_interactive(args: RunInteractiveArgs) {
                 .replacen("{}", &pool_type_label(&pool.pool_type, lang), 1);
             println!("{}", line);
         }
-        let default_index = 1usize;
+        let default_index = default_pool_index(&config);
         print!(
             "{}",
             I18n::get(lang, "prompt_pool_select").replace("{}", &default_index.to_string())
@@ -1603,7 +1651,8 @@ fn run_interactive(args: RunInteractiveArgs) {
                         neural_sender: None,
                         ppo_sender: None,
                     };
-                    let (s_total, u_total, _, _) = simulate_stats(n, sims_n, rng.next_u64(), &ctx);
+                    let (s_total, u_total, _, _) =
+                        simulate_stats(n, sims_n, rng.next_u64(), free_pulls, &ctx);
                     let s_avg = s_total as f64 / sims_n as f64;
                     let u_avg = u_total as f64 / sims_n as f64;
                     let elapsed_ms = pool_start.elapsed().as_millis() as u64;
@@ -1640,7 +1689,8 @@ fn run_interactive(args: RunInteractiveArgs) {
                     neural_sender: None,
                     ppo_sender: None,
                 };
-                let (s_total, u_total, _, _) = simulate_stats(n, sims_n, rng.next_u64(), &ctx);
+                let (s_total, u_total, _, _) =
+                    simulate_stats(n, sims_n, rng.next_u64(), free_pulls, &ctx);
                 let s_avg = s_total as f64 / sims_n as f64;
                 let u_avg = u_total as f64 / sims_n as f64;
                 let elapsed_ms = sim_start.elapsed().as_millis() as u64;
@@ -1693,7 +1743,8 @@ fn run_interactive(args: RunInteractiveArgs) {
                         neural_sender: None,
                         ppo_sender: None,
                     };
-                    let (s_total, u_total, _, _) = simulate_stats(n, 1, rng.next_u64(), &ctx);
+                    let (s_total, u_total, _, _) =
+                        simulate_stats(n, 1, rng.next_u64(), free_pulls, &ctx);
                     let s_avg = s_total as f64;
                     let u_avg = u_total as f64;
                     println!(
@@ -1818,6 +1869,7 @@ fn run_interactive(args: RunInteractiveArgs) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PoolConfig;
     use sim::{simulate_core, simulate_fast, simulate_one, SimControl, SimModelContext};
 
     fn build_context() -> (Config, Dbn, NeuralLuckOptimizer) {
@@ -1826,6 +1878,77 @@ mod tests {
         let dbn = Dbn::new(&[32, 128, 64, 32], &mut rng);
         let neural_opt = NeuralLuckOptimizer::new(5678);
         (config, dbn, neural_opt)
+    }
+
+    #[test]
+    fn default_pool_index_uses_active_pool_position() {
+        let mut config = Config::default();
+        config.active_pool = Some("pool_b".to_string());
+        config.pools = vec![
+            PoolConfig {
+                id: "pool_a".to_string(),
+                name: "Pool A".to_string(),
+                pool_type: "character_up".to_string(),
+                up_six: vec![],
+                up_rate: 0.0,
+                prob_6_base: 0.008,
+                prob_5_base: 0.08,
+                prob_4_base: 0.912,
+                soft_pity_start: 65,
+                soft_pity_slope: 0.05,
+                small_pity_guarantee: 80,
+                big_pity_cumulative: 120,
+                up_pity_soft: 0,
+                five_star_pity: 10,
+                always_5_star: false,
+                big_pity_requires_not_up: true,
+                six_stars: vec![],
+                five_stars: vec![],
+                four_stars: vec![],
+                is_archived: false,
+            },
+            PoolConfig {
+                id: "pool_b".to_string(),
+                name: "Pool B".to_string(),
+                pool_type: "character_up".to_string(),
+                up_six: vec![],
+                up_rate: 0.0,
+                prob_6_base: 0.008,
+                prob_5_base: 0.08,
+                prob_4_base: 0.912,
+                soft_pity_start: 65,
+                soft_pity_slope: 0.05,
+                small_pity_guarantee: 80,
+                big_pity_cumulative: 120,
+                up_pity_soft: 0,
+                five_star_pity: 10,
+                always_5_star: false,
+                big_pity_requires_not_up: true,
+                six_stars: vec![],
+                five_stars: vec![],
+                four_stars: vec![],
+                is_archived: false,
+            },
+        ];
+
+        assert_eq!(default_pool_index(&config), 2);
+    }
+
+    #[test]
+    fn resolve_f2p_luck_mode_defaults_to_probability_when_global_mode_is_ppo() {
+        let mut config = Config::default();
+        config.luck_mode = LuckMode::Ppo;
+
+        assert_eq!(resolve_f2p_luck_mode(&config), LuckMode::Probability);
+    }
+
+    #[test]
+    fn resolve_f2p_luck_mode_respects_explicit_override() {
+        let mut config = Config::default();
+        config.luck_mode = LuckMode::Ppo;
+        config.f2p_luck_mode = Some(LuckMode::Dqn);
+
+        assert_eq!(resolve_f2p_luck_mode(&config), LuckMode::Dqn);
     }
 
     #[test]
