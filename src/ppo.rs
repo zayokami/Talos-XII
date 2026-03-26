@@ -13,6 +13,7 @@ use crate::worker::GoodJobWorker;
 use rand::seq::SliceRandom;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -25,6 +26,18 @@ const VALUE_COEF: f64 = 0.5;
 const ENTROPY_COEF: f64 = 0.01;
 const EARLY_UP_BONUS_THRESHOLD_1: usize = 80;
 const EARLY_UP_BONUS_THRESHOLD_2: usize = 50;
+
+#[derive(Default)]
+struct CachedStepScratch {
+    last: Vec<f64>,
+    logits: Vec<f64>,
+    value: Vec<f64>,
+}
+
+thread_local! {
+    static CACHED_STEP_SCRATCH: RefCell<CachedStepScratch> =
+        RefCell::new(CachedStepScratch::default());
+}
 
 // Softmax + categorical sample over fixed ACTION_SPACE logits.
 // Returns (action_index, log_prob_of_action).
@@ -159,13 +172,20 @@ impl ActorCritic {
         kv_cache: &mut [KVCache],
         start_pos: usize,
     ) -> (usize, f64, f64) {
-        let last = self
-            .backbone
-            .forward_inference_step(state, kv_cache, start_pos);
-        let logits = self.actor_head.forward_inference(&last);
-        let value = self.critic_head.forward_inference(&last);
-        let (action_idx, log_prob) = softmax_sample(&logits);
-        (action_idx, log_prob, value[0])
+        CACHED_STEP_SCRATCH.with(|scratch_cell| {
+            let mut scratch = scratch_cell.borrow_mut();
+            let CachedStepScratch {
+                last,
+                logits,
+                value,
+            } = &mut *scratch;
+            self.backbone
+                .forward_inference_step_into(state, kv_cache, start_pos, last);
+            self.actor_head.forward_inference_into(last, logits);
+            self.critic_head.forward_inference_into(last, value);
+            let (action_idx, log_prob) = softmax_sample(logits);
+            (action_idx, log_prob, value[0])
+        })
     }
 
     pub fn step_inference_cached(
@@ -174,11 +194,18 @@ impl ActorCritic {
         kv_cache: &mut [KVCache],
         start_pos: usize,
     ) -> usize {
-        let last = self
-            .backbone
-            .forward_inference_step(state, kv_cache, start_pos);
-        let logits = self.actor_head.forward_inference(&last);
-        softmax_sample(&logits).0
+        CACHED_STEP_SCRATCH.with(|scratch_cell| {
+            let mut scratch = scratch_cell.borrow_mut();
+            let CachedStepScratch {
+                last,
+                logits,
+                value: _,
+            } = &mut *scratch;
+            self.backbone
+                .forward_inference_step_into(state, kv_cache, start_pos, last);
+            self.actor_head.forward_inference_into(last, logits);
+            softmax_sample(logits).0
+        })
     }
 
     pub fn prune_cache(&self, kv_cache: &mut [KVCache], max_len: usize) {

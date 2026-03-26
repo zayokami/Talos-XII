@@ -4,6 +4,7 @@ use crate::config::AchfConfig;
 use crate::nn::{Linear, Module, RMSNorm};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::sync::{Arc, RwLock};
 
 // --- Configuration ---
@@ -43,6 +44,21 @@ pub struct TransformerBlock {
     pub ffn_1: Linear,
     pub ffn_2: Linear,
     pub achf_ffn: Option<AchfLayer>,
+}
+
+#[derive(Default)]
+struct TransformerStepScratch {
+    h: Vec<f64>,
+    norm1: Vec<f64>,
+    attn: Vec<f64>,
+    norm2: Vec<f64>,
+    ffn1: Vec<f64>,
+    ffn2: Vec<f64>,
+}
+
+thread_local! {
+    static TRANSFORMER_STEP_SCRATCH: RefCell<TransformerStepScratch> =
+        RefCell::new(TransformerStepScratch::default());
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -319,58 +335,78 @@ impl LuckTransformer {
         x[start..].to_vec()
     }
 
+    #[allow(dead_code)]
     pub fn forward_inference_step(
         &self,
         x: &[f64],
         kv_caches: &mut [KVCache],
         start_pos: usize,
     ) -> Vec<f64> {
-        use crate::simd::vector_grad_acc;
-        let mut h = self.embed.forward_inference(x);
+        let mut out = Vec::new();
+        self.forward_inference_step_into(x, kv_caches, start_pos, &mut out);
+        out
+    }
 
-        let layer_count = self.blocks.len().min(kv_caches.len());
-        for (i, kv_cache) in kv_caches.iter_mut().enumerate().take(layer_count) {
-            let block = &self.blocks[i];
-            let h_norm1 = block.norm_1.forward_inference(&h);
+    pub fn forward_inference_step_into(
+        &self,
+        x: &[f64],
+        kv_caches: &mut [KVCache],
+        start_pos: usize,
+        out: &mut Vec<f64>,
+    ) {
+        use crate::simd::{vector_grad_acc, vector_relu};
 
-            let attn_out = block
-                .mla_layer
-                .forward_inference_cached(&h_norm1, kv_cache, start_pos);
+        TRANSFORMER_STEP_SCRATCH.with(|scratch_cell| {
+            let mut scratch = scratch_cell.borrow_mut();
+            let TransformerStepScratch {
+                h,
+                norm1,
+                attn,
+                norm2,
+                ffn1,
+                ffn2,
+            } = &mut *scratch;
 
-            let achf_attn_out = block
-                .achf_attn
-                .as_ref()
-                .map(|achf| achf.forward_inference_residual(&h));
+            self.embed.forward_inference_into(x, h);
 
-            vector_grad_acc(&mut h, &attn_out);
-            if let Some(ref achf_out) = achf_attn_out {
-                vector_grad_acc(&mut h, achf_out);
-            }
+            let layer_count = self.blocks.len().min(kv_caches.len());
+            for (i, kv_cache) in kv_caches.iter_mut().enumerate().take(layer_count) {
+                let block = &self.blocks[i];
+                block.norm_1.forward_inference_into(h, norm1);
+                block
+                    .mla_layer
+                    .forward_inference_cached_into(norm1, kv_cache, start_pos, attn);
 
-            let h_norm2 = block.norm_2.forward_inference(&h);
+                let achf_attn_out = block
+                    .achf_attn
+                    .as_ref()
+                    .map(|achf| achf.forward_inference_residual(h));
 
-            let mut f1 = block.ffn_1.forward_inference(&h_norm2);
-            for v in f1.iter_mut() {
-                if *v < 0.0 {
-                    *v = 0.0;
+                vector_grad_acc(h, attn);
+                if let Some(ref achf_out) = achf_attn_out {
+                    vector_grad_acc(h, achf_out);
+                }
+
+                block.norm_2.forward_inference_into(h, norm2);
+                block.ffn_1.forward_inference_into(norm2, ffn1);
+                ffn2.resize(ffn1.len(), 0.0);
+                vector_relu(ffn2, ffn1);
+                block.ffn_2.forward_inference_into(ffn2, attn);
+
+                let achf_ffn_out = block
+                    .achf_ffn
+                    .as_ref()
+                    .map(|achf| achf.forward_inference_residual(h));
+
+                vector_grad_acc(h, attn);
+                if let Some(ref achf_out) = achf_ffn_out {
+                    vector_grad_acc(h, achf_out);
                 }
             }
 
-            let f2 = block.ffn_2.forward_inference(&f1);
-
-            let achf_ffn_out = block
-                .achf_ffn
-                .as_ref()
-                .map(|achf| achf.forward_inference_residual(&h));
-
-            vector_grad_acc(&mut h, &f2);
-            if let Some(ref achf_out) = achf_ffn_out {
-                vector_grad_acc(&mut h, achf_out);
-            }
-        }
-
-        let h_final = self.norm_final.forward_inference(&h);
-        self.out_proj.forward_inference(&h_final)
+            self.norm_final.forward_inference_into(h, norm1);
+            self.out_proj.forward_inference_into(norm1, out);
+        })
     }
 
     pub fn max_seq_len(&self) -> usize {
@@ -609,6 +645,12 @@ pub struct KVCache {
     pub v_cache: Vec<Vec<f64>>,
     scratch_scores: Vec<f64>,
     scratch_att_out: Vec<f64>,
+    scratch_c_kv: Vec<f64>,
+    scratch_k_c: Vec<f64>,
+    scratch_v_c: Vec<f64>,
+    scratch_k_r: Vec<f64>,
+    scratch_q_r: Vec<f64>,
+    scratch_q_c: Vec<f64>,
 }
 
 impl KVCache {
@@ -618,6 +660,12 @@ impl KVCache {
             v_cache: vec![Vec::new(); num_heads],
             scratch_scores: Vec::new(),
             scratch_att_out: Vec::new(),
+            scratch_c_kv: Vec::new(),
+            scratch_k_c: Vec::new(),
+            scratch_v_c: Vec::new(),
+            scratch_k_r: Vec::new(),
+            scratch_q_r: Vec::new(),
+            scratch_q_c: Vec::new(),
         }
     }
 
@@ -631,6 +679,12 @@ impl KVCache {
         }
         self.scratch_scores.clear();
         self.scratch_att_out.clear();
+        self.scratch_c_kv.clear();
+        self.scratch_k_c.clear();
+        self.scratch_v_c.clear();
+        self.scratch_k_r.clear();
+        self.scratch_q_r.clear();
+        self.scratch_q_c.clear();
     }
 }
 
@@ -908,12 +962,25 @@ impl MultiHeadLatentAttention {
     }
 
     // --- KV Cache Support ---
+    #[allow(dead_code)]
     pub fn forward_inference_cached(
         &self,
         x: &[f64],
         kv_cache: &mut KVCache,
         start_pos: usize,
     ) -> Vec<f64> {
+        let mut out = Vec::new();
+        self.forward_inference_cached_into(x, kv_cache, start_pos, &mut out);
+        out
+    }
+
+    pub fn forward_inference_cached_into(
+        &self,
+        x: &[f64],
+        kv_cache: &mut KVCache,
+        start_pos: usize,
+        out: &mut Vec<f64>,
+    ) {
         use crate::simd::{add_scaled_row, dot_product};
 
         let dim = self.config.dim;
@@ -926,7 +993,8 @@ impl MultiHeadLatentAttention {
         let seq_len = num_elements / dim;
 
         if seq_len == 1 {
-            return self.forward_inference_cached_single_token(x, kv_cache, start_pos);
+            self.forward_inference_cached_single_token_into(x, kv_cache, start_pos, out);
+            return;
         }
 
         // 1. Projections
@@ -1102,7 +1170,7 @@ impl MultiHeadLatentAttention {
                     att_out[dst..dst + head_dim].copy_from_slice(&head_buf[src..src + head_dim]);
                 }
             }
-            self.w_o.forward_inference(&att_out)
+            self.w_o.forward_inference_into(&att_out, out);
         } else {
             for h in 0..num_heads {
                 let k_cache_head = &kv_cache.k_cache[h];
@@ -1146,16 +1214,17 @@ impl MultiHeadLatentAttention {
                     }
                 }
             }
-            self.w_o.forward_inference(&att_out)
+            self.w_o.forward_inference_into(&att_out, out);
         }
     }
 
-    fn forward_inference_cached_single_token(
+    fn forward_inference_cached_single_token_into(
         &self,
         x: &[f64],
         kv_cache: &mut KVCache,
         start_pos: usize,
-    ) -> Vec<f64> {
+        out: &mut Vec<f64>,
+    ) {
         use crate::simd::{add_scaled_row, dot_product, softmax_exp_sum, vector_scale};
 
         let dim = self.config.dim;
@@ -1166,12 +1235,21 @@ impl MultiHeadLatentAttention {
 
         debug_assert_eq!(x.len(), dim);
 
-        let c_kv = self.w_dkv.forward_inference(x);
-        let k_c = self.w_uk.forward_inference(&c_kv);
-        let v_c = self.w_uv.forward_inference(&c_kv);
-        let mut k_r_rot = self.w_kr.forward_inference(x);
-        let mut q_r_rot = self.w_qr.forward_inference(x);
-        let q_c = self.w_q.forward_inference(x);
+        self.w_dkv
+            .forward_inference_into(x, &mut kv_cache.scratch_c_kv);
+        {
+            let c_kv = &kv_cache.scratch_c_kv;
+            self.w_uk
+                .forward_inference_into(c_kv, &mut kv_cache.scratch_k_c);
+            self.w_uv
+                .forward_inference_into(c_kv, &mut kv_cache.scratch_v_c);
+        }
+        self.w_kr
+            .forward_inference_into(x, &mut kv_cache.scratch_k_r);
+        self.w_qr
+            .forward_inference_into(x, &mut kv_cache.scratch_q_r);
+        self.w_q
+            .forward_inference_into(x, &mut kv_cache.scratch_q_c);
 
         let cache_offset = start_pos * (rope_dim / 2);
         if cache_offset < self.rope.cos_cache.len() {
@@ -1184,15 +1262,15 @@ impl MultiHeadLatentAttention {
                     let idx1 = base + 2 * i;
                     let idx2 = base + 2 * i + 1;
 
-                    let k1 = k_r_rot[idx1];
-                    let k2 = k_r_rot[idx2];
-                    k_r_rot[idx1] = k1 * c - k2 * s;
-                    k_r_rot[idx2] = k1 * s + k2 * c;
+                    let k1 = kv_cache.scratch_k_r[idx1];
+                    let k2 = kv_cache.scratch_k_r[idx2];
+                    kv_cache.scratch_k_r[idx1] = k1 * c - k2 * s;
+                    kv_cache.scratch_k_r[idx2] = k1 * s + k2 * c;
 
-                    let q1 = q_r_rot[idx1];
-                    let q2 = q_r_rot[idx2];
-                    q_r_rot[idx1] = q1 * c - q2 * s;
-                    q_r_rot[idx2] = q1 * s + q2 * c;
+                    let q1 = kv_cache.scratch_q_r[idx1];
+                    let q2 = kv_cache.scratch_q_r[idx2];
+                    kv_cache.scratch_q_r[idx1] = q1 * c - q2 * s;
+                    kv_cache.scratch_q_r[idx2] = q1 * s + q2 * c;
                 }
             }
         }
@@ -1217,9 +1295,9 @@ impl MultiHeadLatentAttention {
 
             let content_base = h * head_dim;
             let rope_base = h * rope_dim;
-            k_cache.extend_from_slice(&k_c[content_base..content_base + head_dim]);
-            k_cache.extend_from_slice(&k_r_rot[rope_base..rope_base + rope_dim]);
-            v_cache.extend_from_slice(&v_c[content_base..content_base + head_dim]);
+            k_cache.extend_from_slice(&kv_cache.scratch_k_c[content_base..content_base + head_dim]);
+            k_cache.extend_from_slice(&kv_cache.scratch_k_r[rope_base..rope_base + rope_dim]);
+            v_cache.extend_from_slice(&kv_cache.scratch_v_c[content_base..content_base + head_dim]);
         }
 
         let cached_len = kv_cache.k_cache[0].len() / total_head_dim;
@@ -1236,8 +1314,8 @@ impl MultiHeadLatentAttention {
         );
 
         for h in 0..num_heads {
-            let q_content = &q_c[h * head_dim..(h + 1) * head_dim];
-            let q_rope = &q_r_rot[h * rope_dim..(h + 1) * rope_dim];
+            let q_content = &kv_cache.scratch_q_c[h * head_dim..(h + 1) * head_dim];
+            let q_rope = &kv_cache.scratch_q_r[h * rope_dim..(h + 1) * rope_dim];
             let k_cache_head = &k_caches[h];
 
             for (j, score) in scratch_scores.iter_mut().enumerate().take(cached_len) {
@@ -1265,7 +1343,7 @@ impl MultiHeadLatentAttention {
             }
         }
 
-        self.w_o.forward_inference(scratch_att_out)
+        self.w_o.forward_inference_into(scratch_att_out, out);
     }
 
     pub fn prune_kv_cache(&self, kv_cache: &mut KVCache, max_seq_len: usize) {
@@ -2015,5 +2093,35 @@ mod tests {
                 full
             );
         }
+    }
+
+    #[test]
+    fn test_luck_transformer_step_into_matches_allocating_path() {
+        let achf = crate::config::AchfConfig::default();
+        let model = LuckTransformer::new(8, 8, true, 2, 42, &achf);
+        let num_heads = model.blocks[0].mla_layer.config.num_heads;
+        let mut base_cache = vec![KVCache::new(num_heads); model.blocks.len()];
+
+        let prefill = Tensor::rand(vec![2 * 8], -0.1, 0.1, 500)
+            .data
+            .read()
+            .unwrap()
+            .clone();
+        let _ = model.forward_inference_step(&prefill, &mut base_cache, 0);
+
+        let token = Tensor::rand(vec![8], -0.1, 0.1, 501)
+            .data
+            .read()
+            .unwrap()
+            .clone();
+
+        let mut cache_a = base_cache.clone();
+        let expected = model.forward_inference_step(&token, &mut cache_a, 2);
+
+        let mut cache_b = base_cache;
+        let mut actual = vec![123.0; 3];
+        model.forward_inference_step_into(&token, &mut cache_b, 2, &mut actual);
+
+        assert_eq!(actual, expected);
     }
 }

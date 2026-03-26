@@ -35,6 +35,12 @@ impl Linear {
     }
 
     pub fn forward_inference(&self, input: &[f64]) -> Vec<f64> {
+        let mut out = Vec::new();
+        self.forward_inference_into(input, &mut out);
+        out
+    }
+
+    pub fn forward_inference_into(&self, input: &[f64], out: &mut Vec<f64>) {
         let in_dim = self.in_features;
         let out_dim = self.out_features;
         debug_assert!(
@@ -44,7 +50,7 @@ impl Linear {
             in_dim
         );
         let num_rows = input.len() / in_dim;
-        let mut out = vec![0.0; num_rows * out_dim];
+        out.resize(num_rows * out_dim, 0.0);
         let w_data = self.weight.data.read().unwrap();
         let b_data = self.bias.as_ref().map(|b| b.data.read().unwrap());
 
@@ -80,9 +86,11 @@ impl Linear {
                         }
                     });
             } else {
+                let out_row = &mut out[row_offset_out..row_offset_out + out_dim];
                 if let Some(b) = &b_data {
-                    let out_row = &mut out[row_offset_out..row_offset_out + out_dim];
                     out_row.copy_from_slice(b);
+                } else {
+                    out_row.fill(0.0);
                 }
 
                 for i in 0..in_dim {
@@ -91,12 +99,10 @@ impl Linear {
                         continue;
                     }
                     let w_row = &w_data[i * out_dim..(i + 1) * out_dim];
-                    let out_row = &mut out[row_offset_out..row_offset_out + out_dim];
                     add_scaled_row(out_row, w_row, scale);
                 }
             }
         }
-        out
     }
 }
 
@@ -189,9 +195,15 @@ impl RMSNorm {
     }
 
     pub fn forward_inference(&self, input: &[f64]) -> Vec<f64> {
+        let mut out = Vec::new();
+        self.forward_inference_into(input, &mut out);
+        out
+    }
+
+    pub fn forward_inference_into(&self, input: &[f64], out: &mut Vec<f64>) {
         let dim = self.dim;
         let num_rows = input.len() / dim;
-        let mut out = vec![0.0; input.len()];
+        out.resize(input.len(), 0.0);
         let w_data = self.weight.data.read().unwrap();
 
         for r in 0..num_rows {
@@ -206,7 +218,6 @@ impl RMSNorm {
                 out[base + i] = (input[base + i] / rms) * w_data[i];
             }
         }
-        out
     }
 }
 
