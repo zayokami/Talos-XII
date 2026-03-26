@@ -447,7 +447,7 @@
   "achf": {
     "enabled": true,
     "mode": "lite",
-    "proj_mode": "rowcol",
+    "proj_mode": "sinkhorn",
     "proj_freq": 8,
     "proj_steps": 0,
     "lambda_ortho": 0.001,
