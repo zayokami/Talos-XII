@@ -1882,71 +1882,77 @@ mod tests {
 
     #[test]
     fn default_pool_index_uses_active_pool_position() {
-        let mut config = Config::default();
-        config.active_pool = Some("pool_b".to_string());
-        config.pools = vec![
-            PoolConfig {
-                id: "pool_a".to_string(),
-                name: "Pool A".to_string(),
-                pool_type: "character_up".to_string(),
-                up_six: vec![],
-                up_rate: 0.0,
-                prob_6_base: 0.008,
-                prob_5_base: 0.08,
-                prob_4_base: 0.912,
-                soft_pity_start: 65,
-                soft_pity_slope: 0.05,
-                small_pity_guarantee: 80,
-                big_pity_cumulative: 120,
-                up_pity_soft: 0,
-                five_star_pity: 10,
-                always_5_star: false,
-                big_pity_requires_not_up: true,
-                six_stars: vec![],
-                five_stars: vec![],
-                four_stars: vec![],
-                is_archived: false,
-            },
-            PoolConfig {
-                id: "pool_b".to_string(),
-                name: "Pool B".to_string(),
-                pool_type: "character_up".to_string(),
-                up_six: vec![],
-                up_rate: 0.0,
-                prob_6_base: 0.008,
-                prob_5_base: 0.08,
-                prob_4_base: 0.912,
-                soft_pity_start: 65,
-                soft_pity_slope: 0.05,
-                small_pity_guarantee: 80,
-                big_pity_cumulative: 120,
-                up_pity_soft: 0,
-                five_star_pity: 10,
-                always_5_star: false,
-                big_pity_requires_not_up: true,
-                six_stars: vec![],
-                five_stars: vec![],
-                four_stars: vec![],
-                is_archived: false,
-            },
-        ];
+        let config = Config {
+            active_pool: Some("pool_b".to_string()),
+            pools: vec![
+                PoolConfig {
+                    id: "pool_a".to_string(),
+                    name: "Pool A".to_string(),
+                    pool_type: "character_up".to_string(),
+                    up_six: vec![],
+                    up_rate: 0.0,
+                    prob_6_base: 0.008,
+                    prob_5_base: 0.08,
+                    prob_4_base: 0.912,
+                    soft_pity_start: 65,
+                    soft_pity_slope: 0.05,
+                    small_pity_guarantee: 80,
+                    big_pity_cumulative: 120,
+                    up_pity_soft: 0,
+                    five_star_pity: 10,
+                    always_5_star: false,
+                    big_pity_requires_not_up: true,
+                    six_stars: vec![],
+                    five_stars: vec![],
+                    four_stars: vec![],
+                    is_archived: false,
+                },
+                PoolConfig {
+                    id: "pool_b".to_string(),
+                    name: "Pool B".to_string(),
+                    pool_type: "character_up".to_string(),
+                    up_six: vec![],
+                    up_rate: 0.0,
+                    prob_6_base: 0.008,
+                    prob_5_base: 0.08,
+                    prob_4_base: 0.912,
+                    soft_pity_start: 65,
+                    soft_pity_slope: 0.05,
+                    small_pity_guarantee: 80,
+                    big_pity_cumulative: 120,
+                    up_pity_soft: 0,
+                    five_star_pity: 10,
+                    always_5_star: false,
+                    big_pity_requires_not_up: true,
+                    six_stars: vec![],
+                    five_stars: vec![],
+                    four_stars: vec![],
+                    is_archived: false,
+                },
+            ],
+            ..Default::default()
+        };
 
         assert_eq!(default_pool_index(&config), 2);
     }
 
     #[test]
     fn resolve_f2p_luck_mode_defaults_to_probability_when_global_mode_is_ppo() {
-        let mut config = Config::default();
-        config.luck_mode = LuckMode::Ppo;
+        let config = Config {
+            luck_mode: LuckMode::Ppo,
+            ..Default::default()
+        };
 
         assert_eq!(resolve_f2p_luck_mode(&config), LuckMode::Probability);
     }
 
     #[test]
     fn resolve_f2p_luck_mode_respects_explicit_override() {
-        let mut config = Config::default();
-        config.luck_mode = LuckMode::Ppo;
-        config.f2p_luck_mode = Some(LuckMode::Dqn);
+        let config = Config {
+            luck_mode: LuckMode::Ppo,
+            f2p_luck_mode: Some(LuckMode::Dqn),
+            ..Default::default()
+        };
 
         assert_eq!(resolve_f2p_luck_mode(&config), LuckMode::Dqn);
     }

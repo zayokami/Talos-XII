@@ -6,6 +6,7 @@ use crate::neural::{NeuralLuckOptimizer, DIM};
 use crate::nn::{Linear, Module};
 use crate::rng::Rng;
 use crate::sim::{build_features, dbn_env, prob_6, PullState};
+use std::cell::RefCell;
 use std::collections::VecDeque;
 
 // DQN Hyperparameters
@@ -230,36 +231,67 @@ impl DuelingQNetwork {
     }
 
     /// Zero-allocation inference: compute Q-values from a raw feature slice
-    /// using `Linear::forward_inference`, bypassing the autograd `Tensor` graph.
+    /// using `Linear::forward_inference_into`, bypassing the autograd `Tensor` graph.
+    ///
+    /// This function uses thread-local scratch buffers to avoid allocations in hot paths.
     pub fn predict_action_fast(&self, state: &[f64]) -> (usize, f64) {
-        let h1 = self.l1.forward_inference(state);
-        let mut h1_relu: Vec<f64> = h1.into_iter().map(|v| v.max(0.0)).collect();
-        let h2 = self.l2.forward_inference(&h1_relu);
-        h1_relu.clear();
-        h1_relu.extend(h2.iter().map(|v| v.max(0.0)));
-        let h2_relu = &h1_relu;
-
-        if let Some(achf) = &self.achf {
-            let residual = achf.forward_inference_residual(h2_relu);
-            for (dst, &r) in h1_relu.iter_mut().zip(residual.iter()) {
-                *dst += r;
-            }
+        struct Scratch {
+            h1: Vec<f64>,
+            h2: Vec<f64>,
+            val: Vec<f64>,
+            adv: Vec<f64>,
         }
 
-        let val = self.val_head.forward_inference(&h1_relu);
-        let adv = self.adv_head.forward_inference(&h1_relu);
-
-        let mean_adv: f64 = adv.iter().sum::<f64>() / ACTION_SPACE as f64;
-        let mut max_val = f64::NEG_INFINITY;
-        let mut max_idx = 0;
-        for (i, &a) in adv.iter().enumerate() {
-            let q = val[0] + a - mean_adv;
-            if q > max_val {
-                max_val = q;
-                max_idx = i;
-            }
+        thread_local! {
+            static SCRATCH: RefCell<Scratch> = const { RefCell::new(Scratch {
+                h1: Vec::new(),
+                h2: Vec::new(),
+                val: Vec::new(),
+                adv: Vec::new(),
+            }) };
         }
-        (max_idx, ACTIONS[max_idx])
+
+        SCRATCH.with(|scratch| {
+            let mut s = scratch.borrow_mut();
+            let Scratch { h1, h2, val, adv } = &mut *s;
+
+            self.l1.forward_inference_into(state, h1);
+            for v in h1.iter_mut() {
+                if *v < 0.0 {
+                    *v = 0.0;
+                }
+            }
+
+            self.l2.forward_inference_into(h1, h2);
+            for v in h2.iter_mut() {
+                if *v < 0.0 {
+                    *v = 0.0;
+                }
+            }
+
+            if let Some(achf) = &self.achf {
+                let residual = achf.forward_inference_residual(h2);
+                for (dst, &r) in h2.iter_mut().zip(residual.iter()) {
+                    *dst += r;
+                }
+            }
+
+            self.val_head.forward_inference_into(h2, val);
+            self.adv_head.forward_inference_into(h2, adv);
+
+            let mean_adv: f64 = adv.iter().sum::<f64>() / ACTION_SPACE as f64;
+            let mut max_val = f64::NEG_INFINITY;
+            let mut max_idx = 0;
+            let base = val.first().copied().unwrap_or(0.0);
+            for (i, &a) in adv.iter().enumerate() {
+                let q = base + a - mean_adv;
+                if q > max_val {
+                    max_val = q;
+                    max_idx = i;
+                }
+            }
+            (max_idx, ACTIONS[max_idx])
+        })
     }
 }
 
