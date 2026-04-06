@@ -56,7 +56,9 @@ impl Linear {
 
         use crate::simd::add_scaled_row;
 
-        let parallel_matvec = num_rows > 1 && in_dim * out_dim >= 65536;
+        // Disabled: nested parallelism causes thread pool oversubscription when called
+        // from within an outer par_iter. External parallelism handles this better.
+        let parallel_matvec = false;
 
         for r in 0..num_rows {
             let row_offset_in = r * in_dim;
