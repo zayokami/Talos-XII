@@ -589,7 +589,18 @@ impl Tensor {
         }
         // Cache forward result for backward (sign function needs original values)
         let sign_cache: Arc<Vec<f64>> = Arc::new(
-            self_data.iter().map(|&x| if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 }).collect()
+            self_data
+                .iter()
+                .map(|&x| {
+                    if x > 0.0 {
+                        1.0
+                    } else if x < 0.0 {
+                        -1.0
+                    } else {
+                        0.0
+                    }
+                })
+                .collect(),
         );
         let parents = vec![self.clone()];
 
@@ -636,9 +647,8 @@ impl Tensor {
         }
         // Cache forward result and exponent for backward
         let exp = exponent;
-        let pow_cache: Arc<Vec<f64>> = Arc::new(
-            self_data.iter().map(|&x| x.powf(exp - 1.0)).collect()
-        );
+        let pow_cache: Arc<Vec<f64>> =
+            Arc::new(self_data.iter().map(|&x| x.powf(exp - 1.0)).collect());
         let parents = vec![self.clone()];
 
         Tensor {
@@ -790,9 +800,8 @@ impl Tensor {
                         let base = slice_idx * dim_size_cap;
                         for j in 0..dim_size_cap {
                             let idx = base + j;
-                            inp_grad[idx] +=
-                                softmax_cache_for_backward[idx]
-                                    * (grad_out[idx] - sum_terms[slice_idx]);
+                            inp_grad[idx] += softmax_cache_for_backward[idx]
+                                * (grad_out[idx] - sum_terms[slice_idx]);
                         }
                     }
                 }),
@@ -889,7 +898,9 @@ impl Tensor {
                         // dx_j = grad_out_j / std + dvar * 2 * (x_j - m) / N + dmean / N
                         for j in 0..last_dim {
                             let diff = input_data[base + j] - m;
-                            let dx = grad_out[base + j] / std + dvar * 2.0 * diff / last_dim_f + dmean / last_dim_f;
+                            let dx = grad_out[base + j] / std
+                                + dvar * 2.0 * diff / last_dim_f
+                                + dmean / last_dim_f;
                             inp_grad[base + j] += dx;
                         }
                     }
@@ -1026,8 +1037,16 @@ impl Tensor {
             let old_offset = i as isize - (max_len as isize - old_len as isize);
             let new_offset = i as isize - (max_len as isize - new_len as isize);
 
-            let old_dim = if old_offset < 0 { 1 } else { old[old_len - 1 - old_offset as usize] };
-            let new_dim = if new_offset < 0 { 1 } else { new[new_len - 1 - new_offset as usize] };
+            let old_dim = if old_offset < 0 {
+                1
+            } else {
+                old[old_len - 1 - old_offset as usize]
+            };
+            let new_dim = if new_offset < 0 {
+                1
+            } else {
+                new[new_len - 1 - new_offset as usize]
+            };
 
             if old_dim != new_dim && old_dim != 1 && new_dim != 1 {
                 return false;
