@@ -669,6 +669,34 @@ impl KVCache {
         }
     }
 
+    /// Pre-allocate scratch buffers for inference to avoid reallocation overhead.
+    /// Call this after construction where MLA config is available.
+    pub fn preallocate(
+        &mut self,
+        num_heads: usize,
+        kv_lora_rank: usize,
+        v_head_dim: usize,
+        qk_rope_dim: usize,
+        max_seq_len: usize,
+    ) {
+        let k_cache_target = max_seq_len * (v_head_dim + qk_rope_dim);
+        let v_cache_target = max_seq_len * v_head_dim;
+        for k in &mut self.k_cache {
+            k.reserve(k_cache_target);
+        }
+        for v in &mut self.v_cache {
+            v.reserve(v_cache_target);
+        }
+        self.scratch_scores.reserve(max_seq_len * num_heads);
+        self.scratch_att_out.reserve(num_heads * v_head_dim);
+        self.scratch_c_kv.reserve(kv_lora_rank);
+        self.scratch_k_c.reserve(num_heads * v_head_dim);
+        self.scratch_v_c.reserve(num_heads * v_head_dim);
+        self.scratch_k_r.reserve(num_heads * qk_rope_dim);
+        self.scratch_q_r.reserve(num_heads * qk_rope_dim);
+        self.scratch_q_c.reserve(num_heads * v_head_dim);
+    }
+
     #[allow(dead_code)]
     pub fn clear(&mut self) {
         for h in self.k_cache.iter_mut() {

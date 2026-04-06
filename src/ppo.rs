@@ -643,9 +643,30 @@ struct PpoEnvState {
 }
 
 impl PpoEnvState {
-    fn new(seed: u64, dbn: &Dbn, context_len: usize, num_heads: usize, num_layers: usize) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        seed: u64,
+        dbn: &Dbn,
+        context_len: usize,
+        num_heads: usize,
+        num_layers: usize,
+        kv_lora_rank: usize,
+        v_head_dim: usize,
+        qk_rope_dim: usize,
+        max_seq_len: usize,
+    ) -> Self {
         let mut rng = Rng::from_seed(seed);
         let (env_noise, env_bias) = dbn_env(dbn, &mut rng);
+        let mut caches: Vec<_> = (0..num_layers).map(|_| KVCache::new(num_heads)).collect();
+        for cache in &mut caches {
+            cache.preallocate(
+                num_heads,
+                kv_lora_rank,
+                v_head_dim,
+                qk_rope_dim,
+                max_seq_len,
+            );
+        }
         Self {
             state_struct: PullState {
                 pity_6: 0,
@@ -661,7 +682,7 @@ impl PpoEnvState {
             pity_buffer: VecDeque::with_capacity(context_len),
             flat_data: Vec::with_capacity(context_len * DIM),
             pity_vec: Vec::with_capacity(context_len),
-            kv_cache: (0..num_layers).map(|_| KVCache::new(num_heads)).collect(),
+            kv_cache: caches,
             episode_reward: 0.0,
             rng,
         }
@@ -886,6 +907,7 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
     let mut steps_done = 0;
 
     let env_seeds: Vec<u64> = (0..num_envs).map(|_| rng.next_u64()).collect();
+    let mla_cfg = &ppo.policy.backbone.blocks[0].mla_layer.config;
     let mut envs: Vec<PpoEnvState> = env_seeds
         .into_iter()
         .map(|seed| {
@@ -893,8 +915,12 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
                 seed,
                 dbn,
                 context_len,
-                ppo.policy.backbone.blocks[0].mla_layer.config.num_heads,
+                mla_cfg.num_heads,
                 ppo.policy.backbone.blocks.len(),
+                mla_cfg.kv_lora_rank,
+                mla_cfg.v_head_dim,
+                mla_cfg.qk_rope_dim,
+                mla_cfg.max_seq_len,
             )
         })
         .collect();
@@ -1078,6 +1104,7 @@ pub fn train_ppo_with_metrics(
     let mut steps_done = 0;
 
     let env_seeds: Vec<u64> = (0..num_envs).map(|_| rng.next_u64()).collect();
+    let mla_cfg = &ppo.policy.backbone.blocks[0].mla_layer.config;
     let mut envs: Vec<PpoEnvState> = env_seeds
         .into_iter()
         .map(|seed| {
@@ -1085,8 +1112,12 @@ pub fn train_ppo_with_metrics(
                 seed,
                 dbn,
                 context_len,
-                ppo.policy.backbone.blocks[0].mla_layer.config.num_heads,
+                mla_cfg.num_heads,
                 ppo.policy.backbone.blocks.len(),
+                mla_cfg.kv_lora_rank,
+                mla_cfg.v_head_dim,
+                mla_cfg.qk_rope_dim,
+                mla_cfg.max_seq_len,
             )
         })
         .collect();

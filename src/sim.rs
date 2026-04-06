@@ -117,9 +117,20 @@ impl PpoContext {
     ) -> Self {
         let kv_cache = if active && fast_inference {
             ppo_policy.map(|policy| {
-                let num_heads = policy.backbone.blocks[0].mla_layer.config.num_heads;
+                let mla_config = &policy.backbone.blocks[0].mla_layer.config;
+                let num_heads = mla_config.num_heads;
                 let num_layers = policy.backbone.blocks.len();
-                (0..num_layers).map(|_| KVCache::new(num_heads)).collect()
+                let mut caches: Vec<_> = (0..num_layers).map(|_| KVCache::new(num_heads)).collect();
+                for cache in &mut caches {
+                    cache.preallocate(
+                        num_heads,
+                        mla_config.kv_lora_rank,
+                        mla_config.v_head_dim,
+                        mla_config.qk_rope_dim,
+                        mla_config.max_seq_len,
+                    );
+                }
+                caches
             })
         } else {
             None
@@ -166,27 +177,54 @@ impl PpoContext {
                 .reserve(context_len - self.pity_vec.capacity());
         }
         if active && fast_inference {
-            let (num_heads, num_layers) = ppo_policy
-                .map(|policy| {
-                    (
-                        policy.backbone.blocks[0].mla_layer.config.num_heads,
-                        policy.backbone.blocks.len(),
-                    )
-                })
-                .unwrap_or((0, 0));
+            let (num_heads, num_layers, kv_lora_rank, v_head_dim, qk_rope_dim, max_seq_len) =
+                ppo_policy
+                    .map(|policy| {
+                        let cfg = &policy.backbone.blocks[0].mla_layer.config;
+                        (
+                            cfg.num_heads,
+                            policy.backbone.blocks.len(),
+                            cfg.kv_lora_rank,
+                            cfg.v_head_dim,
+                            cfg.qk_rope_dim,
+                            cfg.max_seq_len,
+                        )
+                    })
+                    .unwrap_or((0, 0, 0, 0, 0, 0));
             if num_heads == 0 || num_layers == 0 {
                 self.kv_cache = None;
             } else if let Some(caches) = &mut self.kv_cache {
                 if caches.len() != num_layers || caches[0].k_cache.len() != num_heads {
-                    self.kv_cache =
-                        Some((0..num_layers).map(|_| KVCache::new(num_heads)).collect());
+                    let mut new_caches: Vec<_> =
+                        (0..num_layers).map(|_| KVCache::new(num_heads)).collect();
+                    for cache in &mut new_caches {
+                        cache.preallocate(
+                            num_heads,
+                            kv_lora_rank,
+                            v_head_dim,
+                            qk_rope_dim,
+                            max_seq_len,
+                        );
+                    }
+                    self.kv_cache = Some(new_caches);
                 } else {
                     for cache in caches.iter_mut() {
                         cache.clear();
                     }
                 }
             } else {
-                self.kv_cache = Some((0..num_layers).map(|_| KVCache::new(num_heads)).collect());
+                let mut new_caches: Vec<_> =
+                    (0..num_layers).map(|_| KVCache::new(num_heads)).collect();
+                for cache in &mut new_caches {
+                    cache.preallocate(
+                        num_heads,
+                        kv_lora_rank,
+                        v_head_dim,
+                        qk_rope_dim,
+                        max_seq_len,
+                    );
+                }
+                self.kv_cache = Some(new_caches);
             }
         } else {
             self.kv_cache = None;
@@ -1438,11 +1476,21 @@ mod tests {
         let slow_data = slow_logits.data.read().unwrap().clone();
         let slow_probs = softmax(&slow_data);
 
-        let num_heads = policy.backbone.blocks[0].mla_layer.config.num_heads;
+        let mla_cfg = &policy.backbone.blocks[0].mla_layer.config;
+        let num_heads = mla_cfg.num_heads;
         let num_layers = policy.backbone.blocks.len();
-        let mut kv: Vec<crate::transformer::KVCache> = (0..num_layers)
+        let mut kv: Vec<_> = (0..num_layers)
             .map(|_| crate::transformer::KVCache::new(num_heads))
             .collect();
+        for cache in &mut kv {
+            cache.preallocate(
+                num_heads,
+                mla_cfg.kv_lora_rank,
+                mla_cfg.v_head_dim,
+                mla_cfg.qk_rope_dim,
+                mla_cfg.max_seq_len,
+            );
+        }
         for cache in kv.iter_mut() {
             cache.clear();
         }
