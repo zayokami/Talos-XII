@@ -828,8 +828,10 @@ impl AchfLayer {
 
     fn input_hash(x: &[f64]) -> u64 {
         let mut h: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
-        for &v in x {
-            let quantized = (v * 10000.0).round() as i64;
+                                             // Sample every 8th element for faster hashing (acceptable collision rate for cache key)
+        let step = (x.len() / 64).clamp(1, 8);
+        for i in (0..x.len()).step_by(step) {
+            let quantized = (x[i] * 10000.0).round() as i64;
             let bytes = quantized.to_le_bytes();
             for &b in &bytes {
                 h ^= b as u64;
