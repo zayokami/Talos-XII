@@ -161,20 +161,11 @@ mod tests {
         // f'(x) = 2x*sin(x) + x^2*cos(x)
         // Check at x = 2.0
 
-        let x_val = 2.0;
-        let epsilon = 1e-6;
+        let x = Tensor::new(vec![2.0], vec![1]);
+        let loss_fn = |t: &Tensor| t.clone() * t.clone() * t.sin();
+        let (max_diff, all_passed) = super::numerical_grad_check(&x, loss_fn, 1e-6, 1e-4);
 
-        // Analytical (Autograd)
-        let x = Tensor::new(vec![x_val], vec![1]);
-        let y = (&x * &x) * x.sin();
-        y.backward();
-        let grad_auto = x.grad.read().unwrap()[0];
-
-        // Numerical
-        let f = |v: f64| v * v * v.sin();
-        let grad_num = (f(x_val + epsilon) - f(x_val - epsilon)) / (2.0 * epsilon);
-
-        println!("Auto: {}, Num: {}", grad_auto, grad_num);
-        assert!((grad_auto - grad_num).abs() < 1e-4);
+        println!("Max diff: {}", max_diff);
+        assert!(all_passed);
     }
 }
