@@ -134,15 +134,26 @@ impl Tensor {
         Tensor::new(vec![0.0; len], shape)
     }
 
+    /// Generate a tensor with uniformly distributed random values in [min, max).
     pub fn rand(shape: Vec<usize>, min: f64, max: f64, seed: u64) -> Self {
+        use crate::rng::Rng;
         let len = shape.iter().product::<usize>();
-        let mut data = Vec::with_capacity(len);
-        let mut x = seed;
-        for _ in 0..len {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let r = (x >> 33) as f64 / u32::MAX as f64;
-            data.push(min + r * (max - min));
-        }
+        let mut rng = Rng::from_seed(seed);
+        let data: Vec<f64> = (0..len)
+            .map(|_| {
+                let r = rng.next_f64();
+                min + r * (max - min)
+            })
+            .collect();
+        Tensor::new(data, shape)
+    }
+
+    /// Generate a tensor with normally distributed random values (mean=0, std=1).
+    pub fn randn(shape: Vec<usize>, seed: u64) -> Self {
+        use crate::rng::Rng;
+        let len = shape.iter().product::<usize>();
+        let mut rng = Rng::from_seed(seed);
+        let data: Vec<f64> = (0..len).map(|_| rng.next_f64_normal()).collect();
         Tensor::new(data, shape)
     }
 
@@ -562,26 +573,24 @@ impl Tensor {
         }
     }
 
-    /// Fused log-softmax: log(softmax(x)) = x - max(x) - log(sum(exp(x - max(x))))
-    /// Single allocation instead of 6+ intermediate tensors.
-    pub fn log_softmax(&self) -> Tensor {
+    /// Element-wise absolute value.
+    /// Forward: |x|
+    /// Backward: d/dx|x| = sign(x), where sign(0) = 0
+    pub fn abs(&self) -> Tensor {
         let self_data = self.data.read().unwrap();
         let len = self_data.len();
-        let max_val = self_data.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-        let mut exp_shifted = vec![0.0; len];
-        for i in 0..len {
-            exp_shifted[i] = (self_data[i] - max_val).exp();
-        }
-        let sum_exp: f64 = exp_shifted.iter().sum::<f64>().max(f64::MIN_POSITIVE);
-        let log_sum_exp = sum_exp.ln() + max_val;
-
         let mut data = vec![0.0; len];
-        for i in 0..len {
-            data[i] = self_data[i] - log_sum_exp;
+        if len >= PAR_THRESHOLD {
+            data = self_data.par_iter().map(|&x| x.abs()).collect();
+        } else {
+            for i in 0..len {
+                data[i] = self_data[i].abs();
+            }
         }
-
-        let softmax_cache: Arc<Vec<f64>> =
-            Arc::new(exp_shifted.iter().map(|&e| e / sum_exp).collect());
+        // Cache forward result for backward (sign function needs original values)
+        let sign_cache: Arc<Vec<f64>> = Arc::new(
+            self_data.iter().map(|&x| if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 }).collect()
+        );
         let parents = vec![self.clone()];
 
         Tensor {
@@ -591,11 +600,298 @@ impl Tensor {
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
-                    // d/dx log_softmax(x) = grad_out - softmax(x) * sum(grad_out)
+                    let input = &parents[0];
+                    let mut inp_grad = input.grad.write().unwrap();
+                    if inp_grad.len() >= PAR_THRESHOLD {
+                        inp_grad
+                            .par_iter_mut()
+                            .zip(grad_out.par_iter())
+                            .zip(sign_cache.par_iter())
+                            .for_each(|((ig, &g), &s)| {
+                                *ig += g * s;
+                            });
+                    } else {
+                        for i in 0..inp_grad.len() {
+                            inp_grad[i] += grad_out[i] * sign_cache[i];
+                        }
+                    }
+                }),
+            })),
+        }
+    }
+
+    /// Element-wise exponentiation: x^exponent.
+    /// Forward: x^n
+    /// Backward: d/dx x^n = n * x^(n-1)
+    pub fn pow(&self, exponent: f64) -> Tensor {
+        let self_data = self.data.read().unwrap();
+        let len = self_data.len();
+        let mut data = vec![0.0; len];
+        if len >= PAR_THRESHOLD {
+            data = self_data.par_iter().map(|&x| x.powf(exponent)).collect();
+        } else {
+            for i in 0..len {
+                data[i] = self_data[i].powf(exponent);
+            }
+        }
+        // Cache forward result and exponent for backward
+        let exp = exponent;
+        let pow_cache: Arc<Vec<f64>> = Arc::new(
+            self_data.iter().map(|&x| x.powf(exp - 1.0)).collect()
+        );
+        let parents = vec![self.clone()];
+
+        Tensor {
+            data: Arc::new(RwLock::new(data)),
+            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            shape: self.shape.clone(),
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    let input = &parents[0];
+                    let mut inp_grad = input.grad.write().unwrap();
+                    if inp_grad.len() >= PAR_THRESHOLD {
+                        inp_grad
+                            .par_iter_mut()
+                            .zip(grad_out.par_iter())
+                            .zip(pow_cache.par_iter())
+                            .for_each(|((ig, &g), &cached)| {
+                                *ig += g * exp * cached;
+                            });
+                    } else {
+                        for i in 0..inp_grad.len() {
+                            inp_grad[i] += grad_out[i] * exp * pow_cache[i];
+                        }
+                    }
+                }),
+            })),
+        }
+    }
+
+    /// Softmax: exp(x_i) / sum_j(exp(x_j)) with numerical stability (shift by max)
+    pub fn softmax(&self) -> Tensor {
+        let self_data = self.data.read().unwrap();
+        let len = self_data.len();
+        let max_val = self_data.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+        let mut exp_shifted = vec![0.0; len];
+        for i in 0..len {
+            exp_shifted[i] = (self_data[i] - max_val).exp();
+        }
+        let sum_exp: f64 = exp_shifted.iter().sum::<f64>().max(f64::MIN_POSITIVE);
+        let mut data = vec![0.0; len];
+        for i in 0..len {
+            data[i] = exp_shifted[i] / sum_exp;
+        }
+
+        let softmax_cache: Arc<Vec<f64>> = Arc::new(data.to_vec());
+        let parents = vec![self.clone()];
+
+        Tensor {
+            data: Arc::new(RwLock::new(data)),
+            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            shape: self.shape.clone(),
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    // d/dx softmax = softmax * (grad_out - sum(grad_out * softmax))
                     let mut inp_grad = parents[0].grad.write().unwrap();
-                    let g_sum: f64 = grad_out.iter().sum();
+                    let sum_term: f64 = grad_out
+                        .iter()
+                        .zip(softmax_cache.iter())
+                        .map(|(&g, &s)| g * s)
+                        .sum();
                     for i in 0..inp_grad.len() {
-                        inp_grad[i] += grad_out[i] - softmax_cache[i] * g_sum;
+                        inp_grad[i] += softmax_cache[i] * (grad_out[i] - sum_term);
+                    }
+                }),
+            })),
+        }
+    }
+
+    /// Log-softmax along specified dimension: log(softmax(x)) along dim.
+    /// Fused for efficiency with numerical stability.
+    pub fn log_softmax_dim(&self, dim: usize) -> Tensor {
+        assert!(dim < self.shape.len(), "dim out of bounds");
+        let self_data = self.data.read().unwrap();
+        let shape = &self.shape;
+        let rank = shape.len();
+
+        // Compute strides for multi-dimensional indexing
+        let mut strides = vec![0usize; rank];
+        strides[rank - 1] = 1;
+        for i in (0..rank - 1).rev() {
+            strides[i] = strides[i + 1] * shape[i + 1];
+        }
+
+        let dim_size = shape[dim];
+        let num_slices: usize = self_data.len() / dim_size;
+
+        let mut data = vec![0.0; self_data.len()];
+        let mut softmax_values = vec![0.0; self_data.len()];
+
+        // Forward pass: compute softmax per slice
+        for slice_idx in 0..num_slices {
+            // Compute max in this slice
+            let mut max_val = f64::NEG_INFINITY;
+            for j in 0..dim_size {
+                let linear_idx = slice_idx * dim_size + j;
+                if self_data[linear_idx] > max_val {
+                    max_val = self_data[linear_idx];
+                }
+            }
+
+            // Compute sum of exp(x - max) in this slice
+            let mut sum_exp = 0.0;
+            for j in 0..dim_size {
+                let linear_idx = slice_idx * dim_size + j;
+                sum_exp += (self_data[linear_idx] - max_val).exp();
+            }
+            sum_exp = sum_exp.max(f64::MIN_POSITIVE);
+            let log_sum_exp = sum_exp.ln() + max_val;
+
+            // Compute output and cache softmax values
+            for j in 0..dim_size {
+                let linear_idx = slice_idx * dim_size + j;
+                let softmax_val = (self_data[linear_idx] - max_val).exp() / sum_exp;
+                data[linear_idx] = self_data[linear_idx] - log_sum_exp;
+                softmax_values[linear_idx] = softmax_val;
+            }
+        }
+
+        let softmax_cache: Arc<Vec<f64>> = Arc::new(softmax_values);
+        let parents = vec![self.clone()];
+        let dim_size_cap = dim_size;
+        let num_slices_cap = num_slices;
+        let softmax_cache_for_backward = softmax_cache.clone();
+
+        Tensor {
+            data: Arc::new(RwLock::new(data)),
+            grad: Arc::new(RwLock::new(vec![0.0; self_data.len()])),
+            shape: self.shape.clone(),
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    // Precompute sum_term per slice: sum(grad_out * softmax)
+                    let mut sum_terms = vec![0.0; num_slices_cap];
+                    for (slice_idx, sum_term) in sum_terms.iter_mut().enumerate() {
+                        let base = slice_idx * dim_size_cap;
+                        let mut slice_sum = 0.0;
+                        for j in 0..dim_size_cap {
+                            let idx = base + j;
+                            slice_sum += grad_out[idx] * softmax_cache_for_backward[idx];
+                        }
+                        *sum_term = slice_sum;
+                    }
+
+                    let mut inp_grad = parents[0].grad.write().unwrap();
+                    // Manually compute slice_idx and idx to avoid needless iteration
+                    #[allow(clippy::needless_range_loop)]
+                    for slice_idx in 0..num_slices_cap {
+                        let base = slice_idx * dim_size_cap;
+                        for j in 0..dim_size_cap {
+                            let idx = base + j;
+                            inp_grad[idx] +=
+                                softmax_cache_for_backward[idx]
+                                    * (grad_out[idx] - sum_terms[slice_idx]);
+                        }
+                    }
+                }),
+            })),
+        }
+    }
+
+    /// Fused log-softmax: log(softmax(x)) = x - max(x) - log(sum(exp(x - max(x))))
+    /// Single allocation instead of 6+ intermediate tensors.
+    /// Uses log_softmax_dim internally for backward compatibility.
+    pub fn log_softmax(&self) -> Tensor {
+        self.log_softmax_dim(self.shape.len() - 1)
+    }
+
+    /// Layer Normalization (simplified): normalize over the last dimension.
+    /// y = (x - mean) / sqrt(var + eps)
+    /// No learnable gamma/beta parameters.
+    pub fn layer_norm_simple(&self, eps: f64) -> Tensor {
+        let self_data = self.data.read().unwrap();
+        let shape = self.shape.clone();
+        let ndim = shape.len();
+        assert!(ndim >= 1, "layer_norm requires at least 1D tensor");
+
+        let last_dim = shape[ndim - 1];
+        let outer_len = shape[..ndim - 1].iter().product();
+
+        // Compute mean over last dimension
+        let mut mean = vec![0.0; outer_len];
+        for (i, mean_elem) in mean.iter_mut().enumerate().take(outer_len) {
+            let base = i * last_dim;
+            let mut sum = 0.0;
+            for j in 0..last_dim {
+                sum += self_data[base + j];
+            }
+            *mean_elem = sum / last_dim as f64;
+        }
+
+        // Compute variance and normalized output
+        let mut var = vec![0.0; outer_len];
+        let mut output = vec![0.0; self_data.len()];
+        for i in 0..outer_len {
+            let base = i * last_dim;
+            let m = mean[i];
+            let mut sum_sq = 0.0;
+            for j in 0..last_dim {
+                let diff = self_data[base + j] - m;
+                sum_sq += diff * diff;
+            }
+            var[i] = sum_sq / last_dim as f64;
+            let std = (var[i] + eps).sqrt();
+            for j in 0..last_dim {
+                output[base + j] = (self_data[base + j] - m) / std;
+            }
+        }
+
+        // Store input data in Arc so backward pass can access it
+        let input_data = (*self_data).clone();
+        let mean_arc = Arc::new(mean);
+        let var_arc = Arc::new(var);
+        let last_dim_f = last_dim as f64;
+        let parents = vec![self.clone()];
+
+        Tensor {
+            data: Arc::new(RwLock::new(output)),
+            grad: Arc::new(RwLock::new(vec![0.0; self_data.len()])),
+            shape,
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    let input = &parents[0];
+                    let mut inp_grad = input.grad.write().unwrap();
+
+                    for i in 0..outer_len {
+                        let base = i * last_dim;
+                        let m = mean_arc[i];
+                        let v = var_arc[i];
+                        let std = (v + eps).sqrt();
+                        let std3 = std * std * std;
+
+                        // Compute aggregated gradients
+                        let mut g_sum = 0.0;
+                        let mut g_diff_sum = 0.0;
+                        for j in 0..last_dim {
+                            let diff = input_data[base + j] - m;
+                            g_sum += grad_out[base + j];
+                            g_diff_sum += grad_out[base + j] * diff;
+                        }
+
+                        // dvar = sum grad_out * (x - mean) * -0.5 / std^3
+                        let dvar = -0.5 * g_diff_sum / std3;
+                        // dmean = -sum(grad_out) / std + dvar * -2 * mean / N
+                        let dmean = -g_sum / std + dvar * -2.0 * m / last_dim_f;
+
+                        // dx_j = grad_out_j / std + dvar * 2 * (x_j - m) / N + dmean / N
+                        for j in 0..last_dim {
+                            let diff = input_data[base + j] - m;
+                            let dx = grad_out[base + j] / std + dvar * 2.0 * diff / last_dim_f + dmean / last_dim_f;
+                            inp_grad[base + j] += dx;
+                        }
                     }
                 }),
             })),
@@ -717,28 +1013,118 @@ impl Tensor {
         }
     }
 
+    /// Check if two shapes are broadcast-compatible.
+    /// Dimensions are compared from the right; each dimension must either match or be 1.
+    fn broadcastable_shapes(old: &[usize], new: &[usize]) -> bool {
+        let old_len = old.len();
+        let new_len = new.len();
+        let max_len = old_len.max(new_len);
+
+        for i in 0..max_len {
+            // Compute offset into old/new when aligned from the right
+            // i=0 is the rightmost dimension
+            let old_offset = i as isize - (max_len as isize - old_len as isize);
+            let new_offset = i as isize - (max_len as isize - new_len as isize);
+
+            let old_dim = if old_offset < 0 { 1 } else { old[old_len - 1 - old_offset as usize] };
+            let new_dim = if new_offset < 0 { 1 } else { new[new_len - 1 - new_offset as usize] };
+
+            if old_dim != new_dim && old_dim != 1 && new_dim != 1 {
+                return false;
+            }
+        }
+        true
+    }
+
     pub fn broadcast(&self, new_shape: Vec<usize>) -> Tensor {
-        assert_eq!(
-            self.shape,
-            vec![1],
-            "Broadcast only supported for scalar (1) to N"
+        let old_shape = self.shape.clone();
+        let old_len = old_shape.len();
+        let new_len = new_shape.len();
+
+        assert!(
+            Self::broadcastable_shapes(&old_shape, &new_shape),
+            "Shapes {:?} and {:?} are not broadcast-compatible",
+            old_shape,
+            new_shape
         );
-        let len = new_shape.iter().product();
-        let val = self.data.read().unwrap()[0];
-        let data = vec![val; len];
+
+        let max_len = old_len.max(new_len);
+        let total_elements: usize = new_shape.iter().product();
+
+        let self_data = self.data.read().unwrap();
+        let old_data = &*self_data;
+
+        let mut new_data = Vec::with_capacity(total_elements);
+
+        for linear_idx in 0..total_elements {
+            let mut old_linear_idx = 0usize;
+            let mut multiplier = 1usize;
+
+            for dim in 0..max_len {
+                let old_dim = if dim < max_len - old_len {
+                    1
+                } else {
+                    old_shape[old_len - 1 - (dim - (max_len - old_len))]
+                };
+                let new_dim = if dim < max_len - new_len {
+                    1
+                } else {
+                    new_shape[new_len - 1 - (dim - (max_len - new_len))]
+                };
+
+                let pos = (linear_idx / multiplier) % new_dim;
+                // Input position is pos when old_dim > 1 (broadcast replicates along dim=1)
+                if old_dim != 1 {
+                    old_linear_idx += pos * multiplier;
+                }
+                multiplier *= new_dim;
+            }
+
+            new_data.push(old_data[old_linear_idx]);
+        }
 
         let parents = vec![self.clone()];
 
         Tensor {
-            data: Arc::new(RwLock::new(data)),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
-            shape: new_shape,
+            data: Arc::new(RwLock::new(new_data)),
+            grad: Arc::new(RwLock::new(vec![0.0; total_elements])),
+            shape: new_shape.clone(),
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
                     let mut inp_grad = parents[0].grad.write().unwrap();
-                    let sum_grad: f64 = grad_out.par_iter().sum();
-                    inp_grad[0] += sum_grad;
+                    let total_elements = grad_out.len();
+                    let old_shape = old_shape.clone();
+                    let old_len = old_shape.len();
+                    let new_len = new_shape.len();
+                    let max_len = old_len.max(new_len);
+
+                    #[allow(clippy::needless_range_loop)]
+                    for linear_idx in 0..total_elements {
+                        let mut old_linear_idx = 0usize;
+                        let mut multiplier = 1usize;
+
+                        for dim in 0..max_len {
+                            let old_dim = if dim < max_len - old_len {
+                                1
+                            } else {
+                                old_shape[old_len - 1 - (dim - (max_len - old_len))]
+                            };
+                            let new_dim = if dim < max_len - new_len {
+                                1
+                            } else {
+                                new_shape[new_len - 1 - (dim - (max_len - new_len))]
+                            };
+
+                            let pos = (linear_idx / multiplier) % new_dim;
+                            if old_dim != 1 {
+                                old_linear_idx += pos * multiplier;
+                            }
+                            multiplier *= new_dim;
+                        }
+
+                        inp_grad[old_linear_idx] += grad_out[linear_idx];
+                    }
                 }),
             })),
         }
@@ -1306,8 +1692,9 @@ impl Tensor {
                 });
         }
 
-        // Backward pass: Just use the standard implementation.
-        // Gradients don't care about the forward algorithm.
+        // Backward pass: Use standard Im2Col gradient computation.
+        // Winograd F(2x2, 3x3) is mathematically equivalent to standard conv2d,
+        // so standard backward produces correct gradients for the forward result.
 
         let parents = vec![self.clone(), weight.clone()];
 
@@ -1339,7 +1726,8 @@ impl Tensor {
                         weight.shape[3],
                     );
 
-                    // Stride is 1, Padding is `padding` (captured)
+                    // Winograd F(2x2, 3x3) only supports stride=1.
+                    // Stride and padding are captured; stride is hardcoded to 1.
                     let stride = 1;
                     let h_out = h_in + 2 * padding - 2;
                     let w_out = w_in + 2 * padding - 2; // k_h=3, k_w=3

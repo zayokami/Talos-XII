@@ -1,3 +1,68 @@
+use crate::autograd::Tensor;
+use std::sync::{Arc, RwLock};
+
+/// Numerical gradient check using finite differences.
+/// Compares analytical gradients (via backward()) against numerical approximation.
+///
+/// Returns (max_abs_diff, all_passed) where:
+/// - max_abs_diff: Maximum absolute difference between analytical and numerical gradients
+/// - all_passed: true if all gradient differences are within tolerance
+pub fn numerical_grad_check<F>(
+    tensor: &Tensor,
+    loss_fn: F,
+    epsilon: f64,
+    tolerance: f64,
+) -> (f64, bool)
+where
+    F: Fn(&Tensor) -> Tensor,
+{
+    let original_data = tensor.data.read().unwrap().clone();
+    let shape = tensor.shape.clone();
+    let n = original_data.len();
+
+    // Compute analytical gradient via backward
+    let loss = loss_fn(tensor);
+    loss.backward();
+    let analytical_grad = tensor.grad.read().unwrap().clone();
+
+    // Compute numerical gradients via finite differences
+    let mut max_diff: f64 = 0.0;
+    for i in 0..n {
+        // loss at x + eps
+        let mut data_plus = original_data.clone();
+        data_plus[i] += epsilon;
+        let t_plus = Tensor {
+            data: Arc::new(RwLock::new(data_plus)),
+            grad: Arc::new(RwLock::new(vec![0.0; n])),
+            shape: shape.clone(),
+            _ctx: None,
+        };
+        let loss_plus = loss_fn(&t_plus);
+        let loss_plus_val = loss_plus.data.read().unwrap()[0];
+
+        // loss at x - eps
+        let mut data_minus = original_data.clone();
+        data_minus[i] -= epsilon;
+        let t_minus = Tensor {
+            data: Arc::new(RwLock::new(data_minus)),
+            grad: Arc::new(RwLock::new(vec![0.0; n])),
+            shape: shape.clone(),
+            _ctx: None,
+        };
+        let loss_minus = loss_fn(&t_minus);
+        let loss_minus_val = loss_minus.data.read().unwrap()[0];
+
+        // Numerical gradient via centered difference
+        let numerical_grad = (loss_plus_val - loss_minus_val) / (2.0 * epsilon);
+
+        let diff = (analytical_grad[i] - numerical_grad).abs();
+        max_diff = max_diff.max(diff);
+    }
+
+    let all_passed = max_diff <= tolerance;
+    (max_diff, all_passed)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::autograd::Tensor;
