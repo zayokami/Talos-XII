@@ -235,6 +235,9 @@ pub struct Config {
     pub ppo_context_len: usize,
     pub ppo_num_envs: usize,
     pub ppo_top_k: usize,
+    pub distill_enabled: bool,
+    pub distill_ema_decay: f64,
+    pub distill_kl_coef: f64,
     pub worker_max_threads: usize,
     pub worker_reserve_cores: usize,
     pub worker_priority: String,
@@ -288,6 +291,9 @@ impl Default for Config {
             ppo_context_len: 0,
             ppo_num_envs: 1,
             ppo_top_k: 0, // 0 = disabled (full softmax), >0 = top-k truncation
+            distill_enabled: false,
+            distill_ema_decay: 0.995,
+            distill_kl_coef: 0.1,
             worker_max_threads: 0,
             worker_reserve_cores: 1,
             worker_priority: "time_critical".to_string(),
@@ -456,6 +462,15 @@ impl Config {
             }
             if let Some(v) = map.get("ppo_top_k") {
                 config.ppo_top_k = v.as_f64().unwrap_or(0.0).round() as usize;
+            }
+            if let Some(v) = map.get("distill_enabled") {
+                config.distill_enabled = v.as_bool().unwrap_or(false);
+            }
+            if let Some(v) = map.get("distill_ema_decay") {
+                config.distill_ema_decay = v.as_f64().unwrap_or(0.995);
+            }
+            if let Some(v) = map.get("distill_kl_coef") {
+                config.distill_kl_coef = v.as_f64().unwrap_or(0.1);
             }
             if let Some(v) = map.get("worker_max_threads") {
                 config.worker_max_threads = v.as_f64().unwrap_or(0.0).round() as usize;
@@ -837,6 +852,9 @@ fn warn_unknown_fields(map: &serde_json::Map<String, JsonValue>) {
         "ppo_context_len",
         "ppo_num_envs",
         "ppo_top_k",
+        "distill_enabled",
+        "distill_ema_decay",
+        "distill_kl_coef",
         "worker_max_threads",
         "worker_reserve_cores",
         "worker_priority",
