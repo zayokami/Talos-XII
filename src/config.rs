@@ -234,6 +234,7 @@ pub struct Config {
     pub ppo_batch_size: usize,
     pub ppo_context_len: usize,
     pub ppo_num_envs: usize,
+    pub ppo_top_k: usize,
     pub worker_max_threads: usize,
     pub worker_reserve_cores: usize,
     pub worker_priority: String,
@@ -286,6 +287,7 @@ impl Default for Config {
             ppo_batch_size: 0,
             ppo_context_len: 0,
             ppo_num_envs: 1,
+            ppo_top_k: 0, // 0 = disabled (full softmax), >0 = top-k truncation
             worker_max_threads: 0,
             worker_reserve_cores: 1,
             worker_priority: "time_critical".to_string(),
@@ -451,6 +453,9 @@ impl Config {
             }
             if let Some(v) = map.get("ppo_num_envs") {
                 config.ppo_num_envs = v.as_f64().unwrap_or(1.0).round() as usize;
+            }
+            if let Some(v) = map.get("ppo_top_k") {
+                config.ppo_top_k = v.as_f64().unwrap_or(0.0).round() as usize;
             }
             if let Some(v) = map.get("worker_max_threads") {
                 config.worker_max_threads = v.as_f64().unwrap_or(0.0).round() as usize;
@@ -831,6 +836,7 @@ fn warn_unknown_fields(map: &serde_json::Map<String, JsonValue>) {
         "ppo_batch_size",
         "ppo_context_len",
         "ppo_num_envs",
+        "ppo_top_k",
         "worker_max_threads",
         "worker_reserve_cores",
         "worker_priority",

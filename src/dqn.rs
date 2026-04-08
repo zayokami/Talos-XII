@@ -234,12 +234,51 @@ impl DuelingQNetwork {
     /// using `Linear::forward_inference_into`, bypassing the autograd `Tensor` graph.
     ///
     /// This function uses thread-local scratch buffers to avoid allocations in hot paths.
+    /// Uses RepCache to avoid recomputing Q-values for previously seen states.
     pub fn predict_action_fast(&self, state: &[f64]) -> (usize, f64) {
         struct Scratch {
             h1: Vec<f64>,
             h2: Vec<f64>,
             val: Vec<f64>,
             adv: Vec<f64>,
+        }
+
+        // RepCache: bounded hash map for state -> Q-values
+        struct RepCache {
+            entries: std::collections::HashMap<u64, [f64; ACTION_SPACE]>,
+        }
+
+        impl RepCache {
+            // FNV-1a hash, same as ACHF input_hash
+            fn state_hash(x: &[f64]) -> u64 {
+                let mut h: u64 = 0xcbf29ce484222325;
+                let step = (x.len() / 64).clamp(1, 8);
+                for i in (0..x.len()).step_by(step) {
+                    let quantized = (x[i] * 10000.0).round() as i64;
+                    let bytes = quantized.to_le_bytes();
+                    for &b in &bytes {
+                        h ^= b as u64;
+                        h = h.wrapping_mul(0x100000001b3);
+                    }
+                }
+                h
+            }
+
+            fn get(&self, hash: u64) -> Option<&[f64; ACTION_SPACE]> {
+                self.entries.get(&hash).map(|q| unsafe {
+                    // Safe: ACTION_SPACE is constant and we're just reinterpreting
+                    &*(q.as_slice() as *const [f64] as *const [_; ACTION_SPACE])
+                })
+            }
+
+            fn insert(&mut self, hash: u64, q_values: [f64; ACTION_SPACE]) {
+                if self.entries.len() >= 1024 {
+                    if let Some(key) = self.entries.keys().next().copied() {
+                        self.entries.remove(&key);
+                    }
+                }
+                self.entries.insert(hash, q_values);
+            }
         }
 
         thread_local! {
@@ -250,7 +289,33 @@ impl DuelingQNetwork {
                 adv: Vec::new(),
             }) };
         }
+        thread_local! {
+            static REP_CACHE: RefCell<RepCache> = RefCell::new(RepCache {
+                entries: std::collections::HashMap::with_capacity(1024),
+            });
+        }
 
+        let state_hash = RepCache::state_hash(state);
+
+        // Check RepCache first (cache hit path)
+        let cache_hit = REP_CACHE.with(|cache| cache.borrow().get(state_hash).is_some());
+        if cache_hit {
+            return REP_CACHE.with(|cache| {
+                let binding = cache.borrow();
+                let q_ref = binding.get(state_hash).unwrap();
+                let mut max_idx = 0;
+                let mut max_val = f64::NEG_INFINITY;
+                for (i, &q) in q_ref.iter().enumerate() {
+                    if q > max_val {
+                        max_val = q;
+                        max_idx = i;
+                    }
+                }
+                (max_idx, ACTIONS[max_idx])
+            });
+        }
+
+        // Cache miss: compute forward pass
         SCRATCH.with(|scratch| {
             let mut s = scratch.borrow_mut();
             let Scratch { h1, h2, val, adv } = &mut *s;
@@ -283,13 +348,21 @@ impl DuelingQNetwork {
             let mut max_val = f64::NEG_INFINITY;
             let mut max_idx = 0;
             let base = val.first().copied().unwrap_or(0.0);
+            let mut q_values = [0.0f64; ACTION_SPACE];
             for (i, &a) in adv.iter().enumerate() {
                 let q = base + a - mean_adv;
+                q_values[i] = q;
                 if q > max_val {
                     max_val = q;
                     max_idx = i;
                 }
             }
+
+            // Store in RepCache
+            REP_CACHE.with(|cache| {
+                cache.borrow_mut().insert(state_hash, q_values);
+            });
+
             (max_idx, ACTIONS[max_idx])
         })
     }

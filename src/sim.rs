@@ -362,10 +362,10 @@ fn decide_policy(inputs: PolicyInputs<'_>) -> PolicyDecision {
             }
             let (idx, log_prob, value) =
                 if let (Some(seq), Some(pities)) = (ppo_state_seq, ppo_pity_seq) {
-                    policy.step(seq, pities)
+                    policy.step(seq, pities, config.ppo_top_k)
                 } else {
                     let tensor_x = AutoTensor::new(current_features.to_vec(), vec![DIM]);
-                    policy.step(&tensor_x, &[state.pity_6])
+                    policy.step(&tensor_x, &[state.pity_6], config.ppo_top_k)
                 };
             return PolicyDecision {
                 luck_factor: crate::utils::ACTIONS[idx],

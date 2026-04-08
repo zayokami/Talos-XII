@@ -41,23 +41,53 @@ thread_local! {
 
 // Softmax + categorical sample over fixed ACTION_SPACE logits.
 // Returns (action_index, log_prob_of_action).
+// If top_k > 0, only the top_k logits are kept (others set to -inf).
 #[inline]
-fn softmax_sample(logits: &[f64]) -> (usize, f64) {
+fn softmax_sample(logits: &[f64], top_k: usize) -> (usize, f64) {
+    // Find max for numerical stability
     let mut max_l = f64::NEG_INFINITY;
     for &v in logits {
         if v > max_l {
             max_l = v;
         }
     }
-    let mut sum_exp = 0.0;
+
+    // Top-k truncation: set non-top-k logits to -inf
     let mut probs = [0.0; ACTION_SPACE];
-    for (i, prob) in probs.iter_mut().enumerate() {
-        *prob = (logits[i] - max_l).exp();
-        sum_exp += *prob;
+    if top_k > 0 && top_k < ACTION_SPACE {
+        // Find top_k values
+        let mut sorted_logits = logits.to_vec();
+        sorted_logits.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let threshold = sorted_logits[top_k.saturating_sub(1)];
+
+        // Compute softmax with top-k masking
+        let mut sum_exp = 0.0;
+        for (i, prob) in probs.iter_mut().enumerate() {
+            if logits[i] < threshold {
+                *prob = 0.0; // masked out
+            } else {
+                *prob = (logits[i] - max_l).exp();
+                sum_exp += *prob;
+            }
+        }
+        for prob in probs.iter_mut() {
+            if sum_exp > 0.0 {
+                *prob /= sum_exp;
+            }
+        }
+    } else {
+        // Full softmax (top_k disabled or >= ACTION_SPACE)
+        let mut sum_exp = 0.0;
+        for (i, prob) in probs.iter_mut().enumerate() {
+            *prob = (logits[i] - max_l).exp();
+            sum_exp += *prob;
+        }
+        for prob in probs.iter_mut() {
+            *prob /= sum_exp;
+        }
     }
-    for prob in probs.iter_mut() {
-        *prob /= sum_exp;
-    }
+
+    // Categorical sampling
     let mut r = rand::random::<f64>();
     let mut idx = ACTION_SPACE - 1;
     for (i, &p) in probs.iter().enumerate() {
@@ -150,10 +180,10 @@ impl ActorCritic {
     }
 
     // Returns (action_idx, log_prob, value)
-    pub fn step(&self, state: &Tensor, pity: &[usize]) -> (usize, f64, f64) {
+    pub fn step(&self, state: &Tensor, pity: &[usize], top_k: usize) -> (usize, f64, f64) {
         let (logits, value) = self.forward_actor_critic(state, pity);
         let logits_data = logits.data.read().unwrap();
-        let (action_idx, log_prob) = softmax_sample(&logits_data);
+        let (action_idx, log_prob) = softmax_sample(&logits_data, top_k);
         let val = value.data.read().unwrap()[0];
         (action_idx, log_prob, val)
     }
@@ -163,7 +193,7 @@ impl ActorCritic {
         let seq = self.backbone.forward_inference(state);
         let last = self.backbone.last_token_inference(&seq);
         let logits = self.actor_head.forward_inference(&last);
-        softmax_sample(&logits).0
+        softmax_sample(&logits, 0).0 // top_k=0 for inference (full softmax)
     }
 
     pub fn step_inference_cached_with_value(
@@ -183,7 +213,7 @@ impl ActorCritic {
                 .forward_inference_step_into(state, kv_cache, start_pos, last);
             self.actor_head.forward_inference_into(last, logits);
             self.critic_head.forward_inference_into(last, value);
-            let (action_idx, log_prob) = softmax_sample(logits);
+            let (action_idx, log_prob) = softmax_sample(logits, 0); // top_k=0 for inference
             (action_idx, log_prob, value[0])
         })
     }
@@ -204,7 +234,7 @@ impl ActorCritic {
             self.backbone
                 .forward_inference_step_into(state, kv_cache, start_pos, last);
             self.actor_head.forward_inference_into(last, logits);
-            softmax_sample(logits).0
+            softmax_sample(logits, 0).0 // top_k=0 for inference
         })
     }
 
