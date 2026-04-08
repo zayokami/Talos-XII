@@ -1,6 +1,6 @@
 use crate::simd::{
     add_scaled_row, dot_product, horizontal_sum, prefetch_read_l1, vector_add, vector_fma,
-    vector_grad_acc, vector_mul, vector_relu, vector_sub,
+    vector_gelu, vector_grad_acc, vector_mul, vector_relu, vector_sub,
 };
 use memmap2::Mmap;
 use rayon::prelude::*;
@@ -476,6 +476,73 @@ impl Tensor {
                             if input_data[i] > 0.0 {
                                 inp_grad[i] += grad_out[i];
                             }
+                        }
+                    }
+                }),
+            })),
+        }
+    }
+
+    /// GELU activation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    pub fn gelu(&self) -> Tensor {
+        let self_data = self.data.read().unwrap();
+        let len = self_data.len();
+        let mut data = vec![0.0; len];
+        if len >= PAR_THRESHOLD {
+            data.par_chunks_mut(PAR_THRESHOLD)
+                .enumerate()
+                .for_each(|(chunk_idx, chunk)| {
+                    let start = chunk_idx * PAR_THRESHOLD;
+                    vector_gelu(chunk, &self_data[start..start + chunk.len()]);
+                });
+        } else {
+            vector_gelu(&mut data, &self_data);
+        }
+        let parents = vec![self.clone()];
+
+        let sqrt_2_over_pi = (2.0 / std::f64::consts::PI).sqrt();
+        let c = 0.044715;
+
+        Tensor {
+            data: Arc::new(RwLock::new(data)),
+            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            shape: self.shape.clone(),
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    let input = &parents[0];
+                    let input_data = input.data.read().unwrap();
+                    let mut inp_grad = input.grad.write().unwrap();
+                    // GELU derivative:
+                    // gelu'(x) = 0.5 * (1 + tanh(u)) + 0.5 * x * (1 - tanh^2(u)) * du/dx
+                    // where u = sqrt(2/pi) * (x + 0.044715 * x^3)
+                    // and du_dx = sqrt(2/pi) * (1 + 3 * 0.044715 * x^2)
+                    if inp_grad.len() >= PAR_THRESHOLD {
+                        inp_grad
+                            .par_iter_mut()
+                            .zip(grad_out.par_iter())
+                            .zip(input_data.par_iter())
+                            .for_each(|((ig, &go), &x)| {
+                                let x2 = x * x;
+                                let x3 = x2 * x;
+                                let u = sqrt_2_over_pi * (x + c * x3);
+                                let tanh_u = u.tanh();
+                                let sech2_u = 1.0 - tanh_u * tanh_u;
+                                let du_dx = sqrt_2_over_pi * (1.0 + 3.0 * c * x2);
+                                let gelu_grad = 0.5 * (1.0 + tanh_u) + 0.5 * x * sech2_u * du_dx;
+                                *ig += go * gelu_grad;
+                            });
+                    } else {
+                        for i in 0..inp_grad.len() {
+                            let x = input_data[i];
+                            let x2 = x * x;
+                            let x3 = x2 * x;
+                            let u = sqrt_2_over_pi * (x + c * x3);
+                            let tanh_u = u.tanh();
+                            let sech2_u = 1.0 - tanh_u * tanh_u;
+                            let du_dx = sqrt_2_over_pi * (1.0 + 3.0 * c * x2);
+                            let gelu_grad = 0.5 * (1.0 + tanh_u) + 0.5 * x * sech2_u * du_dx;
+                            inp_grad[i] += grad_out[i] * gelu_grad;
                         }
                     }
                 }),

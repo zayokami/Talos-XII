@@ -146,7 +146,7 @@ impl LuckTransformer {
 
             // Block 2: FFN (Pre-Norm)
             let h_norm2 = block.norm_2.forward(&h2);
-            let f1 = block.ffn_1.forward(&h_norm2).relu();
+            let f1 = block.ffn_1.forward(&h_norm2).gelu();
             let f2 = block.ffn_2.forward(&f1);
             let mut h3 = h2.clone() + f2;
             if let Some(achf) = &block.achf_ffn {
@@ -216,6 +216,7 @@ impl LuckTransformer {
 
     /// Run inference forcing a specific ACHF path (0=Cached, 1=LowRank, 2=Dense).
     pub fn forward_inference_forced_path(&self, x: &[f64], forced_path: u8) -> Vec<f64> {
+        use crate::simd::vector_gelu;
         let mut h = self.embed.forward_inference(x);
         for block in &self.blocks {
             let h_norm1 = block.norm_1.forward_inference(&h);
@@ -232,13 +233,9 @@ impl LuckTransformer {
             }
             let h_norm2 = block.norm_2.forward_inference(&h2);
             let f1 = block.ffn_1.forward_inference(&h_norm2);
-            let mut f1_relu = f1;
-            for v in f1_relu.iter_mut() {
-                if *v < 0.0 {
-                    *v = 0.0;
-                }
-            }
-            let f2 = block.ffn_2.forward_inference(&f1_relu);
+            let mut f1_gelu = vec![0.0; f1.len()];
+            vector_gelu(&mut f1_gelu, &f1);
+            let f2 = block.ffn_2.forward_inference(&f1_gelu);
             let mut h3 = vec![0.0; h2.len()];
             for i in 0..h2.len() {
                 h3[i] = h2[i] + f2[i];
@@ -293,7 +290,7 @@ impl LuckTransformer {
     }
 
     pub fn forward_inference(&self, x: &[f64]) -> Vec<f64> {
-        use crate::simd::{vector_add, vector_grad_acc, vector_relu};
+        use crate::simd::{vector_add, vector_gelu, vector_grad_acc};
 
         let mut h = self.embed.forward_inference(x);
 
@@ -311,10 +308,10 @@ impl LuckTransformer {
             let h_norm2 = block.norm_2.forward_inference(&h2);
             let f1 = block.ffn_1.forward_inference(&h_norm2);
 
-            let mut f1_relu = vec![0.0; f1.len()];
-            vector_relu(&mut f1_relu, &f1);
+            let mut f1_gelu = vec![0.0; f1.len()];
+            vector_gelu(&mut f1_gelu, &f1);
 
-            let f2 = block.ffn_2.forward_inference(&f1_relu);
+            let f2 = block.ffn_2.forward_inference(&f1_gelu);
 
             let mut h3 = vec![0.0; h2.len()];
             vector_add(&mut h3, &h2, &f2);
@@ -331,8 +328,9 @@ impl LuckTransformer {
 
     pub fn last_token_inference(&self, x: &[f64]) -> Vec<f64> {
         let dim = self.out_proj.out_features;
-        let start = x.len().saturating_sub(dim);
-        x[start..].to_vec()
+        let seq_len = x.len() / dim;
+        let start = (seq_len.saturating_sub(1)) * dim;
+        x[start..start + dim].to_vec()
     }
 
     #[allow(dead_code)]
@@ -354,7 +352,7 @@ impl LuckTransformer {
         start_pos: usize,
         out: &mut Vec<f64>,
     ) {
-        use crate::simd::{vector_grad_acc, vector_relu};
+        use crate::simd::{vector_gelu, vector_grad_acc};
 
         TRANSFORMER_STEP_SCRATCH.with(|scratch_cell| {
             let mut scratch = scratch_cell.borrow_mut();
@@ -390,7 +388,7 @@ impl LuckTransformer {
                 block.norm_2.forward_inference_into(h, norm2);
                 block.ffn_1.forward_inference_into(norm2, ffn1);
                 ffn2.resize(ffn1.len(), 0.0);
-                vector_relu(ffn2, ffn1);
+                vector_gelu(ffn2, ffn1);
                 block.ffn_2.forward_inference_into(ffn2, attn);
 
                 let achf_ffn_out = block
@@ -1136,7 +1134,7 @@ impl MultiHeadLatentAttention {
         let mut att_scores = vec![0.0; num_heads * head_stride];
         let scale = 1.0 / (total_head_dim as f64).sqrt();
 
-        let use_par = false;
+        let use_par = true;
 
         if use_par {
             use rayon::prelude::*;

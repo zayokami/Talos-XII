@@ -63,7 +63,7 @@ fn softmax_sample(logits: &[f64], top_k: usize) -> (usize, f64) {
         // Compute softmax with top-k masking
         let mut sum_exp = 0.0;
         for (i, prob) in probs.iter_mut().enumerate() {
-            if logits[i] < threshold {
+            if logits[i] <= threshold {
                 *prob = 0.0; // masked out
             } else {
                 *prob = (logits[i] - max_l).exp();
@@ -662,12 +662,12 @@ impl Ppo {
                     if self.distill_kl_coef > 0.0 {
                         if let Some(ref ema) = self.ema_policy {
                             let (teacher_logits, _) = ema.forward_actor_critic(state, pity);
-                            // KL(student || teacher) = sum(teacher_prob * (log_student_prob - log_teacher_prob))
-                            let teacher_probs = teacher_logits.softmax().exp();
+                            // KL(student || teacher) = sum(student_prob * (log_student_prob - log_teacher_prob))
+                            let student_probs = logits.softmax().exp();
                             let student_log_probs = logits.log_softmax();
                             let teacher_log_probs = teacher_logits.log_softmax();
-                            // KL = sum(p_teacher * (log_p_student - log_p_teacher))
-                            let kl_vals = teacher_probs * (student_log_probs - teacher_log_probs);
+                            // KL = sum(p_student * (log_p_student - log_p_teacher))
+                            let kl_vals = student_probs * (student_log_probs - teacher_log_probs);
                             let kl_div_scalar = kl_vals.sum();
                             // Scalar * Tensor creates a Tensor, so we add it to distill_accum
                             distill_accum = distill_accum + kl_div_scalar;
@@ -1405,6 +1405,85 @@ impl OnlinePpoTrainer {
 mod tests {
     use super::*;
 
+    /// Compute KL divergence KL(student || teacher) for two categorical distributions.
+    /// KL(P||Q) = sum(P_i * (log(P_i) - log(Q_i)))
+    fn kl_categorical(student: &[f64], teacher: &[f64]) -> f64 {
+        assert_eq!(student.len(), teacher.len());
+        student
+            .iter()
+            .zip(teacher.iter())
+            .map(|(p, q)| {
+                if *p > 0.0 && *q > 0.0 {
+                    p * (p.ln() - q.ln())
+                } else {
+                    0.0
+                }
+            })
+            .sum()
+    }
+
+    #[test]
+    fn kl_divergence_identical_distributions_is_zero() {
+        // When student and teacher are identical, KL should be exactly 0
+        let p = vec![0.5, 0.5];
+        let kl = kl_categorical(&p, &p);
+        assert!(
+            (kl - 0.0).abs() < 1e-9,
+            "KL divergence of identical distributions should be 0, got {}",
+            kl
+        );
+
+        let p2 = vec![0.9, 0.1];
+        let kl2 = kl_categorical(&p2, &p2);
+        assert!(
+            (kl2 - 0.0).abs() < 1e-9,
+            "KL divergence of identical distributions should be 0, got {}",
+            kl2
+        );
+
+        let p3 = vec![0.25, 0.25, 0.25, 0.25];
+        let kl3 = kl_categorical(&p3, &p3);
+        assert!(
+            (kl3 - 0.0).abs() < 1e-9,
+            "KL divergence of identical distributions should be 0, got {}",
+            kl3
+        );
+    }
+
+    #[test]
+    fn kl_divergence_is_not_symmetric() {
+        // KL is NOT symmetric: KL(student||teacher) != KL(teacher||student)
+        let student = vec![0.5, 0.5];
+        let teacher = vec![0.9, 0.1];
+
+        let kl_forward = kl_categorical(&student, &teacher);
+        let kl_reverse = kl_categorical(&teacher, &student);
+
+        // They should be different (KL is not symmetric)
+        assert!(
+            (kl_forward - kl_reverse).abs() > 1e-6,
+            "KL should not be symmetric: forward={}, reverse={}",
+            kl_forward,
+            kl_reverse
+        );
+
+        // Verify specific values: KL([0.5,0.5]||[0.9,0.1]) should be positive
+        assert!(
+            kl_forward > 0.0,
+            "KL divergence should be positive, got {}",
+            kl_forward
+        );
+
+        // Check manual computation: 0.5*ln(0.5/0.9) + 0.5*ln(0.5/0.1) ≈ 0.5108
+        let expected = 0.5 * (0.5_f64.ln() - 0.9_f64.ln()) + 0.5 * (0.5_f64.ln() - 0.1_f64.ln());
+        assert!(
+            (kl_forward - expected).abs() < 1e-6,
+            "KL forward = {}, expected = {}",
+            kl_forward,
+            expected
+        );
+    }
+
     #[test]
     fn sum_f64_matches_scalar() {
         let values = vec![1.0, -2.5, 3.25, 4.0, -5.0, 6.5, 7.75, -8.0, 9.0];
@@ -1463,5 +1542,243 @@ mod tests {
             .clone();
 
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn ema_update_blends_teacher_student_with_decay_0_5() {
+        // Use same seed for both so they start with identical weights
+        let policy = ActorCritic::new(42, &crate::config::AchfConfig::default());
+        let mut ppo = Ppo::from_policy(policy, 2, 128);
+
+        // Create EMA as separate instance with same seed (not clone, to avoid Arc sharing)
+        ppo.ema_policy = Some(ActorCritic::new(42, &crate::config::AchfConfig::default()));
+        ppo.distill_ema_decay = 0.5;
+
+        // Capture original teacher values (initial = policy values since same seed)
+        let teacher_before = ppo.ema_policy.as_ref().unwrap().parameters()[0]
+            .data
+            .read()
+            .unwrap()
+            .clone();
+
+        // Modify student first parameter to 1.0
+        let params = ppo.policy.parameters();
+        let mut data = params[0].data.write().unwrap();
+        for val in data.iter_mut() {
+            *val = 1.0;
+        }
+
+        // Perform EMA update
+        ppo.update_ema_teacher();
+
+        // With decay=0.5, teacher_new = 0.5 * teacher_old + 0.5 * student
+        let teacher_after = ppo.ema_policy.as_ref().unwrap().parameters()[0]
+            .data
+            .read()
+            .unwrap()
+            .clone();
+
+        for (before, after) in teacher_before.iter().zip(teacher_after.iter()) {
+            let expected = 0.5 * before + 0.5 * 1.0;
+            assert!((after - expected).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn ema_update_applies_to_all_parameter_tensors() {
+        let policy = ActorCritic::new(42, &crate::config::AchfConfig::default());
+        let mut ppo = Ppo::from_policy(policy, 2, 128);
+
+        // Create separate EMA with same seed (not clone)
+        ppo.ema_policy = Some(ActorCritic::new(42, &crate::config::AchfConfig::default()));
+        ppo.distill_ema_decay = 0.5;
+
+        let num_params = ppo.policy.parameters().len();
+        assert!(num_params > 0, "Should have parameters");
+
+        // Record first and last tensor values before update
+        let before_first = ppo.ema_policy.as_ref().unwrap().parameters()[0]
+            .data
+            .read()
+            .unwrap()
+            .clone();
+        let before_last = ppo.ema_policy.as_ref().unwrap().parameters()[num_params - 1]
+            .data
+            .read()
+            .unwrap()
+            .clone();
+
+        // Set all student parameters to 2.0
+        for param in ppo.policy.parameters() {
+            let mut data = param.data.write().unwrap();
+            for val in data.iter_mut() {
+                *val = 2.0;
+            }
+        }
+
+        ppo.update_ema_teacher();
+
+        // Check first and last tensor values after update
+        let after_first = ppo.ema_policy.as_ref().unwrap().parameters()[0]
+            .data
+            .read()
+            .unwrap()
+            .clone();
+        let after_last = ppo.ema_policy.as_ref().unwrap().parameters()[num_params - 1]
+            .data
+            .read()
+            .unwrap()
+            .clone();
+
+        // First tensor should have changed
+        let first_changed = before_first
+            .iter()
+            .zip(after_first.iter())
+            .any(|(b, a)| (*b - *a).abs() > 1e-9);
+        assert!(first_changed, "First parameter tensor was not updated");
+
+        // Last tensor should have changed
+        let last_changed = before_last
+            .iter()
+            .zip(after_last.iter())
+            .any(|(b, a)| (*b - *a).abs() > 1e-9);
+        assert!(last_changed, "Last parameter tensor was not updated");
+    }
+
+    #[test]
+    fn ema_approaches_student_after_multiple_updates() {
+        let policy = ActorCritic::new(42, &crate::config::AchfConfig::default());
+        let mut ppo = Ppo::from_policy(policy, 2, 128);
+
+        // Create separate EMA with same seed
+        ppo.ema_policy = Some(ActorCritic::new(42, &crate::config::AchfConfig::default()));
+        ppo.distill_ema_decay = 0.5;
+
+        // Set all student params to 10.0
+        for param in ppo.policy.parameters() {
+            let mut data = param.data.write().unwrap();
+            for val in data.iter_mut() {
+                *val = 10.0;
+            }
+        }
+
+        // Perform many EMA updates
+        for _ in 0..100 {
+            ppo.update_ema_teacher();
+        }
+
+        // After 100 updates with decay=0.5, EMA should be very close to student (10.0)
+        let teacher_final = ppo.ema_policy.as_ref().unwrap().parameters()[0]
+            .data
+            .read()
+            .unwrap()
+            .clone();
+
+        for val in teacher_final.iter() {
+            assert!(
+                (*val - 10.0).abs() < 1e-6,
+                "EMA did not converge: got {}",
+                val
+            );
+        }
+    }
+
+    #[test]
+    fn softmax_sample_top_k_zero_like_full_softmax() {
+        // top_k=0 should behave identically to full softmax (no truncation)
+        // Compare empirical distributions over many samples
+        let logits = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let trials = 1000;
+
+        let mut counts_0 = [0usize; ACTION_SPACE];
+        let mut counts_full = [0usize; ACTION_SPACE];
+
+        for _ in 0..trials {
+            let (a0, _) = softmax_sample(&logits, 0);
+            let (af, _) = softmax_sample(&logits, ACTION_SPACE);
+            counts_0[a0] += 1;
+            counts_full[af] += 1;
+        }
+
+        // Distributions should be identical (normalized counts should match)
+        for i in 0..ACTION_SPACE {
+            let p0 = counts_0[i] as f64 / trials as f64;
+            let pf = counts_full[i] as f64 / trials as f64;
+            assert!(
+                (p0 - pf).abs() < 0.05,
+                "Distribution mismatch at index {}: top_k=0 has {:.3}, full softmax has {:.3}",
+                i,
+                p0,
+                pf
+            );
+        }
+    }
+
+    #[test]
+    fn softmax_sample_top_k_gte_action_space_like_full_softmax() {
+        // top_k >= ACTION_SPACE should behave identically to full softmax
+        let logits = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let trials = 1000;
+
+        let mut counts_large = [0usize; ACTION_SPACE];
+        let mut counts_full = [0usize; ACTION_SPACE];
+
+        for _ in 0..trials {
+            let (al, _) = softmax_sample(&logits, ACTION_SPACE + 10);
+            let (af, _) = softmax_sample(&logits, ACTION_SPACE);
+            counts_large[al] += 1;
+            counts_full[af] += 1;
+        }
+
+        // Distributions should be identical
+        for i in 0..ACTION_SPACE {
+            let pl = counts_large[i] as f64 / trials as f64;
+            let pf = counts_full[i] as f64 / trials as f64;
+            assert!(
+                (pl - pf).abs() < 0.05,
+                "Distribution mismatch at index {}: top_k large has {:.3}, full softmax has {:.3}",
+                i,
+                pl,
+                pf
+            );
+        }
+    }
+
+    #[test]
+    fn softmax_sample_top_k_boundary_identical_values() {
+        // When multiple logits have identical values at the threshold boundary,
+        // all logits with that value should be treated consistently.
+        // Test case: logits where 3rd and 4th highest values differ
+        // [5.0, 4.0, 4.0, 3.0, 2.0] with top_k=3
+        // Sorted: [5.0, 4.0, 4.0, 3.0, 2.0], threshold = 4.0
+        // With <=: indices 1,2 (4.0) are masked -> only index 0 (5.0) survives
+        // With <: indices 1,2 (4.0) are kept -> indices 0,1,2 survive
+        // This test verifies the bug: with <=, only index 0 should be sampled
+        let logits = [5.0, 4.0, 4.0, 3.0, 2.0];
+        let top_k = 3;
+
+        let mut counts = [0usize; ACTION_SPACE];
+        for _ in 0..1000 {
+            let (action, _) = softmax_sample(&logits, top_k);
+            counts[action] += 1;
+        }
+
+        // With the <= bug: only index 0 (5.0) survives, others masked
+        // So counts[0] should be 1000, others 0
+        // (If bug is fixed with <, indices 0,1,2 would share the samples)
+        assert_eq!(
+            counts[0], 1000,
+            "With <= bug, only index 0 (5.0) should be sampled"
+        );
+        assert_eq!(
+            counts[1], 0,
+            "Index 1 (4.0) should be masked with <= boundary"
+        );
+        assert_eq!(
+            counts[2], 0,
+            "Index 2 (4.0) should be masked with <= boundary"
+        );
+        assert_eq!(counts[3], 0, "Index 3 (3.0) should be masked");
+        assert_eq!(counts[4], 0, "Index 4 (2.0) should be masked");
     }
 }

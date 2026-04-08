@@ -320,6 +320,41 @@ pub fn vector_relu(dst: &mut [f64], src: &[f64]) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  Public API: vector_gelu  —  GELU activation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[inline(always)]
+pub fn vector_gelu(dst: &mut [f64], src: &[f64]) {
+    let len = dst.len();
+    debug_assert!(len <= src.len());
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let t = tier::get();
+        unsafe {
+            if t >= tier::AVX512 {
+                vector_gelu_avx512(dst, src);
+                return;
+            }
+            if t >= tier::AVX2 {
+                vector_gelu_avx2(dst, src);
+                return;
+            }
+        }
+    }
+
+    // Scalar fallback using accurate GELU formula
+    let sqrt_2_over_pi = (2.0 / std::f64::consts::PI).sqrt();
+    let c = 0.044715f64;
+    for i in 0..len {
+        let x = src[i];
+        let x3 = x * x * x;
+        let inner = sqrt_2_over_pi * (x + c * x3);
+        dst[i] = 0.5 * x * (1.0 + inner.tanh());
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  Public API: horizontal_sum  —  sum of all elements
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -716,6 +751,35 @@ unsafe fn vector_relu_avx2(dst: &mut [f64], src: &[f64]) {
     while i < len {
         dst[i] = if src[i] > 0.0 { src[i] } else { 0.0 };
         i += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn vector_gelu_avx512(dst: &mut [f64], src: &[f64]) {
+    // AVX doesn't have tanh intrinsic, so we use scalar fallback
+    // which still benefits from the outer loop structure and cache
+    let sqrt_2_over_pi = (2.0 / std::f64::consts::PI).sqrt();
+    let c = 0.044715;
+    for i in 0..dst.len() {
+        let x = src[i];
+        let x3 = x * x * x;
+        let inner = sqrt_2_over_pi * (x + c * x3);
+        dst[i] = 0.5 * x * (1.0 + inner.tanh());
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn vector_gelu_avx2(dst: &mut [f64], src: &[f64]) {
+    // AVX doesn't have tanh intrinsic, so we use scalar fallback
+    let sqrt_2_over_pi = (2.0 / std::f64::consts::PI).sqrt();
+    let c = 0.044715;
+    for i in 0..dst.len() {
+        let x = src[i];
+        let x3 = x * x * x;
+        let inner = sqrt_2_over_pi * (x + c * x3);
+        dst[i] = 0.5 * x * (1.0 + inner.tanh());
     }
 }
 
