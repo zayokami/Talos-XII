@@ -276,6 +276,7 @@ CI 在 Ubuntu、Windows、macOS 三个平台上执行测试和 Clippy 检查，�
 
 - *DeepSeek mHC: Manifold-Constrained Hyper-Connections* — 流形约束超连接，本项目优化器设计的理论基础
 - *Proximal Policy Optimization Algorithms* (OpenAI) — PPO 算法
+- *Embarrassingly Simple Self-Distillation Improves Code Generation* — 自蒸馏技术，用于 EMA teacher 更新与 Best-K Sampling
 
 ## 免责声明
 
