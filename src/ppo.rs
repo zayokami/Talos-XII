@@ -1567,6 +1567,8 @@ mod tests {
         for val in data.iter_mut() {
             *val = 1.0;
         }
+        drop(data); // Release lock before EMA update to avoid deadlock
+        drop(params); // Explicitly drop to release all locks
 
         // Perform EMA update
         ppo.update_ema_teacher();
