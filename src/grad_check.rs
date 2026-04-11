@@ -35,6 +35,7 @@ where
             data: Arc::new(RwLock::new(data_plus)),
             grad: Arc::new(RwLock::new(vec![0.0; n])),
             shape: shape.clone(),
+            device: crate::autograd::Device::Cpu,
             _ctx: None,
         };
         let loss_plus = loss_fn(&t_plus);
@@ -47,6 +48,7 @@ where
             data: Arc::new(RwLock::new(data_minus)),
             grad: Arc::new(RwLock::new(vec![0.0; n])),
             shape: shape.clone(),
+            device: crate::autograd::Device::Cpu,
             _ctx: None,
         };
         let loss_minus = loss_fn(&t_minus);

@@ -23,6 +23,13 @@ plotters = { version = "0.3", default-features = false, features = [
     "ttf", "ab_glyph",
 ] }
 
+[features]
+default = []
+cuda = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(cuda)'] }
+
 [profile.release]
 lto = true        # Link Time Optimization (smaller binary, faster code)
 codegen-units = 1 # Maximize optimization units (slower compile, faster code)

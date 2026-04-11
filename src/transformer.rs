@@ -535,6 +535,7 @@ impl RoPE {
             data: Arc::new(RwLock::new(out_data)),
             grad: Arc::new(RwLock::new(vec![0.0; num_elements])),
             shape: shape.clone(),
+            device: crate::autograd::Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -1449,6 +1450,7 @@ impl MultiHeadLatentAttention {
             data: Arc::new(RwLock::new(out_data)),
             grad: Arc::new(RwLock::new(vec![0.0; b * seq * seq])),
             shape: vec![b, seq, seq],
+            device: crate::autograd::Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -1543,6 +1545,7 @@ impl MultiHeadLatentAttention {
             data: Arc::new(RwLock::new(out_data)),
             grad: Arc::new(RwLock::new(vec![0.0; b * seq * dim_v])),
             shape: vec![b, seq, dim_v],
+            device: crate::autograd::Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -1609,6 +1612,7 @@ impl MultiHeadLatentAttention {
             data: Arc::new(RwLock::new(new_data)),
             grad: Arc::new(RwLock::new(vec![0.0; data.len()])),
             shape: t.shape.clone(),
+            device: crate::autograd::Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -1638,6 +1642,7 @@ impl MultiHeadLatentAttention {
             data: Arc::new(RwLock::new(new_data)),
             grad: Arc::new(RwLock::new(vec![0.0; data.len()])),
             shape: t.shape.clone(),
+            device: crate::autograd::Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -1673,6 +1678,7 @@ impl MultiHeadLatentAttention {
             data: Arc::new(RwLock::new(new_data)),
             grad: Arc::new(RwLock::new(vec![0.0; data.len()])),
             shape: t.shape.clone(),
+            device: crate::autograd::Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -1739,6 +1745,7 @@ impl MultiHeadLatentAttention {
                 total_elements * (last_dim_a + last_dim_b)
             ])),
             shape: new_shape,
+            device: crate::autograd::Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {

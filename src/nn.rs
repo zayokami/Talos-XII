@@ -273,6 +273,7 @@ impl Module for RMSNorm {
             data: Arc::new(RwLock::new(out_data)),
             grad: Arc::new(RwLock::new(vec![0.0; num_elements])),
             shape: shape.clone(),
+            device: crate::autograd::Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {

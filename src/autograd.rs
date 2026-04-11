@@ -10,6 +10,19 @@ use std::fs::File;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 use std::sync::{Arc, RwLock};
 
+// --- Device enumeration for CPU/GPU placement ---
+
+/// Device where tensor data resides
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Device {
+    /// CPU (default)
+    #[default]
+    Cpu,
+    /// CUDA GPU (when cuda feature is enabled)
+    #[cfg(cuda)]
+    Cuda,
+}
+
 // --- Autograd Engine ---
 
 // Minimum element count to justify Rayon parallel dispatch.
@@ -21,6 +34,7 @@ pub struct Tensor {
     pub data: Arc<RwLock<Vec<f64>>>, // Read-write access (backward pass needs write)
     pub grad: Arc<RwLock<Vec<f64>>>,
     pub shape: Vec<usize>,
+    pub device: Device,             // Device where tensor resides
     pub _ctx: Option<Arc<Context>>, // Keeps the graph alive
 }
 
@@ -100,6 +114,7 @@ impl Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape,
+            device: Device::Cpu,
             _ctx: None,
         })
     }
@@ -125,6 +140,7 @@ impl Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape,
+            device: Device::Cpu,
             _ctx: None,
         }
     }
@@ -163,6 +179,7 @@ impl Tensor {
             data: self.data.clone(),
             grad: Arc::new(RwLock::new(vec![0.0; grad_len])),
             shape: self.shape.clone(),
+            device: Device::Cpu,
             _ctx: None,
         }
     }
@@ -330,6 +347,7 @@ impl Tensor {
             data: Arc::new(RwLock::new(out_data)),
             grad: Arc::new(RwLock::new(vec![0.0; m * n])),
             shape: out_shape,
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -455,6 +473,7 @@ impl Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -507,6 +526,7 @@ impl Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -564,6 +584,7 @@ impl Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -617,6 +638,7 @@ impl Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -675,6 +697,7 @@ impl Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -722,6 +745,7 @@ impl Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -767,6 +791,7 @@ impl Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -845,6 +870,7 @@ impl Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; self_data.len()])),
             shape: self.shape.clone(),
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -935,6 +961,7 @@ impl Tensor {
             data: Arc::new(RwLock::new(output)),
             grad: Arc::new(RwLock::new(vec![0.0; self_data.len()])),
             shape,
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -986,6 +1013,7 @@ impl Tensor {
             data: Arc::new(RwLock::new(vec![val])),
             grad: Arc::new(RwLock::new(vec![0.0])),
             shape: vec![1],
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -1012,6 +1040,7 @@ impl Tensor {
             data: Arc::new(RwLock::new(vec![sum_val])),
             grad: Arc::new(RwLock::new(vec![0.0])),
             shape: vec![1],
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -1043,6 +1072,7 @@ impl Tensor {
             data: Arc::new(RwLock::new(vec![sum_val / len as f64])),
             grad: Arc::new(RwLock::new(vec![0.0])),
             shape: vec![1],
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -1076,6 +1106,7 @@ impl Tensor {
             data: Arc::new(RwLock::new(out_data)),
             grad: Arc::new(RwLock::new(vec![0.0; rows * cols])),
             shape: vec![cols, rows],
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -1175,6 +1206,7 @@ impl Tensor {
             data: Arc::new(RwLock::new(new_data)),
             grad: Arc::new(RwLock::new(vec![0.0; total_elements])),
             shape: new_shape.clone(),
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -1233,6 +1265,7 @@ impl Tensor {
             data: Arc::new(RwLock::new(new_data)),
             grad: Arc::new(RwLock::new(vec![0.0; len * batch_size])),
             shape: new_shape,
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -1268,6 +1301,7 @@ impl Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -1306,6 +1340,7 @@ impl Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -1345,6 +1380,7 @@ impl Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -1431,6 +1467,7 @@ impl Tensor {
             data: Arc::new(RwLock::new(new_data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: new_shape,
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -1473,6 +1510,7 @@ impl Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -1516,6 +1554,7 @@ impl Tensor {
             data: Arc::clone(&self.data),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: new_shape,
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -1788,6 +1827,7 @@ impl Tensor {
             data: Arc::new(RwLock::new(out_data)),
             grad: Arc::new(RwLock::new(vec![0.0; out_len])),
             shape: out_shape,
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 // Using standard Im2Col backward pass logic.
@@ -2032,6 +2072,7 @@ impl Tensor {
             data: Arc::new(RwLock::new(out_data)),
             grad: Arc::new(RwLock::new(vec![0.0; out_len])),
             shape: out_shape,
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -2229,6 +2270,7 @@ impl Tensor {
             data: Arc::new(RwLock::new(out_data)),
             grad: Arc::new(RwLock::new(vec![0.0; out_len])),
             shape: out_shape,
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -2382,6 +2424,7 @@ impl Tensor {
             data: Arc::new(RwLock::new(vec![result_val])),
             grad: Arc::new(RwLock::new(vec![0.0])),
             shape: vec![1],
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -2422,6 +2465,7 @@ impl Add for Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(|grad_out, parents| {
@@ -2475,6 +2519,7 @@ impl<'b> Add<&'b Tensor> for &Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(|grad_out, parents| {
@@ -2528,6 +2573,7 @@ impl Sub for Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(|grad_out, parents| {
@@ -2583,6 +2629,7 @@ impl<'b> Sub<&'b Tensor> for &Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(|grad_out, parents| {
@@ -2638,6 +2685,7 @@ impl Mul for Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(|grad_out, parents| {
@@ -2719,6 +2767,7 @@ impl<'b> Mul<&'b Tensor> for &Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(|grad_out, parents| {
@@ -2779,6 +2828,7 @@ impl Div for Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(|grad_out, parents| {
@@ -2897,6 +2947,7 @@ impl<'b> Div<&'b Tensor> for &Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(|grad_out, parents| {
@@ -2966,6 +3017,7 @@ impl Neg for Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
+            device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(|grad_out, parents| {

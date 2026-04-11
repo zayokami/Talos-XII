@@ -1,5 +1,5 @@
 // Talos-XII SIMD acceleration layer.
-// Multi-tier dispatch: Scalar -> AVX2 -> AVX2+FMA -> AVX-512F
+// Multi-tier dispatch: Scalar -> AVX2 -> AVX2+FMA -> AVX-512F -> CUDA
 // Runtime detection cached in a single atomic for near-zero dispatch overhead.
 
 #[cfg(target_arch = "x86_64")]
@@ -43,6 +43,56 @@ mod tier {
         CPU_TIER.store(t, Ordering::Relaxed);
         t
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  CUDA Tier (when cuda feature is enabled)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(cuda)]
+pub const CUDA: u8 = 5;
+
+#[cfg(cuda)]
+mod cuda_tier {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    static CUDA_TIER: AtomicU8 = AtomicU8::new(0);
+    static mut CUDA_AVAILABLE: bool = false;
+
+    #[inline(always)]
+    pub fn get() -> u8 {
+        let t = CUDA_TIER.load(Ordering::Relaxed);
+        if t != 0 {
+            return t;
+        }
+        detect()
+    }
+
+    #[inline(always)]
+    pub fn is_available() -> bool {
+        // Safety: This is only called once during initialization
+        unsafe { CUDA_AVAILABLE }
+    }
+
+    #[cold]
+    fn detect() -> u8 {
+        if crate::cuda::init().is_ok() {
+            unsafe {
+                CUDA_AVAILABLE = true;
+            }
+            CUDA_TIER.store(crate::cuda::CUDA, Ordering::Relaxed);
+            crate::cuda::CUDA
+        } else {
+            CUDA_TIER.store(0, Ordering::Relaxed);
+            0
+        }
+    }
+}
+
+#[cfg(cuda)]
+#[inline(always)]
+pub fn cuda_is_available() -> bool {
+    cuda_tier::is_available()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
