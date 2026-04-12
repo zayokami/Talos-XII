@@ -89,6 +89,38 @@ impl LuckMode {
     }
 }
 
+/// Compute device for neural network operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComputeDevice {
+    /// CPU (default).
+    Cpu,
+    /// NVIDIA CUDA GPU (when available).
+    Cuda,
+    /// Auto-select: CUDA if available, otherwise CPU.
+    Auto,
+}
+
+impl ComputeDevice {
+    /// Parse from a config string. Unrecognized values map to `Cpu`.
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "cuda" => Self::Cuda,
+            "auto" => Self::Auto,
+            _ => Self::Cpu,
+        }
+    }
+
+    /// Return the canonical string representation.
+    #[allow(dead_code)]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Cuda => "cuda",
+            Self::Auto => "auto",
+        }
+    }
+}
+
 // --- Configuration (Data-Driven) ---
 
 /// Configuration for Adaptive Cache-aware Hyper-Connections (ACHF).
@@ -227,6 +259,7 @@ pub struct Config {
     pub calibrated_path: String,
     pub player_data_path: String,
     pub fast_init: bool,
+    pub device: ComputeDevice,
     pub ppo_mode: String,
     pub ppo_total_steps: usize,
     pub ppo_steps_per_update: usize,
@@ -283,6 +316,7 @@ impl Default for Config {
             calibrated_path: "data/calibrated.json".to_string(),
             player_data_path: "data/player_data.json".to_string(),
             fast_init: false,
+            device: ComputeDevice::Cpu,
             ppo_mode: "balanced".to_string(),
             ppo_total_steps: 0,
             ppo_steps_per_update: 0,
@@ -438,6 +472,9 @@ impl Config {
             }
             if let Some(v) = map.get("fast_init") {
                 config.fast_init = v.as_bool().unwrap_or(false);
+            }
+            if let Some(v) = map.get("device") {
+                config.device = ComputeDevice::from_str(v.as_str().unwrap_or("cpu"));
             }
             if let Some(v) = map.get("ppo_mode") {
                 config.ppo_mode = v.as_str().unwrap_or("balanced").to_string();
