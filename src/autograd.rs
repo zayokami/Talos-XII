@@ -254,7 +254,10 @@ impl Tensor {
         let mut d_buf = match alloc::<f64>(len) {
             Ok(buf) => buf,
             Err(_) => {
-                eprintln!("[Tensor] Failed to allocate GPU memory for {} elements", len);
+                eprintln!(
+                    "[Tensor] Failed to allocate GPU memory for {} elements",
+                    len
+                );
                 return Err(());
             }
         };
@@ -3105,7 +3108,7 @@ impl Neg for Tensor {
     #[allow(dead_code)]
     fn matmul_cuda(&self, other: &Tensor, m: usize, k: usize, n: usize) -> Tensor {
         use crate::cuda::blas::Cublas;
-        use crate::cuda::memory::{alloc, copy_h2d, copy_d2h};
+        use crate::cuda::memory::{alloc, copy_d2h, copy_h2d};
 
         let mut cublas = match Cublas::new() {
             Ok(c) => c,
@@ -3142,8 +3145,8 @@ impl Neg for Tensor {
         let beta = 0.0f64;
 
         if let Err(_) = cublas.gemm(
-            false, false, m as i32, n as i32, k as i32,
-            alpha, &d_a, k as i32, &d_b, n as i32, beta, &mut d_c, n as i32,
+            false, false, m as i32, n as i32, k as i32, alpha, &d_a, k as i32, &d_b, n as i32,
+            beta, &mut d_c, n as i32,
         ) {
             return self.matmul_cpu_fallback(other, m, k, n);
         }
@@ -3153,7 +3156,11 @@ impl Neg for Tensor {
             return self.matmul_cpu_fallback(other, m, k, n);
         }
 
-        let out_shape = if self.shape.len() == 1 { vec![n] } else { vec![m, n] };
+        let out_shape = if self.shape.len() == 1 {
+            vec![n]
+        } else {
+            vec![m, n]
+        };
 
         let parents = vec![self.clone(), other.clone()];
         Tensor {
@@ -3170,7 +3177,8 @@ impl Neg for Tensor {
                     let lhs_data = guards.get(0);
                     let rhs_data = guards.get(1);
 
-                    { // dL/dLHS
+                    {
+                        // dL/dLHS
                         let mut lhs_grad = lhs.grad.write().unwrap();
                         for r in 0..m {
                             for i in 0..k {
@@ -3182,12 +3190,14 @@ impl Neg for Tensor {
                         }
                     }
 
-                    { // dL/dRHS
+                    {
+                        // dL/dRHS
                         let mut rhs_grad = rhs.grad.write().unwrap();
                         for i in 0..k {
                             for j in 0..n {
                                 for r in 0..m {
-                                    rhs_grad[i * n + j] += lhs_data[r * k + i] * grad_out[r * n + j];
+                                    rhs_grad[i * n + j] +=
+                                        lhs_data[r * k + i] * grad_out[r * n + j];
                                 }
                             }
                         }
@@ -3210,13 +3220,19 @@ impl Neg for Tensor {
             let out_row = &mut out_data[r * n..(r + 1) * n];
             for i in 0..k {
                 let scale = lhs_data[r * k + i];
-                if scale == 0.0 { continue; }
+                if scale == 0.0 {
+                    continue;
+                }
                 let rhs_row = &rhs_data[i * n..(i + 1) * n];
                 add_scaled_row(out_row, rhs_row, scale);
             }
         }
 
-        let out_shape = if self.shape.len() == 1 { vec![n] } else { vec![m, n] };
+        let out_shape = if self.shape.len() == 1 {
+            vec![n]
+        } else {
+            vec![m, n]
+        };
         let parents = vec![self.clone(), other.clone()];
         Tensor {
             data: Arc::new(RwLock::new(out_data)),
@@ -3232,7 +3248,8 @@ impl Neg for Tensor {
                     let lhs_data = guards.get(0);
                     let rhs_data = guards.get(1);
 
-                    { // dL/dLHS
+                    {
+                        // dL/dLHS
                         let mut lhs_grad = lhs.grad.write().unwrap();
                         for r in 0..m {
                             for i in 0..k {
@@ -3244,12 +3261,14 @@ impl Neg for Tensor {
                         }
                     }
 
-                    { // dL/dRHS
+                    {
+                        // dL/dRHS
                         let mut rhs_grad = rhs.grad.write().unwrap();
                         for i in 0..k {
                             for j in 0..n {
                                 for r in 0..m {
-                                    rhs_grad[i * n + j] += lhs_data[r * k + i] * grad_out[r * n + j];
+                                    rhs_grad[i * n + j] +=
+                                        lhs_data[r * k + i] * grad_out[r * n + j];
                                 }
                             }
                         }
@@ -3263,7 +3282,7 @@ impl Neg for Tensor {
     #[cfg(cuda)]
     #[allow(dead_code)]
     fn gelu_cuda(&self) -> Tensor {
-        use crate::cuda::memory::{alloc, copy_h2d, copy_d2h};
+        use crate::cuda::memory::{alloc, copy_d2h, copy_h2d};
 
         let len = self.data.read().unwrap().len();
         let mut d_data = match alloc::<f64>(len) {
