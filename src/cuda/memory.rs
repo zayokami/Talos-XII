@@ -105,6 +105,23 @@ pub fn copy_d2h<T: Clone>(host: &mut [T], device: &DevicePtr<T>) -> Result<(), (
     Ok(())
 }
 
+/// Copy data from device (GPU) to host (CPU) using raw pointers - synchronous
+/// Does NOT free the GPU memory (caller manages lifetime)
+#[cfg(cuda)]
+pub unsafe fn copy_d2h_raw<T: Clone>(
+    host: *mut T,
+    device_ptr: usize,
+    count: usize,
+) -> Result<(), ()> {
+    let size_bytes = count * std::mem::size_of::<T>();
+    let result = cuMemcpyDtoH(host as usize, device_ptr, size_bytes);
+    if result != CUDA_SUCCESS {
+        eprintln!("[CUDA] cuMemcpyDtoH (raw) failed: {}", result);
+        return Err(());
+    }
+    Ok(())
+}
+
 // =============================================================================
 // Stub implementations for non-CUDA builds
 // =============================================================================

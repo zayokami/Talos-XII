@@ -1,6 +1,6 @@
-// common.cuh - Common CUDA utilities and macros
-#ifndef COMMON_CUH
-#define COMMON_CUH
+// common.cu - Common CUDA utilities and macros
+#ifndef COMMON_CU
+#define COMMON_CU
 
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
@@ -117,4 +117,4 @@ inline dim3 compute_grid_2d(size_t rows, size_t cols, size_t block_rows = 16, si
     return grid;
 }
 
-#endif // COMMON_CUH
+#endif // COMMON_CU

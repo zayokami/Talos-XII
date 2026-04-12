@@ -1,5 +1,5 @@
 // matmul.cu - Matrix multiplication kernels
-#include "common.cuh"
+#include "common.cu"
 
 // TILE_SIZE for shared memory blocking
 #define TILE_SIZE 16
@@ -88,6 +88,11 @@ __global__ void gemm_blocked_kernel(
 
 //==============================================================================
 // FP64 GEMM using cuBLAS (wrapper for high performance)
+// For row-major: C[m,n] = A[m,k] * B[k,n]
+//
+// cuBLAS is column-major: C_col[n,m] = B_col[k,n]^T * A_col[m,k]^T
+// Therefore we call cublasDgemm with both matrices transposed:
+// cublasDgemm(handle, CUBLAS_OP_T, CUBLAS_OP_T, n, m, k, alpha, B, n, A, k, beta, C, n)
 //==============================================================================
 extern "C" void cublas_gemm(
     cublasHandle_t handle,
@@ -100,21 +105,27 @@ extern "C" void cublas_gemm(
     const double* beta,
     double* C, int ldc
 ) {
-    // Note: A is [m, k] if transa == CUBLAS_OP_N, [k, m] otherwise
-    // Note: B is [k, n] if transb == CUBLAS_OP_N, [n, k] otherwise
-    // Note: C is [m, n]
+    // A is [m, k] row-major -> column-major shape [k, m], leading dim m
+    // B is [k, n] row-major -> column-major shape [n, k], leading dim k
+    // C is [m, n] row-major -> column-major shape [n, m], leading dim m
+    //
+    // For row-major C = A * B using cuBLAS column-major:
+    // C_col = transpose(B) * transpose(A)
+    // cublasDgemm(handle, CUBLAS_OP_T, CUBLAS_OP_T, n, m, k, alpha, B, n, A, m, beta, C, m)
+    //
+    // The transa/transb parameters are ignored since we always transpose.
+    // We swap A and B, and swap m and n to achieve the row-major result.
 
-    // For row-major [m, k] * [k, n] = [m, n]:
-    // cuBLAS expects column-major, so we swap A and B, and m and n
     CUBLAS_CHECK(cublasDgemm(
         handle,
-        transb, transa,  // Swap to account for row-major
-        n, m, k,         // Swap dimensions
+        CUBLAS_OP_T,  // Transpose A (row-major A -> column-major A^T)
+        CUBLAS_OP_T,  // Transpose B (row-major B -> column-major B^T)
+        n, m, k,      // Dimensions swapped: (n,m) = (cols_C, rows_C) in column-major
         alpha,
-        B, ldb,
-        A, lda,
+        B, n,         // B is [k,n] row-major -> leading dim is n
+        A, m,         // A is [m,k] row-major -> leading dim is m
         beta,
-        C, ldc
+        C, m          // C is [m,n] row-major -> leading dim is m
     ));
 }
 
@@ -131,8 +142,9 @@ extern "C" void gemm_naive(
     double *dev_B = (double*)d_B;
     double *dev_C = (double*)d_C;
 
-    dim3 block_dim(16, 16);
-    dim3 grid_dim((n + 15) / 16, (m + 15) / 16);
+    // Use 32x32 blocks for better occupancy
+    dim3 block_dim(32, 32);
+    dim3 grid_dim((n + 31) / 32, (m + 31) / 32);
 
     CUDA_LAUNCH(gemm_naive_kernel, grid_dim, block_dim, 0,
         dev_A, dev_B, dev_C, m, n, k, alpha, beta);
@@ -176,8 +188,8 @@ extern "C" void gemm_relu(
     double *dev_B = (double*)d_B;
     double *dev_C = (double*)d_C;
 
-    dim3 block_dim(16, 16);
-    dim3 grid_dim((n + 15) / 16, (m + 15) / 16);
+    dim3 block_dim(32, 32);
+    dim3 grid_dim((n + 31) / 32, (m + 31) / 32);
 
     CUDA_LAUNCH(gemm_relu_kernel, grid_dim, block_dim, 0,
         dev_A, dev_B, dev_C, m, n, k, alpha, beta);
@@ -202,14 +214,23 @@ __global__ void vector_add_kernel(
     }
 }
 
+//==============================================================================
+// Host wrapper for bias addition
+//==============================================================================
 extern "C" void add_bias(
     double* h_C, const double* h_bias,
     int m, int n,
-    int* d_C
+    int* d_C, int* d_bias
 ) {
-    double *dev_C = (double*)d_C;
-    const double *dev_bias = (const double*)d_C;  // Will be replaced
+    double* dev_C = (double*)d_C;
+    const double* dev_bias = (const double*)d_bias;
 
-    // For now, bias addition is done on CPU after GEMM
-    // This kernel is for future optimization
+    int total = m * n;
+    dim3 grid_dim = compute_grid_1d(total, 256);
+    dim3 block_dim(256);
+
+    CUDA_LAUNCH(vector_add_kernel, grid_dim, block_dim, 0,
+        dev_C, dev_bias, m, n);
+
+    CUDA_CHECK(cudaPeekAtLastError());
 }

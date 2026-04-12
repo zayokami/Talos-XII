@@ -13,6 +13,60 @@ fn main() {
 
     println!("Building with CUDA support...");
 
+    // On Windows, NVCC requires MSVC's cl.exe in PATH.
+    // Set the PATH to include MSVC bin directory before running NVCC.
+    if cfg!(windows) {
+        let msvc_bin = env::var("MSVC_BIN_DIR").unwrap_or_else(|_| {
+            // Try to find MSVC automatically via VSINSTALLDIR
+            let vs_install_dir = env::var("VSINSTALLDIR").ok();
+            let toolset_version = env::var("VCToolsVersion").ok();
+
+            if let (Some(vs_dir), Some(toolset)) = (&vs_install_dir, &toolset_version) {
+                let path = format!(
+                    "{}/VC/Tools/MSvc/{}/bin/Hostx64/x64",
+                    vs_dir.trim_end_matches('\\'),
+                    toolset
+                );
+                if Path::new(&path).exists() {
+                    return path;
+                }
+            }
+
+            // Fallback: search standard installation paths
+            let possible_paths = [
+                "C:/Program Files/Microsoft Visual Studio/2022/Enterprise/VC/Tools/MSvc",
+                "C:/Program Files/Microsoft Visual Studio/2022/Professional/VC/Tools/MSvc",
+                "C:/Program Files/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSvc",
+                "C:/Program Files (x86)/Microsoft Visual Studio/2019/BuildTools/VC/Tools/MSvc",
+            ];
+
+            for base in possible_paths {
+                if let Ok(entries) = std::fs::read_dir(base) {
+                    for entry in entries.flatten() {
+                        if let Ok(name) = entry.file_name().into_string() {
+                            let candidate = format!("{}/{}/bin/Hostx64/x64", base, name);
+                            if Path::new(&candidate).exists() {
+                                return candidate;
+                            }
+                        }
+                    }
+                }
+            }
+
+            eprintln!(
+                "[build.rs] Warning: Could not find MSVC bin directory. Set MSVC_BIN_DIR environment variable."
+            );
+            String::new()
+        });
+
+        if !msvc_bin.is_empty() {
+            let current_path = env::var("PATH").unwrap_or_default();
+            let new_path = format!("{};{}", msvc_bin, current_path);
+            env::set_var("PATH", new_path);
+            println!("Updated PATH with MSVC: {}", msvc_bin);
+        }
+    }
+
     // Find NVCC - use NVCC env var or CUDA_PATH, or rely on PATH
     let nvcc = env::var("NVCC").unwrap_or_else(|_| {
         if cfg!(windows) {
@@ -59,8 +113,6 @@ fn main() {
                 .arg("-o")
                 .arg(&obj)
                 .arg(f)
-                // Generate position-independent code for linking
-                .arg("--shared")
                 // Generate code for current architecture if not specified
                 .arg("-arch=sm_75");
             // Add defines
@@ -69,7 +121,12 @@ fn main() {
             println!("Compiling {}...", f);
             let output = cmd.output().expect("Failed to execute nvcc");
             if !output.status.success() {
-                eprintln!("NVCC Error: {}", String::from_utf8_lossy(&output.stderr));
+                eprintln!(
+                    "NVCC Error compiling {}: {}",
+                    f,
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                eprintln!("NVCC stdout: {}", String::from_utf8_lossy(&output.stdout));
                 std::process::exit(1);
             }
             obj
@@ -84,6 +141,19 @@ fn main() {
     };
     let lib_path = format!("{}/{}", out_dir, lib_name);
 
+    // Find CUDA lib directory - use CUDA_LIB_DIR env var or CUDA_PATH
+    let cuda_lib_dir = env::var("CUDA_LIB_DIR").unwrap_or_else(|_| {
+        if cfg!(windows) {
+            if let Ok(cuda_path) = env::var("CUDA_PATH") {
+                format!("{}/lib/x64", cuda_path)
+            } else {
+                "D:/NvidiaDevTool/NVIDIA GPU Computing Toolkit/CUDA/lib/x64".to_string()
+            }
+        } else {
+            "/usr/local/cuda/lib64".to_string()
+        }
+    });
+
     println!("Linking to {}...", lib_path);
     let mut link_cmd = std::process::Command::new(&nvcc);
     link_cmd
@@ -92,20 +162,31 @@ fn main() {
         .arg(&lib_path)
         .args(&obj_files)
         // Link CUDA runtime and cuBLAS
+        .arg("-L")
+        .arg(&cuda_lib_dir)
         .arg("-lcudart")
         .arg("-lcublas");
 
+    println!("Link command: {:?}", link_cmd);
     let output = link_cmd.output().expect("Failed to link CUDA library");
     if !output.status.success() {
         eprintln!(
             "NVCC Link Error: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        eprintln!(
+            "NVCC Link stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
         std::process::exit(1);
     }
 
     // Tell cargo to link against the library
     println!("cargo:rustc-link-search=native={}", out_dir);
+    // Add CUDA lib directory to search path
+    if cfg!(windows) {
+        println!("cargo:rustc-link-search=native={}", cuda_lib_dir);
+    }
     println!("cargo:rustc-link-lib=dylib=cuda");
     println!("cargo:rustc-link-lib=dylib=cublas");
 

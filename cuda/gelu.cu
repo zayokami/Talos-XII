@@ -1,8 +1,8 @@
 // gelu.cu - GELU activation kernel
-#include "common.cuh"
+#include "common.cu"
 
-const double GELU_SQRT_2_OVER_PI = 0.7978845608028654;  // sqrt(2/pi)
-const double GELU_C = 0.044715;
+#define GELU_SQRT_2_OVER_PI 0.7978845608028654  // sqrt(2/pi)
+#define GELU_C 0.044715
 
 //==============================================================================
 // GELU activation kernel
@@ -23,25 +23,11 @@ __global__ void gelu_kernel(
 }
 
 //==============================================================================
-// GELU with inplace modification
-//==============================================================================
-__global__ void gelu_inplace_kernel(
-    double* __restrict__ data,
-    int size
-) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (idx < size) {
-        double x = data[idx];
-        double x3 = x * x * x;
-        double inner = GELU_SQRT_2_OVER_PI * (x + GELU_C * x3);
-        data[idx] = 0.5 * x * (1.0 + tanh(inner));
-    }
-}
-
-//==============================================================================
 // GELU derivative kernel (for backward pass)
-// dGELU/dx = 0.5 * (1 + tanh(inner)) + 0.5 * x * (1 - tanh^2(inner)) * sqrt(2/pi) * (1 + 3 * 0.044715 * x^2)
+// dGELU/dx = 0.5 * (1 + tanh(inner)) + 0.5 * x * sech^2(inner) * sqrt(2/pi) * (1 + 3*c*x^2)
+// Note: forward_input must hold pre-activation values (before GELU was applied).
+// The in-place forward kernel overwrites the buffer, so callers must preserve
+// forward_input separately for the backward pass.
 //==============================================================================
 __global__ void gelu_backward_kernel(
     const double* __restrict__ grad_output,
@@ -106,7 +92,49 @@ extern "C" void gelu(
     dim3 grid_dim = compute_grid_1d(size, 256);
     dim3 block_dim(256);
 
-    CUDA_LAUNCH(gelu_inplace_kernel, grid_dim, block_dim, 0, dev_data, size);
+    CUDA_LAUNCH(gelu_kernel, grid_dim, block_dim, 0, dev_data, size);
+
+    CUDA_CHECK(cudaPeekAtLastError());
+}
+
+//==============================================================================
+// GELU forward + storage kernel (fused for training)
+// Saves forward_input before applying GELU in-place
+//==============================================================================
+__global__ void gelu_forward_storage_kernel(
+    const double* __restrict__ input,
+    double* __restrict__ output,
+    double* __restrict__ storage,
+    int size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < size) {
+        double x = input[idx];
+        storage[idx] = x;  // Save pre-activation value for backward
+        double x3 = x * x * x;
+        double inner = GELU_SQRT_2_OVER_PI * (x + GELU_C * x3);
+        output[idx] = 0.5 * x * (1.0 + tanh(inner));
+    }
+}
+
+//==============================================================================
+// Host wrapper for GELU forward + storage (for training)
+//==============================================================================
+extern "C" void gelu_forward_storage(
+    double* h_input, double* h_output,
+    int size,
+    int* d_input, int* d_output, int* d_storage
+) {
+    const double* dev_input = (const double*)d_input;
+    double* dev_output = (double*)d_output;
+    double* dev_storage = (double*)d_storage;
+
+    dim3 grid_dim = compute_grid_1d(size, 256);
+    dim3 block_dim(256);
+
+    CUDA_LAUNCH(gelu_forward_storage_kernel, grid_dim, block_dim, 0,
+        dev_input, dev_output, dev_storage, size);
 
     CUDA_CHECK(cudaPeekAtLastError());
 }
@@ -143,7 +171,7 @@ extern "C" void relu(
     dim3 grid_dim = compute_grid_1d(size, 256);
     dim3 block_dim(256);
 
-    CUDA_LAUNCH(relu_inplace_kernel, grid_dim, block_dim, 0, dev_data, size);
+    CUDA_LAUNCH(relu_kernel, grid_dim, block_dim, 0, dev_data, size);
 
     CUDA_CHECK(cudaPeekAtLastError());
 }
