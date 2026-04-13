@@ -128,6 +128,134 @@ fn sanitize_pity_settings(
         *big_pity_cumulative = MAX_BIG_PITY_CUMULATIVE;
     }
 }
+
+fn sanitize_unit_interval(value: &mut f64, key: &str, default: f64) {
+    if !value.is_finite() {
+        eprintln!(
+            "[Config Warning] ACHF {key} is non-finite, fallback to {}",
+            default
+        );
+        *value = default;
+        return;
+    }
+    if *value < 0.0 {
+        eprintln!("[Config Warning] ACHF {key} ({}) below 0, clamping", *value);
+        *value = 0.0;
+    } else if *value > 1.0 {
+        eprintln!("[Config Warning] ACHF {key} ({}) above 1, clamping", *value);
+        *value = 1.0;
+    }
+}
+
+fn sanitize_non_negative(value: &mut f64, key: &str, default: f64) {
+    if !value.is_finite() {
+        eprintln!(
+            "[Config Warning] ACHF {key} is non-finite, fallback to {}",
+            default
+        );
+        *value = default;
+        return;
+    }
+    if *value < 0.0 {
+        eprintln!("[Config Warning] ACHF {key} ({}) below 0, clamping", *value);
+        *value = 0.0;
+    }
+}
+
+fn sanitize_positive(value: &mut f64, key: &str, default: f64) {
+    if !value.is_finite() || *value <= 0.0 {
+        eprintln!(
+            "[Config Warning] ACHF {key} ({}) must be > 0, fallback to {}",
+            *value, default
+        );
+        *value = default;
+    }
+}
+
+fn sanitize_achf_config(achf: &mut AchfConfig) {
+    let defaults = AchfConfig::default();
+    sanitize_unit_interval(
+        &mut achf.gate_momentum,
+        "gate_momentum",
+        defaults.gate_momentum,
+    );
+    sanitize_unit_interval(&mut achf.g_min, "g_min", defaults.g_min);
+    sanitize_unit_interval(
+        &mut achf.g_target_min,
+        "g_target_min",
+        defaults.g_target_min,
+    );
+    sanitize_unit_interval(
+        &mut achf.g_target_max,
+        "g_target_max",
+        defaults.g_target_max,
+    );
+    if achf.g_target_max < achf.g_target_min {
+        eprintln!(
+            "[Config Warning] ACHF g_target_max ({}) below g_target_min ({}), clamping",
+            achf.g_target_max, achf.g_target_min
+        );
+        achf.g_target_max = achf.g_target_min;
+    }
+    sanitize_non_negative(
+        &mut achf.g_min_adapt_rate,
+        "g_min_adapt_rate",
+        defaults.g_min_adapt_rate,
+    );
+    sanitize_unit_interval(
+        &mut achf.g_min_momentum,
+        "g_min_momentum",
+        defaults.g_min_momentum,
+    );
+    sanitize_non_negative(&mut achf.gate_k_clip, "gate_k_clip", defaults.gate_k_clip);
+    sanitize_unit_interval(
+        &mut achf.cache_min_nonzero_ratio,
+        "cache_min_nonzero_ratio",
+        defaults.cache_min_nonzero_ratio,
+    );
+    sanitize_positive(
+        &mut achf.cache_cost_bias,
+        "cache_cost_bias",
+        defaults.cache_cost_bias,
+    );
+    sanitize_non_negative(
+        &mut achf.cache_adapt_rate,
+        "cache_adapt_rate",
+        defaults.cache_adapt_rate,
+    );
+    sanitize_positive(
+        &mut achf.cache_bias_min,
+        "cache_bias_min",
+        defaults.cache_bias_min,
+    );
+    sanitize_positive(
+        &mut achf.cache_bias_max,
+        "cache_bias_max",
+        defaults.cache_bias_max,
+    );
+    if achf.cache_bias_max < achf.cache_bias_min {
+        eprintln!(
+            "[Config Warning] ACHF cache_bias_max ({}) below cache_bias_min ({}), clamping",
+            achf.cache_bias_max, achf.cache_bias_min
+        );
+        achf.cache_bias_max = achf.cache_bias_min;
+    }
+    sanitize_unit_interval(
+        &mut achf.cache_latency_ema,
+        "cache_latency_ema",
+        defaults.cache_latency_ema,
+    );
+    sanitize_unit_interval(
+        &mut achf.cache_latency_long_ema,
+        "cache_latency_long_ema",
+        defaults.cache_latency_long_ema,
+    );
+    sanitize_unit_interval(
+        &mut achf.cache_adapt_blend,
+        "cache_adapt_blend",
+        defaults.cache_adapt_blend,
+    );
+}
 /// Determines which policy drives the luck factor during simulation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LuckMode {
@@ -772,6 +900,7 @@ impl Config {
             &mut config.big_pity_cumulative,
             "root config",
         );
+        sanitize_achf_config(&mut config.achf);
 
         if !config.pools.is_empty() {
             if let Some(active) = config.active_pool.clone() {
@@ -1112,5 +1241,46 @@ mod tests {
         assert_eq!(soft, 80);
         assert_eq!(small, 80);
         assert_eq!(big, 100);
+    }
+
+    #[test]
+    fn sanitize_achf_clamps_numeric_bounds() {
+        let defaults = AchfConfig::default();
+        let mut achf = AchfConfig {
+            gate_momentum: 2.0,
+            g_min: -0.1,
+            g_target_min: 1.5,
+            g_target_max: -0.4,
+            g_min_adapt_rate: -0.2,
+            g_min_momentum: f64::NAN,
+            gate_k_clip: -1.0,
+            cache_min_nonzero_ratio: 1.2,
+            cache_cost_bias: 0.0,
+            cache_adapt_rate: -0.3,
+            cache_bias_min: -1.0,
+            cache_bias_max: 0.1,
+            cache_latency_ema: -0.5,
+            cache_latency_long_ema: f64::INFINITY,
+            cache_adapt_blend: -0.8,
+            ..Default::default()
+        };
+
+        sanitize_achf_config(&mut achf);
+
+        assert_eq!(achf.gate_momentum, 1.0);
+        assert_eq!(achf.g_min, 0.0);
+        assert_eq!(achf.g_target_min, 1.0);
+        assert_eq!(achf.g_target_max, 1.0);
+        assert_eq!(achf.g_min_adapt_rate, 0.0);
+        assert_eq!(achf.g_min_momentum, defaults.g_min_momentum);
+        assert_eq!(achf.gate_k_clip, 0.0);
+        assert_eq!(achf.cache_min_nonzero_ratio, 1.0);
+        assert_eq!(achf.cache_cost_bias, defaults.cache_cost_bias);
+        assert_eq!(achf.cache_adapt_rate, 0.0);
+        assert_eq!(achf.cache_bias_min, defaults.cache_bias_min);
+        assert!(achf.cache_bias_max >= achf.cache_bias_min);
+        assert_eq!(achf.cache_latency_ema, 0.0);
+        assert_eq!(achf.cache_latency_long_ema, defaults.cache_latency_long_ema);
+        assert_eq!(achf.cache_adapt_blend, 0.0);
     }
 }

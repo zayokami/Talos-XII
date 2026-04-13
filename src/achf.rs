@@ -224,7 +224,7 @@ where
         ema_low_rank_long_ns: 0.0,
         decision_ema_ns: 0.0,
         decision_ema_long_ns: 0.0,
-        adaptive_bias: 1.0,
+        adaptive_bias: 0.0,
         latency_samples: 0,
         decision_samples: 0,
     };
@@ -392,22 +392,36 @@ impl AchfLayer {
         if !self.config.enabled {
             return vec![0.0; x.len()];
         }
+        if self.weight.in_features == 0 || !x.len().is_multiple_of(self.weight.in_features) {
+            self.metrics.calls.fetch_add(1, Ordering::Relaxed);
+            self.metrics.cache_skips.fetch_add(1, Ordering::Relaxed);
+            return vec![0.0; x.len()];
+        }
         self.maybe_project();
         let g = self.infer_gate_value();
 
         if self.config.cache_min_reuse > 0 {
             let hash = Self::input_hash(x);
-            let stored_hash = self.metrics.memo_hash.load(Ordering::Relaxed);
+            let stored_hash = self.metrics.memo_hash.load(Ordering::Acquire);
             if stored_hash == hash && hash != 0 {
-                let count = self.metrics.memo_count.load(Ordering::Relaxed);
+                let count = self.metrics.memo_count.load(Ordering::Acquire);
                 if count >= self.config.cache_min_reuse as u64 {
                     if let Ok(cache) = self.cache.try_read() {
-                        let recheck = self.metrics.memo_hash.load(Ordering::Relaxed);
-                        if recheck == hash {
-                            if let Some(ref out) = cache.last_output {
-                                self.metrics.calls.fetch_add(1, Ordering::Relaxed);
-                                self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
-                                return out.clone();
+                        let recheck = self.metrics.memo_hash.load(Ordering::Acquire);
+                        if recheck == hash
+                            && cache.last_input_hash == Some(hash)
+                            && cache.last_input_count == x.len() as u64
+                        {
+                            if let Some(ref raw_out) = cache.last_output {
+                                if raw_out.len() == x.len() {
+                                    let mut out = raw_out.clone();
+                                    for v in out.iter_mut() {
+                                        *v *= g;
+                                    }
+                                    self.metrics.calls.fetch_add(1, Ordering::Relaxed);
+                                    self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
+                                    return out;
+                                }
                             }
                         }
                     }
@@ -426,10 +440,12 @@ impl AchfLayer {
         if decision_ns > 0.0 {
             self.record_decision_latency(decision_ns);
         }
-        let (mut out, elapsed_ns) = if sample_latency {
+        let (raw_out, elapsed_ns) = if sample_latency {
             let start = Instant::now();
             let out = match path {
-                InferencePath::Cached => self.forward_inference_cached(x).unwrap(),
+                InferencePath::Cached => self
+                    .forward_inference_cached(x)
+                    .unwrap_or_else(|| self.weight.forward_inference(x)),
                 InferencePath::LowRank => {
                     let down = self.down.as_ref().unwrap();
                     let up = self.up.as_ref().unwrap();
@@ -441,7 +457,9 @@ impl AchfLayer {
             (out, start.elapsed().as_nanos() as f64)
         } else {
             let out = match path {
-                InferencePath::Cached => self.forward_inference_cached(x).unwrap(),
+                InferencePath::Cached => self
+                    .forward_inference_cached(x)
+                    .unwrap_or_else(|| self.weight.forward_inference(x)),
                 InferencePath::LowRank => {
                     let down = self.down.as_ref().unwrap();
                     let up = self.up.as_ref().unwrap();
@@ -455,6 +473,8 @@ impl AchfLayer {
         if elapsed_ns > 0.0 {
             self.record_path_latency(path, elapsed_ns);
         }
+
+        let mut out = raw_out.clone();
         for v in out.iter_mut() {
             *v *= g;
         }
@@ -462,14 +482,16 @@ impl AchfLayer {
         if self.config.cache_min_reuse > 0 {
             if let Ok(mut cache) = self.cache.try_write() {
                 let hash = Self::input_hash(x);
-                let prev = self.metrics.memo_hash.load(Ordering::Relaxed);
+                let prev = self.metrics.memo_hash.load(Ordering::Acquire);
                 if prev == hash {
-                    self.metrics.memo_count.fetch_add(1, Ordering::Relaxed);
+                    self.metrics.memo_count.fetch_add(1, Ordering::Release);
                 } else {
-                    self.metrics.memo_hash.store(hash, Ordering::Relaxed);
-                    self.metrics.memo_count.store(1, Ordering::Relaxed);
+                    self.metrics.memo_hash.store(hash, Ordering::Release);
+                    self.metrics.memo_count.store(1, Ordering::Release);
                 }
-                cache.last_output = Some(out.clone());
+                cache.last_input_hash = Some(hash);
+                cache.last_input_count = x.len() as u64;
+                cache.last_output = Some(raw_out);
             }
         }
 
@@ -809,6 +831,8 @@ impl AchfLayer {
         cache.last_input_hash = None;
         cache.last_output = None;
         cache.last_input_count = 0;
+        self.metrics.memo_hash.store(0, Ordering::Relaxed);
+        self.metrics.memo_count.store(0, Ordering::Relaxed);
         self.metrics.latency_samples.store(0, Ordering::Relaxed);
         self.metrics.decision_samples.store(0, Ordering::Relaxed);
     }
@@ -828,11 +852,14 @@ impl AchfLayer {
 
     fn input_hash(x: &[f64]) -> u64 {
         let mut h: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
-                                             // Sample every 8th element for faster hashing (acceptable collision rate for cache key)
+        for &b in (x.len() as u64).to_le_bytes().iter() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3); // FNV-1a prime
+        }
+        // Sample every 8th element for faster hashing.
         let step = (x.len() / 64).clamp(1, 8);
         for i in (0..x.len()).step_by(step) {
-            let quantized = (x[i] * 10000.0).round() as i64;
-            let bytes = quantized.to_le_bytes();
+            let bytes = x[i].to_bits().to_le_bytes();
             for &b in &bytes {
                 h ^= b as u64;
                 h = h.wrapping_mul(0x100000001b3); // FNV-1a prime
@@ -879,6 +906,9 @@ impl AchfLayer {
         let in_dim = cache.in_dim;
         let out_dim = cache.out_dim;
         if in_dim == 0 || out_dim == 0 {
+            return None;
+        }
+        if !x.len().is_multiple_of(in_dim) {
             return None;
         }
         let num_rows = x.len() / in_dim;
@@ -935,6 +965,9 @@ impl AchfLayer {
         let out_dim = cache.out_dim;
         if in_dim == 0 || out_dim == 0 {
             return (false, false, false);
+        }
+        if !x.len().is_multiple_of(in_dim) {
+            return (false, true, true);
         }
         let num_rows = x.len() / in_dim;
         if self.config.cache_min_rows > 0 && num_rows < self.config.cache_min_rows {
@@ -1367,5 +1400,99 @@ mod tests {
         layer.record_path_latency(InferencePath::Cached, 50.0);
         let cache = layer.cache.read().unwrap();
         assert!(cache.adaptive_bias < 1.0);
+    }
+
+    #[test]
+    fn achf_memoized_output_applies_current_gate() {
+        let cfg = AchfConfig {
+            enabled: true,
+            rank: 2,
+            cache_min_reuse: 1,
+            infer_gate: "last".to_string(),
+            ..Default::default()
+        };
+        let layer = AchfLayer::new(4, cfg, 81);
+        let x_data = vec![0.1, -0.2, 0.3, 0.4, -0.5, 0.6, -0.7, 0.8];
+        let hash = AchfLayer::input_hash(&x_data);
+        layer.metrics.memo_hash.store(hash, Ordering::Relaxed);
+        layer.metrics.memo_count.store(1, Ordering::Relaxed);
+        {
+            let mut cache = layer.cache.write().unwrap();
+            cache.last_input_hash = Some(hash);
+            cache.last_input_count = x_data.len() as u64;
+            cache.last_output = Some(vec![2.0; x_data.len()]);
+        }
+        {
+            let mut state = layer.state.write().unwrap();
+            state.last_gate = 0.5;
+        }
+        let out = layer.forward_inference_residual(&x_data);
+        assert_eq!(out.len(), x_data.len());
+        for v in out {
+            assert!((v - 1.0).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn achf_invalid_shape_returns_zero_residual() {
+        let cfg = AchfConfig {
+            enabled: true,
+            rank: 2,
+            ..Default::default()
+        };
+        let layer = AchfLayer::new(4, cfg, 91);
+        let x_data = vec![0.1, 0.2, 0.3];
+        let out = layer.forward_inference_residual(&x_data);
+        assert_eq!(out.len(), x_data.len());
+        assert!(out.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn achf_clear_cache_resets_memo_state() {
+        let cfg = AchfConfig {
+            enabled: true,
+            rank: 2,
+            ..Default::default()
+        };
+        let layer = AchfLayer::new(4, cfg, 101);
+        layer.metrics.memo_hash.store(123, Ordering::Relaxed);
+        layer.metrics.memo_count.store(9, Ordering::Relaxed);
+        layer.clear_cache();
+        assert_eq!(layer.metrics.memo_hash.load(Ordering::Relaxed), 0);
+        assert_eq!(layer.metrics.memo_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn achf_input_hash_distinguishes_length() {
+        let a = vec![1.0, 2.0, 3.0, 4.0];
+        let b = vec![1.0, 2.0, 3.0, 4.0, 0.0];
+        assert_ne!(AchfLayer::input_hash(&a), AchfLayer::input_hash(&b));
+    }
+
+    #[test]
+    fn aggregate_cache_stats_bias_average_is_unbiased() {
+        let s1 = AchfCacheStats {
+            calls: 1,
+            cache_hits: 0,
+            cache_misses: 0,
+            cache_skips: 0,
+            low_rank_paths: 0,
+            dense_paths: 0,
+            ema_cached_ns: 0.0,
+            ema_cached_long_ns: 0.0,
+            ema_low_rank_ns: 0.0,
+            ema_low_rank_long_ns: 0.0,
+            decision_ema_ns: 0.0,
+            decision_ema_long_ns: 0.0,
+            adaptive_bias: 2.0,
+            latency_samples: 0,
+            decision_samples: 0,
+        };
+        let s2 = AchfCacheStats {
+            adaptive_bias: 4.0,
+            ..s1
+        };
+        let agg = aggregate_cache_stats_iter([s1, s2]);
+        assert!((agg.adaptive_bias - 3.0).abs() < 1e-12);
     }
 }
