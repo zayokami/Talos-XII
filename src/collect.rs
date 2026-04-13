@@ -7,6 +7,7 @@ use crate::i18n::{I18n, Language};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::path::{Component, Path};
 
 /// A single pull result from a real player.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,12 +52,15 @@ pub struct PoolEmpiricalStats {
 impl PlayerDatabase {
     /// Resolve the actual file path, trying the given path first then a `../../` fallback.
     fn resolve_path(path: &str) -> String {
-        if std::path::Path::new(path).exists() {
+        if Path::new(path).exists() {
             return path.to_string();
         }
-        let alt = format!("../../{}", path);
-        if std::path::Path::new(&alt).exists() {
-            return alt;
+        let requested = Path::new(path);
+        if !requested.is_absolute() && !requested.components().any(|c| c == Component::ParentDir) {
+            let alt = Path::new("..").join("..").join(requested);
+            if alt.exists() {
+                return alt.to_string_lossy().into_owned();
+            }
         }
         path.to_string()
     }
@@ -119,7 +123,9 @@ impl PlayerDatabase {
                 .unwrap_or_else(|| pool_id.clone());
 
             let pool_cfg = config.pools.iter().find(|p| &p.id == pool_id);
-            let guarantee = pool_cfg.map(|p| p.small_pity_guarantee).unwrap_or(80);
+            let guarantee = pool_cfg
+                .map(|p| p.small_pity_guarantee.min(10_000))
+                .unwrap_or(80);
 
             let mut total_pulls = 0usize;
             let mut total_six = 0usize;

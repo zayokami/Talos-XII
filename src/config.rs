@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::Read;
+use std::path::{Component, Path};
 
 pub use serde_json::Value as JsonValue;
 
@@ -56,6 +57,76 @@ fn strip_json_comments(input: &str) -> String {
         }
     }
     out
+}
+
+const DEFAULT_SOFT_PITY_START: usize = 65;
+const DEFAULT_SMALL_PITY_GUARANTEE: usize = 80;
+const DEFAULT_BIG_PITY_CUMULATIVE: usize = 120;
+const MAX_SMALL_PITY_GUARANTEE: usize = 10_000;
+const MAX_BIG_PITY_CUMULATIVE: usize = 100_000;
+
+fn fallback_parent_path(path: &str) -> Option<String> {
+    let requested = Path::new(path);
+    if requested.is_absolute() || requested.components().any(|c| c == Component::ParentDir) {
+        return None;
+    }
+    Some(
+        Path::new("..")
+            .join("..")
+            .join(requested)
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+fn sanitize_pity_settings(
+    soft_pity_start: &mut usize,
+    small_pity_guarantee: &mut usize,
+    big_pity_cumulative: &mut usize,
+    scope: &str,
+) {
+    if *small_pity_guarantee == 0 {
+        eprintln!(
+            "[Config Warning] {scope} small_pity_guarantee is 0, fallback to {}",
+            DEFAULT_SMALL_PITY_GUARANTEE
+        );
+        *small_pity_guarantee = DEFAULT_SMALL_PITY_GUARANTEE;
+    }
+    if *small_pity_guarantee > MAX_SMALL_PITY_GUARANTEE {
+        eprintln!(
+            "[Config Warning] {scope} small_pity_guarantee ({}) exceeds max {}, clamping",
+            *small_pity_guarantee, MAX_SMALL_PITY_GUARANTEE
+        );
+        *small_pity_guarantee = MAX_SMALL_PITY_GUARANTEE;
+    }
+
+    if *soft_pity_start == 0 {
+        eprintln!("[Config Warning] {scope} soft_pity_start is 0, fallback to 1");
+        *soft_pity_start = 1;
+    }
+
+    if *soft_pity_start > *small_pity_guarantee {
+        eprintln!(
+            "[Config Warning] {scope} soft_pity_start ({}) exceeds small_pity_guarantee ({}), clamping",
+            *soft_pity_start, *small_pity_guarantee
+        );
+        *soft_pity_start = *small_pity_guarantee;
+    }
+
+    if *big_pity_cumulative > 0 && *big_pity_cumulative < *small_pity_guarantee {
+        eprintln!(
+            "[Config Warning] {scope} big_pity_cumulative ({}) is below small_pity_guarantee ({}), clamping",
+            *big_pity_cumulative, *small_pity_guarantee
+        );
+        *big_pity_cumulative = *small_pity_guarantee;
+    }
+    if *big_pity_cumulative > MAX_BIG_PITY_CUMULATIVE {
+        eprintln!(
+            "[Config Warning] {scope} big_pity_cumulative ({}) exceeds max {}, clamping",
+            *big_pity_cumulative, MAX_BIG_PITY_CUMULATIVE
+        );
+        *big_pity_cumulative = MAX_BIG_PITY_CUMULATIVE;
+    }
 }
 /// Determines which policy drives the luck factor during simulation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -298,10 +369,10 @@ impl Default for Config {
             prob_6_base: 0.008,
             prob_5_base: 0.08,
             prob_4_base: 0.912,
-            soft_pity_start: 65,
+            soft_pity_start: DEFAULT_SOFT_PITY_START,
             soft_pity_slope: 0.05,
-            small_pity_guarantee: 80,
-            big_pity_cumulative: 120,
+            small_pity_guarantee: DEFAULT_SMALL_PITY_GUARANTEE,
+            big_pity_cumulative: DEFAULT_BIG_PITY_CUMULATIVE,
             up_pity_soft: 0,
             five_star_pity: 10,
             always_5_star: false,
@@ -363,25 +434,41 @@ impl Config {
             Ok(f) => f,
             Err(_) => {
                 // Try ../../data/config.json (standard cargo layout: target/release/exe vs project/data)
-                match File::open(format!("../../{}", path)) {
-                    Ok(f) => {
-                        println!("[System] Config found in parent directory.");
-                        f
-                    }
-                    Err(_) => {
-                        eprintln!("\x1b[1;31m[Error]\x1b[0m Configuration file not found.");
-                        eprintln!("  Looked at: './{path}' and '../../{path}'");
-                        eprintln!(
-                            "  Tip: Use --config <path> or --config default for built-in defaults."
-                        );
-                        if path == "data/config.json" {
-                            eprintln!(
-                                "\x1b[33m[Warning]\x1b[0m Missing data/config.json. Falling back to built-in defaults."
-                            );
-                            return Config::default();
+                if let Some(fallback) = fallback_parent_path(path) {
+                    match File::open(&fallback) {
+                        Ok(f) => {
+                            println!("[System] Config found in parent directory.");
+                            f
                         }
-                        std::process::exit(1);
+                        Err(_) => {
+                            eprintln!("\x1b[1;31m[Error]\x1b[0m Configuration file not found.");
+                            eprintln!("  Looked at: './{path}' and '{fallback}'");
+                            eprintln!(
+                                "  Tip: Use --config <path> or --config default for built-in defaults."
+                            );
+                            if path == "data/config.json" {
+                                eprintln!(
+                                    "\x1b[33m[Warning]\x1b[0m Missing data/config.json. Falling back to built-in defaults."
+                                );
+                                return Config::default();
+                            }
+                            std::process::exit(1);
+                        }
                     }
+                } else {
+                    eprintln!("\x1b[1;31m[Error]\x1b[0m Configuration file not found.");
+                    eprintln!("  Looked at: './{path}'");
+                    eprintln!("  Skipped '../../' fallback because the path is absolute or contains '..'.");
+                    eprintln!(
+                        "  Tip: Use --config <path> or --config default for built-in defaults."
+                    );
+                    if path == "data/config.json" {
+                        eprintln!(
+                            "\x1b[33m[Warning]\x1b[0m Missing data/config.json. Falling back to built-in defaults."
+                        );
+                        return Config::default();
+                    }
+                    std::process::exit(1);
                 }
             }
         };
@@ -679,6 +766,13 @@ impl Config {
             }
         }
 
+        sanitize_pity_settings(
+            &mut config.soft_pity_start,
+            &mut config.small_pity_guarantee,
+            &mut config.big_pity_cumulative,
+            "root config",
+        );
+
         if !config.pools.is_empty() {
             if let Some(active) = config.active_pool.clone() {
                 if !config.apply_pool(&active) {
@@ -856,6 +950,17 @@ fn parse_pool_config(pool_map: &serde_json::Map<String, JsonValue>) -> PoolConfi
     if pool.up_rate <= 0.0 || pool.up_six.is_empty() {
         pool.up_rate = 0.0;
     }
+    let scope = if pool.id.is_empty() {
+        "pool <unknown>".to_string()
+    } else {
+        format!("pool '{}'", pool.id)
+    };
+    sanitize_pity_settings(
+        &mut pool.soft_pity_start,
+        &mut pool.small_pity_guarantee,
+        &mut pool.big_pity_cumulative,
+        &scope,
+    );
     pool
 }
 
@@ -986,5 +1091,26 @@ mod tests {
         } else {
             panic!("Expected string");
         }
+    }
+
+    #[test]
+    fn sanitize_pity_clamps_large_small_guarantee() {
+        let mut soft = 50usize;
+        let mut small = usize::MAX;
+        let mut big = usize::MAX;
+        sanitize_pity_settings(&mut soft, &mut small, &mut big, "test");
+        assert_eq!(small, MAX_SMALL_PITY_GUARANTEE);
+        assert_eq!(big, MAX_BIG_PITY_CUMULATIVE);
+    }
+
+    #[test]
+    fn sanitize_pity_clamps_soft_to_small() {
+        let mut soft = 200usize;
+        let mut small = 80usize;
+        let mut big = 100usize;
+        sanitize_pity_settings(&mut soft, &mut small, &mut big, "test");
+        assert_eq!(soft, 80);
+        assert_eq!(small, 80);
+        assert_eq!(big, 100);
     }
 }

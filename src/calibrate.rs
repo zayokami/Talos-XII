@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::i18n::{I18n, Language};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Component, Path};
 
 const CALIBRATION_MIN_PULLS: usize = 500;
 
@@ -39,12 +40,15 @@ pub struct CalibrationData {
 
 impl CalibrationData {
     fn resolve_path(path: &str) -> String {
-        if std::path::Path::new(path).exists() {
+        if Path::new(path).exists() {
             return path.to_string();
         }
-        let alt = format!("../../{}", path);
-        if std::path::Path::new(&alt).exists() {
-            return alt;
+        let requested = Path::new(path);
+        if !requested.is_absolute() && !requested.components().any(|c| c == Component::ParentDir) {
+            let alt = Path::new("..").join("..").join(requested);
+            if alt.exists() {
+                return alt.to_string_lossy().into_owned();
+            }
         }
         path.to_string()
     }

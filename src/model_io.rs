@@ -1,12 +1,27 @@
 use crate::binary_codec;
 use crate::neural::NeuralLuckOptimizer;
 use log::info;
+use std::path::{Component, Path};
+
+fn safe_parent_fallback(path: &str) -> Option<String> {
+    let requested = Path::new(path);
+    if requested.is_absolute() || requested.components().any(|c| c == Component::ParentDir) {
+        return None;
+    }
+    Some(
+        Path::new("..")
+            .join("..")
+            .join(requested)
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
 
 pub fn read_cache_bytes(path: &str) -> Option<Vec<u8>> {
     if let Ok(bytes) = std::fs::read(path) {
         return Some(bytes);
     }
-    let alt = format!("../../{}", path);
+    let alt = safe_parent_fallback(path)?;
     std::fs::read(alt).ok()
 }
 
@@ -20,8 +35,10 @@ pub fn save_neural_cache(path: &str, net: &NeuralLuckOptimizer) -> bool {
     if std::fs::write(path, &bytes).is_ok() {
         return true;
     }
-    let alt = format!("../../{}", path);
-    std::fs::write(alt, &bytes).is_ok()
+    match safe_parent_fallback(path) {
+        Some(alt) => std::fs::write(alt, &bytes).is_ok(),
+        None => false,
+    }
 }
 
 pub fn save_model<T: serde::Serialize>(model: &T, path: &str, label: &str) {

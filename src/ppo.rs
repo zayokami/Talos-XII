@@ -44,6 +44,11 @@ thread_local! {
 // If top_k > 0, only the top_k logits are kept (others set to -inf).
 #[inline]
 fn softmax_sample(logits: &[f64], top_k: usize) -> (usize, f64) {
+    if logits.len() != ACTION_SPACE {
+        let fallback_prob = 1.0 / ACTION_SPACE as f64;
+        return (0, fallback_prob.ln());
+    }
+
     // Find max for numerical stability
     let mut max_l = f64::NEG_INFINITY;
     for &v in logits {
@@ -63,17 +68,20 @@ fn softmax_sample(logits: &[f64], top_k: usize) -> (usize, f64) {
         // Compute softmax with top-k masking
         let mut sum_exp = 0.0;
         for (i, prob) in probs.iter_mut().enumerate() {
-            if logits[i] <= threshold {
+            if logits[i] < threshold {
                 *prob = 0.0; // masked out
             } else {
                 *prob = (logits[i] - max_l).exp();
                 sum_exp += *prob;
             }
         }
-        for prob in probs.iter_mut() {
-            if sum_exp > 0.0 {
+        if sum_exp > 0.0 {
+            for prob in probs.iter_mut() {
                 *prob /= sum_exp;
             }
+        } else {
+            let uniform = 1.0 / ACTION_SPACE as f64;
+            probs.fill(uniform);
         }
     } else {
         // Full softmax (top_k disabled or >= ACTION_SPACE)
@@ -97,7 +105,8 @@ fn softmax_sample(logits: &[f64], top_k: usize) -> (usize, f64) {
         }
         r -= p;
     }
-    (idx, probs[idx].ln())
+    let log_prob = probs[idx].max(f64::MIN_POSITIVE).ln();
+    (idx, log_prob)
 }
 
 /// Actor-Critic model combining a LuckTransformer backbone with action/value heads.
@@ -461,6 +470,7 @@ impl Ppo {
 
     pub fn from_policy(policy: ActorCritic, k_epochs: usize, batch_size: usize) -> Self {
         let optimizer = Adam::new(policy.parameters(), 0.0003);
+        let safe_batch_size = batch_size.max(1);
         Ppo {
             policy,
             ema_policy: None,
@@ -476,7 +486,7 @@ impl Ppo {
                 values: vec![],
             },
             k_epochs,
-            batch_size,
+            batch_size: safe_batch_size,
             reward_normalizer: RunningMeanStd::new(),
             distill_ema_decay: 0.995,
             distill_kl_coef: 0.0,
@@ -1753,9 +1763,7 @@ mod tests {
         // Test case: logits where 3rd and 4th highest values differ
         // [5.0, 4.0, 4.0, 3.0, 2.0] with top_k=3
         // Sorted: [5.0, 4.0, 4.0, 3.0, 2.0], threshold = 4.0
-        // With <=: indices 1,2 (4.0) are masked -> only index 0 (5.0) survives
-        // With <: indices 1,2 (4.0) are kept -> indices 0,1,2 survive
-        // This test verifies the bug: with <=, only index 0 should be sampled
+        // Correct behavior with <: indices 0,1,2 survive and 3,4 are masked.
         let logits = [5.0, 4.0, 4.0, 3.0, 2.0];
         let top_k = 3;
 
@@ -1765,22 +1773,17 @@ mod tests {
             counts[action] += 1;
         }
 
-        // With the <= bug: only index 0 (5.0) survives, others masked
-        // So counts[0] should be 1000, others 0
-        // (If bug is fixed with <, indices 0,1,2 would share the samples)
-        assert_eq!(
-            counts[0], 1000,
-            "With <= bug, only index 0 (5.0) should be sampled"
-        );
-        assert_eq!(
-            counts[1], 0,
-            "Index 1 (4.0) should be masked with <= boundary"
-        );
-        assert_eq!(
-            counts[2], 0,
-            "Index 2 (4.0) should be masked with <= boundary"
-        );
+        assert!(counts[0] > 0, "Index 0 (5.0) should be sampled");
+        assert!(counts[1] > 0, "Index 1 (4.0) should be sampled");
+        assert!(counts[2] > 0, "Index 2 (4.0) should be sampled");
         assert_eq!(counts[3], 0, "Index 3 (3.0) should be masked");
         assert_eq!(counts[4], 0, "Index 4 (2.0) should be masked");
+    }
+
+    #[test]
+    fn ppo_from_policy_clamps_zero_batch_size() {
+        let policy = ActorCritic::new(7, &crate::config::AchfConfig::default());
+        let ppo = Ppo::from_policy(policy, 1, 0);
+        assert_eq!(ppo.batch_size, 1);
     }
 }

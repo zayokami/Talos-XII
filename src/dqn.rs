@@ -343,6 +343,9 @@ impl DuelingQNetwork {
 
             self.val_head.forward_inference_into(h2, val);
             self.adv_head.forward_inference_into(h2, adv);
+            if adv.len() != ACTION_SPACE {
+                return (0, ACTIONS[0]);
+            }
 
             let mean_adv: f64 = adv.iter().sum::<f64>() / ACTION_SPACE as f64;
             let mut max_val = f64::NEG_INFINITY;

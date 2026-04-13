@@ -99,22 +99,40 @@ impl Tensor {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
         let bytes = &mmap[..];
-        let len = bytes.len() / std::mem::size_of::<f64>();
+        let elem_size = std::mem::size_of::<f64>();
+        if bytes.len() % elem_size != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Mmap size is not a multiple of f64 element size",
+            ));
+        }
+
         let expected_len: usize = shape.iter().product();
-        if len != expected_len {
+        let expected_bytes = expected_len.checked_mul(elem_size).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "Mmap shape size overflow")
+        })?;
+        if bytes.len() != expected_bytes {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Mmap size mismatch",
             ));
         }
 
+        if !(bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f64>()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Mmap pointer is not aligned for f64 data",
+            ));
+        }
+
         // Zero-copy cast (unsafe but fast)
-        let slice = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f64, len) };
+        let slice =
+            unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f64, expected_len) };
         let data = slice.to_vec(); // Copy to Vec (mmap loading is still faster than JSON parsing!)
 
         Ok(Tensor {
             data: Arc::new(RwLock::new(data)),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Arc::new(RwLock::new(vec![0.0; expected_len])),
             shape,
             device: Device::Cpu,
             _ctx: None,
@@ -3633,6 +3651,17 @@ impl Neg for &Tensor {
 mod tests {
     use super::*;
 
+    fn temp_file_path(prefix: &str) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("{}_{}_{}.bin", prefix, std::process::id(), now))
+            .to_string_lossy()
+            .into_owned()
+    }
+
     #[test]
     fn test_broadcast_scalar() {
         let t = Tensor::new(vec![5.0], vec![1]);
@@ -3640,6 +3669,30 @@ mod tests {
         assert_eq!(b.shape, vec![2, 2]);
         let data = b.data.read().unwrap();
         assert_eq!(*data, vec![5.0, 5.0, 5.0, 5.0]);
+    }
+
+    #[test]
+    fn test_from_mmap_rejects_trailing_bytes() {
+        let path = temp_file_path("autograd_mmap_invalid");
+        std::fs::write(&path, [0u8; 9]).unwrap();
+
+        let result = Tensor::from_mmap(&path, vec![1]);
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_from_mmap_roundtrip_small_tensor() {
+        let path = temp_file_path("autograd_mmap_roundtrip");
+        let tensor = Tensor::new(vec![1.25, -2.5], vec![2]);
+        tensor.save_binary(&path).unwrap();
+
+        let loaded = Tensor::from_mmap(&path, vec![2]).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.shape, vec![2]);
+        let data = loaded.data.read().unwrap();
+        assert_eq!(*data, vec![1.25, -2.5]);
     }
 
     #[test]

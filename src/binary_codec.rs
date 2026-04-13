@@ -23,6 +23,8 @@ use std::io::{self, Read, Write};
 /// Hard cap on deserialized collection length to prevent OOM from corrupt data.
 /// 32M elements is generous for any realistic model payload.
 const MAX_COLLECTION_LEN: usize = 32 * 1024 * 1024;
+/// Hard cap on raw byte buffers (aligned with MAX_COLLECTION_LEN * sizeof(f64)).
+const MAX_BYTE_BUF_LEN: usize = MAX_COLLECTION_LEN * std::mem::size_of::<f64>();
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Error
@@ -480,9 +482,12 @@ impl<R: Read> BinDeserializer<R> {
     }
 
     fn read_bytes(&mut self) -> Result<Vec<u8>, Error> {
-        let len = self.read_u64()? as usize;
+        let raw_len = self.read_u64()?;
+        let len = usize::try_from(raw_len).map_err(|_| {
+            Error::Message(format!("byte buffer length {} overflows usize", raw_len))
+        })?;
         // Sanity cap to prevent OOM on corrupt data
-        if len > 256 * 1024 * 1024 {
+        if len > MAX_BYTE_BUF_LEN {
             return Err(Error::Message(format!("sequence too large: {} bytes", len)));
         }
         let mut buf = vec![0u8; len];

@@ -6,6 +6,42 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const DEFAULT_STACK_SIZE_BYTES: usize = 4 * 1024 * 1024;
+const MIN_STACK_SIZE_BYTES: usize = 64 * 1024;
+const MAX_STACK_SIZE_BYTES: usize = 512 * 1024 * 1024;
+
+fn stack_size_bytes_from_mb(worker_stack_size_mb: usize) -> usize {
+    if worker_stack_size_mb == 0 {
+        return DEFAULT_STACK_SIZE_BYTES;
+    }
+
+    let bytes = match worker_stack_size_mb
+        .checked_mul(1024)
+        .and_then(|v| v.checked_mul(1024))
+    {
+        Some(v) => v,
+        None => {
+            eprintln!(
+                "[Config Warning] worker_stack_size_mb={} overflows, using default {} MB",
+                worker_stack_size_mb,
+                DEFAULT_STACK_SIZE_BYTES / (1024 * 1024)
+            );
+            return DEFAULT_STACK_SIZE_BYTES;
+        }
+    };
+
+    if bytes < MIN_STACK_SIZE_BYTES {
+        MIN_STACK_SIZE_BYTES
+    } else if bytes > MAX_STACK_SIZE_BYTES {
+        eprintln!(
+            "[Config Warning] worker_stack_size_mb={} is too large, clamping to {} MB",
+            worker_stack_size_mb,
+            MAX_STACK_SIZE_BYTES / (1024 * 1024)
+        );
+        MAX_STACK_SIZE_BYTES
+    } else {
+        bytes
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Platform: Windows thread priority and CPU affinity
@@ -89,8 +125,11 @@ mod win_platform {
         let mut dummy: u8 = 0;
         for i in 0..pages {
             // Volatile write to force stack page allocation without optimization
+            let Some(offset) = i.checked_mul(4096) else {
+                break;
+            };
             unsafe {
-                let stack_probe: *mut u8 = (&mut dummy as *mut u8).sub(i * 4096);
+                let stack_probe: *mut u8 = (&mut dummy as *mut u8).sub(offset);
                 std::ptr::write_volatile(stack_probe, 0);
             }
         }
@@ -170,11 +209,7 @@ impl GoodJobWorker {
         if num_threads > hard_cap {
             num_threads = hard_cap;
         }
-        let stack_size = if config.worker_stack_size_mb == 0 {
-            DEFAULT_STACK_SIZE_BYTES
-        } else {
-            config.worker_stack_size_mb * 1024 * 1024
-        };
+        let stack_size = stack_size_bytes_from_mb(config.worker_stack_size_mb);
         let priority = Some(config.worker_priority.clone());
         Self::build_pool(num_threads, stack_size, priority, true)
     }
@@ -346,5 +381,29 @@ impl GoodJobWorker {
             tasks_failed: failed,
             avg_exec_us: avg_us,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stack_size_mb_zero_uses_default() {
+        assert_eq!(stack_size_bytes_from_mb(0), DEFAULT_STACK_SIZE_BYTES);
+    }
+
+    #[test]
+    fn stack_size_overflow_falls_back_to_default() {
+        assert_eq!(
+            stack_size_bytes_from_mb(usize::MAX),
+            DEFAULT_STACK_SIZE_BYTES
+        );
+    }
+
+    #[test]
+    fn stack_size_is_clamped_to_max() {
+        let max_mb = (MAX_STACK_SIZE_BYTES / (1024 * 1024)).saturating_add(1);
+        assert_eq!(stack_size_bytes_from_mb(max_mb), MAX_STACK_SIZE_BYTES);
     }
 }

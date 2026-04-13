@@ -204,6 +204,26 @@ impl Rbm {
             }
 
             let (hk_probs, _) = self.sample_h_given_v(&vk_samples, rng);
+            assert_eq!(
+                vk_samples.len(),
+                self.visible_size,
+                "Visible sample size mismatch"
+            );
+            assert_eq!(
+                vk_probs.len(),
+                self.visible_size,
+                "Visible probability size mismatch"
+            );
+            assert_eq!(
+                h0_probs.len(),
+                self.hidden_size,
+                "Hidden probability size mismatch (h0)"
+            );
+            assert_eq!(
+                hk_probs.len(),
+                self.hidden_size,
+                "Hidden probability size mismatch (hk)"
+            );
 
             // Accumulate Gradients (Positive phase - Negative phase)
             for (i, &input_i) in input.iter().enumerate().take(self.visible_size) {

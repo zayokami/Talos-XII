@@ -467,8 +467,14 @@ pub fn build_features(
     config: &Config,
 ) -> Tensor {
     const DEFAULT_BIG_PITY_FALLBACK: f64 = 120.0;
+    const DEFAULT_SMALL_PITY_FALLBACK: f64 = 80.0;
     const PITY_HIGH_THRESHOLD: usize = 50;
-    let pity_norm = pity_6 as f64 / config.small_pity_guarantee as f64;
+    let pity_norm_base = if config.small_pity_guarantee > 0 {
+        config.small_pity_guarantee as f64
+    } else {
+        DEFAULT_SMALL_PITY_FALLBACK
+    };
+    let pity_norm = pity_6 as f64 / pity_norm_base;
     let loss_norm = loss_streak as f64 / 3.0;
     // Use big_pity_cumulative for normalization if possible, or fallback
     let total_norm_base = if config.big_pity_cumulative > 0 {

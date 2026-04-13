@@ -520,7 +520,17 @@ impl NeuralLuckOptimizer {
         let mut count_bytes = [0u8; 4];
         count_bytes.copy_from_slice(&bytes[4..8]);
         let count = u32::from_le_bytes(count_bytes) as usize;
-        let expected_len = 8 + count * 8;
+        let expected_count = if magic == b"NLC1" {
+            Self::param_count_v1()
+        } else if magic == b"NLC2" {
+            Self::param_count_v2()
+        } else {
+            return None;
+        };
+        if count != expected_count {
+            return None;
+        }
+        let expected_len = 8usize.checked_add(count.checked_mul(8)?)?;
         if bytes.len() != expected_len {
             return None;
         }
@@ -534,21 +544,12 @@ impl NeuralLuckOptimizer {
         }
         let mut idx = 0;
         if magic == b"NLC1" {
-            if count != Self::param_count_v1() {
-                return None;
-            }
             let res_block = ResidualBlock::read_params(&data, &mut idx)?;
             return Some(NeuralLuckOptimizer {
                 res_block,
                 linear_weights: [0.0; DIM],
                 linear_bias: 0.0,
             });
-        }
-        if magic != b"NLC2" {
-            return None;
-        }
-        if count != Self::param_count_v2() {
-            return None;
         }
         let res_block = ResidualBlock::read_params(&data, &mut idx)?;
         if idx + DIM + 1 > data.len() {
@@ -598,5 +599,25 @@ impl NeuralLuckOptimizer {
         }
         let linear_bias = linear_sum.clamp(-1.0, 1.0) * 0.01;
         (activation * 0.015 + linear_bias).clamp(-0.02, 0.02)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn neural_cache_roundtrip_bytes() {
+        let net = NeuralLuckOptimizer::new(42);
+        let bytes = net.to_bytes();
+        let restored = NeuralLuckOptimizer::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.to_bytes(), bytes);
+    }
+
+    #[test]
+    fn neural_cache_rejects_invalid_count() {
+        let mut bytes = NeuralLuckOptimizer::new(123).to_bytes();
+        bytes[4..8].copy_from_slice(&(u32::MAX).to_le_bytes());
+        assert!(NeuralLuckOptimizer::from_bytes(&bytes).is_none());
     }
 }
