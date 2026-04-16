@@ -31,6 +31,23 @@ cargo build --release
 
 首次启动时，程序会训练 DBN、DQN（50k 步）和 PPO（200k 步）模型，大约需要 30～45 秒。训练完成后模型会缓存到 `neural.cache`、`dqn.cache.bin`、`ppo.cache.bin`，之后启动通常不到 1 秒。
 
+### CUDA 支持（可选）
+
+项目支持可选 CUDA 编译：
+
+```bash
+cargo check --features cuda
+cargo run --features cuda -- simulate -n 1000 -p 100
+```
+
+`data/config.json` 中可通过 `device` 控制设备选择：
+
+- `cpu`：强制 CPU
+- `cuda`：优先 CUDA，不可用时自动回退 CPU
+- `auto`：自动探测，优先 CUDA
+
+当二进制未启用 `cuda` feature 时，`cuda/auto` 会自动回退到 CPU。
+
 启动成功会看到类似输出：
 
 ```

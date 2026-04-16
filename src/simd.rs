@@ -50,9 +50,11 @@ mod tier {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[cfg(cuda)]
+#[allow(dead_code)]
 pub const CUDA: u8 = 5;
 
 #[cfg(cuda)]
+#[allow(dead_code)]
 mod cuda_tier {
     use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -80,8 +82,8 @@ mod cuda_tier {
             unsafe {
                 CUDA_AVAILABLE = true;
             }
-            CUDA_TIER.store(crate::cuda::CUDA, Ordering::Relaxed);
-            crate::cuda::CUDA
+            CUDA_TIER.store(super::CUDA, Ordering::Relaxed);
+            super::CUDA
         } else {
             CUDA_TIER.store(0, Ordering::Relaxed);
             0
@@ -91,6 +93,7 @@ mod cuda_tier {
 
 #[cfg(cuda)]
 #[inline(always)]
+#[allow(dead_code)]
 pub fn cuda_is_available() -> bool {
     cuda_tier::is_available()
 }

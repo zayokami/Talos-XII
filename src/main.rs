@@ -6,6 +6,8 @@ mod calibrate;
 mod chart;
 mod collect;
 mod config;
+#[cfg(cuda)]
+mod cuda;
 mod dbn;
 mod dqn;
 #[cfg(test)]
@@ -28,7 +30,7 @@ use calibrate::{apply_calibration, run_calibration, CalibrationData};
 use clap::{Parser, Subcommand};
 use collect::{add_session_interactive, import_from_json, print_stats, PlayerDatabase};
 use colored::Colorize;
-use config::{Config, LuckMode};
+use config::{ComputeDevice, Config, LuckMode};
 use dbn::Dbn;
 use dqn::{train_dqn, DuelingQNetwork, Experience, OnlineDqnTrainer};
 use i18n::{I18n, Language};
@@ -511,7 +513,8 @@ fn initialize_system(
     GoodJobWorker,
     Rng,
 ) {
-    let config = Config::load(&args.config);
+    let mut config = Config::load(&args.config);
+    apply_compute_device_policy(&mut config);
     let mut rng = if let Some(seed) = args.seed {
         Rng::from_seed(seed)
     } else {
@@ -610,6 +613,61 @@ fn initialize_system(
         worker,
         rng,
     )
+}
+
+fn apply_compute_device_policy(config: &mut Config) {
+    match config.device {
+        ComputeDevice::Cpu => {
+            info!("[Device] Using CPU backend.");
+        }
+        ComputeDevice::Auto => {
+            #[cfg(cuda)]
+            {
+                if cuda::init().is_ok() && cuda::device_count() > 0 {
+                    if let Ok(dev) = cuda::get_device_info(0) {
+                        info!(
+                            "[Device] Auto-selected CUDA: {} (CC {}.{})",
+                            dev.name, dev.compute_capability.0, dev.compute_capability.1
+                        );
+                    } else {
+                        info!("[Device] Auto-selected CUDA.");
+                    }
+                    config.device = ComputeDevice::Cuda;
+                } else {
+                    info!("[Device] Auto requested, CUDA unavailable. Falling back to CPU.");
+                    config.device = ComputeDevice::Cpu;
+                }
+            }
+            #[cfg(not(cuda))]
+            {
+                info!("[Device] Auto requested, but binary was built without CUDA. Using CPU.");
+                config.device = ComputeDevice::Cpu;
+            }
+        }
+        ComputeDevice::Cuda => {
+            #[cfg(cuda)]
+            {
+                if cuda::init().is_ok() && cuda::device_count() > 0 {
+                    if let Ok(dev) = cuda::get_device_info(0) {
+                        info!(
+                            "[Device] CUDA requested: {} (CC {}.{})",
+                            dev.name, dev.compute_capability.0, dev.compute_capability.1
+                        );
+                    } else {
+                        info!("[Device] CUDA requested and initialized.");
+                    }
+                } else {
+                    info!("[Device] CUDA requested, but unavailable. Falling back to CPU.");
+                    config.device = ComputeDevice::Cpu;
+                }
+            }
+            #[cfg(not(cuda))]
+            {
+                info!("[Device] CUDA requested, but binary was built without CUDA. Using CPU.");
+                config.device = ComputeDevice::Cpu;
+            }
+        }
+    }
 }
 
 fn main() {

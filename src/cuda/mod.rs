@@ -2,17 +2,20 @@
 //!
 //! This module provides CUDA GPU acceleration for neural network operations.
 //! When the `cuda` feature is not enabled, all operations gracefully fall back to CPU.
+#![allow(dead_code)]
 
 #[cfg(cuda)]
 pub mod bindings;
 #[cfg(cuda)]
+pub mod blas;
+#[cfg(cuda)]
 pub mod memory;
 #[cfg(cuda)]
 pub mod stream;
-#[cfg(cuda)]
-pub mod blas;
 
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(cuda)]
+use std::{ffi::c_char, ffi::CStr};
 
 /// Indicates whether CUDA is available and initialized
 static CUDA_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -77,9 +80,8 @@ pub fn get_device_info(device_id: usize) -> Result<CudaDevice, ()> {
             return Err(());
         }
 
-        let mut name = [0u8; 256];
-        let mut name_len: i32 = 256;
-        cuDeviceGetName(name.as_mut_ptr() as *mut c_char, name_len, device);
+        let mut name = [0 as c_char; 256];
+        cuDeviceGetName(name.as_mut_ptr(), 256, device);
 
         let mut cc_major: i32 = 0;
         let mut cc_minor: i32 = 0;
@@ -97,7 +99,7 @@ pub fn get_device_info(device_id: usize) -> Result<CudaDevice, ()> {
         let mut total_mem: usize = 0;
         cuDeviceTotalMem(&mut total_mem, device);
 
-        let name_str = String::from_utf8_lossy(&name).trim().to_string();
+        let name_str = CStr::from_ptr(name.as_ptr()).to_string_lossy().into_owned();
 
         println!(
             "[CUDA] Device {}: {} (CC {}.{}, {} MB)",

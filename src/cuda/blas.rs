@@ -1,17 +1,18 @@
 //! cuBLAS wrapper for GPU-accelerated BLAS operations
 //!
 //! Provides GPU matrix multiplication using NVIDIA cuBLAS library.
+#![allow(dead_code)]
 
 #[cfg(cuda)]
 use crate::cuda::bindings::{
-    cublasCreate_v2, cublasDestroy_v2, cublasDgemm_v2, cublasSetStream_v2,
+    cublasCreate_v2, cublasDestroy_v2, cublasDgemm_v2, cublasHandle_t, cublasSetStream_v2,
     CUBLAS_OP_N, CUBLAS_OP_T,
 };
 
 /// cuBLAS context wrapper
 #[cfg(cuda)]
 pub struct Cublas {
-    handle: usize,  // cublasHandle_t
+    handle: cublasHandle_t,
 }
 
 #[cfg(cuda)]
@@ -19,7 +20,7 @@ impl Cublas {
     /// Create a new cuBLAS context
     pub fn new() -> Result<Self, ()> {
         unsafe {
-            let mut handle: usize = 0;
+            let mut handle: cublasHandle_t = std::ptr::null_mut();
             let result = cublasCreate_v2(&mut handle);
             if result != 0 {
                 eprintln!("[CUDA] cublasCreate_v2 failed: {}", result);
@@ -47,16 +48,16 @@ impl Cublas {
     #[cfg(cuda)]
     pub fn gemm(
         &mut self,
-        transa: bool,  // transpose A
-        transb: bool,  // transpose B
-        m: i32,        // rows of A and C
-        n: i32,        // columns of B and C
-        k: i32,        // columns of A and rows of B
+        transa: bool, // transpose A
+        transb: bool, // transpose B
+        m: i32,       // rows of A and C
+        n: i32,       // columns of B and C
+        k: i32,       // columns of A and rows of B
         alpha: f64,
-        a: &[f64],     // A matrix data (row-major)
-        lda: i32,      // leading dim of A
-        b: &[f64],     // B matrix data (row-major)
-        ldb: i32,      // leading dim of B
+        a: &[f64], // A matrix data (row-major)
+        lda: i32,  // leading dim of A
+        b: &[f64], // B matrix data (row-major)
+        ldb: i32,  // leading dim of B
         beta: f64,
         c: &mut [f64], // C matrix data (row-major)
         ldc: i32,      // leading dim of C
@@ -65,25 +66,17 @@ impl Cublas {
         // For row-major: C = A * B means column-major: C = B^T * A^T
         // So we swap A <-> B and transpose the operation
 
-        let op_a = if transa {
-            CUBLAS_OP_T
-        } else {
-            CUBLAS_OP_N
-        };
-        let op_b = if transb {
-            CUBLAS_OP_T
-        } else {
-            CUBLAS_OP_N
-        };
+        let op_a = if transa { CUBLAS_OP_T } else { CUBLAS_OP_N };
+        let op_b = if transb { CUBLAS_OP_T } else { CUBLAS_OP_N };
 
         unsafe {
             let result = cublasDgemm_v2(
                 self.handle,
-                op_b,   // swapped
-                op_a,   // swapped
-                n,      // swapped: columns of B (rows of C)
-                m,      // swapped: rows of A (cols of C)
-                k,      // K dimension unchanged
+                op_b, // swapped
+                op_a, // swapped
+                n,    // swapped: columns of B (rows of C)
+                m,    // swapped: rows of A (cols of C)
+                k,    // K dimension unchanged
                 &alpha,
                 b.as_ptr(),
                 ldb,

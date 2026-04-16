@@ -10,6 +10,7 @@ fn main() {
         println!("cargo:rerun-if-changed=cuda/");
         return;
     }
+    println!("cargo:rustc-cfg=cuda");
 
     println!("Building with CUDA support...");
 

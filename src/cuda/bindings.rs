@@ -2,6 +2,7 @@
 //!
 //! Direct FFI declarations for CUDA runtime and cuBLAS APIs.
 //! These bindings are based on the CUDA driver API.
+#![allow(dead_code, non_camel_case_types, non_snake_case)]
 
 use std::os::raw::c_char;
 
@@ -28,9 +29,9 @@ pub const CUDA_SUCCESS: CUresult = 0;
 pub const CUBLAS_STATUS_SUCCESS: cublasStatus_t = 0;
 
 // cublasOperation_t
-pub const CUBLAS_OP_N: cublasOperation_t = 111;  // 'N' or 'n'
-pub const CUBLAS_OP_T: cublasOperation_t = 114;  // 'T' or 't'
-pub const CUBLAS_OP_C: cublasOperation_t = 99;   // 'C' or 'c'
+pub const CUBLAS_OP_N: cublasOperation_t = 111; // 'N' or 'n'
+pub const CUBLAS_OP_T: cublasOperation_t = 114; // 'T' or 't'
+pub const CUBLAS_OP_C: cublasOperation_t = 99; // 'C' or 'c'
 
 // =============================================================================
 // CUDA Driver API (libcuda.so / cuda.dll)
@@ -45,7 +46,11 @@ extern "C" {
     pub fn cuDeviceGetCount(count: *mut i32) -> CUresult;
     pub fn cuDeviceGetName(name: *mut c_char, len: i32, device: CUdevice) -> CUresult;
     pub fn cuDeviceTotalMem(bytes: *mut usize, device: CUdevice) -> CUresult;
-    pub fn cuDeviceGetAttribute(pi: *mut i32, attrib: CUdevice_attribute, device: CUdevice) -> CUresult;
+    pub fn cuDeviceGetAttribute(
+        pi: *mut i32,
+        attrib: CUdevice_attribute,
+        device: CUdevice,
+    ) -> CUresult;
 
     // Context management
     pub fn cuCtxCreate(ctx: *mut CUcontext, flags: u32, device: CUdevice) -> CUresult;
@@ -56,7 +61,11 @@ extern "C" {
     // Memory management
     pub fn cuMemAlloc(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult;
     pub fn cuMemFree(dptr: CUdeviceptr) -> CUresult;
-    pub fn cuMemcpyHtoD(dst: CUdeviceptr, src: *const std::ffi::c_void, bytesize: usize) -> CUresult;
+    pub fn cuMemcpyHtoD(
+        dst: CUdeviceptr,
+        src: *const std::ffi::c_void,
+        bytesize: usize,
+    ) -> CUresult;
     pub fn cuMemcpyDtoH(dst: *mut std::ffi::c_void, src: CUdeviceptr, bytesize: usize) -> CUresult;
     pub fn cuMemcpyDtoD(dst: CUdeviceptr, src: CUdeviceptr, bytesize: usize) -> CUresult;
 
@@ -80,12 +89,17 @@ extern "C" {
         handle: cublasHandle_t,
         transa: cublasOperation_t,
         transb: cublasOperation_t,
-        m: i32, n: i32, k: i32,
+        m: i32,
+        n: i32,
+        k: i32,
         alpha: *const f32,
-        A: *const f32, lda: i32,
-        B: *const f32, ldb: i32,
+        A: *const f32,
+        lda: i32,
+        B: *const f32,
+        ldb: i32,
         beta: *const f32,
-        C: *mut f32, ldc: i32,
+        C: *mut f32,
+        ldc: i32,
     ) -> cublasStatus_t;
 
     // DGEMM (double precision)
@@ -93,12 +107,17 @@ extern "C" {
         handle: cublasHandle_t,
         transa: cublasOperation_t,
         transb: cublasOperation_t,
-        m: i32, n: i32, k: i32,
+        m: i32,
+        n: i32,
+        k: i32,
         alpha: *const f64,
-        A: *const f64, lda: i32,
-        B: *const f64, ldb: i32,
+        A: *const f64,
+        lda: i32,
+        B: *const f64,
+        ldb: i32,
         beta: *const f64,
-        C: *mut f64, ldc: i32,
+        C: *mut f64,
+        ldc: i32,
     ) -> cublasStatus_t;
 }
 

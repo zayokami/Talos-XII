@@ -34,9 +34,7 @@ pub struct Tensor {
     pub data: Arc<RwLock<Vec<f64>>>, // Read-write access (backward pass needs write)
     pub grad: Arc<RwLock<Vec<f64>>>,
     pub shape: Vec<usize>,
-    pub device: Device, // Device where tensor resides
-    #[cfg(cuda)]
-    gpu_ptr: Option<usize>, // Raw GPU pointer for GPU-resident tensors
+    pub device: Device,             // Device where tensor resides
     pub _ctx: Option<Arc<Context>>, // Keeps the graph alive
 }
 
@@ -264,39 +262,20 @@ impl Tensor {
     }
 
     /// Copy tensor data to CUDA GPU.
-    /// Returns a new Tensor with data stored on GPU (device = Device::Cuda).
+    /// Current implementation keeps data on host while marking device intent.
     #[cfg(cuda)]
     #[allow(dead_code)]
     pub fn to_cuda(&self) -> Result<Tensor, ()> {
-        use crate::cuda::memory::{alloc, copy_h2d};
-
-        let len = self.data.read().unwrap().len();
-        let mut d_buf = match alloc::<f64>(len) {
-            Ok(buf) => buf,
-            Err(_) => {
-                eprintln!(
-                    "[Tensor] Failed to allocate GPU memory for {} elements",
-                    len
-                );
-                return Err(());
-            }
-        };
-
-        let data = self.data.read().unwrap();
-        if let Err(_) = copy_h2d(&d_buf, &data) {
-            eprintln!("[Tensor] Failed to copy data to GPU");
+        if crate::cuda::init().is_err() {
+            eprintln!("[Tensor] CUDA runtime unavailable");
             return Err(());
         }
 
-        // Save the raw GPU pointer before the DevicePtr is moved into the closure
-        let gpu_ptr = d_buf.as_raw();
-
         Ok(Tensor {
-            data: Arc::new(RwLock::new(vec![0.0; len])), // Placeholder, actual data on GPU
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            data: self.data.clone(),
+            grad: self.grad.clone(),
             shape: self.shape.clone(),
             device: Device::Cuda,
-            gpu_ptr: Some(gpu_ptr),
             _ctx: self._ctx.clone(),
         })
     }
@@ -305,31 +284,10 @@ impl Tensor {
     #[cfg(cuda)]
     #[allow(dead_code)]
     pub fn from_cuda(&self) -> Result<Vec<f64>, ()> {
-        use crate::cuda::memory::copy_d2h_raw;
-
         if self.device != Device::Cuda {
             return Err(());
         }
-
-        let gpu_ptr = match self.gpu_ptr {
-            Some(ptr) => ptr,
-            None => {
-                eprintln!("[Tensor] from_cuda: no GPU pointer stored");
-                return Err(());
-            }
-        };
-
-        let len = self.data.read().unwrap().len();
-        let mut result = vec![0.0; len];
-
-        unsafe {
-            if let Err(_) = copy_d2h_raw(result.as_mut_ptr(), gpu_ptr, len) {
-                eprintln!("[Tensor] from_cuda: failed to copy data from GPU");
-                return Err(());
-            }
-        }
-
-        Ok(result)
+        Ok(self.data.read().unwrap().clone())
     }
 
     // Operations
@@ -671,50 +629,7 @@ impl Tensor {
     #[cfg(cuda)]
     #[allow(dead_code)]
     fn relu_cuda(&self) -> Tensor {
-        use crate::cuda::memory::{alloc, copy_d2h, copy_h2d};
-
-        let len = self.data.read().unwrap().len();
-        let mut d_data = match alloc::<f64>(len) {
-            Ok(buf) => buf,
-            Err(_) => return self.relu_cpu_fallback(),
-        };
-
-        let self_data = self.data.read().unwrap();
-        if let Err(_) = copy_h2d(&d_data, &self_data) {
-            return self.relu_cpu_fallback();
-        }
-
-        // Call CUDA ReLU kernel
-        // For now, fall back to CPU since we don't have direct kernel calls
-        let mut out_data = self_data.clone();
-        drop(self_data);
-
-        // CPU ReLU on the data
-        for i in 0..len {
-            out_data[i] = out_data[i].max(0.0);
-        }
-
-        let parents = vec![self.clone()];
-
-        Tensor {
-            data: Arc::new(RwLock::new(out_data)),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
-            shape: self.shape.clone(),
-            device: Device::Cpu,
-            _ctx: Some(Arc::new(Context {
-                parents,
-                backward_op: Box::new(move |grad_out, parents| {
-                    let input = &parents[0];
-                    let input_data = input.data.read().unwrap();
-                    let mut inp_grad = input.grad.write().unwrap();
-                    for i in 0..inp_grad.len() {
-                        if input_data[i] > 0.0 {
-                            inp_grad[i] += grad_out[i];
-                        }
-                    }
-                }),
-            })),
-        }
+        self.relu_cpu_fallback()
     }
 
     /// GELU activation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
@@ -3260,109 +3175,15 @@ impl Neg for Tensor {
             })),
         }
     }
+}
 
+#[cfg(cuda)]
+impl Tensor {
     /// GPU-accelerated matrix multiplication using CUDA cuBLAS
     #[cfg(cuda)]
     #[allow(dead_code)]
     fn matmul_cuda(&self, other: &Tensor, m: usize, k: usize, n: usize) -> Tensor {
-        use crate::cuda::blas::Cublas;
-        use crate::cuda::memory::{alloc, copy_d2h, copy_h2d};
-
-        let mut cublas = match Cublas::new() {
-            Ok(c) => c,
-            Err(_) => {
-                eprintln!("[Autograd] cuBLAS init failed, using CPU");
-                return self.matmul_cpu_fallback(other, m, k, n);
-            }
-        };
-
-        let mut d_a = match alloc::<f64>(m * k) {
-            Ok(buf) => buf,
-            Err(_) => return self.matmul_cpu_fallback(other, m, k, n),
-        };
-        let mut d_b = match alloc::<f64>(k * n) {
-            Ok(buf) => buf,
-            Err(_) => return self.matmul_cpu_fallback(other, m, k, n),
-        };
-        let mut d_c = match alloc::<f64>(m * n) {
-            Ok(buf) => buf,
-            Err(_) => return self.matmul_cpu_fallback(other, m, k, n),
-        };
-
-        let lhs_data = self.data.read().unwrap();
-        let rhs_data = other.data.read().unwrap();
-
-        if let Err(_) = copy_h2d(&d_a, &lhs_data) {
-            return self.matmul_cpu_fallback(other, m, k, n);
-        }
-        if let Err(_) = copy_h2d(&d_b, &rhs_data) {
-            return self.matmul_cpu_fallback(other, m, k, n);
-        }
-
-        let alpha = 1.0f64;
-        let beta = 0.0f64;
-
-        if let Err(_) = cublas.gemm(
-            false, false, m as i32, n as i32, k as i32, alpha, &d_a, k as i32, &d_b, n as i32,
-            beta, &mut d_c, n as i32,
-        ) {
-            return self.matmul_cpu_fallback(other, m, k, n);
-        }
-
-        let mut out_data = vec![0.0; m * n];
-        if let Err(_) = copy_d2h(&mut out_data, &d_c) {
-            return self.matmul_cpu_fallback(other, m, k, n);
-        }
-
-        let out_shape = if self.shape.len() == 1 {
-            vec![n]
-        } else {
-            vec![m, n]
-        };
-
-        let parents = vec![self.clone(), other.clone()];
-        Tensor {
-            data: Arc::new(RwLock::new(out_data)),
-            grad: Arc::new(RwLock::new(vec![0.0; m * n])),
-            shape: out_shape,
-            device: Device::Cpu,
-            _ctx: Some(Arc::new(Context {
-                parents,
-                backward_op: Box::new(move |grad_out, parents| {
-                    let lhs = &parents[0];
-                    let rhs = &parents[1];
-                    let guards = TensorReadGuard::new(&[lhs, rhs]);
-                    let lhs_data = guards.get(0);
-                    let rhs_data = guards.get(1);
-
-                    {
-                        // dL/dLHS
-                        let mut lhs_grad = lhs.grad.write().unwrap();
-                        for r in 0..m {
-                            for i in 0..k {
-                                lhs_grad[r * k + i] += dot_product(
-                                    &grad_out[r * n..r * n + n],
-                                    &rhs_data[i * n..i * n + n],
-                                );
-                            }
-                        }
-                    }
-
-                    {
-                        // dL/dRHS
-                        let mut rhs_grad = rhs.grad.write().unwrap();
-                        for i in 0..k {
-                            for j in 0..n {
-                                for r in 0..m {
-                                    rhs_grad[i * n + j] +=
-                                        lhs_data[r * k + i] * grad_out[r * n + j];
-                                }
-                            }
-                        }
-                    }
-                }),
-            })),
-        }
+        self.matmul_cpu_fallback(other, m, k, n)
     }
 
     /// CPU fallback for matmul
@@ -3440,62 +3261,7 @@ impl Neg for Tensor {
     #[cfg(cuda)]
     #[allow(dead_code)]
     fn gelu_cuda(&self) -> Tensor {
-        use crate::cuda::memory::{alloc, copy_d2h, copy_h2d};
-
-        let len = self.data.read().unwrap().len();
-        let mut d_data = match alloc::<f64>(len) {
-            Ok(buf) => buf,
-            Err(_) => return self.gelu_cpu_fallback(),
-        };
-
-        let self_data = self.data.read().unwrap();
-        if let Err(_) = copy_h2d(&d_data, &self_data) {
-            return self.gelu_cpu_fallback();
-        }
-
-        // Call CUDA GELU kernel
-        // For now, fall back to CPU since we don't have direct kernel calls
-        // In a full implementation, we would call the CUDA kernel here
-        let mut out_data = self_data.clone();
-        drop(self_data);
-
-        // CPU GELU on the data
-        for i in 0..len {
-            let x = out_data[i];
-            let x3 = x * x * x;
-            let inner = 0.7978845608028654 * (x + 0.044715 * x3);
-            out_data[i] = 0.5 * x * (1.0 + inner.tanh());
-        }
-
-        let parents = vec![self.clone()];
-        let sqrt_2_over_pi = (2.0 / std::f64::consts::PI).sqrt();
-        let c = 0.044715;
-
-        Tensor {
-            data: Arc::new(RwLock::new(out_data)),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
-            shape: self.shape.clone(),
-            device: Device::Cpu,
-            _ctx: Some(Arc::new(Context {
-                parents,
-                backward_op: Box::new(move |grad_out, parents| {
-                    let input = &parents[0];
-                    let input_data = input.data.read().unwrap();
-                    let mut inp_grad = input.grad.write().unwrap();
-                    for i in 0..inp_grad.len() {
-                        let x = input_data[i];
-                        let x2 = x * x;
-                        let x3 = x2 * x;
-                        let u = sqrt_2_over_pi * (x + c * x3);
-                        let tanh_u = u.tanh();
-                        let sech2_u = 1.0 - tanh_u * tanh_u;
-                        let du_dx = sqrt_2_over_pi * (1.0 + 3.0 * c * x2);
-                        let gelu_grad = 0.5 * (1.0 + tanh_u) + 0.5 * x * sech2_u * du_dx;
-                        inp_grad[i] += grad_out[i] * gelu_grad;
-                    }
-                }),
-            })),
-        }
+        self.gelu_cpu_fallback()
     }
 
     /// CPU fallback for GELU
@@ -3546,55 +3312,7 @@ impl Neg for Tensor {
     #[cfg(cuda)]
     #[allow(dead_code)]
     fn softmax_cuda(&self) -> Tensor {
-        use crate::cuda::memory::{alloc, copy_d2h, copy_h2d};
-
-        let len = self.data.read().unwrap().len();
-        let mut d_data = match alloc::<f64>(len) {
-            Ok(buf) => buf,
-            Err(_) => return self.softmax_cpu_fallback(),
-        };
-
-        let self_data = self.data.read().unwrap();
-        if let Err(_) = copy_h2d(&d_data, &self_data) {
-            return self.softmax_cpu_fallback();
-        }
-
-        // CPU softmax (kernel integration pending)
-        drop(self_data);
-        let mut out_data = vec![0.0; len];
-        if let Err(_) = copy_d2h(&mut out_data, &d_data) {
-            return self.softmax_cpu_fallback();
-        }
-
-        let max_val = out_data.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-        let sum_exp: f64 = out_data.iter().map(|&x| (x - max_val).exp()).sum();
-        for i in 0..len {
-            out_data[i] = (out_data[i] - max_val).exp() / sum_exp;
-        }
-
-        let softmax_cache: Arc<Vec<f64>> = Arc::new(out_data.clone());
-        let parents = vec![self.clone()];
-
-        Tensor {
-            data: Arc::new(RwLock::new(out_data)),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
-            shape: self.shape.clone(),
-            device: Device::Cpu,
-            _ctx: Some(Arc::new(Context {
-                parents,
-                backward_op: Box::new(move |grad_out, parents| {
-                    let mut inp_grad = parents[0].grad.write().unwrap();
-                    let sum_term: f64 = grad_out
-                        .iter()
-                        .zip(softmax_cache.iter())
-                        .map(|(&g, &s)| g * s)
-                        .sum();
-                    for i in 0..inp_grad.len() {
-                        inp_grad[i] += softmax_cache[i] * (grad_out[i] - sum_term);
-                    }
-                }),
-            })),
-        }
+        self.softmax_cpu_fallback()
     }
 
     /// CPU fallback for Softmax

@@ -1,14 +1,17 @@
 //! CUDA Stream management
 //!
 //! Provides asynchronous stream operations for CUDA kernels.
+#![allow(dead_code)]
 
 #[cfg(cuda)]
-use crate::cuda::bindings::{cuStreamCreate, cuStreamDestroy, cuStreamSynchronize, CUDA_SUCCESS};
+use crate::cuda::bindings::{
+    cuStreamCreate, cuStreamDestroy, cuStreamSynchronize, CUstream, CUDA_SUCCESS,
+};
 
 /// CUDA Stream wrapper
 #[cfg(cuda)]
 pub struct CudaStream {
-    handle: usize,  // CUstream is a pointer
+    handle: CUstream,
 }
 
 #[cfg(cuda)]
@@ -16,7 +19,7 @@ impl CudaStream {
     /// Create a new CUDA stream
     pub fn new() -> Result<Self, ()> {
         unsafe {
-            let mut handle: usize = 0;
+            let mut handle: CUstream = std::ptr::null_mut();
             let result = cuStreamCreate(&mut handle, 0);
             if result != CUDA_SUCCESS {
                 eprintln!("[CUDA] cuStreamCreate failed: {}", result);
@@ -39,7 +42,7 @@ impl CudaStream {
     }
 
     /// Get raw handle
-    pub fn as_raw(&self) -> usize {
+    pub fn as_raw(&self) -> CUstream {
         self.handle
     }
 }
