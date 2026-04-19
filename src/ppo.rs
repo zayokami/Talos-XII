@@ -661,7 +661,7 @@ impl Ppo {
                     let v_loss = (value_err.clone() * value_err).sum();
 
                     let p = all_log_probs.exp();
-                    let entropy = -(p * all_log_probs).sum();
+                    let entropy = -(p.clone() * all_log_probs.clone()).sum();
 
                     let loss = -policy_loss + v_loss * value_coef_tensor.clone()
                         - entropy * entropy_coef_tensor.clone();
@@ -673,8 +673,8 @@ impl Ppo {
                         if let Some(ref ema) = self.ema_policy {
                             let (teacher_logits, _) = ema.forward_actor_critic(state, pity);
                             // KL(student || teacher) = sum(student_prob * (log_student_prob - log_teacher_prob))
-                            let student_probs = logits.softmax().exp();
-                            let student_log_probs = logits.log_softmax();
+                            let student_probs = p.clone();
+                            let student_log_probs = all_log_probs.clone();
                             let teacher_log_probs = teacher_logits.log_softmax();
                             // KL = sum(p_student * (log_p_student - log_p_teacher))
                             let kl_vals = student_probs * (student_log_probs - teacher_log_probs);
@@ -1047,8 +1047,10 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
         let progress = steps_done as f64 / total_steps as f64;
         let current_lr = initial_lr * (1.0 - progress).max(0.1); // Decay to 10%
 
-        let rounds = steps_per_update / num_envs;
-        let remainder = steps_per_update % num_envs;
+        let remaining_steps = total_steps - steps_done;
+        let update_steps = steps_per_update.min(remaining_steps);
+        let rounds = update_steps / num_envs;
+        let remainder = update_steps % num_envs;
         let mut collected = 0usize;
         for _ in 0..rounds {
             let step_results: Vec<PpoStepResult> = worker
@@ -1123,7 +1125,7 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
             collected, k_epochs
         ));
         ppo.update(current_lr);
-        steps_done += steps_per_update;
+        steps_done += update_steps;
 
         if config.achf.cache_log_interval_steps > 0
             && steps_done % config.achf.cache_log_interval_steps == 0
@@ -1243,8 +1245,10 @@ pub fn train_ppo_with_metrics(
         let progress = steps_done as f64 / total_steps as f64;
         let current_lr = initial_lr * (1.0 - progress).max(0.1);
 
-        let rounds = steps_per_update / num_envs;
-        let remainder = steps_per_update % num_envs;
+        let remaining_steps = total_steps - steps_done;
+        let update_steps = steps_per_update.min(remaining_steps);
+        let rounds = update_steps / num_envs;
+        let remainder = update_steps % num_envs;
         let mut collected = 0usize;
         for _ in 0..rounds {
             let step_results: Vec<PpoStepResult> = worker
@@ -1304,10 +1308,10 @@ pub fn train_ppo_with_metrics(
 
         pb.set_message(format!(
             "Updating ({} samples, {} epochs)...",
-            steps_per_update, k_epochs
+            collected, k_epochs
         ));
         let update_loss = ppo.update(current_lr);
-        steps_done = (steps_done + steps_per_update).min(total_steps);
+        steps_done += update_steps;
 
         let avg_r = if recent_rewards.is_empty() {
             0.0
@@ -1316,7 +1320,7 @@ pub fn train_ppo_with_metrics(
         };
 
         if let Some(ref tx) = metrics_tx {
-            if steps_done % snapshot_every < steps_per_update {
+            if steps_done % snapshot_every < update_steps {
                 let achf_snap = ppo.policy.snapshot_achf();
                 let snapshot = crate::bench::StepSnapshot {
                     step: steps_done,

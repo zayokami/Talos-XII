@@ -4,12 +4,30 @@ use crate::cuda::bindings;
 use crate::cuda::error::{CudaError, CudaResult};
 use crate::cuda::memory::DevicePtr;
 
+const SOFTMAX_WARP_WIDTH: usize = 32;
+
 fn to_i32_len(op: &'static str, value: usize) -> CudaResult<i32> {
     i32::try_from(value).map_err(|_| CudaError::SizeOverflow {
         op,
         count: value,
         elem_size: std::mem::size_of::<f64>(),
     })
+}
+
+fn validate_softmax_dims(op: &'static str, rows: usize, cols: usize) -> CudaResult<()> {
+    if rows > 0 && cols == 0 {
+        return Err(CudaError::InvalidInput {
+            op,
+            message: "cols must be greater than zero when rows is non-zero",
+        });
+    }
+    if rows > 0 && cols > SOFTMAX_WARP_WIDTH {
+        return Err(CudaError::InvalidInput {
+            op,
+            message: "cols > 32 are not supported by the current CUDA softmax kernel",
+        });
+    }
+    Ok(())
 }
 
 #[cfg(cuda)]
@@ -77,6 +95,7 @@ pub fn softmax_inplace(data: &DevicePtr<f64>, rows: usize, cols: usize) -> CudaR
             actual: data.len(),
         });
     }
+    validate_softmax_dims("cuda::kernels::softmax_inplace", rows, cols)?;
     if expected == 0 {
         return Ok(());
     }
@@ -116,6 +135,7 @@ pub fn softmax_causal_inplace(data: &DevicePtr<f64>, rows: usize, cols: usize) -
             actual: data.len(),
         });
     }
+    validate_softmax_dims("cuda::kernels::softmax_causal_inplace", rows, cols)?;
     if expected == 0 {
         return Ok(());
     }
@@ -167,6 +187,7 @@ pub fn log_softmax(
             actual: out.len(),
         });
     }
+    validate_softmax_dims("cuda::kernels::log_softmax", rows, cols)?;
     if expected == 0 {
         return Ok(());
     }
@@ -190,5 +211,27 @@ pub fn log_softmax(
             op: "cuda::kernels::log_softmax",
             code: status as u32,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_softmax_dims;
+
+    #[test]
+    fn softmax_dim_validation_rejects_zero_cols_with_rows() {
+        let err = validate_softmax_dims("test", 2, 0).unwrap_err();
+        assert!(format!("{err}").contains("cols must be greater than zero"));
+    }
+
+    #[test]
+    fn softmax_dim_validation_rejects_wide_rows() {
+        let err = validate_softmax_dims("test", 1, 33).unwrap_err();
+        assert!(format!("{err}").contains("cols > 32"));
+    }
+
+    #[test]
+    fn softmax_dim_validation_allows_empty_rows() {
+        assert!(validate_softmax_dims("test", 0, 4096).is_ok());
     }
 }

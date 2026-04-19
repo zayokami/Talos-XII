@@ -430,14 +430,15 @@ pub fn dbn_env(dbn: &Dbn, rng: &mut Rng) -> (f64, f64) {
 
 /// Calculate 6-star probability at a given pity count.
 pub fn prob_6(pity_6: usize, config: &Config) -> f64 {
-    if pity_6 < config.soft_pity_start {
+    let raw = if pity_6 < config.soft_pity_start {
         config.prob_6_base
     } else if pity_6 < config.small_pity_guarantee {
         config.prob_6_base
             + config.soft_pity_slope * (pity_6 as f64 - (config.soft_pity_start as f64 - 1.0))
     } else {
         1.0
-    }
+    };
+    raw.clamp(0.0, 1.0)
 }
 
 /// Expected number of pulls for one 6-star under the current pool config.
@@ -1241,6 +1242,13 @@ pub fn simulate_f2p_clearing_with_progress(
         ppo_sender: ctx.ppo_sender,
     };
 
+    fn f2p_stop_pull_limit(config: &Config) -> usize {
+        let free_limit = FREE_PULLS_WELFARE as usize;
+        free_limit
+            .max(config.big_pity_cumulative)
+            .max(config.up_pity_soft)
+    }
+
     let chunk_size = compute_chunk_size(num_sims, ctx.worker);
     let chunk_count = num_sims.div_ceil(chunk_size);
     let (total_extra_cost, extra_cost_samples, success_count_val) = ctx
@@ -1258,10 +1266,7 @@ pub fn simulate_f2p_clearing_with_progress(
                         let control = SimControl {
                             max_pulls: None,
                             stop_on_up: true,
-                            stop_after_total_pulls: Some(
-                                FREE_PULLS_WELFARE.max(ctx.config.big_pity_cumulative as u32)
-                                    as usize,
-                            ),
+                            stop_after_total_pulls: Some(f2p_stop_pull_limit(ctx.config)),
                             nn_total_pulls_one_based: true,
                             collect_details: false,
                             big_pity_requires_not_up: ctx.config.big_pity_requires_not_up,
@@ -1570,6 +1575,18 @@ mod tests {
     }
 
     #[test]
+    fn prob_6_clamps_to_unit_interval() {
+        let mut config = Config::load("data/config.json");
+        config.prob_6_base = -0.2;
+        config.soft_pity_start = 2;
+        config.soft_pity_slope = 2.0;
+        config.small_pity_guarantee = 10;
+
+        assert_eq!(prob_6(1, &config), 0.0);
+        assert_eq!(prob_6(3, &config), 1.0);
+    }
+
+    #[test]
     fn roll_one_respects_up_rate_zero() {
         let (mut config, _dbn, neural_opt) = build_context();
         config.up_rate = 0.0;
@@ -1635,5 +1652,41 @@ mod tests {
             pulls.len(),
             limit
         );
+    }
+
+    #[test]
+    fn simulate_f2p_clearing_respects_up_pity_soft_when_big_pity_off() {
+        let (mut config, dbn, neural_opt) = build_context();
+        config.big_pity_cumulative = 0;
+        config.up_pity_soft = FREE_PULLS_WELFARE as usize + 15;
+        config.small_pity_guarantee = config.up_pity_soft + 100;
+        config.soft_pity_start = config.small_pity_guarantee;
+        config.prob_6_base = 0.0;
+        config.soft_pity_slope = 0.0;
+        config.up_rate = 0.0;
+        config.up_six.clear();
+
+        let worker = GoodJobWorker::new(1);
+        let run_ctx = SimRunContext {
+            neural_opt: &neural_opt,
+            dqn_policy: None,
+            ppo_policy: None,
+            dbn: &dbn,
+            config: &config,
+            worker: &worker,
+            exp_sender: None,
+            neural_sender: None,
+            ppo_sender: None,
+        };
+
+        let sims = 8;
+        let (total_extra_cost, extra_cost_samples, success_count) =
+            simulate_f2p_clearing(sims, 7, &run_ctx);
+        let expected_extra_per_sim =
+            ((config.up_pity_soft as u32 - FREE_PULLS_WELFARE) * COST_PER_PULL) as u64;
+
+        assert_eq!(success_count, sims);
+        assert_eq!(extra_cost_samples, sims);
+        assert_eq!(total_extra_cost, expected_extra_per_sim * sims as u64);
     }
 }

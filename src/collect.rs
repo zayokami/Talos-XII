@@ -225,9 +225,16 @@ pub fn reconstruct_from_six_star_positions(
     let mut paired: Vec<(usize, bool)> = raw_positions
         .into_iter()
         .enumerate()
-        .map(|(i, pos)| (pos, raw_up_flags.get(i).copied().unwrap_or(false)))
+        .filter_map(|(i, pos)| {
+            if (1..=total_pulls).contains(&pos) {
+                Some((pos, raw_up_flags.get(i).copied().unwrap_or(false)))
+            } else {
+                None
+            }
+        })
         .collect();
-    paired.sort_unstable_by_key(|&(pos, _)| pos);
+    paired.sort_by_key(|&(pos, _)| pos);
+    paired.dedup_by_key(|(pos, _)| *pos);
 
     let positions: Vec<usize> = paired.iter().map(|&(p, _)| p).collect();
     let up_flags: Vec<bool> = paired.iter().map(|&(_, u)| u).collect();
@@ -457,12 +464,9 @@ pub fn print_stats(db: &PlayerDatabase, config: &Config, lang: Language) {
         let guarantee = pool_cfg.map(|p| p.small_pity_guarantee).unwrap_or(80);
 
         let pre_soft: usize = ps.pity_hits.iter().take(soft_start).sum();
-        let in_soft: usize = ps
-            .pity_hits
-            .iter()
-            .skip(soft_start)
-            .take(guarantee - soft_start)
-            .sum();
+        let soft_span = guarantee.saturating_sub(soft_start);
+        let in_soft: usize = ps.pity_hits.iter().skip(soft_start).take(soft_span).sum();
+        let soft_end = guarantee.saturating_sub(1);
         let at_guarantee = if guarantee < ps.pity_hits.len() {
             ps.pity_hits[guarantee]
         } else {
@@ -484,7 +488,7 @@ pub fn print_stats(db: &PlayerDatabase, config: &Config, lang: Language) {
         println!(
             "    {}-{} {}: {} {}",
             soft_start,
-            guarantee - 1,
+            soft_end,
             I18n::get(lang, "stats_pity_six"),
             in_soft,
             I18n::get(lang, "stats_soft_range"),
@@ -531,6 +535,17 @@ mod tests {
     }
 
     #[test]
+    fn reconstruct_ignores_invalid_and_duplicate_positions() {
+        let pulls = reconstruct_from_six_star_positions("0,3,3,7,11", "y,n,y,y,n", 10);
+        assert_eq!(pulls.len(), 10);
+        assert_eq!(pulls.iter().filter(|p| p.rarity == 6).count(), 2);
+        assert_eq!(pulls[2].rarity, 6);
+        assert!(!pulls[2].is_up);
+        assert_eq!(pulls[6].rarity, 6);
+        assert!(pulls[6].is_up);
+    }
+
+    #[test]
     fn database_round_trip() {
         let mut db = PlayerDatabase::default();
         db.add_session(PlayerSession {
@@ -554,5 +569,33 @@ mod tests {
         let db2: PlayerDatabase = serde_json::from_str(&json).unwrap();
         assert_eq!(db2.sessions.len(), 1);
         assert_eq!(db2.sessions[0].pulls.len(), 2);
+    }
+
+    #[test]
+    fn print_stats_handles_soft_start_above_guarantee() {
+        let mut config = Config::load("data/config.json");
+        let pool_id = config.pools[0].id.clone();
+        config.pools[0].soft_pity_start = config.pools[0].small_pity_guarantee + 5;
+        let db = PlayerDatabase {
+            sessions: vec![PlayerSession {
+                player_id: "p1".to_string(),
+                pool_id,
+                pulls: vec![
+                    PlayerPullRecord {
+                        rarity: 4,
+                        is_up: false,
+                    },
+                    PlayerPullRecord {
+                        rarity: 6,
+                        is_up: true,
+                    },
+                ],
+                total_jade_spent: None,
+                free_pulls_used: None,
+                timestamp: "0".to_string(),
+            }],
+        };
+        let result = std::panic::catch_unwind(|| print_stats(&db, &config, Language::En));
+        assert!(result.is_ok());
     }
 }

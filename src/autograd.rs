@@ -227,7 +227,7 @@ impl Tensor {
             data: self.data.clone(),
             grad: Arc::new(RwLock::new(vec![0.0; grad_len])),
             shape: self.shape.clone(),
-            device: Device::Cpu,
+            device: self.device,
             _ctx: None,
         }
     }
@@ -3363,6 +3363,10 @@ impl Tensor {
         let len = host.len();
         if let Some(buffer) = self.cuda_cached_buffer() {
             if buffer.len() == len {
+                if let Err(err) = copy_h2d(&buffer, &host) {
+                    self.cuda_remove_cached_buffer();
+                    return Err(("copy", err));
+                }
                 return Ok(buffer);
             }
             self.cuda_remove_cached_buffer();
@@ -3417,21 +3421,32 @@ impl Tensor {
             }
         };
         let d_c = Arc::new(d_c);
+        let (m_i32, n_i32, k_i32) = match (i32::try_from(m), i32::try_from(n), i32::try_from(k)) {
+            (Ok(mv), Ok(nv), Ok(kv)) => (mv, nv, kv),
+            _ => {
+                crate::cuda::record_matmul_fallback("gemm");
+                eprintln!(
+                    "[Autograd] CUDA GEMM dimensions overflow i32 (m={}, n={}, k={}), using CPU",
+                    m, n, k
+                );
+                return self.matmul_cpu_fallback(other, m, k, n);
+            }
+        };
 
         if let Err(err) = gemm_thread_local(
             false,
             false,
-            m as i32,
-            n as i32,
-            k as i32,
+            m_i32,
+            n_i32,
+            k_i32,
             1.0,
             d_a.as_raw(),
-            k as i32,
+            k_i32,
             d_b.as_raw(),
-            n as i32,
+            n_i32,
             0.0,
             d_c.as_raw(),
-            n as i32,
+            n_i32,
         ) {
             let stage = match &err {
                 CudaError::Blas { op, .. } if *op == "cublasCreate_v2" => "init",
@@ -4089,6 +4104,81 @@ mod tests {
                 cuda_d[i]
             );
         }
+    }
+
+    #[cfg(cuda)]
+    #[test]
+    fn test_cuda_relu_refreshes_cached_input_after_host_mutation() {
+        if crate::cuda::init().is_err() {
+            return;
+        }
+
+        let t = Tensor::new(vec![-3.0, 2.0], vec![2]);
+        let t_cuda = match t.to_cuda() {
+            Ok(tensor) => tensor,
+            Err(_) => return,
+        };
+
+        {
+            let mut data = t_cuda.data.write().unwrap();
+            data[0] = 5.0;
+            data[1] = -4.0;
+        }
+
+        let out = t_cuda.relu();
+        let d = out.data.read().unwrap();
+        assert_eq!(d.as_slice(), &[5.0, 0.0]);
+    }
+
+    #[cfg(cuda)]
+    #[test]
+    fn test_cuda_softmax_wide_last_dim_matches_cpu() {
+        if crate::cuda::init().is_err() {
+            return;
+        }
+
+        let cols = 64usize;
+        let mut values = Vec::with_capacity(cols * 2);
+        for i in 0..(cols * 2) {
+            values.push((i as f64 * 0.125) - 4.0);
+        }
+
+        let t = Tensor::new(values, vec![2, cols]);
+        let t_cuda = match t.to_cuda() {
+            Ok(tensor) => tensor,
+            Err(_) => return,
+        };
+
+        let cpu = t.softmax();
+        let cuda = t_cuda.softmax();
+        let cpu_d = cpu.data.read().unwrap();
+        let cuda_d = cuda.data.read().unwrap();
+        assert_eq!(cpu_d.len(), cuda_d.len());
+        for i in 0..cpu_d.len() {
+            assert!(
+                (cpu_d[i] - cuda_d[i]).abs() < 1e-10,
+                "idx {} cpu={} cuda={}",
+                i,
+                cpu_d[i],
+                cuda_d[i]
+            );
+        }
+    }
+
+    #[cfg(cuda)]
+    #[test]
+    fn test_cuda_detach_preserves_device() {
+        if crate::cuda::init().is_err() {
+            return;
+        }
+
+        let t = Tensor::new(vec![1.0, 2.0], vec![2]);
+        let t_cuda = match t.to_cuda() {
+            Ok(tensor) => tensor,
+            Err(_) => return,
+        };
+        let detached = t_cuda.detach();
+        assert_eq!(detached.device, Device::Cuda);
     }
 
     #[test]

@@ -220,11 +220,13 @@ fn estimate_base_rate(
     let pre_soft_pulls: usize = {
         let total_episodes: usize = stats.pity_hits.iter().sum();
         if total_episodes == 0 {
+            let ci_lower = (config_base * 0.5).clamp(0.0, 1.0);
+            let ci_upper = (config_base * 2.0).clamp(0.0, 1.0);
             return BayesianEstimate {
                 prior_mean: config_base,
                 posterior_mean: config_base,
-                ci_lower: config_base * 0.5,
-                ci_upper: config_base * 2.0,
+                ci_lower,
+                ci_upper,
                 significant: false,
             };
         }
@@ -596,5 +598,25 @@ mod tests {
         // I_0.5(1, 1) = 0.5 (Uniform distribution)
         let val = reg_incomplete_beta(0.5, 1.0, 1.0);
         assert!((val - 0.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn estimate_base_rate_empty_data_ci_stays_in_unit_interval() {
+        let stats = PoolEmpiricalStats {
+            pool_id: "p".to_string(),
+            pool_name: "Pool".to_string(),
+            total_pulls: 0,
+            total_six_star: 0,
+            total_up: 0,
+            session_count: 0,
+            pity_hits: vec![0; 10],
+            observed_base_rate: 0.0,
+            observed_up_rate: 0.0,
+            avg_pulls_per_six: 0.0,
+        };
+
+        let est = estimate_base_rate(&stats, 0.8, 5);
+        assert!(est.ci_lower >= 0.0);
+        assert!(est.ci_upper <= 1.0);
     }
 }
