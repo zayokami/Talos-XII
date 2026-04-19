@@ -29,6 +29,16 @@ static CUDA_MATMUL_FALLBACK_INIT: AtomicU64 = AtomicU64::new(0);
 static CUDA_MATMUL_FALLBACK_ALLOC: AtomicU64 = AtomicU64::new(0);
 static CUDA_MATMUL_FALLBACK_COPY: AtomicU64 = AtomicU64::new(0);
 static CUDA_MATMUL_FALLBACK_GEMM: AtomicU64 = AtomicU64::new(0);
+static CUDA_ACTIVATION_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static CUDA_ACTIVATION_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+static CUDA_ACTIVATION_FALLBACK_ALLOC: AtomicU64 = AtomicU64::new(0);
+static CUDA_ACTIVATION_FALLBACK_COPY: AtomicU64 = AtomicU64::new(0);
+static CUDA_ACTIVATION_FALLBACK_KERNEL: AtomicU64 = AtomicU64::new(0);
+static CUDA_LOGSOFTMAX_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static CUDA_LOGSOFTMAX_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+static CUDA_LOGSOFTMAX_FALLBACK_ALLOC: AtomicU64 = AtomicU64::new(0);
+static CUDA_LOGSOFTMAX_FALLBACK_COPY: AtomicU64 = AtomicU64::new(0);
+static CUDA_LOGSOFTMAX_FALLBACK_KERNEL: AtomicU64 = AtomicU64::new(0);
 
 /// Runtime observability counters for CUDA matmul routing.
 #[derive(Debug, Clone, Copy)]
@@ -39,6 +49,16 @@ pub struct CudaRuntimeStats {
     pub matmul_fallback_alloc: u64,
     pub matmul_fallback_copy: u64,
     pub matmul_fallback_gemm: u64,
+    pub activation_attempts: u64,
+    pub activation_successes: u64,
+    pub activation_fallback_alloc: u64,
+    pub activation_fallback_copy: u64,
+    pub activation_fallback_kernel: u64,
+    pub log_softmax_attempts: u64,
+    pub log_softmax_successes: u64,
+    pub log_softmax_fallback_alloc: u64,
+    pub log_softmax_fallback_copy: u64,
+    pub log_softmax_fallback_kernel: u64,
 }
 
 pub fn record_matmul_attempt() {
@@ -67,6 +87,52 @@ pub fn record_matmul_fallback(stage: &'static str) {
     }
 }
 
+pub fn record_activation_attempt() {
+    CUDA_ACTIVATION_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_activation_success() {
+    CUDA_ACTIVATION_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_activation_fallback(stage: &'static str) {
+    match stage {
+        "alloc" => {
+            CUDA_ACTIVATION_FALLBACK_ALLOC.fetch_add(1, Ordering::Relaxed);
+        }
+        "copy" => {
+            CUDA_ACTIVATION_FALLBACK_COPY.fetch_add(1, Ordering::Relaxed);
+        }
+        "kernel" => {
+            CUDA_ACTIVATION_FALLBACK_KERNEL.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
+pub fn record_log_softmax_attempt() {
+    CUDA_LOGSOFTMAX_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_log_softmax_success() {
+    CUDA_LOGSOFTMAX_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_log_softmax_fallback(stage: &'static str) {
+    match stage {
+        "alloc" => {
+            CUDA_LOGSOFTMAX_FALLBACK_ALLOC.fetch_add(1, Ordering::Relaxed);
+        }
+        "copy" => {
+            CUDA_LOGSOFTMAX_FALLBACK_COPY.fetch_add(1, Ordering::Relaxed);
+        }
+        "kernel" => {
+            CUDA_LOGSOFTMAX_FALLBACK_KERNEL.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
 pub fn runtime_stats() -> CudaRuntimeStats {
     CudaRuntimeStats {
         matmul_attempts: CUDA_MATMUL_ATTEMPTS.load(Ordering::Relaxed),
@@ -75,6 +141,47 @@ pub fn runtime_stats() -> CudaRuntimeStats {
         matmul_fallback_alloc: CUDA_MATMUL_FALLBACK_ALLOC.load(Ordering::Relaxed),
         matmul_fallback_copy: CUDA_MATMUL_FALLBACK_COPY.load(Ordering::Relaxed),
         matmul_fallback_gemm: CUDA_MATMUL_FALLBACK_GEMM.load(Ordering::Relaxed),
+        activation_attempts: CUDA_ACTIVATION_ATTEMPTS.load(Ordering::Relaxed),
+        activation_successes: CUDA_ACTIVATION_SUCCESSES.load(Ordering::Relaxed),
+        activation_fallback_alloc: CUDA_ACTIVATION_FALLBACK_ALLOC.load(Ordering::Relaxed),
+        activation_fallback_copy: CUDA_ACTIVATION_FALLBACK_COPY.load(Ordering::Relaxed),
+        activation_fallback_kernel: CUDA_ACTIVATION_FALLBACK_KERNEL.load(Ordering::Relaxed),
+        log_softmax_attempts: CUDA_LOGSOFTMAX_ATTEMPTS.load(Ordering::Relaxed),
+        log_softmax_successes: CUDA_LOGSOFTMAX_SUCCESSES.load(Ordering::Relaxed),
+        log_softmax_fallback_alloc: CUDA_LOGSOFTMAX_FALLBACK_ALLOC.load(Ordering::Relaxed),
+        log_softmax_fallback_copy: CUDA_LOGSOFTMAX_FALLBACK_COPY.load(Ordering::Relaxed),
+        log_softmax_fallback_kernel: CUDA_LOGSOFTMAX_FALLBACK_KERNEL.load(Ordering::Relaxed),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn activation_counters_are_monotonic() {
+        let before = runtime_stats();
+        record_activation_attempt();
+        record_activation_fallback("kernel");
+        record_activation_success();
+        let after = runtime_stats();
+
+        assert!(after.activation_attempts >= before.activation_attempts + 1);
+        assert!(after.activation_fallback_kernel >= before.activation_fallback_kernel + 1);
+        assert!(after.activation_successes >= before.activation_successes + 1);
+    }
+
+    #[test]
+    fn log_softmax_counters_are_monotonic() {
+        let before = runtime_stats();
+        record_log_softmax_attempt();
+        record_log_softmax_fallback("copy");
+        record_log_softmax_success();
+        let after = runtime_stats();
+
+        assert!(after.log_softmax_attempts >= before.log_softmax_attempts + 1);
+        assert!(after.log_softmax_fallback_copy >= before.log_softmax_fallback_copy + 1);
+        assert!(after.log_softmax_successes >= before.log_softmax_successes + 1);
     }
 }
 

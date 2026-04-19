@@ -640,10 +640,12 @@ impl Tensor {
         if len == 0 {
             return self.relu_cpu_fallback();
         }
+        crate::cuda::record_activation_attempt();
 
         let d_data = match alloc::<f64>(len) {
             Ok(buf) => buf,
             Err(err) => {
+                crate::cuda::record_activation_fallback("alloc");
                 eprintln!(
                     "[Autograd] CUDA alloc ReLU buffer failed ({}), using CPU",
                     err
@@ -653,21 +655,25 @@ impl Tensor {
         };
 
         if let Err(err) = copy_h2d(&d_data, &self_data) {
+            crate::cuda::record_activation_fallback("copy");
             eprintln!("[Autograd] CUDA H2D ReLU failed ({}), using CPU", err);
             return self.relu_cpu_fallback();
         }
         drop(self_data);
 
         if let Err(err) = relu_inplace(&d_data) {
+            crate::cuda::record_activation_fallback("kernel");
             eprintln!("[Autograd] CUDA ReLU kernel failed ({}), using CPU", err);
             return self.relu_cpu_fallback();
         }
 
         let mut data = vec![0.0; len];
         if let Err(err) = copy_d2h(&mut data, &d_data) {
+            crate::cuda::record_activation_fallback("copy");
             eprintln!("[Autograd] CUDA D2H ReLU failed ({}), using CPU", err);
             return self.relu_cpu_fallback();
         }
+        crate::cuda::record_activation_success();
 
         let parents = vec![self.clone()];
         Tensor {
@@ -3461,10 +3467,12 @@ impl Tensor {
         if len == 0 {
             return self.gelu_cpu_fallback();
         }
+        crate::cuda::record_activation_attempt();
 
         let d_data = match alloc::<f64>(len) {
             Ok(buf) => buf,
             Err(err) => {
+                crate::cuda::record_activation_fallback("alloc");
                 eprintln!(
                     "[Autograd] CUDA alloc GELU buffer failed ({}), using CPU",
                     err
@@ -3474,21 +3482,25 @@ impl Tensor {
         };
 
         if let Err(err) = copy_h2d(&d_data, &self_data) {
+            crate::cuda::record_activation_fallback("copy");
             eprintln!("[Autograd] CUDA H2D GELU failed ({}), using CPU", err);
             return self.gelu_cpu_fallback();
         }
         drop(self_data);
 
         if let Err(err) = gelu_inplace(&d_data) {
+            crate::cuda::record_activation_fallback("kernel");
             eprintln!("[Autograd] CUDA GELU kernel failed ({}), using CPU", err);
             return self.gelu_cpu_fallback();
         }
 
         let mut data = vec![0.0; len];
         if let Err(err) = copy_d2h(&mut data, &d_data) {
+            crate::cuda::record_activation_fallback("copy");
             eprintln!("[Autograd] CUDA D2H GELU failed ({}), using CPU", err);
             return self.gelu_cpu_fallback();
         }
+        crate::cuda::record_activation_success();
 
         let parents = vec![self.clone()];
         let sqrt_2_over_pi = (2.0 / std::f64::consts::PI).sqrt();
@@ -3576,10 +3588,12 @@ impl Tensor {
         if len == 0 {
             return self.softmax_cpu_fallback();
         }
+        crate::cuda::record_activation_attempt();
 
         let d_data = match alloc::<f64>(len) {
             Ok(buf) => buf,
             Err(err) => {
+                crate::cuda::record_activation_fallback("alloc");
                 eprintln!(
                     "[Autograd] CUDA alloc Softmax buffer failed ({}), using CPU",
                     err
@@ -3589,21 +3603,25 @@ impl Tensor {
         };
 
         if let Err(err) = copy_h2d(&d_data, &self_data) {
+            crate::cuda::record_activation_fallback("copy");
             eprintln!("[Autograd] CUDA H2D Softmax failed ({}), using CPU", err);
             return self.softmax_cpu_fallback();
         }
         drop(self_data);
 
         if let Err(err) = softmax_inplace(&d_data, 1, len) {
+            crate::cuda::record_activation_fallback("kernel");
             eprintln!("[Autograd] CUDA Softmax kernel failed ({}), using CPU", err);
             return self.softmax_cpu_fallback();
         }
 
         let mut data = vec![0.0; len];
         if let Err(err) = copy_d2h(&mut data, &d_data) {
+            crate::cuda::record_activation_fallback("copy");
             eprintln!("[Autograd] CUDA D2H Softmax failed ({}), using CPU", err);
             return self.softmax_cpu_fallback();
         }
+        crate::cuda::record_activation_success();
 
         let softmax_cache: Arc<Vec<f64>> = Arc::new(data.clone());
         let parents = vec![self.clone()];
@@ -3690,10 +3708,12 @@ impl Tensor {
         if len == 0 || num_slices == 0 {
             return self.log_softmax_last_dim_cpu_fallback();
         }
+        crate::cuda::record_log_softmax_attempt();
 
         let d_in = match alloc::<f64>(len) {
             Ok(buf) => buf,
             Err(err) => {
+                crate::cuda::record_log_softmax_fallback("alloc");
                 eprintln!(
                     "[Autograd] CUDA alloc LogSoftmax input failed ({}), using CPU",
                     err
@@ -3704,6 +3724,7 @@ impl Tensor {
         let d_out = match alloc::<f64>(len) {
             Ok(buf) => buf,
             Err(err) => {
+                crate::cuda::record_log_softmax_fallback("alloc");
                 eprintln!(
                     "[Autograd] CUDA alloc LogSoftmax output failed ({}), using CPU",
                     err
@@ -3713,12 +3734,14 @@ impl Tensor {
         };
 
         if let Err(err) = copy_h2d(&d_in, &self_data) {
+            crate::cuda::record_log_softmax_fallback("copy");
             eprintln!("[Autograd] CUDA H2D LogSoftmax failed ({}), using CPU", err);
             return self.log_softmax_last_dim_cpu_fallback();
         }
         drop(self_data);
 
         if let Err(err) = cuda_log_softmax(&d_in, &d_out, num_slices, dim_size) {
+            crate::cuda::record_log_softmax_fallback("kernel");
             eprintln!(
                 "[Autograd] CUDA LogSoftmax kernel failed ({}), using CPU",
                 err
@@ -3728,9 +3751,11 @@ impl Tensor {
 
         let mut data = vec![0.0; len];
         if let Err(err) = copy_d2h(&mut data, &d_out) {
+            crate::cuda::record_log_softmax_fallback("copy");
             eprintln!("[Autograd] CUDA D2H LogSoftmax failed ({}), using CPU", err);
             return self.log_softmax_last_dim_cpu_fallback();
         }
+        crate::cuda::record_log_softmax_success();
 
         let softmax_cache: Arc<Vec<f64>> = Arc::new(data.iter().map(|v| v.exp()).collect());
         let parents = vec![self.clone()];
