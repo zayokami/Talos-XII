@@ -4,7 +4,9 @@
 #![allow(dead_code)]
 
 #[cfg(cuda)]
-use crate::cuda::bindings::{cuMemAlloc, cuMemFree, cuMemcpyDtoH, cuMemcpyHtoD, CUDA_SUCCESS};
+use crate::cuda::bindings::{
+    cuMemAlloc, cuMemFree, cuMemcpyDtoD, cuMemcpyDtoH, cuMemcpyHtoD, CUDA_SUCCESS,
+};
 use crate::cuda::error::{CudaError, CudaResult};
 #[cfg(cuda)]
 use std::ffi::c_void;
@@ -146,6 +148,38 @@ pub fn copy_d2h<T: Copy>(host: &mut [T], device: &DevicePtr<T>) -> CudaResult<()
     Ok(())
 }
 
+/// Copy data from device (GPU) to device (GPU) - synchronous
+#[cfg(cuda)]
+pub fn copy_d2d<T: Copy>(dst: &DevicePtr<T>, src: &DevicePtr<T>) -> CudaResult<()> {
+    if dst.size != src.size {
+        return Err(CudaError::SizeMismatch {
+            op: "cuMemcpyDtoD",
+            expected: dst.size,
+            actual: src.size,
+        });
+    }
+
+    let elem_size = std::mem::size_of::<T>();
+    let size_bytes = dst
+        .size
+        .checked_mul(elem_size)
+        .ok_or(CudaError::SizeOverflow {
+            op: "cuMemcpyDtoD",
+            count: dst.size,
+            elem_size,
+        })?;
+    unsafe {
+        let result = cuMemcpyDtoD(dst.ptr, src.ptr, size_bytes);
+        if result != CUDA_SUCCESS {
+            return Err(CudaError::Runtime {
+                op: "cuMemcpyDtoD",
+                code: result,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Copy data from device (GPU) to host (CPU) using raw pointers - synchronous
 /// Does NOT free the GPU memory (caller manages lifetime)
 #[cfg(cuda)]
@@ -228,5 +262,12 @@ pub fn copy_h2d<T: Copy>(_device: &DevicePtr<T>, _host: &[T]) -> CudaResult<()> 
 pub fn copy_d2h<T: Copy>(_host: &mut [T], _device: &DevicePtr<T>) -> CudaResult<()> {
     Err(CudaError::UnsupportedBuild {
         op: "cuda::memory::copy_d2h",
+    })
+}
+
+#[cfg(not(cuda))]
+pub fn copy_d2d<T: Copy>(_dst: &DevicePtr<T>, _src: &DevicePtr<T>) -> CudaResult<()> {
+    Err(CudaError::UnsupportedBuild {
+        op: "cuda::memory::copy_d2d",
     })
 }

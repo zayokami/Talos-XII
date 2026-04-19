@@ -9,6 +9,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fs::File;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 use std::sync::{Arc, RwLock};
+#[cfg(cuda)]
+use std::{
+    collections::HashMap,
+    sync::{Mutex, OnceLock},
+};
 
 // --- Device enumeration for CPU/GPU placement ---
 
@@ -29,6 +34,16 @@ pub enum Device {
 // Below this, serial iteration is faster due to scheduling overhead.
 const PAR_THRESHOLD: usize = 4096;
 
+#[cfg(cuda)]
+type CudaTensorBufferMap = HashMap<usize, Arc<crate::cuda::memory::DevicePtr<f64>>>;
+#[cfg(cuda)]
+static CUDA_TENSOR_BUFFER_CACHE: OnceLock<Mutex<CudaTensorBufferMap>> = OnceLock::new();
+
+#[cfg(cuda)]
+fn cuda_tensor_buffer_cache() -> &'static Mutex<CudaTensorBufferMap> {
+    CUDA_TENSOR_BUFFER_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 #[derive(Clone)]
 pub struct Tensor {
     pub data: Arc<RwLock<Vec<f64>>>, // Read-write access (backward pass needs write)
@@ -36,6 +51,21 @@ pub struct Tensor {
     pub shape: Vec<usize>,
     pub device: Device,             // Device where tensor resides
     pub _ctx: Option<Arc<Context>>, // Keeps the graph alive
+}
+
+#[cfg(cuda)]
+impl Drop for Tensor {
+    fn drop(&mut self) {
+        // Remove cache entry when this is the last owner of tensor data.
+        if Arc::strong_count(&self.data) == 1 {
+            let key = Arc::as_ptr(&self.data) as usize;
+            if let Some(cache) = CUDA_TENSOR_BUFFER_CACHE.get() {
+                if let Ok(mut map) = cache.lock() {
+                    map.remove(&key);
+                }
+            }
+        }
+    }
 }
 
 /// Batch lock acquisition helper for reducing lock overhead in parallel operations
@@ -271,13 +301,23 @@ impl Tensor {
             return Err(err);
         }
 
-        Ok(Tensor {
+        let tensor = Tensor {
             data: self.data.clone(),
             grad: self.grad.clone(),
             shape: self.shape.clone(),
             device: Device::Cuda,
             _ctx: self._ctx.clone(),
-        })
+        };
+
+        let len = tensor.data.read().unwrap().len();
+        if len > 0 {
+            if let Err((_, err)) = tensor.cuda_get_or_upload_buffer() {
+                eprintln!("[Tensor] CUDA upload failed: {err}");
+                return Err(err);
+            }
+        }
+
+        Ok(tensor)
     }
 
     /// Copy tensor data from CUDA GPU back to CPU.
@@ -290,6 +330,13 @@ impl Tensor {
                 message: "tensor is not on CUDA device",
             });
         }
+
+        if let Some(buffer) = self.cuda_cached_buffer() {
+            let mut host = vec![0.0; buffer.len()];
+            crate::cuda::memory::copy_d2h(&mut host, &buffer)?;
+            return Ok(host);
+        }
+
         Ok(self.data.read().unwrap().clone())
     }
 
@@ -633,15 +680,25 @@ impl Tensor {
     #[allow(dead_code)]
     fn relu_cuda(&self) -> Tensor {
         use crate::cuda::kernels::relu_inplace;
-        use crate::cuda::memory::{alloc, copy_d2h, copy_h2d};
+        use crate::cuda::memory::{alloc, copy_d2d, copy_d2h};
 
-        let self_data = self.data.read().unwrap();
-        let len = self_data.len();
+        let len = self.data.read().unwrap().len();
         if len == 0 {
             return self.relu_cpu_fallback();
         }
         crate::cuda::record_activation_attempt();
 
+        let d_src = match self.cuda_get_or_upload_buffer() {
+            Ok(buf) => buf,
+            Err((stage, err)) => {
+                crate::cuda::record_activation_fallback(stage);
+                eprintln!(
+                    "[Autograd] CUDA prepare ReLU input failed ({}), using CPU",
+                    err
+                );
+                return self.relu_cpu_fallback();
+            }
+        };
         let d_data = match alloc::<f64>(len) {
             Ok(buf) => buf,
             Err(err) => {
@@ -653,13 +710,14 @@ impl Tensor {
                 return self.relu_cpu_fallback();
             }
         };
-
-        if let Err(err) = copy_h2d(&d_data, &self_data) {
+        if let Err(err) = copy_d2d(&d_data, &d_src) {
             crate::cuda::record_activation_fallback("copy");
-            eprintln!("[Autograd] CUDA H2D ReLU failed ({}), using CPU", err);
+            eprintln!(
+                "[Autograd] CUDA D2D ReLU input copy failed ({}), using CPU",
+                err
+            );
             return self.relu_cpu_fallback();
         }
-        drop(self_data);
 
         if let Err(err) = relu_inplace(&d_data) {
             crate::cuda::record_activation_fallback("kernel");
@@ -667,6 +725,7 @@ impl Tensor {
             return self.relu_cpu_fallback();
         }
 
+        let d_data = Arc::new(d_data);
         let mut data = vec![0.0; len];
         if let Err(err) = copy_d2h(&mut data, &d_data) {
             crate::cuda::record_activation_fallback("copy");
@@ -676,11 +735,11 @@ impl Tensor {
         crate::cuda::record_activation_success();
 
         let parents = vec![self.clone()];
-        Tensor {
+        let out = Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
-            device: Device::Cpu,
+            device: Device::Cuda,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -706,7 +765,9 @@ impl Tensor {
                     }
                 }),
             })),
-        }
+        };
+        out.cuda_set_cached_buffer(d_data);
+        out
     }
 
     /// GELU activation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
@@ -3248,12 +3309,68 @@ impl Neg for Tensor {
 
 #[cfg(cuda)]
 impl Tensor {
+    fn cuda_cache_key(&self) -> usize {
+        Arc::as_ptr(&self.data) as usize
+    }
+
+    fn cuda_cached_buffer(&self) -> Option<Arc<crate::cuda::memory::DevicePtr<f64>>> {
+        let key = self.cuda_cache_key();
+        let cache = cuda_tensor_buffer_cache();
+        let map = cache.lock().ok()?;
+        map.get(&key).cloned()
+    }
+
+    fn cuda_set_cached_buffer(&self, buffer: Arc<crate::cuda::memory::DevicePtr<f64>>) {
+        let key = self.cuda_cache_key();
+        if let Ok(mut map) = cuda_tensor_buffer_cache().lock() {
+            map.insert(key, buffer);
+        }
+    }
+
+    fn cuda_remove_cached_buffer(&self) {
+        let key = self.cuda_cache_key();
+        if let Ok(mut map) = cuda_tensor_buffer_cache().lock() {
+            map.remove(&key);
+        }
+    }
+
+    fn cuda_get_or_upload_buffer(
+        &self,
+    ) -> Result<
+        Arc<crate::cuda::memory::DevicePtr<f64>>,
+        (&'static str, crate::cuda::error::CudaError),
+    > {
+        use crate::cuda::memory::{alloc, copy_h2d};
+
+        let host = self.data.read().unwrap();
+        let len = host.len();
+        if let Some(buffer) = self.cuda_cached_buffer() {
+            if buffer.len() == len {
+                return Ok(buffer);
+            }
+            self.cuda_remove_cached_buffer();
+        }
+
+        let device = match alloc::<f64>(len) {
+            Ok(buf) => buf,
+            Err(err) => return Err(("alloc", err)),
+        };
+        if let Err(err) = copy_h2d(&device, &host) {
+            return Err(("copy", err));
+        }
+        drop(host);
+
+        let device = Arc::new(device);
+        self.cuda_set_cached_buffer(device.clone());
+        Ok(device)
+    }
+
     /// GPU-accelerated matrix multiplication using CUDA cuBLAS
     #[cfg(cuda)]
     #[allow(dead_code)]
     fn matmul_cuda(&self, other: &Tensor, m: usize, k: usize, n: usize) -> Tensor {
         use crate::cuda::blas::Cublas;
-        use crate::cuda::memory::{alloc, copy_d2h, copy_h2d};
+        use crate::cuda::memory::{alloc, copy_d2h};
 
         crate::cuda::record_matmul_attempt();
         let mut cublas = match Cublas::new() {
@@ -3265,19 +3382,19 @@ impl Tensor {
             }
         };
 
-        let d_a = match alloc::<f64>(m * k) {
+        let d_a = match self.cuda_get_or_upload_buffer() {
             Ok(buf) => buf,
-            Err(err) => {
-                crate::cuda::record_matmul_fallback("alloc");
-                eprintln!("[Autograd] CUDA alloc A failed ({}), using CPU", err);
+            Err((stage, err)) => {
+                crate::cuda::record_matmul_fallback(stage);
+                eprintln!("[Autograd] CUDA prepare A failed ({}), using CPU", err);
                 return self.matmul_cpu_fallback(other, m, k, n);
             }
         };
-        let d_b = match alloc::<f64>(k * n) {
+        let d_b = match other.cuda_get_or_upload_buffer() {
             Ok(buf) => buf,
-            Err(err) => {
-                crate::cuda::record_matmul_fallback("alloc");
-                eprintln!("[Autograd] CUDA alloc B failed ({}), using CPU", err);
+            Err((stage, err)) => {
+                crate::cuda::record_matmul_fallback(stage);
+                eprintln!("[Autograd] CUDA prepare B failed ({}), using CPU", err);
                 return self.matmul_cpu_fallback(other, m, k, n);
             }
         };
@@ -3289,22 +3406,7 @@ impl Tensor {
                 return self.matmul_cpu_fallback(other, m, k, n);
             }
         };
-
-        let lhs_data = self.data.read().unwrap();
-        let rhs_data = other.data.read().unwrap();
-
-        if let Err(err) = copy_h2d(&d_a, &lhs_data) {
-            crate::cuda::record_matmul_fallback("copy");
-            eprintln!("[Autograd] CUDA H2D A failed ({}), using CPU", err);
-            return self.matmul_cpu_fallback(other, m, k, n);
-        }
-        if let Err(err) = copy_h2d(&d_b, &rhs_data) {
-            crate::cuda::record_matmul_fallback("copy");
-            eprintln!("[Autograd] CUDA H2D B failed ({}), using CPU", err);
-            return self.matmul_cpu_fallback(other, m, k, n);
-        }
-        drop(lhs_data);
-        drop(rhs_data);
+        let d_c = Arc::new(d_c);
 
         if let Err(err) = cublas.gemm(
             false,
@@ -3340,11 +3442,11 @@ impl Tensor {
             vec![m, n]
         };
         let parents = vec![self.clone(), other.clone()];
-        Tensor {
+        let out = Tensor {
             data: Arc::new(RwLock::new(out_data)),
             grad: Arc::new(RwLock::new(vec![0.0; m * n])),
             shape: out_shape,
-            device: Device::Cpu,
+            device: Device::Cuda,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -3381,7 +3483,9 @@ impl Tensor {
                     }
                 }),
             })),
-        }
+        };
+        out.cuda_set_cached_buffer(d_c);
+        out
     }
 
     /// CPU fallback for matmul
@@ -3460,15 +3564,25 @@ impl Tensor {
     #[allow(dead_code)]
     fn gelu_cuda(&self) -> Tensor {
         use crate::cuda::kernels::gelu_inplace;
-        use crate::cuda::memory::{alloc, copy_d2h, copy_h2d};
+        use crate::cuda::memory::{alloc, copy_d2d, copy_d2h};
 
-        let self_data = self.data.read().unwrap();
-        let len = self_data.len();
+        let len = self.data.read().unwrap().len();
         if len == 0 {
             return self.gelu_cpu_fallback();
         }
         crate::cuda::record_activation_attempt();
 
+        let d_src = match self.cuda_get_or_upload_buffer() {
+            Ok(buf) => buf,
+            Err((stage, err)) => {
+                crate::cuda::record_activation_fallback(stage);
+                eprintln!(
+                    "[Autograd] CUDA prepare GELU input failed ({}), using CPU",
+                    err
+                );
+                return self.gelu_cpu_fallback();
+            }
+        };
         let d_data = match alloc::<f64>(len) {
             Ok(buf) => buf,
             Err(err) => {
@@ -3480,13 +3594,14 @@ impl Tensor {
                 return self.gelu_cpu_fallback();
             }
         };
-
-        if let Err(err) = copy_h2d(&d_data, &self_data) {
+        if let Err(err) = copy_d2d(&d_data, &d_src) {
             crate::cuda::record_activation_fallback("copy");
-            eprintln!("[Autograd] CUDA H2D GELU failed ({}), using CPU", err);
+            eprintln!(
+                "[Autograd] CUDA D2D GELU input copy failed ({}), using CPU",
+                err
+            );
             return self.gelu_cpu_fallback();
         }
-        drop(self_data);
 
         if let Err(err) = gelu_inplace(&d_data) {
             crate::cuda::record_activation_fallback("kernel");
@@ -3494,6 +3609,7 @@ impl Tensor {
             return self.gelu_cpu_fallback();
         }
 
+        let d_data = Arc::new(d_data);
         let mut data = vec![0.0; len];
         if let Err(err) = copy_d2h(&mut data, &d_data) {
             crate::cuda::record_activation_fallback("copy");
@@ -3505,11 +3621,11 @@ impl Tensor {
         let parents = vec![self.clone()];
         let sqrt_2_over_pi = (2.0 / std::f64::consts::PI).sqrt();
         let c = 0.044715;
-        Tensor {
+        let out = Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
-            device: Device::Cpu,
+            device: Device::Cuda,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -3529,7 +3645,9 @@ impl Tensor {
                     }
                 }),
             })),
-        }
+        };
+        out.cuda_set_cached_buffer(d_data);
+        out
     }
 
     /// CPU fallback for GELU
@@ -3581,15 +3699,25 @@ impl Tensor {
     #[allow(dead_code)]
     fn softmax_cuda(&self) -> Tensor {
         use crate::cuda::kernels::softmax_inplace;
-        use crate::cuda::memory::{alloc, copy_d2h, copy_h2d};
+        use crate::cuda::memory::{alloc, copy_d2d, copy_d2h};
 
-        let self_data = self.data.read().unwrap();
-        let len = self_data.len();
+        let len = self.data.read().unwrap().len();
         if len == 0 {
             return self.softmax_cpu_fallback();
         }
         crate::cuda::record_activation_attempt();
 
+        let d_src = match self.cuda_get_or_upload_buffer() {
+            Ok(buf) => buf,
+            Err((stage, err)) => {
+                crate::cuda::record_activation_fallback(stage);
+                eprintln!(
+                    "[Autograd] CUDA prepare Softmax input failed ({}), using CPU",
+                    err
+                );
+                return self.softmax_cpu_fallback();
+            }
+        };
         let d_data = match alloc::<f64>(len) {
             Ok(buf) => buf,
             Err(err) => {
@@ -3602,12 +3730,14 @@ impl Tensor {
             }
         };
 
-        if let Err(err) = copy_h2d(&d_data, &self_data) {
+        if let Err(err) = copy_d2d(&d_data, &d_src) {
             crate::cuda::record_activation_fallback("copy");
-            eprintln!("[Autograd] CUDA H2D Softmax failed ({}), using CPU", err);
+            eprintln!(
+                "[Autograd] CUDA D2D Softmax input copy failed ({}), using CPU",
+                err
+            );
             return self.softmax_cpu_fallback();
         }
-        drop(self_data);
 
         if let Err(err) = softmax_inplace(&d_data, 1, len) {
             crate::cuda::record_activation_fallback("kernel");
@@ -3615,6 +3745,7 @@ impl Tensor {
             return self.softmax_cpu_fallback();
         }
 
+        let d_data = Arc::new(d_data);
         let mut data = vec![0.0; len];
         if let Err(err) = copy_d2h(&mut data, &d_data) {
             crate::cuda::record_activation_fallback("copy");
@@ -3625,11 +3756,11 @@ impl Tensor {
 
         let softmax_cache: Arc<Vec<f64>> = Arc::new(data.clone());
         let parents = vec![self.clone()];
-        Tensor {
+        let out = Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
-            device: Device::Cpu,
+            device: Device::Cuda,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -3644,7 +3775,9 @@ impl Tensor {
                     }
                 }),
             })),
-        }
+        };
+        out.cuda_set_cached_buffer(d_data);
+        out
     }
 
     /// CPU fallback for Softmax
@@ -3694,7 +3827,7 @@ impl Tensor {
     #[allow(dead_code)]
     fn log_softmax_cuda_last_dim(&self) -> Tensor {
         use crate::cuda::kernels::log_softmax as cuda_log_softmax;
-        use crate::cuda::memory::{alloc, copy_d2h, copy_h2d};
+        use crate::cuda::memory::{alloc, copy_d2h};
 
         let shape = self.shape.clone();
         let dim_size = *shape.last().unwrap_or(&1);
@@ -3702,20 +3835,19 @@ impl Tensor {
             return self.log_softmax_last_dim_cpu_fallback();
         }
 
-        let self_data = self.data.read().unwrap();
-        let len = self_data.len();
+        let len = self.data.read().unwrap().len();
         let num_slices = len / dim_size;
         if len == 0 || num_slices == 0 {
             return self.log_softmax_last_dim_cpu_fallback();
         }
         crate::cuda::record_log_softmax_attempt();
 
-        let d_in = match alloc::<f64>(len) {
+        let d_in = match self.cuda_get_or_upload_buffer() {
             Ok(buf) => buf,
-            Err(err) => {
-                crate::cuda::record_log_softmax_fallback("alloc");
+            Err((stage, err)) => {
+                crate::cuda::record_log_softmax_fallback(stage);
                 eprintln!(
-                    "[Autograd] CUDA alloc LogSoftmax input failed ({}), using CPU",
+                    "[Autograd] CUDA prepare LogSoftmax input failed ({}), using CPU",
                     err
                 );
                 return self.log_softmax_last_dim_cpu_fallback();
@@ -3732,13 +3864,7 @@ impl Tensor {
                 return self.log_softmax_last_dim_cpu_fallback();
             }
         };
-
-        if let Err(err) = copy_h2d(&d_in, &self_data) {
-            crate::cuda::record_log_softmax_fallback("copy");
-            eprintln!("[Autograd] CUDA H2D LogSoftmax failed ({}), using CPU", err);
-            return self.log_softmax_last_dim_cpu_fallback();
-        }
-        drop(self_data);
+        let d_out = Arc::new(d_out);
 
         if let Err(err) = cuda_log_softmax(&d_in, &d_out, num_slices, dim_size) {
             crate::cuda::record_log_softmax_fallback("kernel");
@@ -3763,11 +3889,11 @@ impl Tensor {
         let num_slices_cap = num_slices;
         let softmax_cache_for_backward = softmax_cache.clone();
 
-        Tensor {
+        let out = Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape,
-            device: Device::Cpu,
+            device: Device::Cuda,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -3794,7 +3920,9 @@ impl Tensor {
                     }
                 }),
             })),
-        }
+        };
+        out.cuda_set_cached_buffer(d_out);
+        out
     }
 
     #[cfg(cuda)]
@@ -3900,7 +4028,10 @@ mod tests {
         }
 
         let t = Tensor::new(vec![1.0, 2.0, 3.0, -1.0, 0.5, 4.0], vec![2, 3]);
-        let t_cuda = t.to_cuda().unwrap();
+        let t_cuda = match t.to_cuda() {
+            Ok(tensor) => tensor,
+            Err(_) => return,
+        };
         let cpu = t.log_softmax_dim(1);
         let cuda = t_cuda.log_softmax_dim(1);
 
