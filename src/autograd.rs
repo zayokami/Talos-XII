@@ -3369,18 +3369,11 @@ impl Tensor {
     #[cfg(cuda)]
     #[allow(dead_code)]
     fn matmul_cuda(&self, other: &Tensor, m: usize, k: usize, n: usize) -> Tensor {
-        use crate::cuda::blas::Cublas;
+        use crate::cuda::blas::gemm_thread_local;
+        use crate::cuda::error::CudaError;
         use crate::cuda::memory::{alloc, copy_d2h};
 
         crate::cuda::record_matmul_attempt();
-        let mut cublas = match Cublas::new() {
-            Ok(c) => c,
-            Err(err) => {
-                crate::cuda::record_matmul_fallback("init");
-                eprintln!("[Autograd] cuBLAS init failed ({}), using CPU", err);
-                return self.matmul_cpu_fallback(other, m, k, n);
-            }
-        };
 
         let d_a = match self.cuda_get_or_upload_buffer() {
             Ok(buf) => buf,
@@ -3408,7 +3401,7 @@ impl Tensor {
         };
         let d_c = Arc::new(d_c);
 
-        if let Err(err) = cublas.gemm(
+        if let Err(err) = gemm_thread_local(
             false,
             false,
             m as i32,
@@ -3423,7 +3416,11 @@ impl Tensor {
             d_c.as_raw(),
             n as i32,
         ) {
-            crate::cuda::record_matmul_fallback("gemm");
+            let stage = match &err {
+                CudaError::Blas { op, .. } if *op == "cublasCreate_v2" => "init",
+                _ => "gemm",
+            };
+            crate::cuda::record_matmul_fallback(stage);
             eprintln!("[Autograd] CUDA GEMM failed ({}), using CPU", err);
             return self.matmul_cpu_fallback(other, m, k, n);
         }
