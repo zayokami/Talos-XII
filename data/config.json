@@ -100,10 +100,10 @@
     "apply_dqn": "是否在DQN模块应用ACHF",
     "infer_gate": "推理时门控策略，例如 g_min"
   },
-  "pool_name": "河流的女儿",
-  "pool_name_en": "River's Daughter",
-  "up_six": ["汤汤"],
-  "up_six_en": ["Tangtang"],
+  "pool_name": "春晓时",
+  "pool_name_en": "Spring Dawn",
+  "up_six": ["庄方宜"],
+  "up_six_en": ["Zhuang Fangyi"],
   "up_rate": 0.75,
   "prob_6_base": 0.008,
   "prob_5_base": 0.08,
@@ -116,11 +116,11 @@
   "always_5_star": false,
   "big_pity_requires_not_up": true,
   "six_stars": [
-    "汤汤", "伊冯", "洁尔佩塔", "余烬",
+    "庄方宜", "伊冯", "洁尔佩塔", "余烬",
     "黎风", "艾尔黛拉", "别礼", "骏卫"
   ],
   "six_stars_en": [
-    "Tangtang", "Yvonne", "Gilberta", "Ember",
+    "Zhuang Fangyi", "Yvonne", "Gilberta", "Ember",
     "Lifeng", "Ardelia", "Last Rite", "Pogranichnik"
   ],
   "five_stars": [
@@ -137,12 +137,93 @@
   "four_stars_en": [
     "Catcher", "Antal", "Fluorite", "Akekuri"
   ],
-  "active_pool": "char_up_20260312",
+  "active_pool": "char_up_20260417",
   "pools": [
+    {
+      "id": "char_up_20260417",
+      "name": "春晓时",
+      "name_en": "Spring Dawn",
+      "pool_type": "character_up",
+      "up_six": ["庄方宜"],
+      "up_six_en": ["Zhuang Fangyi"],
+      "up_rate": 0.75,
+      "prob_6_base": 0.008,
+      "prob_5_base": 0.08,
+      "prob_4_base": 0.912,
+      "soft_pity_start": 65,
+      "small_pity_guarantee": 80,
+      "big_pity_cumulative": 120,
+      "up_pity_soft": 0,
+      "five_star_pity": 10,
+      "always_5_star": false,
+      "big_pity_requires_not_up": true,
+      "six_stars": [
+        "庄方宜", "伊冯", "洁尔佩塔", "余烬",
+        "黎风", "艾尔黛拉", "别礼", "骏卫"
+      ],
+      "six_stars_en": [
+        "Zhuang Fangyi", "Yvonne", "Gilberta", "Ember",
+        "Lifeng", "Ardelia", "Last Rite", "Pogranichnik"
+      ],
+      "five_stars": [
+        "昼雪", "赛希", "狼卫", "佩丽卡",
+        "弧光", "阿列什", "艾维文娜", "大潘", "埃特拉"
+      ],
+      "five_stars_en": [
+        "Snowshine", "Xaihi", "Wulfgard", "Perlica",
+        "Arclight", "Alesh", "Avywenna", "Da Pan", "Estella"
+      ],
+      "four_stars": [
+        "卡契尔", "安塔尔", "萤石", "秋栗"
+      ],
+      "four_stars_en": [
+        "Catcher", "Antal", "Fluorite", "Akekuri"
+      ]
+    },
+    {
+      "id": "char_up_20260514",
+      "name": "辉光庆典",
+      "name_en": "Radiance Celebration",
+      "pool_type": "character_up",
+      "up_six": ["骏卫", "莱万汀", "艾尔黛拉", "洁尔佩塔"],
+      "up_six_en": ["Pogranichnik", "Laevatain", "Ardelia", "Gilberta"],
+      "up_rate": 1.0,
+      "prob_6_base": 0.008,
+      "prob_5_base": 0.08,
+      "prob_4_base": 0.912,
+      "soft_pity_start": 65,
+      "small_pity_guarantee": 80,
+      "big_pity_cumulative": 120,
+      "up_pity_soft": 0,
+      "five_star_pity": 10,
+      "always_5_star": false,
+      "big_pity_requires_not_up": false,
+      "six_stars": [
+        "骏卫", "莱万汀", "艾尔黛拉", "洁尔佩塔"
+      ],
+      "six_stars_en": [
+        "Pogranichnik", "Laevatain", "Ardelia", "Gilberta"
+      ],
+      "five_stars": [
+        "昼雪", "赛希", "狼卫", "佩丽卡",
+        "弧光", "阿列什", "艾维文娜", "大潘", "埃特拉"
+      ],
+      "five_stars_en": [
+        "Snowshine", "Xaihi", "Wulfgard", "Perlica",
+        "Arclight", "Alesh", "Avywenna", "Da Pan", "Estella"
+      ],
+      "four_stars": [
+        "卡契尔", "安塔尔", "萤石", "秋栗"
+      ],
+      "four_stars_en": [
+        "Catcher", "Antal", "Fluorite", "Akekuri"
+      ]
+    },
     {
       "id": "char_up_20260312",
       "name": "河流的女儿",
       "name_en": "River's Daughter",
+      "is_archived": true,
       "pool_type": "character_up",
       "up_six": ["汤汤"],
       "up_six_en": ["Tangtang"],
