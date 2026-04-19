@@ -3189,9 +3189,11 @@ impl Tensor {
         use crate::cuda::blas::Cublas;
         use crate::cuda::memory::{alloc, copy_d2h, copy_h2d};
 
+        crate::cuda::record_matmul_attempt();
         let mut cublas = match Cublas::new() {
             Ok(c) => c,
             Err(err) => {
+                crate::cuda::record_matmul_fallback("init");
                 eprintln!("[Autograd] cuBLAS init failed ({}), using CPU", err);
                 return self.matmul_cpu_fallback(other, m, k, n);
             }
@@ -3200,6 +3202,7 @@ impl Tensor {
         let d_a = match alloc::<f64>(m * k) {
             Ok(buf) => buf,
             Err(err) => {
+                crate::cuda::record_matmul_fallback("alloc");
                 eprintln!("[Autograd] CUDA alloc A failed ({}), using CPU", err);
                 return self.matmul_cpu_fallback(other, m, k, n);
             }
@@ -3207,6 +3210,7 @@ impl Tensor {
         let d_b = match alloc::<f64>(k * n) {
             Ok(buf) => buf,
             Err(err) => {
+                crate::cuda::record_matmul_fallback("alloc");
                 eprintln!("[Autograd] CUDA alloc B failed ({}), using CPU", err);
                 return self.matmul_cpu_fallback(other, m, k, n);
             }
@@ -3214,6 +3218,7 @@ impl Tensor {
         let d_c = match alloc::<f64>(m * n) {
             Ok(buf) => buf,
             Err(err) => {
+                crate::cuda::record_matmul_fallback("alloc");
                 eprintln!("[Autograd] CUDA alloc C failed ({}), using CPU", err);
                 return self.matmul_cpu_fallback(other, m, k, n);
             }
@@ -3223,10 +3228,12 @@ impl Tensor {
         let rhs_data = other.data.read().unwrap();
 
         if let Err(err) = copy_h2d(&d_a, &lhs_data) {
+            crate::cuda::record_matmul_fallback("copy");
             eprintln!("[Autograd] CUDA H2D A failed ({}), using CPU", err);
             return self.matmul_cpu_fallback(other, m, k, n);
         }
         if let Err(err) = copy_h2d(&d_b, &rhs_data) {
+            crate::cuda::record_matmul_fallback("copy");
             eprintln!("[Autograd] CUDA H2D B failed ({}), using CPU", err);
             return self.matmul_cpu_fallback(other, m, k, n);
         }
@@ -3248,15 +3255,18 @@ impl Tensor {
             d_c.as_raw(),
             n as i32,
         ) {
+            crate::cuda::record_matmul_fallback("gemm");
             eprintln!("[Autograd] CUDA GEMM failed ({}), using CPU", err);
             return self.matmul_cpu_fallback(other, m, k, n);
         }
 
         let mut out_data = vec![0.0; m * n];
         if let Err(err) = copy_d2h(&mut out_data, &d_c) {
+            crate::cuda::record_matmul_fallback("copy");
             eprintln!("[Autograd] CUDA D2H C failed ({}), using CPU", err);
             return self.matmul_cpu_fallback(other, m, k, n);
         }
+        crate::cuda::record_matmul_success();
 
         let out_shape = if self.shape.len() == 1 {
             vec![n]

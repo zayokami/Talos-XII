@@ -17,12 +17,66 @@ pub mod memory;
 pub mod stream;
 
 use self::error::{CudaError, CudaResult};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(cuda)]
 use std::{ffi::c_char, ffi::CStr};
 
 /// Indicates whether CUDA is available and initialized
 static CUDA_INITIALIZED: AtomicBool = AtomicBool::new(false);
+static CUDA_MATMUL_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static CUDA_MATMUL_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+static CUDA_MATMUL_FALLBACK_INIT: AtomicU64 = AtomicU64::new(0);
+static CUDA_MATMUL_FALLBACK_ALLOC: AtomicU64 = AtomicU64::new(0);
+static CUDA_MATMUL_FALLBACK_COPY: AtomicU64 = AtomicU64::new(0);
+static CUDA_MATMUL_FALLBACK_GEMM: AtomicU64 = AtomicU64::new(0);
+
+/// Runtime observability counters for CUDA matmul routing.
+#[derive(Debug, Clone, Copy)]
+pub struct CudaRuntimeStats {
+    pub matmul_attempts: u64,
+    pub matmul_successes: u64,
+    pub matmul_fallback_init: u64,
+    pub matmul_fallback_alloc: u64,
+    pub matmul_fallback_copy: u64,
+    pub matmul_fallback_gemm: u64,
+}
+
+pub fn record_matmul_attempt() {
+    CUDA_MATMUL_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_matmul_success() {
+    CUDA_MATMUL_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_matmul_fallback(stage: &'static str) {
+    match stage {
+        "init" => {
+            CUDA_MATMUL_FALLBACK_INIT.fetch_add(1, Ordering::Relaxed);
+        }
+        "alloc" => {
+            CUDA_MATMUL_FALLBACK_ALLOC.fetch_add(1, Ordering::Relaxed);
+        }
+        "copy" => {
+            CUDA_MATMUL_FALLBACK_COPY.fetch_add(1, Ordering::Relaxed);
+        }
+        "gemm" => {
+            CUDA_MATMUL_FALLBACK_GEMM.fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+}
+
+pub fn runtime_stats() -> CudaRuntimeStats {
+    CudaRuntimeStats {
+        matmul_attempts: CUDA_MATMUL_ATTEMPTS.load(Ordering::Relaxed),
+        matmul_successes: CUDA_MATMUL_SUCCESSES.load(Ordering::Relaxed),
+        matmul_fallback_init: CUDA_MATMUL_FALLBACK_INIT.load(Ordering::Relaxed),
+        matmul_fallback_alloc: CUDA_MATMUL_FALLBACK_ALLOC.load(Ordering::Relaxed),
+        matmul_fallback_copy: CUDA_MATMUL_FALLBACK_COPY.load(Ordering::Relaxed),
+        matmul_fallback_gemm: CUDA_MATMUL_FALLBACK_GEMM.load(Ordering::Relaxed),
+    }
+}
 
 /// Device information
 pub struct CudaDevice {
