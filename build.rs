@@ -196,6 +196,7 @@ fn main() {
     } else {
         println!("cargo:rustc-link-lib=dylib=cuda_lib");
     }
+    println!("cargo:rustc-link-lib=dylib=cudart");
     println!("cargo:rustc-link-lib=dylib=cuda");
     println!("cargo:rustc-link-lib=dylib=cublas");
 

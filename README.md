@@ -48,6 +48,7 @@ cargo run --features cuda -- simulate -n 1000 -p 100
 
 当二进制未启用 `cuda` feature 时，`cuda/auto` 会自动回退到 CPU。
 运行时会输出明确的设备初始化/回退原因，便于定位 CUDA 环境与配置问题。
+在启用 `cuda` feature 的构建中，`Tensor` 的 CUDA 路径已覆盖 `matmul`（cuBLAS）与 `relu/gelu/softmax`（CUDA kernel），遇到运行时错误会记录原因并回退到 CPU 路径。
 
 启动成功会看到类似输出：
 

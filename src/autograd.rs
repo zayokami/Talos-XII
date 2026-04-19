@@ -632,7 +632,75 @@ impl Tensor {
     #[cfg(cuda)]
     #[allow(dead_code)]
     fn relu_cuda(&self) -> Tensor {
-        self.relu_cpu_fallback()
+        use crate::cuda::kernels::relu_inplace;
+        use crate::cuda::memory::{alloc, copy_d2h, copy_h2d};
+
+        let self_data = self.data.read().unwrap();
+        let len = self_data.len();
+        if len == 0 {
+            return self.relu_cpu_fallback();
+        }
+
+        let d_data = match alloc::<f64>(len) {
+            Ok(buf) => buf,
+            Err(err) => {
+                eprintln!(
+                    "[Autograd] CUDA alloc ReLU buffer failed ({}), using CPU",
+                    err
+                );
+                return self.relu_cpu_fallback();
+            }
+        };
+
+        if let Err(err) = copy_h2d(&d_data, &self_data) {
+            eprintln!("[Autograd] CUDA H2D ReLU failed ({}), using CPU", err);
+            return self.relu_cpu_fallback();
+        }
+        drop(self_data);
+
+        if let Err(err) = relu_inplace(&d_data) {
+            eprintln!("[Autograd] CUDA ReLU kernel failed ({}), using CPU", err);
+            return self.relu_cpu_fallback();
+        }
+
+        let mut data = vec![0.0; len];
+        if let Err(err) = copy_d2h(&mut data, &d_data) {
+            eprintln!("[Autograd] CUDA D2H ReLU failed ({}), using CPU", err);
+            return self.relu_cpu_fallback();
+        }
+
+        let parents = vec![self.clone()];
+        Tensor {
+            data: Arc::new(RwLock::new(data)),
+            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            shape: self.shape.clone(),
+            device: Device::Cpu,
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    let input = &parents[0];
+                    let input_data = input.data.read().unwrap();
+                    let mut inp_grad = input.grad.write().unwrap();
+                    if inp_grad.len() >= PAR_THRESHOLD {
+                        inp_grad
+                            .par_iter_mut()
+                            .zip(grad_out.par_iter())
+                            .zip(input_data.par_iter())
+                            .for_each(|((ig, &go), &val)| {
+                                if val > 0.0 {
+                                    *ig += go;
+                                }
+                            });
+                    } else {
+                        for i in 0..inp_grad.len() {
+                            if input_data[i] > 0.0 {
+                                inp_grad[i] += grad_out[i];
+                            }
+                        }
+                    }
+                }),
+            })),
+        }
     }
 
     /// GELU activation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
@@ -955,6 +1023,11 @@ impl Tensor {
     /// Fused for efficiency with numerical stability.
     pub fn log_softmax_dim(&self, dim: usize) -> Tensor {
         assert!(dim < self.shape.len(), "dim out of bounds");
+        #[cfg(cuda)]
+        if self.device == Device::Cuda && dim == self.shape.len() - 1 {
+            return self.log_softmax_cuda_last_dim();
+        }
+
         let self_data = self.data.read().unwrap();
         let shape = &self.shape;
         let rank = shape.len();
@@ -3393,7 +3466,71 @@ impl Tensor {
     #[cfg(cuda)]
     #[allow(dead_code)]
     fn gelu_cuda(&self) -> Tensor {
-        self.gelu_cpu_fallback()
+        use crate::cuda::kernels::gelu_inplace;
+        use crate::cuda::memory::{alloc, copy_d2h, copy_h2d};
+
+        let self_data = self.data.read().unwrap();
+        let len = self_data.len();
+        if len == 0 {
+            return self.gelu_cpu_fallback();
+        }
+
+        let d_data = match alloc::<f64>(len) {
+            Ok(buf) => buf,
+            Err(err) => {
+                eprintln!(
+                    "[Autograd] CUDA alloc GELU buffer failed ({}), using CPU",
+                    err
+                );
+                return self.gelu_cpu_fallback();
+            }
+        };
+
+        if let Err(err) = copy_h2d(&d_data, &self_data) {
+            eprintln!("[Autograd] CUDA H2D GELU failed ({}), using CPU", err);
+            return self.gelu_cpu_fallback();
+        }
+        drop(self_data);
+
+        if let Err(err) = gelu_inplace(&d_data) {
+            eprintln!("[Autograd] CUDA GELU kernel failed ({}), using CPU", err);
+            return self.gelu_cpu_fallback();
+        }
+
+        let mut data = vec![0.0; len];
+        if let Err(err) = copy_d2h(&mut data, &d_data) {
+            eprintln!("[Autograd] CUDA D2H GELU failed ({}), using CPU", err);
+            return self.gelu_cpu_fallback();
+        }
+
+        let parents = vec![self.clone()];
+        let sqrt_2_over_pi = (2.0 / std::f64::consts::PI).sqrt();
+        let c = 0.044715;
+        Tensor {
+            data: Arc::new(RwLock::new(data)),
+            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            shape: self.shape.clone(),
+            device: Device::Cpu,
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    let input = &parents[0];
+                    let input_data = input.data.read().unwrap();
+                    let mut inp_grad = input.grad.write().unwrap();
+                    for i in 0..inp_grad.len() {
+                        let x = input_data[i];
+                        let x2 = x * x;
+                        let x3 = x2 * x;
+                        let u = sqrt_2_over_pi * (x + c * x3);
+                        let tanh_u = u.tanh();
+                        let sech2_u = 1.0 - tanh_u * tanh_u;
+                        let du_dx = sqrt_2_over_pi * (1.0 + 3.0 * c * x2);
+                        let gelu_grad = 0.5 * (1.0 + tanh_u) + 0.5 * x * sech2_u * du_dx;
+                        inp_grad[i] += grad_out[i] * gelu_grad;
+                    }
+                }),
+            })),
+        }
     }
 
     /// CPU fallback for GELU
@@ -3444,7 +3581,65 @@ impl Tensor {
     #[cfg(cuda)]
     #[allow(dead_code)]
     fn softmax_cuda(&self) -> Tensor {
-        self.softmax_cpu_fallback()
+        use crate::cuda::kernels::softmax_inplace;
+        use crate::cuda::memory::{alloc, copy_d2h, copy_h2d};
+
+        let self_data = self.data.read().unwrap();
+        let len = self_data.len();
+        if len == 0 {
+            return self.softmax_cpu_fallback();
+        }
+
+        let d_data = match alloc::<f64>(len) {
+            Ok(buf) => buf,
+            Err(err) => {
+                eprintln!(
+                    "[Autograd] CUDA alloc Softmax buffer failed ({}), using CPU",
+                    err
+                );
+                return self.softmax_cpu_fallback();
+            }
+        };
+
+        if let Err(err) = copy_h2d(&d_data, &self_data) {
+            eprintln!("[Autograd] CUDA H2D Softmax failed ({}), using CPU", err);
+            return self.softmax_cpu_fallback();
+        }
+        drop(self_data);
+
+        if let Err(err) = softmax_inplace(&d_data, 1, len) {
+            eprintln!("[Autograd] CUDA Softmax kernel failed ({}), using CPU", err);
+            return self.softmax_cpu_fallback();
+        }
+
+        let mut data = vec![0.0; len];
+        if let Err(err) = copy_d2h(&mut data, &d_data) {
+            eprintln!("[Autograd] CUDA D2H Softmax failed ({}), using CPU", err);
+            return self.softmax_cpu_fallback();
+        }
+
+        let softmax_cache: Arc<Vec<f64>> = Arc::new(data.clone());
+        let parents = vec![self.clone()];
+        Tensor {
+            data: Arc::new(RwLock::new(data)),
+            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            shape: self.shape.clone(),
+            device: Device::Cpu,
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    let mut inp_grad = parents[0].grad.write().unwrap();
+                    let sum_term: f64 = grad_out
+                        .iter()
+                        .zip(softmax_cache.iter())
+                        .map(|(&g, &s)| g * s)
+                        .sum();
+                    for i in 0..inp_grad.len() {
+                        inp_grad[i] += softmax_cache[i] * (grad_out[i] - sum_term);
+                    }
+                }),
+            })),
+        }
     }
 
     /// CPU fallback for Softmax
@@ -3487,6 +3682,119 @@ impl Tensor {
                 }),
             })),
         }
+    }
+
+    /// GPU-accelerated log-softmax for the last dimension.
+    #[cfg(cuda)]
+    #[allow(dead_code)]
+    fn log_softmax_cuda_last_dim(&self) -> Tensor {
+        use crate::cuda::kernels::log_softmax as cuda_log_softmax;
+        use crate::cuda::memory::{alloc, copy_d2h, copy_h2d};
+
+        let shape = self.shape.clone();
+        let dim_size = *shape.last().unwrap_or(&1);
+        if dim_size == 0 {
+            return self.log_softmax_last_dim_cpu_fallback();
+        }
+
+        let self_data = self.data.read().unwrap();
+        let len = self_data.len();
+        let num_slices = len / dim_size;
+        if len == 0 || num_slices == 0 {
+            return self.log_softmax_last_dim_cpu_fallback();
+        }
+
+        let d_in = match alloc::<f64>(len) {
+            Ok(buf) => buf,
+            Err(err) => {
+                eprintln!(
+                    "[Autograd] CUDA alloc LogSoftmax input failed ({}), using CPU",
+                    err
+                );
+                return self.log_softmax_last_dim_cpu_fallback();
+            }
+        };
+        let d_out = match alloc::<f64>(len) {
+            Ok(buf) => buf,
+            Err(err) => {
+                eprintln!(
+                    "[Autograd] CUDA alloc LogSoftmax output failed ({}), using CPU",
+                    err
+                );
+                return self.log_softmax_last_dim_cpu_fallback();
+            }
+        };
+
+        if let Err(err) = copy_h2d(&d_in, &self_data) {
+            eprintln!("[Autograd] CUDA H2D LogSoftmax failed ({}), using CPU", err);
+            return self.log_softmax_last_dim_cpu_fallback();
+        }
+        drop(self_data);
+
+        if let Err(err) = cuda_log_softmax(&d_in, &d_out, num_slices, dim_size) {
+            eprintln!(
+                "[Autograd] CUDA LogSoftmax kernel failed ({}), using CPU",
+                err
+            );
+            return self.log_softmax_last_dim_cpu_fallback();
+        }
+
+        let mut data = vec![0.0; len];
+        if let Err(err) = copy_d2h(&mut data, &d_out) {
+            eprintln!("[Autograd] CUDA D2H LogSoftmax failed ({}), using CPU", err);
+            return self.log_softmax_last_dim_cpu_fallback();
+        }
+
+        let softmax_cache: Arc<Vec<f64>> = Arc::new(data.iter().map(|v| v.exp()).collect());
+        let parents = vec![self.clone()];
+        let dim_size_cap = dim_size;
+        let num_slices_cap = num_slices;
+        let softmax_cache_for_backward = softmax_cache.clone();
+
+        Tensor {
+            data: Arc::new(RwLock::new(data)),
+            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            shape,
+            device: Device::Cpu,
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    let mut sum_terms = vec![0.0; num_slices_cap];
+                    for (slice_idx, sum_term) in sum_terms.iter_mut().enumerate() {
+                        let base = slice_idx * dim_size_cap;
+                        let mut slice_sum = 0.0;
+                        for j in 0..dim_size_cap {
+                            let idx = base + j;
+                            slice_sum += grad_out[idx] * softmax_cache_for_backward[idx];
+                        }
+                        *sum_term = slice_sum;
+                    }
+
+                    let mut inp_grad = parents[0].grad.write().unwrap();
+                    #[allow(clippy::needless_range_loop)]
+                    for slice_idx in 0..num_slices_cap {
+                        let base = slice_idx * dim_size_cap;
+                        for j in 0..dim_size_cap {
+                            let idx = base + j;
+                            inp_grad[idx] += softmax_cache_for_backward[idx]
+                                * (grad_out[idx] - sum_terms[slice_idx]);
+                        }
+                    }
+                }),
+            })),
+        }
+    }
+
+    #[cfg(cuda)]
+    fn log_softmax_last_dim_cpu_fallback(&self) -> Tensor {
+        let cpu_view = Tensor {
+            data: self.data.clone(),
+            grad: self.grad.clone(),
+            shape: self.shape.clone(),
+            device: Device::Cpu,
+            _ctx: self._ctx.clone(),
+        };
+        cpu_view.log_softmax_dim(cpu_view.shape.len() - 1)
     }
 }
 
