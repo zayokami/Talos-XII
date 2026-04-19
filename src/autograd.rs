@@ -1050,7 +1050,7 @@ impl Tensor {
         let self_data = self.data.read().unwrap();
         let len = self_data.len();
         let cols = self.shape.last().copied().unwrap_or(len.max(1));
-        let rows = if cols == 0 { 0 } else { len / cols };
+        let rows = len.checked_div(cols).unwrap_or(0);
         assert!(
             rows.checked_mul(cols) == Some(len),
             "Softmax shape mismatch"
