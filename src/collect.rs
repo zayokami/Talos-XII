@@ -179,7 +179,7 @@ impl PlayerDatabase {
                 avg_pulls_per_six,
             });
         }
-        stats_list.sort_by(|a, b| b.total_pulls.cmp(&a.total_pulls));
+        stats_list.sort_by_key(|b| std::cmp::Reverse(b.total_pulls));
         stats_list
     }
 }

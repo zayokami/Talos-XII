@@ -265,10 +265,10 @@ impl Tensor {
     /// Current implementation keeps data on host while marking device intent.
     #[cfg(cuda)]
     #[allow(dead_code)]
-    pub fn to_cuda(&self) -> Result<Tensor, ()> {
-        if crate::cuda::init().is_err() {
-            eprintln!("[Tensor] CUDA runtime unavailable");
-            return Err(());
+    pub fn to_cuda(&self) -> crate::cuda::error::CudaResult<Tensor> {
+        if let Err(err) = crate::cuda::init() {
+            eprintln!("[Tensor] CUDA runtime unavailable: {err}");
+            return Err(err);
         }
 
         Ok(Tensor {
@@ -283,9 +283,12 @@ impl Tensor {
     /// Copy tensor data from CUDA GPU back to CPU.
     #[cfg(cuda)]
     #[allow(dead_code)]
-    pub fn from_cuda(&self) -> Result<Vec<f64>, ()> {
+    pub fn from_cuda(&self) -> crate::cuda::error::CudaResult<Vec<f64>> {
         if self.device != Device::Cuda {
-            return Err(());
+            return Err(crate::cuda::error::CudaError::InvalidInput {
+                op: "Tensor::from_cuda",
+                message: "tensor is not on CUDA device",
+            });
         }
         Ok(self.data.read().unwrap().clone())
     }

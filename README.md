@@ -47,6 +47,7 @@ cargo run --features cuda -- simulate -n 1000 -p 100
 - `auto`：自动探测，优先 CUDA
 
 当二进制未启用 `cuda` feature 时，`cuda/auto` 会自动回退到 CPU。
+运行时会输出明确的设备初始化/回退原因，便于定位 CUDA 环境与配置问题。
 
 启动成功会看到类似输出：
 

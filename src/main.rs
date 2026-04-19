@@ -623,19 +623,29 @@ fn apply_compute_device_policy(config: &mut Config) {
         ComputeDevice::Auto => {
             #[cfg(cuda)]
             {
-                if cuda::init().is_ok() && cuda::device_count() > 0 {
-                    if let Ok(dev) = cuda::get_device_info(0) {
-                        info!(
-                            "[Device] Auto-selected CUDA: {} (CC {}.{})",
-                            dev.name, dev.compute_capability.0, dev.compute_capability.1
-                        );
-                    } else {
-                        info!("[Device] Auto-selected CUDA.");
+                match cuda::device_count() {
+                    Ok(count) if count > 0 => {
+                        if let Ok(dev) = cuda::get_device_info(0) {
+                            info!(
+                                "[Device] Auto-selected CUDA: {} (CC {}.{})",
+                                dev.name, dev.compute_capability.0, dev.compute_capability.1
+                            );
+                        } else {
+                            info!("[Device] Auto-selected CUDA.");
+                        }
+                        config.device = ComputeDevice::Cuda;
                     }
-                    config.device = ComputeDevice::Cuda;
-                } else {
-                    info!("[Device] Auto requested, CUDA unavailable. Falling back to CPU.");
-                    config.device = ComputeDevice::Cpu;
+                    Ok(_) => {
+                        info!("[Device] Auto requested, but no CUDA devices found. Falling back to CPU.");
+                        config.device = ComputeDevice::Cpu;
+                    }
+                    Err(err) => {
+                        info!(
+                            "[Device] Auto requested, CUDA unavailable ({}). Falling back to CPU.",
+                            err
+                        );
+                        config.device = ComputeDevice::Cpu;
+                    }
                 }
             }
             #[cfg(not(cuda))]
@@ -647,18 +657,28 @@ fn apply_compute_device_policy(config: &mut Config) {
         ComputeDevice::Cuda => {
             #[cfg(cuda)]
             {
-                if cuda::init().is_ok() && cuda::device_count() > 0 {
-                    if let Ok(dev) = cuda::get_device_info(0) {
-                        info!(
-                            "[Device] CUDA requested: {} (CC {}.{})",
-                            dev.name, dev.compute_capability.0, dev.compute_capability.1
-                        );
-                    } else {
-                        info!("[Device] CUDA requested and initialized.");
+                match cuda::device_count() {
+                    Ok(count) if count > 0 => {
+                        if let Ok(dev) = cuda::get_device_info(0) {
+                            info!(
+                                "[Device] CUDA requested: {} (CC {}.{})",
+                                dev.name, dev.compute_capability.0, dev.compute_capability.1
+                            );
+                        } else {
+                            info!("[Device] CUDA requested and initialized.");
+                        }
                     }
-                } else {
-                    info!("[Device] CUDA requested, but unavailable. Falling back to CPU.");
-                    config.device = ComputeDevice::Cpu;
+                    Ok(_) => {
+                        info!("[Device] CUDA requested, but no CUDA devices found. Falling back to CPU.");
+                        config.device = ComputeDevice::Cpu;
+                    }
+                    Err(err) => {
+                        info!(
+                            "[Device] CUDA requested, but unavailable ({}). Falling back to CPU.",
+                            err
+                        );
+                        config.device = ComputeDevice::Cpu;
+                    }
                 }
             }
             #[cfg(not(cuda))]

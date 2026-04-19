@@ -8,6 +8,7 @@ use crate::cuda::bindings::{
     cublasCreate_v2, cublasDestroy_v2, cublasDgemm_v2, cublasHandle_t, cublasSetStream_v2,
     CUBLAS_OP_N, CUBLAS_OP_T,
 };
+use crate::cuda::error::{CudaError, CudaResult};
 
 /// cuBLAS context wrapper
 #[cfg(cuda)]
@@ -18,26 +19,29 @@ pub struct Cublas {
 #[cfg(cuda)]
 impl Cublas {
     /// Create a new cuBLAS context
-    pub fn new() -> Result<Self, ()> {
+    pub fn new() -> CudaResult<Self> {
         unsafe {
             let mut handle: cublasHandle_t = std::ptr::null_mut();
             let result = cublasCreate_v2(&mut handle);
             if result != 0 {
-                eprintln!("[CUDA] cublasCreate_v2 failed: {}", result);
-                return Err(());
+                return Err(CudaError::Blas {
+                    op: "cublasCreate_v2",
+                    code: result,
+                });
             }
             Ok(Cublas { handle })
         }
     }
 
     /// Set the CUDA stream for cuBLAS operations
-    #[cfg(cuda)]
-    pub fn set_stream(&mut self, stream: &crate::cuda::stream::CudaStream) -> Result<(), ()> {
+    pub fn set_stream(&mut self, stream: &crate::cuda::stream::CudaStream) -> CudaResult<()> {
         unsafe {
             let result = cublasSetStream_v2(self.handle, stream.as_raw());
             if result != 0 {
-                eprintln!("[CUDA] cublasSetStream_v2 failed: {}", result);
-                return Err(());
+                return Err(CudaError::Blas {
+                    op: "cublasSetStream_v2",
+                    code: result,
+                });
             }
         }
         Ok(())
@@ -45,7 +49,6 @@ impl Cublas {
 
     /// Matrix multiplication: C = alpha * A * B + beta * C
     /// Uses row-major layout: A [m, k] * B [k, n] = C [m, n]
-    #[cfg(cuda)]
     pub fn gemm(
         &mut self,
         transa: bool, // transpose A
@@ -61,7 +64,7 @@ impl Cublas {
         beta: f64,
         c: &mut [f64], // C matrix data (row-major)
         ldc: i32,      // leading dim of C
-    ) -> Result<(), ()> {
+    ) -> CudaResult<()> {
         // cuBLAS uses column-major, but we're using row-major
         // For row-major: C = A * B means column-major: C = B^T * A^T
         // So we swap A <-> B and transpose the operation
@@ -87,8 +90,10 @@ impl Cublas {
                 ldc,
             );
             if result != 0 {
-                eprintln!("[CUDA] cublasDgemm_v2 failed: {}", result);
-                return Err(());
+                return Err(CudaError::Blas {
+                    op: "cublasDgemm_v2",
+                    code: result,
+                });
             }
         }
         Ok(())
@@ -99,7 +104,10 @@ impl Cublas {
 impl Drop for Cublas {
     fn drop(&mut self) {
         unsafe {
-            cublasDestroy_v2(self.handle);
+            let result = cublasDestroy_v2(self.handle);
+            if result != 0 {
+                eprintln!("[CUDA] cublasDestroy_v2 failed during drop: {}", result);
+            }
         }
     }
 }
@@ -113,12 +121,16 @@ pub struct Cublas;
 
 #[cfg(not(cuda))]
 impl Cublas {
-    pub fn new() -> Result<Self, ()> {
-        Err(())
+    pub fn new() -> CudaResult<Self> {
+        Err(CudaError::UnsupportedBuild {
+            op: "cuda::blas::new",
+        })
     }
 
-    pub fn set_stream(&mut self, _stream: &crate::cuda::stream::CudaStream) -> Result<(), ()> {
-        Err(())
+    pub fn set_stream(&mut self, _stream: &crate::cuda::stream::CudaStream) -> CudaResult<()> {
+        Err(CudaError::UnsupportedBuild {
+            op: "cuda::blas::set_stream",
+        })
     }
 
     pub fn gemm(
@@ -136,7 +148,9 @@ impl Cublas {
         _beta: f64,
         _c: &mut [f64],
         _ldc: i32,
-    ) -> Result<(), ()> {
-        Err(())
+    ) -> CudaResult<()> {
+        Err(CudaError::UnsupportedBuild {
+            op: "cuda::blas::gemm",
+        })
     }
 }

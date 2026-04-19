@@ -8,11 +8,13 @@
 pub mod bindings;
 #[cfg(cuda)]
 pub mod blas;
+pub mod error;
 #[cfg(cuda)]
 pub mod memory;
 #[cfg(cuda)]
 pub mod stream;
 
+use self::error::{CudaError, CudaResult};
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(cuda)]
 use std::{ffi::c_char, ffi::CStr};
@@ -31,27 +33,42 @@ pub struct CudaDevice {
 /// Initialize CUDA runtime
 /// Returns Ok(()) if CUDA is available, Err(()) otherwise
 #[cfg(cuda)]
-pub fn init() -> Result<(), ()> {
+pub fn init() -> CudaResult<()> {
     if CUDA_INITIALIZED.load(Ordering::SeqCst) {
         return Ok(());
     }
 
     unsafe {
-        let result = bindings::cuInit(0);
-        if result != bindings::CUDA_SUCCESS {
-            eprintln!("[CUDA] cuInit failed with error code: {}", result);
-            return Err(());
+        let init_result = bindings::cuInit(0);
+        if init_result != bindings::CUDA_SUCCESS {
+            return Err(CudaError::Runtime {
+                op: "cuInit",
+                code: init_result,
+            });
+        }
+
+        let mut count: i32 = 0;
+        let count_result = bindings::cuDeviceGetCount(&mut count);
+        if count_result != bindings::CUDA_SUCCESS {
+            return Err(CudaError::Runtime {
+                op: "cuDeviceGetCount",
+                code: count_result,
+            });
+        }
+        if count <= 0 {
+            return Err(CudaError::NoDevice {
+                op: "cuDeviceGetCount",
+            });
         }
     }
 
     CUDA_INITIALIZED.store(true, Ordering::SeqCst);
-    println!("[CUDA] Initialized successfully");
     Ok(())
 }
 
 #[cfg(not(cuda))]
-pub fn init() -> Result<(), ()> {
-    Err(())
+pub fn init() -> CudaResult<()> {
+    Err(CudaError::UnsupportedBuild { op: "cuda::init" })
 }
 
 /// Check if CUDA is available
@@ -68,47 +85,65 @@ pub fn is_available() -> bool {
 
 /// Get device information
 #[cfg(cuda)]
-pub fn get_device_info(device_id: usize) -> Result<CudaDevice, ()> {
+pub fn get_device_info(device_id: usize) -> CudaResult<CudaDevice> {
     use bindings::*;
 
     init()?;
 
     unsafe {
         let mut device: CUdevice = 0;
-        let result = cuDeviceGet(&mut device, device_id as i32);
-        if result != CUDA_SUCCESS {
-            return Err(());
+        let get_result = cuDeviceGet(&mut device, device_id as i32);
+        if get_result != CUDA_SUCCESS {
+            return Err(CudaError::Runtime {
+                op: "cuDeviceGet",
+                code: get_result,
+            });
         }
 
         let mut name = [0 as c_char; 256];
-        cuDeviceGetName(name.as_mut_ptr(), 256, device);
+        let name_result = cuDeviceGetName(name.as_mut_ptr(), 256, device);
+        if name_result != CUDA_SUCCESS {
+            return Err(CudaError::Runtime {
+                op: "cuDeviceGetName",
+                code: name_result,
+            });
+        }
 
         let mut cc_major: i32 = 0;
         let mut cc_minor: i32 = 0;
-        cuDeviceGetAttribute(
+        let cc_major_result = cuDeviceGetAttribute(
             &mut cc_major,
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
             device,
         );
-        cuDeviceGetAttribute(
+        if cc_major_result != CUDA_SUCCESS {
+            return Err(CudaError::Runtime {
+                op: "cuDeviceGetAttribute(major)",
+                code: cc_major_result,
+            });
+        }
+        let cc_minor_result = cuDeviceGetAttribute(
             &mut cc_minor,
             CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
             device,
         );
+        if cc_minor_result != CUDA_SUCCESS {
+            return Err(CudaError::Runtime {
+                op: "cuDeviceGetAttribute(minor)",
+                code: cc_minor_result,
+            });
+        }
 
         let mut total_mem: usize = 0;
-        cuDeviceTotalMem(&mut total_mem, device);
+        let mem_result = cuDeviceTotalMem(&mut total_mem, device);
+        if mem_result != CUDA_SUCCESS {
+            return Err(CudaError::Runtime {
+                op: "cuDeviceTotalMem",
+                code: mem_result,
+            });
+        }
 
         let name_str = CStr::from_ptr(name.as_ptr()).to_string_lossy().into_owned();
-
-        println!(
-            "[CUDA] Device {}: {} (CC {}.{}, {} MB)",
-            device_id,
-            name_str,
-            cc_major,
-            cc_minor,
-            total_mem / (1024 * 1024)
-        );
 
         Ok(CudaDevice {
             id: device_id,
@@ -120,28 +155,37 @@ pub fn get_device_info(device_id: usize) -> Result<CudaDevice, ()> {
 }
 
 #[cfg(not(cuda))]
-pub fn get_device_info(_device_id: usize) -> Result<CudaDevice, ()> {
-    Err(())
+pub fn get_device_info(_device_id: usize) -> CudaResult<CudaDevice> {
+    Err(CudaError::UnsupportedBuild {
+        op: "cuda::get_device_info",
+    })
 }
 
 /// Number of available CUDA devices
 #[cfg(cuda)]
-pub fn device_count() -> usize {
-    if init().is_err() {
-        return 0;
-    }
+pub fn device_count() -> CudaResult<usize> {
+    init()?;
     unsafe {
         let mut count: i32 = 0;
         let result = bindings::cuDeviceGetCount(&mut count);
         if result != bindings::CUDA_SUCCESS {
-            0
-        } else {
-            count as usize
+            return Err(CudaError::Runtime {
+                op: "cuDeviceGetCount",
+                code: result,
+            });
         }
+        if count <= 0 {
+            return Err(CudaError::NoDevice {
+                op: "cuDeviceGetCount",
+            });
+        }
+        Ok(count as usize)
     }
 }
 
 #[cfg(not(cuda))]
-pub fn device_count() -> usize {
-    0
+pub fn device_count() -> CudaResult<usize> {
+    Err(CudaError::UnsupportedBuild {
+        op: "cuda::device_count",
+    })
 }

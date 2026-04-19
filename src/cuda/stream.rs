@@ -7,6 +7,7 @@
 use crate::cuda::bindings::{
     cuStreamCreate, cuStreamDestroy, cuStreamSynchronize, CUstream, CUDA_SUCCESS,
 };
+use crate::cuda::error::{CudaError, CudaResult};
 
 /// CUDA Stream wrapper
 #[cfg(cuda)]
@@ -17,25 +18,29 @@ pub struct CudaStream {
 #[cfg(cuda)]
 impl CudaStream {
     /// Create a new CUDA stream
-    pub fn new() -> Result<Self, ()> {
+    pub fn new() -> CudaResult<Self> {
         unsafe {
             let mut handle: CUstream = std::ptr::null_mut();
             let result = cuStreamCreate(&mut handle, 0);
             if result != CUDA_SUCCESS {
-                eprintln!("[CUDA] cuStreamCreate failed: {}", result);
-                return Err(());
+                return Err(CudaError::Runtime {
+                    op: "cuStreamCreate",
+                    code: result,
+                });
             }
             Ok(CudaStream { handle })
         }
     }
 
     /// Synchronize the stream (block until all operations complete)
-    pub fn synchronize(&self) -> Result<(), ()> {
+    pub fn synchronize(&self) -> CudaResult<()> {
         unsafe {
             let result = cuStreamSynchronize(self.handle);
             if result != CUDA_SUCCESS {
-                eprintln!("[CUDA] cuStreamSynchronize failed: {}", result);
-                return Err(());
+                return Err(CudaError::Runtime {
+                    op: "cuStreamSynchronize",
+                    code: result,
+                });
             }
         }
         Ok(())
@@ -51,7 +56,10 @@ impl CudaStream {
 impl Drop for CudaStream {
     fn drop(&mut self) {
         unsafe {
-            cuStreamDestroy(self.handle);
+            let result = cuStreamDestroy(self.handle);
+            if result != CUDA_SUCCESS {
+                eprintln!("[CUDA] cuStreamDestroy failed during drop: {}", result);
+            }
         }
     }
 }
@@ -65,12 +73,16 @@ pub struct CudaStream;
 
 #[cfg(not(cuda))]
 impl CudaStream {
-    pub fn new() -> Result<Self, ()> {
-        Err(())
+    pub fn new() -> CudaResult<Self> {
+        Err(CudaError::UnsupportedBuild {
+            op: "cuda::stream::new",
+        })
     }
 
-    pub fn synchronize(&self) -> Result<(), ()> {
-        Err(())
+    pub fn synchronize(&self) -> CudaResult<()> {
+        Err(CudaError::UnsupportedBuild {
+            op: "cuda::stream::synchronize",
+        })
     }
 
     pub fn as_raw(&self) -> usize {

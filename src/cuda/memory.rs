@@ -5,6 +5,7 @@
 
 #[cfg(cuda)]
 use crate::cuda::bindings::{cuMemAlloc, cuMemFree, cuMemcpyDtoH, cuMemcpyHtoD, CUDA_SUCCESS};
+use crate::cuda::error::{CudaError, CudaResult};
 #[cfg(cuda)]
 use std::ffi::c_void;
 
@@ -27,9 +28,13 @@ impl<T> DevicePtr<T> {
 
 impl<T> Drop for DevicePtr<T> {
     fn drop(&mut self) {
+        #[cfg(cuda)]
         if self.ptr != 0 {
             unsafe {
-                cuMemFree(self.ptr);
+                let result = cuMemFree(self.ptr);
+                if result != CUDA_SUCCESS {
+                    eprintln!("[CUDA] cuMemFree failed during drop: {}", result);
+                }
             }
         }
     }
@@ -37,15 +42,30 @@ impl<T> Drop for DevicePtr<T> {
 
 /// Allocate GPU memory for `count` elements of type T
 #[cfg(cuda)]
-pub fn alloc<T>(count: usize) -> Result<DevicePtr<T>, ()> {
-    let size_bytes = count.checked_mul(std::mem::size_of::<T>()).ok_or(())?;
+pub fn alloc<T>(count: usize) -> CudaResult<DevicePtr<T>> {
+    if count == 0 {
+        return Err(CudaError::InvalidInput {
+            op: "cuMemAlloc",
+            message: "count must be greater than zero",
+        });
+    }
+    let elem_size = std::mem::size_of::<T>();
+    let size_bytes = count
+        .checked_mul(elem_size)
+        .ok_or(CudaError::SizeOverflow {
+            op: "cuMemAlloc",
+            count,
+            elem_size,
+        })?;
     let mut ptr: usize = 0;
 
     unsafe {
         let result = cuMemAlloc(&mut ptr, size_bytes);
         if result != CUDA_SUCCESS {
-            eprintln!("[CUDA] cuMemAlloc failed: {}", result);
-            return Err(());
+            return Err(CudaError::Runtime {
+                op: "cuMemAlloc",
+                code: result,
+            });
         }
     }
 
@@ -58,28 +78,37 @@ pub fn alloc<T>(count: usize) -> Result<DevicePtr<T>, ()> {
 
 /// Free GPU memory (automatically called when DevicePtr is dropped)
 #[cfg(cuda)]
-pub fn free<T>(_device: &DevicePtr<T>) -> Result<(), ()> {
+pub fn free<T>(_device: &DevicePtr<T>) -> CudaResult<()> {
     Ok(())
 }
 
 /// Copy data from host (CPU) to device (GPU) - synchronous
 #[cfg(cuda)]
-pub fn copy_h2d<T: Copy>(device: &DevicePtr<T>, host: &[T]) -> Result<(), ()> {
+pub fn copy_h2d<T: Copy>(device: &DevicePtr<T>, host: &[T]) -> CudaResult<()> {
     if host.len() != device.size {
-        eprintln!(
-            "[CUDA] Size mismatch in H2D copy: host={}, device={}",
-            host.len(),
-            device.size
-        );
-        return Err(());
+        return Err(CudaError::SizeMismatch {
+            op: "cuMemcpyHtoD",
+            expected: device.size,
+            actual: host.len(),
+        });
     }
 
-    let size_bytes = host.len().checked_mul(std::mem::size_of::<T>()).ok_or(())?;
+    let elem_size = std::mem::size_of::<T>();
+    let size_bytes = host
+        .len()
+        .checked_mul(elem_size)
+        .ok_or(CudaError::SizeOverflow {
+            op: "cuMemcpyHtoD",
+            count: host.len(),
+            elem_size,
+        })?;
     unsafe {
         let result = cuMemcpyHtoD(device.ptr, host.as_ptr().cast::<c_void>(), size_bytes);
         if result != CUDA_SUCCESS {
-            eprintln!("[CUDA] cuMemcpyHtoD failed: {}", result);
-            return Err(());
+            return Err(CudaError::Runtime {
+                op: "cuMemcpyHtoD",
+                code: result,
+            });
         }
     }
     Ok(())
@@ -87,22 +116,31 @@ pub fn copy_h2d<T: Copy>(device: &DevicePtr<T>, host: &[T]) -> Result<(), ()> {
 
 /// Copy data from device (GPU) to host (CPU) - synchronous
 #[cfg(cuda)]
-pub fn copy_d2h<T: Copy>(host: &mut [T], device: &DevicePtr<T>) -> Result<(), ()> {
+pub fn copy_d2h<T: Copy>(host: &mut [T], device: &DevicePtr<T>) -> CudaResult<()> {
     if host.len() != device.size {
-        eprintln!(
-            "[CUDA] Size mismatch in D2H copy: host={}, device={}",
-            host.len(),
-            device.size
-        );
-        return Err(());
+        return Err(CudaError::SizeMismatch {
+            op: "cuMemcpyDtoH",
+            expected: device.size,
+            actual: host.len(),
+        });
     }
 
-    let size_bytes = host.len().checked_mul(std::mem::size_of::<T>()).ok_or(())?;
+    let elem_size = std::mem::size_of::<T>();
+    let size_bytes = host
+        .len()
+        .checked_mul(elem_size)
+        .ok_or(CudaError::SizeOverflow {
+            op: "cuMemcpyDtoH",
+            count: host.len(),
+            elem_size,
+        })?;
     unsafe {
         let result = cuMemcpyDtoH(host.as_mut_ptr().cast::<c_void>(), device.ptr, size_bytes);
         if result != CUDA_SUCCESS {
-            eprintln!("[CUDA] cuMemcpyDtoH failed: {}", result);
-            return Err(());
+            return Err(CudaError::Runtime {
+                op: "cuMemcpyDtoH",
+                code: result,
+            });
         }
     }
     Ok(())
@@ -115,12 +153,33 @@ pub unsafe fn copy_d2h_raw<T: Copy>(
     host: *mut T,
     device_ptr: usize,
     count: usize,
-) -> Result<(), ()> {
-    let size_bytes = count.checked_mul(std::mem::size_of::<T>()).ok_or(())?;
+) -> CudaResult<()> {
+    if host.is_null() {
+        return Err(CudaError::InvalidInput {
+            op: "cuMemcpyDtoH",
+            message: "host pointer must not be null",
+        });
+    }
+    if device_ptr == 0 {
+        return Err(CudaError::InvalidInput {
+            op: "cuMemcpyDtoH",
+            message: "device pointer must not be zero",
+        });
+    }
+    let elem_size = std::mem::size_of::<T>();
+    let size_bytes = count
+        .checked_mul(elem_size)
+        .ok_or(CudaError::SizeOverflow {
+            op: "cuMemcpyDtoH",
+            count,
+            elem_size,
+        })?;
     let result = cuMemcpyDtoH(host.cast::<c_void>(), device_ptr, size_bytes);
     if result != CUDA_SUCCESS {
-        eprintln!("[CUDA] cuMemcpyDtoH (raw) failed: {}", result);
-        return Err(());
+        return Err(CudaError::Runtime {
+            op: "cuMemcpyDtoH",
+            code: result,
+        });
     }
     Ok(())
 }
@@ -145,21 +204,29 @@ impl<T> DevicePtr<T> {
 }
 
 #[cfg(not(cuda))]
-pub fn alloc<T>(_count: usize) -> Result<DevicePtr<T>, ()> {
-    Err(())
+pub fn alloc<T>(_count: usize) -> CudaResult<DevicePtr<T>> {
+    Err(CudaError::UnsupportedBuild {
+        op: "cuda::memory::alloc",
+    })
 }
 
 #[cfg(not(cuda))]
-pub fn free<T>(_device: &DevicePtr<T>) -> Result<(), ()> {
-    Err(())
+pub fn free<T>(_device: &DevicePtr<T>) -> CudaResult<()> {
+    Err(CudaError::UnsupportedBuild {
+        op: "cuda::memory::free",
+    })
 }
 
 #[cfg(not(cuda))]
-pub fn copy_h2d<T: Copy>(_device: &DevicePtr<T>, _host: &[T]) -> Result<(), ()> {
-    Err(())
+pub fn copy_h2d<T: Copy>(_device: &DevicePtr<T>, _host: &[T]) -> CudaResult<()> {
+    Err(CudaError::UnsupportedBuild {
+        op: "cuda::memory::copy_h2d",
+    })
 }
 
 #[cfg(not(cuda))]
-pub fn copy_d2h<T: Copy>(_host: &mut [T], _device: &DevicePtr<T>) -> Result<(), ()> {
-    Err(())
+pub fn copy_d2h<T: Copy>(_host: &mut [T], _device: &DevicePtr<T>) -> CudaResult<()> {
+    Err(CudaError::UnsupportedBuild {
+        op: "cuda::memory::copy_d2h",
+    })
 }
