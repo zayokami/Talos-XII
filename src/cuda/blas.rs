@@ -57,13 +57,13 @@ impl Cublas {
         n: i32,       // columns of B and C
         k: i32,       // columns of A and rows of B
         alpha: f64,
-        a: &[f64], // A matrix data (row-major)
-        lda: i32,  // leading dim of A
-        b: &[f64], // B matrix data (row-major)
-        ldb: i32,  // leading dim of B
+        a: usize, // device ptr for A matrix (row-major)
+        lda: i32, // leading dim of A
+        b: usize, // device ptr for B matrix (row-major)
+        ldb: i32, // leading dim of B
         beta: f64,
-        c: &mut [f64], // C matrix data (row-major)
-        ldc: i32,      // leading dim of C
+        c: usize, // device ptr for C matrix (row-major)
+        ldc: i32, // leading dim of C
     ) -> CudaResult<()> {
         // cuBLAS uses column-major, but we're using row-major
         // For row-major: C = A * B means column-major: C = B^T * A^T
@@ -81,12 +81,12 @@ impl Cublas {
                 m,    // swapped: rows of A (cols of C)
                 k,    // K dimension unchanged
                 &alpha,
-                b.as_ptr(),
+                b as *const f64,
                 ldb,
-                a.as_ptr(),
+                a as *const f64,
                 lda,
                 &beta,
-                c.as_mut_ptr(),
+                c as *mut f64,
                 ldc,
             );
             if result != 0 {
@@ -141,12 +141,12 @@ impl Cublas {
         _n: i32,
         _k: i32,
         _alpha: f64,
-        _a: &[f64],
+        _a: usize,
         _lda: i32,
-        _b: &[f64],
+        _b: usize,
         _ldb: i32,
         _beta: f64,
-        _c: &mut [f64],
+        _c: usize,
         _ldc: i32,
     ) -> CudaResult<()> {
         Err(CudaError::UnsupportedBuild {

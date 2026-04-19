@@ -183,7 +183,7 @@ __global__ void log_softmax_kernel(
 //==============================================================================
 // Host wrapper for softmax
 //==============================================================================
-extern "C" void softmax(
+extern "C" int softmax(
     double* data,
     int rows, int cols,
     int* d_data
@@ -193,14 +193,14 @@ extern "C" void softmax(
     dim3 block_dim(256);
 
     CUDA_LAUNCH(softmax_kernel, grid_dim, block_dim, 0, dev_data, rows, cols);
-
-    CUDA_CHECK(cudaPeekAtLastError());
+    cudaError_t err = cudaPeekAtLastError();
+    return (int)err;
 }
 
 //==============================================================================
 // Host wrapper for causal softmax
 //==============================================================================
-extern "C" void softmax_causal(
+extern "C" int softmax_causal(
     double* data,
     int rows, int cols,
     int* d_data
@@ -210,14 +210,14 @@ extern "C" void softmax_causal(
     dim3 block_dim(256);
 
     CUDA_LAUNCH(softmax_causal_kernel, grid_dim, block_dim, 0, dev_data, rows, cols);
-
-    CUDA_CHECK(cudaPeekAtLastError());
+    cudaError_t err = cudaPeekAtLastError();
+    return (int)err;
 }
 
 //==============================================================================
 // Host wrapper for log-softmax
 //==============================================================================
-extern "C" void log_softmax(
+extern "C" int log_softmax(
     const double* h_logits, double* h_out,
     int rows, int cols,
     int* d_logits, int* d_out
@@ -230,6 +230,6 @@ extern "C" void log_softmax(
 
     CUDA_LAUNCH(log_softmax_kernel, grid_dim, block_dim, 0,
         dev_logits, dev_out, rows, cols);
-
-    CUDA_CHECK(cudaPeekAtLastError());
+    cudaError_t err = cudaPeekAtLastError();
+    return (int)err;
 }

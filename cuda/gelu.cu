@@ -84,7 +84,7 @@ __global__ void relu_backward_kernel(
 //==============================================================================
 // Host wrapper for GELU
 //==============================================================================
-extern "C" void gelu(
+extern "C" int gelu(
     double* h_data, int size,
     int* d_data
 ) {
@@ -93,8 +93,8 @@ extern "C" void gelu(
     dim3 block_dim(256);
 
     CUDA_LAUNCH(gelu_kernel, grid_dim, block_dim, 0, dev_data, size);
-
-    CUDA_CHECK(cudaPeekAtLastError());
+    cudaError_t err = cudaPeekAtLastError();
+    return (int)err;
 }
 
 //==============================================================================
@@ -121,7 +121,7 @@ __global__ void gelu_forward_storage_kernel(
 //==============================================================================
 // Host wrapper for GELU forward + storage (for training)
 //==============================================================================
-extern "C" void gelu_forward_storage(
+extern "C" int gelu_forward_storage(
     double* h_input, double* h_output,
     int size,
     int* d_input, int* d_output, int* d_storage
@@ -135,14 +135,14 @@ extern "C" void gelu_forward_storage(
 
     CUDA_LAUNCH(gelu_forward_storage_kernel, grid_dim, block_dim, 0,
         dev_input, dev_output, dev_storage, size);
-
-    CUDA_CHECK(cudaPeekAtLastError());
+    cudaError_t err = cudaPeekAtLastError();
+    return (int)err;
 }
 
 //==============================================================================
 // Host wrapper for GELU backward
 //==============================================================================
-extern "C" void gelu_backward(
+extern "C" int gelu_backward(
     const double* h_grad_out, const double* h_forward,
     double* h_grad_in, int size,
     int* d_grad_out, int* d_forward, int* d_grad_in
@@ -156,14 +156,14 @@ extern "C" void gelu_backward(
 
     CUDA_LAUNCH(gelu_backward_kernel, grid_dim, block_dim, 0,
         dev_grad_out, dev_forward, dev_grad_in, size);
-
-    CUDA_CHECK(cudaPeekAtLastError());
+    cudaError_t err = cudaPeekAtLastError();
+    return (int)err;
 }
 
 //==============================================================================
 // Host wrapper for ReLU
 //==============================================================================
-extern "C" void relu(
+extern "C" int relu(
     double* h_data, int size,
     int* d_data
 ) {
@@ -172,6 +172,6 @@ extern "C" void relu(
     dim3 block_dim(256);
 
     CUDA_LAUNCH(relu_kernel, grid_dim, block_dim, 0, dev_data, size);
-
-    CUDA_CHECK(cudaPeekAtLastError());
+    cudaError_t err = cudaPeekAtLastError();
+    return (int)err;
 }

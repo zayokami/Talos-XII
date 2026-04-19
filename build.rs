@@ -134,15 +134,15 @@ fn main() {
         })
         .collect();
 
-    // Link object files into a shared library
-    let lib_name = if cfg!(windows) {
-        "cuda_lib.dll"
+    // Build CUDA kernel library from object files
+    let lib_path = if cfg!(windows) {
+        format!("{}/cuda_lib.lib", out_dir)
     } else {
-        "libcuda_lib.so"
+        format!("{}/libcuda_lib.so", out_dir)
     };
-    let lib_path = format!("{}/{}", out_dir, lib_name);
 
-    // Find CUDA lib directory - use CUDA_LIB_DIR env var or CUDA_PATH
+    // Find CUDA lib directory - use CUDA_LIB_DIR env var or CUDA_PATH.
+    // Needed for runtime driver/cuBLAS linking from Rust target.
     let cuda_lib_dir = env::var("CUDA_LIB_DIR").unwrap_or_else(|_| {
         if cfg!(windows) {
             if let Ok(cuda_path) = env::var("CUDA_PATH") {
@@ -155,18 +155,21 @@ fn main() {
         }
     });
 
-    println!("Linking to {}...", lib_path);
+    println!("Building CUDA kernel library {}...", lib_path);
     let mut link_cmd = std::process::Command::new(&nvcc);
-    link_cmd
-        .arg("-shared")
-        .arg("-o")
-        .arg(&lib_path)
-        .args(&obj_files)
-        // Link CUDA runtime and cuBLAS
-        .arg("-L")
-        .arg(&cuda_lib_dir)
-        .arg("-lcudart")
-        .arg("-lcublas");
+    if cfg!(windows) {
+        link_cmd
+            .arg("-lib")
+            .arg("-o")
+            .arg(&lib_path)
+            .args(&obj_files);
+    } else {
+        link_cmd
+            .arg("-shared")
+            .arg("-o")
+            .arg(&lib_path)
+            .args(&obj_files);
+    }
 
     println!("Link command: {:?}", link_cmd);
     let output = link_cmd.output().expect("Failed to link CUDA library");
@@ -187,6 +190,11 @@ fn main() {
     // Add CUDA lib directory to search path
     if cfg!(windows) {
         println!("cargo:rustc-link-search=native={}", cuda_lib_dir);
+    }
+    if cfg!(windows) {
+        println!("cargo:rustc-link-lib=static=cuda_lib");
+    } else {
+        println!("cargo:rustc-link-lib=dylib=cuda_lib");
     }
     println!("cargo:rustc-link-lib=dylib=cuda");
     println!("cargo:rustc-link-lib=dylib=cublas");

@@ -4,7 +4,7 @@
 //! These bindings are based on the CUDA driver API.
 #![allow(dead_code, non_camel_case_types, non_snake_case)]
 
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_int};
 
 // =============================================================================
 // CUDA Types
@@ -119,6 +119,39 @@ extern "C" {
         C: *mut f64,
         ldc: i32,
     ) -> cublasStatus_t;
+}
+
+// =============================================================================
+// Custom CUDA kernels (compiled from cuda/*.cu)
+// =============================================================================
+
+extern "C" {
+    #[link_name = "relu"]
+    pub fn cuda_relu(h_data: *mut f64, size: c_int, d_data: *mut c_int) -> c_int;
+
+    #[link_name = "gelu"]
+    pub fn cuda_gelu(h_data: *mut f64, size: c_int, d_data: *mut c_int) -> c_int;
+
+    #[link_name = "softmax"]
+    pub fn cuda_softmax(data: *mut f64, rows: c_int, cols: c_int, d_data: *mut c_int) -> c_int;
+
+    #[link_name = "softmax_causal"]
+    pub fn cuda_softmax_causal(
+        data: *mut f64,
+        rows: c_int,
+        cols: c_int,
+        d_data: *mut c_int,
+    ) -> c_int;
+
+    #[link_name = "log_softmax"]
+    pub fn cuda_log_softmax(
+        h_logits: *const f64,
+        h_out: *mut f64,
+        rows: c_int,
+        cols: c_int,
+        d_logits: *mut c_int,
+        d_out: *mut c_int,
+    ) -> c_int;
 }
 
 // =============================================================================

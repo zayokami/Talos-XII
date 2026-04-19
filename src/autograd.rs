@@ -3186,7 +3186,126 @@ impl Tensor {
     #[cfg(cuda)]
     #[allow(dead_code)]
     fn matmul_cuda(&self, other: &Tensor, m: usize, k: usize, n: usize) -> Tensor {
-        self.matmul_cpu_fallback(other, m, k, n)
+        use crate::cuda::blas::Cublas;
+        use crate::cuda::memory::{alloc, copy_d2h, copy_h2d};
+
+        let mut cublas = match Cublas::new() {
+            Ok(c) => c,
+            Err(err) => {
+                eprintln!("[Autograd] cuBLAS init failed ({}), using CPU", err);
+                return self.matmul_cpu_fallback(other, m, k, n);
+            }
+        };
+
+        let d_a = match alloc::<f64>(m * k) {
+            Ok(buf) => buf,
+            Err(err) => {
+                eprintln!("[Autograd] CUDA alloc A failed ({}), using CPU", err);
+                return self.matmul_cpu_fallback(other, m, k, n);
+            }
+        };
+        let d_b = match alloc::<f64>(k * n) {
+            Ok(buf) => buf,
+            Err(err) => {
+                eprintln!("[Autograd] CUDA alloc B failed ({}), using CPU", err);
+                return self.matmul_cpu_fallback(other, m, k, n);
+            }
+        };
+        let d_c = match alloc::<f64>(m * n) {
+            Ok(buf) => buf,
+            Err(err) => {
+                eprintln!("[Autograd] CUDA alloc C failed ({}), using CPU", err);
+                return self.matmul_cpu_fallback(other, m, k, n);
+            }
+        };
+
+        let lhs_data = self.data.read().unwrap();
+        let rhs_data = other.data.read().unwrap();
+
+        if let Err(err) = copy_h2d(&d_a, &lhs_data) {
+            eprintln!("[Autograd] CUDA H2D A failed ({}), using CPU", err);
+            return self.matmul_cpu_fallback(other, m, k, n);
+        }
+        if let Err(err) = copy_h2d(&d_b, &rhs_data) {
+            eprintln!("[Autograd] CUDA H2D B failed ({}), using CPU", err);
+            return self.matmul_cpu_fallback(other, m, k, n);
+        }
+        drop(lhs_data);
+        drop(rhs_data);
+
+        if let Err(err) = cublas.gemm(
+            false,
+            false,
+            m as i32,
+            n as i32,
+            k as i32,
+            1.0,
+            d_a.as_raw(),
+            k as i32,
+            d_b.as_raw(),
+            n as i32,
+            0.0,
+            d_c.as_raw(),
+            n as i32,
+        ) {
+            eprintln!("[Autograd] CUDA GEMM failed ({}), using CPU", err);
+            return self.matmul_cpu_fallback(other, m, k, n);
+        }
+
+        let mut out_data = vec![0.0; m * n];
+        if let Err(err) = copy_d2h(&mut out_data, &d_c) {
+            eprintln!("[Autograd] CUDA D2H C failed ({}), using CPU", err);
+            return self.matmul_cpu_fallback(other, m, k, n);
+        }
+
+        let out_shape = if self.shape.len() == 1 {
+            vec![n]
+        } else {
+            vec![m, n]
+        };
+        let parents = vec![self.clone(), other.clone()];
+        Tensor {
+            data: Arc::new(RwLock::new(out_data)),
+            grad: Arc::new(RwLock::new(vec![0.0; m * n])),
+            shape: out_shape,
+            device: Device::Cpu,
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    let lhs = &parents[0];
+                    let rhs = &parents[1];
+                    let guards = TensorReadGuard::new(&[lhs, rhs]);
+                    let lhs_data = guards.get(0);
+                    let rhs_data = guards.get(1);
+
+                    {
+                        // dL/dLHS
+                        let mut lhs_grad = lhs.grad.write().unwrap();
+                        for r in 0..m {
+                            for i in 0..k {
+                                lhs_grad[r * k + i] += dot_product(
+                                    &grad_out[r * n..r * n + n],
+                                    &rhs_data[i * n..i * n + n],
+                                );
+                            }
+                        }
+                    }
+
+                    {
+                        // dL/dRHS
+                        let mut rhs_grad = rhs.grad.write().unwrap();
+                        for i in 0..k {
+                            for j in 0..n {
+                                for r in 0..m {
+                                    rhs_grad[i * n + j] +=
+                                        lhs_data[r * k + i] * grad_out[r * n + j];
+                                }
+                            }
+                        }
+                    }
+                }),
+            })),
+        }
     }
 
     /// CPU fallback for matmul

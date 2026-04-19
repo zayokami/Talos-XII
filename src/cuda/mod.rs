@@ -10,6 +10,8 @@ pub mod bindings;
 pub mod blas;
 pub mod error;
 #[cfg(cuda)]
+pub mod kernels;
+#[cfg(cuda)]
 pub mod memory;
 #[cfg(cuda)]
 pub mod stream;
