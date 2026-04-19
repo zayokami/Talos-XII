@@ -330,7 +330,7 @@ impl I18n {
                 "info".white().bold(), "Pool details",
                 "history".white().bold(), "Sim history",
                 "[Other]".yellow().bold(),
-                "h/help".white().bold(), "Show this help",
+                "h/help/?".white().bold(), "Show this help",
                 "q".white().bold(), "Quit",
                 "═════════════════".cyan(),
             ),
@@ -357,7 +357,7 @@ impl I18n {
                 "info".white().bold(), "查看卡池详情",
                 "history".white().bold(), "查看模拟历史",
                 "[其他]".yellow().bold(),
-                "h/help".white().bold(), "显示此帮助",
+                "h/help/?".white().bold(), "显示此帮助",
                 "q".white().bold(), "退出",
                 "═════════════════".cyan(),
             ),
@@ -450,12 +450,22 @@ impl I18n {
             // === Prompt with Status ===
             (Language::En, "prompt_pulls_status") => format!(
                 "{}",
-                "\n[{} pulls | {} sims | welfare:{}] Enter pulls (h help, q quit): ".yellow()
+                "\n[{} pulls | {} sims | welfare:{}] Enter pulls (h help, q quit, e.g. 120x500): ".yellow()
             ),
             (Language::Cn, "prompt_pulls_status") => format!(
                 "{}",
-                "\n[{}抽 | {}次模拟 | 福利:{}] 输入抽数 (h 帮助, q 退出): ".yellow()
+                "\n[{}抽 | {}次模拟 | 福利:{}] 输入抽数 (h 帮助, q 退出, 例如 120x500): ".yellow()
             ),
+            (Language::En, "tui_quick_run_tip") => {
+                "Tip: You can run one-off batch input as <pulls>x<sims>, e.g. 120x500."
+                    .dimmed()
+                    .to_string()
+            },
+            (Language::Cn, "tui_quick_run_tip") => {
+                "提示：可使用 <抽数>x<模拟次数> 进行一次性批量模拟，例如 120x500。"
+                    .dimmed()
+                    .to_string()
+            },
             (Language::En, "label_on") => "ON".to_string(),
             (Language::Cn, "label_on") => "开".to_string(),
             (Language::En, "label_off") => "OFF".to_string(),

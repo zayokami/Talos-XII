@@ -1261,9 +1261,38 @@ fn run_interactive(args: RunInteractiveArgs) {
         run_f2p_analysis(&f2p_ctx, &mut rng);
     }
     println!("{}", I18n::get(lang, "total_value"));
+    println!("{}", I18n::get(lang, "tui_quick_run_tip"));
 
     let mut history: std::collections::VecDeque<SimHistoryEntry> =
         std::collections::VecDeque::with_capacity(SIM_HISTORY_CAPACITY);
+    let parse_quick_run = |s: &str| -> Option<(usize, usize)> {
+        for sep in ['x', 'X', '*'] {
+            if let Some((left, right)) = s.split_once(sep) {
+                let pulls = left.trim().parse::<usize>().ok()?;
+                let sims = right.trim().parse::<usize>().ok()?;
+                if pulls > 0 && sims > 0 {
+                    return Some((pulls, sims));
+                }
+            }
+        }
+        None
+    };
+    let resolve_pool_token = |token: &str, cfg: &Config| -> Option<String> {
+        let t = token.trim();
+        if t.is_empty() {
+            return None;
+        }
+        if let Ok(idx) = t.parse::<usize>() {
+            if idx >= 1 && idx <= cfg.pools.len() {
+                return cfg.pools.get(idx - 1).map(|p| p.id.clone());
+            }
+        }
+        let t_lower = t.to_lowercase();
+        cfg.pools
+            .iter()
+            .find(|p| p.id.eq_ignore_ascii_case(t) || p.name.to_lowercase() == t_lower)
+            .map(|p| p.id.clone())
+    };
 
     loop {
         let welfare_label = if use_welfare_default {
@@ -1295,7 +1324,7 @@ fn run_interactive(args: RunInteractiveArgs) {
         let mut parts = input.split_whitespace();
         let cmd = parts.next().unwrap_or("");
         let cmd_lower = cmd.to_lowercase();
-        if cmd_lower == "h" || cmd_lower == "help" {
+        if cmd_lower == "h" || cmd_lower == "help" || cmd_lower == "?" {
             println!("{}", I18n::get(lang, "cmd_help"));
             continue;
         }
@@ -1531,10 +1560,12 @@ fn run_interactive(args: RunInteractiveArgs) {
                     .map(|s| s.trim())
                     .filter(|s| !s.is_empty())
                 {
-                    if config.pools.iter().any(|p| p.id == id) {
-                        valid_ids.push(id.to_string());
+                    if let Some(resolved) = resolve_pool_token(id, &config) {
+                        valid_ids.push(resolved);
                     }
                 }
+                valid_ids.sort_unstable();
+                valid_ids.dedup();
                 if valid_ids.is_empty() {
                     println!("{}", I18n::get(lang, "cmd_pool_multi_empty"));
                 } else {
@@ -1567,21 +1598,56 @@ fn run_interactive(args: RunInteractiveArgs) {
                 } else {
                     println!("{}", I18n::get(lang, "cmd_pool_multi_empty"));
                 }
-            } else if config.apply_pool(sub) {
-                if let Some(cal) = &calibration {
-                    apply_calibration(&mut config, cal);
-                }
-                selected_pool_ids = vec![sub.to_string()];
-                println!(
-                    "{}",
-                    I18n::get(lang, "cmd_pool_switched").replace("{}", &config.pool_name)
-                );
-                print_pool_header(&config, lang);
             } else {
-                println!(
-                    "{}",
-                    I18n::get(lang, "cmd_pool_not_found").replace("{}", sub)
-                );
+                let mut tokens = vec![sub.to_string()];
+                tokens.extend(parts.map(|s| s.to_string()));
+                let is_multi_like = tokens.len() > 1 || sub.contains(',');
+                let mut resolved_ids = Vec::new();
+                for token in tokens
+                    .join(" ")
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                {
+                    if let Some(id) = resolve_pool_token(token, &config) {
+                        resolved_ids.push(id);
+                    }
+                }
+                resolved_ids.sort_unstable();
+                resolved_ids.dedup();
+                if resolved_ids.is_empty() {
+                    println!(
+                        "{}",
+                        I18n::get(lang, "cmd_pool_not_found").replace("{}", sub)
+                    );
+                } else if is_multi_like || resolved_ids.len() > 1 {
+                    let first = resolved_ids[0].clone();
+                    if config.apply_pool(&first) {
+                        if let Some(cal) = &calibration {
+                            apply_calibration(&mut config, cal);
+                        }
+                        selected_pool_ids = resolved_ids;
+                        println!(
+                            "{}",
+                            I18n::get(lang, "cmd_pool_multi_set")
+                                .replace("{}", &selected_pool_ids.join(", "))
+                        );
+                        print_pool_header(&config, lang);
+                    }
+                } else {
+                    let selected_id = resolved_ids[0].clone();
+                    if config.apply_pool(&selected_id) {
+                        if let Some(cal) = &calibration {
+                            apply_calibration(&mut config, cal);
+                        }
+                        selected_pool_ids = vec![selected_id];
+                        println!(
+                            "{}",
+                            I18n::get(lang, "cmd_pool_switched").replace("{}", &config.pool_name)
+                        );
+                        print_pool_header(&config, lang);
+                    }
+                }
             }
             continue;
         }
@@ -1638,8 +1704,30 @@ fn run_interactive(args: RunInteractiveArgs) {
             continue;
         }
 
+        let mut sims_n = default_sims;
         let n = if input.is_empty() {
             default_pulls
+        } else if let Some((pulls, sims)) = parse_quick_run(input) {
+            let capped_pulls = pulls.min(INPUT_CAP);
+            let capped_sims = sims.min(INPUT_CAP);
+            if pulls > INPUT_CAP {
+                println!(
+                    "{}",
+                    I18n::get(lang, "input_capped")
+                        .replacen("{}", &pulls.to_string(), 1)
+                        .replacen("{}", &INPUT_CAP.to_string(), 1)
+                );
+            }
+            if sims > INPUT_CAP {
+                println!(
+                    "{}",
+                    I18n::get(lang, "input_capped")
+                        .replacen("{}", &sims.to_string(), 1)
+                        .replacen("{}", &INPUT_CAP.to_string(), 1)
+                );
+            }
+            sims_n = capped_sims;
+            capped_pulls
         } else {
             match input.parse::<usize>() {
                 Ok(val) => {
@@ -1659,6 +1747,7 @@ fn run_interactive(args: RunInteractiveArgs) {
                     let known_commands: &[&str] = &[
                         "h",
                         "help",
+                        "?",
                         "q",
                         "ppo",
                         "w",
@@ -1697,8 +1786,6 @@ fn run_interactive(args: RunInteractiveArgs) {
         } else {
             0
         };
-        let sims_n = default_sims;
-
         if sims_n > 1 {
             let dqn_guard = dqn_shared.read().unwrap();
             let neural_guard = neural_shared.read().unwrap();
