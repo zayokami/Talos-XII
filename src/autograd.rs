@@ -1029,86 +1029,73 @@ impl Tensor {
         }
 
         let self_data = self.data.read().unwrap();
-        let shape = &self.shape;
-        let rank = shape.len();
-
-        // Compute strides for multi-dimensional indexing
-        let mut strides = vec![0usize; rank];
-        strides[rank - 1] = 1;
-        for i in (0..rank - 1).rev() {
-            strides[i] = strides[i + 1] * shape[i + 1];
-        }
-
+        let shape = self.shape.clone();
         let dim_size = shape[dim];
-        let num_slices: usize = self_data.len() / dim_size;
+        let inner: usize = shape[dim + 1..].iter().product();
+        let outer: usize = shape[..dim].iter().product();
 
         let mut data = vec![0.0; self_data.len()];
         let mut softmax_values = vec![0.0; self_data.len()];
 
-        // Forward pass: compute softmax per slice
-        for slice_idx in 0..num_slices {
-            // Compute max in this slice
-            let mut max_val = f64::NEG_INFINITY;
-            for j in 0..dim_size {
-                let linear_idx = slice_idx * dim_size + j;
-                if self_data[linear_idx] > max_val {
-                    max_val = self_data[linear_idx];
+        // Row-major arbitrary-dim indexing:
+        // idx = outer_idx * (dim_size * inner) + dim_idx * inner + inner_idx
+        for outer_idx in 0..outer {
+            let base_outer = outer_idx * dim_size * inner;
+            for inner_idx in 0..inner {
+                let mut max_val = f64::NEG_INFINITY;
+                for dim_idx in 0..dim_size {
+                    let idx = base_outer + dim_idx * inner + inner_idx;
+                    if self_data[idx] > max_val {
+                        max_val = self_data[idx];
+                    }
                 }
-            }
 
-            // Compute sum of exp(x - max) in this slice
-            let mut sum_exp = 0.0;
-            for j in 0..dim_size {
-                let linear_idx = slice_idx * dim_size + j;
-                sum_exp += (self_data[linear_idx] - max_val).exp();
-            }
-            sum_exp = sum_exp.max(f64::MIN_POSITIVE);
-            let log_sum_exp = sum_exp.ln() + max_val;
+                let mut sum_exp = 0.0;
+                for dim_idx in 0..dim_size {
+                    let idx = base_outer + dim_idx * inner + inner_idx;
+                    sum_exp += (self_data[idx] - max_val).exp();
+                }
+                sum_exp = sum_exp.max(f64::MIN_POSITIVE);
+                let log_sum_exp = sum_exp.ln() + max_val;
 
-            // Compute output and cache softmax values
-            for j in 0..dim_size {
-                let linear_idx = slice_idx * dim_size + j;
-                let softmax_val = (self_data[linear_idx] - max_val).exp() / sum_exp;
-                data[linear_idx] = self_data[linear_idx] - log_sum_exp;
-                softmax_values[linear_idx] = softmax_val;
+                for dim_idx in 0..dim_size {
+                    let idx = base_outer + dim_idx * inner + inner_idx;
+                    let softmax_val = (self_data[idx] - max_val).exp() / sum_exp;
+                    data[idx] = self_data[idx] - log_sum_exp;
+                    softmax_values[idx] = softmax_val;
+                }
             }
         }
 
         let softmax_cache: Arc<Vec<f64>> = Arc::new(softmax_values);
         let parents = vec![self.clone()];
         let dim_size_cap = dim_size;
-        let num_slices_cap = num_slices;
+        let inner_cap = inner;
+        let outer_cap = outer;
         let softmax_cache_for_backward = softmax_cache.clone();
 
         Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; self_data.len()])),
-            shape: self.shape.clone(),
+            shape,
             device: Device::Cpu,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
-                    // Precompute sum_term per slice: sum(grad_out * softmax)
-                    let mut sum_terms = vec![0.0; num_slices_cap];
-                    for (slice_idx, sum_term) in sum_terms.iter_mut().enumerate() {
-                        let base = slice_idx * dim_size_cap;
-                        let mut slice_sum = 0.0;
-                        for j in 0..dim_size_cap {
-                            let idx = base + j;
-                            slice_sum += grad_out[idx] * softmax_cache_for_backward[idx];
-                        }
-                        *sum_term = slice_sum;
-                    }
-
                     let mut inp_grad = parents[0].grad.write().unwrap();
-                    // Manually compute slice_idx and idx to avoid needless iteration
-                    #[allow(clippy::needless_range_loop)]
-                    for slice_idx in 0..num_slices_cap {
-                        let base = slice_idx * dim_size_cap;
-                        for j in 0..dim_size_cap {
-                            let idx = base + j;
-                            inp_grad[idx] += softmax_cache_for_backward[idx]
-                                * (grad_out[idx] - sum_terms[slice_idx]);
+                    for outer_idx in 0..outer_cap {
+                        let base_outer = outer_idx * dim_size_cap * inner_cap;
+                        for inner_idx in 0..inner_cap {
+                            let mut sum_term = 0.0;
+                            for dim_idx in 0..dim_size_cap {
+                                let idx = base_outer + dim_idx * inner_cap + inner_idx;
+                                sum_term += grad_out[idx] * softmax_cache_for_backward[idx];
+                            }
+                            for dim_idx in 0..dim_size_cap {
+                                let idx = base_outer + dim_idx * inner_cap + inner_idx;
+                                inp_grad[idx] +=
+                                    softmax_cache_for_backward[idx] * (grad_out[idx] - sum_term);
+                            }
                         }
                     }
                 }),
@@ -3851,6 +3838,59 @@ mod tests {
         assert_eq!(loaded.shape, vec![2]);
         let data = loaded.data.read().unwrap();
         assert_eq!(*data, vec![1.25, -2.5]);
+    }
+
+    #[test]
+    fn test_log_softmax_dim_zero_normalization() {
+        let t = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
+        let out = t.log_softmax_dim(0);
+        let d = out.data.read().unwrap();
+
+        for col in 0..3 {
+            let p0 = d[col].exp();
+            let p1 = d[3 + col].exp();
+            let sum = p0 + p1;
+            assert!((sum - 1.0).abs() < 1e-10, "column {} sum={}", col, sum);
+        }
+    }
+
+    #[test]
+    fn test_log_softmax_dim_one_normalization() {
+        let t = Tensor::new(vec![1.0, -1.0, 2.0, 0.0, 3.0, 4.0], vec![2, 3]);
+        let out = t.log_softmax_dim(1);
+        let d = out.data.read().unwrap();
+
+        for row in 0..2 {
+            let base = row * 3;
+            let sum = d[base..base + 3].iter().map(|v| v.exp()).sum::<f64>();
+            assert!((sum - 1.0).abs() < 1e-10, "row {} sum={}", row, sum);
+        }
+    }
+
+    #[cfg(cuda)]
+    #[test]
+    fn test_cuda_log_softmax_last_dim_matches_cpu() {
+        if crate::cuda::init().is_err() {
+            return;
+        }
+
+        let t = Tensor::new(vec![1.0, 2.0, 3.0, -1.0, 0.5, 4.0], vec![2, 3]);
+        let t_cuda = t.to_cuda().unwrap();
+        let cpu = t.log_softmax_dim(1);
+        let cuda = t_cuda.log_softmax_dim(1);
+
+        let cpu_d = cpu.data.read().unwrap();
+        let cuda_d = cuda.data.read().unwrap();
+        assert_eq!(cpu_d.len(), cuda_d.len());
+        for i in 0..cpu_d.len() {
+            assert!(
+                (cpu_d[i] - cuda_d[i]).abs() < 1e-9,
+                "idx {} cpu={} cuda={}",
+                i,
+                cpu_d[i],
+                cuda_d[i]
+            );
+        }
     }
 
     #[test]
