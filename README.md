@@ -40,6 +40,12 @@ cargo check --features cuda
 cargo run --features cuda -- simulate -n 1000 -p 100
 ```
 
+编译时可通过环境变量 `CUDA_ARCH` 指定 NVCC 架构（默认 `sm_75`），例如：
+
+```bash
+CUDA_ARCH=sm_86 cargo check --features cuda
+```
+
 `data/config.json` 中可通过 `device` 控制设备选择：
 
 - `cpu`：强制 CPU

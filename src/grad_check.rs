@@ -165,9 +165,7 @@ mod tests {
 
         let x = Tensor::new(vec![2.0], vec![1]);
         let loss_fn = |t: &Tensor| t.clone() * t.clone() * t.sin();
-        let (max_diff, all_passed) = super::numerical_grad_check(&x, loss_fn, 1e-6, 1e-4);
-
-        println!("Max diff: {}", max_diff);
+        let (_, all_passed) = super::numerical_grad_check(&x, loss_fn, 1e-6, 1e-4);
         assert!(all_passed);
     }
 }

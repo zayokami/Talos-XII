@@ -1049,19 +1049,32 @@ impl Tensor {
 
         let self_data = self.data.read().unwrap();
         let len = self_data.len();
-        let max_val = self_data.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-        let mut exp_shifted = vec![0.0; len];
-        for i in 0..len {
-            exp_shifted[i] = (self_data[i] - max_val).exp();
-        }
-        let sum_exp: f64 = exp_shifted.iter().sum::<f64>().max(f64::MIN_POSITIVE);
+        let cols = self.shape.last().copied().unwrap_or(len.max(1));
+        let rows = if cols == 0 { 0 } else { len / cols };
+        assert!(
+            rows.checked_mul(cols) == Some(len),
+            "Softmax shape mismatch"
+        );
+
         let mut data = vec![0.0; len];
-        for i in 0..len {
-            data[i] = exp_shifted[i] / sum_exp;
+        for row in 0..rows {
+            let base = row * cols;
+            let row_slice = &self_data[base..base + cols];
+            let max_val = row_slice.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+            let sum_exp: f64 = row_slice
+                .iter()
+                .map(|&x| (x - max_val).exp())
+                .sum::<f64>()
+                .max(f64::MIN_POSITIVE);
+            for j in 0..cols {
+                data[base + j] = (row_slice[j] - max_val).exp() / sum_exp;
+            }
         }
 
         let softmax_cache: Arc<Vec<f64>> = Arc::new(data.to_vec());
         let parents = vec![self.clone()];
+        let rows_cap = rows;
+        let cols_cap = cols;
 
         Tensor {
             data: Arc::new(RwLock::new(data)),
@@ -1073,13 +1086,17 @@ impl Tensor {
                 backward_op: Box::new(move |grad_out, parents| {
                     // d/dx softmax = softmax * (grad_out - sum(grad_out * softmax))
                     let mut inp_grad = parents[0].grad.write().unwrap();
-                    let sum_term: f64 = grad_out
-                        .iter()
-                        .zip(softmax_cache.iter())
-                        .map(|(&g, &s)| g * s)
-                        .sum();
-                    for i in 0..inp_grad.len() {
-                        inp_grad[i] += softmax_cache[i] * (grad_out[i] - sum_term);
+                    for row in 0..rows_cap {
+                        let base = row * cols_cap;
+                        let mut sum_term = 0.0;
+                        for j in 0..cols_cap {
+                            let idx = base + j;
+                            sum_term += grad_out[idx] * softmax_cache[idx];
+                        }
+                        for j in 0..cols_cap {
+                            let idx = base + j;
+                            inp_grad[idx] += softmax_cache[idx] * (grad_out[idx] - sum_term);
+                        }
                     }
                 }),
             })),
@@ -3702,6 +3719,21 @@ impl Tensor {
         if len == 0 {
             return self.softmax_cpu_fallback();
         }
+        let cols = self.shape.last().copied().unwrap_or(len.max(1));
+        if cols == 0 {
+            crate::cuda::record_activation_fallback("kernel");
+            eprintln!("[Autograd] CUDA Softmax invalid last dimension (cols=0), using CPU");
+            return self.softmax_cpu_fallback();
+        }
+        let rows = len / cols;
+        if rows.checked_mul(cols) != Some(len) {
+            crate::cuda::record_activation_fallback("kernel");
+            eprintln!(
+                "[Autograd] CUDA Softmax shape mismatch (len={}, rows={}, cols={}), using CPU",
+                len, rows, cols
+            );
+            return self.softmax_cpu_fallback();
+        }
         crate::cuda::record_activation_attempt();
 
         let d_src = match self.cuda_get_or_upload_buffer() {
@@ -3736,7 +3768,7 @@ impl Tensor {
             return self.softmax_cpu_fallback();
         }
 
-        if let Err(err) = softmax_inplace(&d_data, 1, len) {
+        if let Err(err) = softmax_inplace(&d_data, rows, cols) {
             crate::cuda::record_activation_fallback("kernel");
             eprintln!("[Autograd] CUDA Softmax kernel failed ({}), using CPU", err);
             return self.softmax_cpu_fallback();
@@ -3753,6 +3785,8 @@ impl Tensor {
 
         let softmax_cache: Arc<Vec<f64>> = Arc::new(data.clone());
         let parents = vec![self.clone()];
+        let rows_cap = rows;
+        let cols_cap = cols;
         let out = Tensor {
             data: Arc::new(RwLock::new(data)),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
@@ -3762,13 +3796,17 @@ impl Tensor {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
                     let mut inp_grad = parents[0].grad.write().unwrap();
-                    let sum_term: f64 = grad_out
-                        .iter()
-                        .zip(softmax_cache.iter())
-                        .map(|(&g, &s)| g * s)
-                        .sum();
-                    for i in 0..inp_grad.len() {
-                        inp_grad[i] += softmax_cache[i] * (grad_out[i] - sum_term);
+                    for row in 0..rows_cap {
+                        let base = row * cols_cap;
+                        let mut sum_term = 0.0;
+                        for j in 0..cols_cap {
+                            let idx = base + j;
+                            sum_term += grad_out[idx] * softmax_cache[idx];
+                        }
+                        for j in 0..cols_cap {
+                            let idx = base + j;
+                            inp_grad[idx] += softmax_cache[idx] * (grad_out[idx] - sum_term);
+                        }
                     }
                 }),
             })),
@@ -3781,42 +3819,14 @@ impl Tensor {
     #[cfg(cuda)]
     #[allow(dead_code)]
     fn softmax_cpu_fallback(&self) -> Tensor {
-        let self_data = self.data.read().unwrap();
-        let len = self_data.len();
-        let max_val = self_data.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-        let sum_exp: f64 = self_data
-            .iter()
-            .map(|&x| (x - max_val).exp())
-            .sum::<f64>()
-            .max(f64::MIN_POSITIVE);
-        let data: Vec<f64> = self_data
-            .iter()
-            .map(|&x| (x - max_val).exp() / sum_exp)
-            .collect();
-
-        let softmax_cache: Arc<Vec<f64>> = Arc::new(data.clone());
-        let parents = vec![self.clone()];
-
-        Tensor {
-            data: Arc::new(RwLock::new(data)),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+        let cpu_view = Tensor {
+            data: self.data.clone(),
+            grad: self.grad.clone(),
             shape: self.shape.clone(),
             device: Device::Cpu,
-            _ctx: Some(Arc::new(Context {
-                parents,
-                backward_op: Box::new(move |grad_out, parents| {
-                    let mut inp_grad = parents[0].grad.write().unwrap();
-                    let sum_term: f64 = grad_out
-                        .iter()
-                        .zip(softmax_cache.iter())
-                        .map(|(&g, &s)| g * s)
-                        .sum();
-                    for i in 0..inp_grad.len() {
-                        inp_grad[i] += softmax_cache[i] * (grad_out[i] - sum_term);
-                    }
-                }),
-            })),
-        }
+            _ctx: self._ctx.clone(),
+        };
+        cpu_view.softmax()
     }
 
     /// GPU-accelerated log-softmax for the last dimension.
@@ -4013,6 +4023,41 @@ mod tests {
         for row in 0..2 {
             let base = row * 3;
             let sum = d[base..base + 3].iter().map(|v| v.exp()).sum::<f64>();
+            assert!((sum - 1.0).abs() < 1e-10, "row {} sum={}", row, sum);
+        }
+    }
+
+    #[test]
+    fn test_softmax_last_dim_row_normalization_cpu() {
+        let t = Tensor::new(vec![1.0, -1.0, 2.0, 0.0, 3.0, 4.0], vec![2, 3]);
+        let out = t.softmax();
+        let d = out.data.read().unwrap();
+
+        for row in 0..2 {
+            let base = row * 3;
+            let sum = d[base..base + 3].iter().sum::<f64>();
+            assert!((sum - 1.0).abs() < 1e-10, "row {} sum={}", row, sum);
+        }
+    }
+
+    #[cfg(cuda)]
+    #[test]
+    fn test_cuda_softmax_last_dim_row_normalization() {
+        if crate::cuda::init().is_err() {
+            return;
+        }
+
+        let t = Tensor::new(vec![1.0, 2.0, 3.0, -1.0, 0.5, 4.0], vec![2, 3]);
+        let t_cuda = match t.to_cuda() {
+            Ok(tensor) => tensor,
+            Err(_) => return,
+        };
+        let out = t_cuda.softmax();
+        let d = out.data.read().unwrap();
+
+        for row in 0..2 {
+            let base = row * 3;
+            let sum = d[base..base + 3].iter().sum::<f64>();
             assert!((sum - 1.0).abs() < 1e-10, "row {} sum={}", row, sum);
         }
     }

@@ -86,6 +86,14 @@ fn main() {
 
     println!("Using NVCC: {}", nvcc);
 
+    let cuda_arch = env::var("CUDA_ARCH")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "sm_75".to_string());
+    let cuda_arch_flag = format!("-arch={}", cuda_arch);
+    println!("cargo:rerun-if-env-changed=CUDA_ARCH");
+    println!("cargo:warning=Using CUDA architecture: {}", cuda_arch);
+
     // CUDA source files
     let cuda_files = &[
         "cuda/common.cu",
@@ -114,8 +122,8 @@ fn main() {
                 .arg("-o")
                 .arg(&obj)
                 .arg(f)
-                // Generate code for current architecture if not specified
-                .arg("-arch=sm_75");
+                // Generate code for selected architecture
+                .arg(&cuda_arch_flag);
             // Add defines
             cmd.arg("-D").arg("CUDA_VERSION=12000");
 
