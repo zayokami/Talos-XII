@@ -5,34 +5,28 @@
 #define SOFTMAX_BLOCK 256
 
 //==============================================================================
-// Warp-level reduction primitives (CUDA 9+, CC 7.0+)
-// __reduce_max_sync / __reduce_add_sync perform butterfly reduction across
-// the warp and return the result to all active threads.
-// Falls back to manual __shfl_xor butterfly on older archs.
+// Warp-level reduction using __shfl_xor butterfly
+// All threads in a warp participate; result returned to all active threads.
+// This works on all CUDA architectures (CC 3.0+). Register-based, no shared
+// memory traffic. Throughput-limited by warp shuffle bandwidth.
 //==============================================================================
-#if CUDA_ARCH_MAJOR >= 7
-    #define WARP_MAX(val) __reduce_max_sync(0xffffffff, val)
-    #define WARP_SUM(val) __reduce_add_sync(0xffffffff, val)
-#else
-    // Manual butterfly using __shfl_xor (works on all CC 3.0+)
-    #define WARP_MAX(val) __warp_max_manual(val)
-    #define WARP_SUM(val) __warp_sum_manual(val)
-    __device__ double __warp_max_manual(double val) {
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            double other = __shfl_xor_sync(0xffffffff, val, offset);
-            val = (other > val) ? other : val;
-        }
-        return val;
+__device__ double warp_reduce_max(double val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        double other = __shfl_xor_sync(0xffffffff, val, offset);
+        val = (other > val) ? other : val;
     }
-    __device__ double __warp_sum_manual(double val) {
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            val += __shfl_xor_sync(0xffffffff, val, offset);
-        }
-        return val;
+    return val;
+}
+__device__ double warp_reduce_sum(double val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_xor_sync(0xffffffff, val, offset);
     }
-#endif
+    return val;
+}
+#define WARP_MAX(val) warp_reduce_max(val)
+#define WARP_SUM(val) warp_reduce_sum(val)
 
 //==============================================================================
 // Softmax forward kernel (row-wise softmax) - arbitrary column width
@@ -40,17 +34,6 @@
 // Output: probs [rows, cols] (in-place)
 // Performs: probs[i,j] = exp(logits[i,j]) / sum_k(exp(logits[i,k]))
 // Uses max-shift for numerical stability
-//
-// Optimization summary:
-// - Pass 1 (max): strided load into shared memory, tree reduction,
-//   final warp-shuffle broadcast. Memory access is strided but all
-//   threads participate equally (good GPU latency hiding).
-// - Pass 2 (exp+sum): re-reads logits with exp, writes to output,
-//   local sum accumulated per thread. Write-back uses contiguous
-//   per-iteration pattern: each iteration writes block_size consecutive
-//   doubles (coalesced within each group of block_size iterations).
-// - Pass 3 (norm): in-place division with same access pattern as Pass 2.
-// - Bank conflicts avoided: sequential shared memory access (stride=1).
 //==============================================================================
 __global__ void softmax_kernel(
     double* __restrict__ data,
