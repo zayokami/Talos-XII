@@ -4,8 +4,6 @@ use crate::cuda::bindings;
 use crate::cuda::error::{CudaError, CudaResult};
 use crate::cuda::memory::DevicePtr;
 
-const SOFTMAX_WARP_WIDTH: usize = 32;
-
 fn to_i32_len(op: &'static str, value: usize) -> CudaResult<i32> {
     i32::try_from(value).map_err(|_| CudaError::SizeOverflow {
         op,
@@ -19,12 +17,6 @@ fn validate_softmax_dims(op: &'static str, rows: usize, cols: usize) -> CudaResu
         return Err(CudaError::InvalidInput {
             op,
             message: "cols must be greater than zero when rows is non-zero",
-        });
-    }
-    if rows > 0 && cols > SOFTMAX_WARP_WIDTH {
-        return Err(CudaError::InvalidInput {
-            op,
-            message: "cols > 32 are not supported by the current CUDA softmax kernel",
         });
     }
     Ok(())
@@ -225,9 +217,11 @@ mod tests {
     }
 
     #[test]
-    fn softmax_dim_validation_rejects_wide_rows() {
-        let err = validate_softmax_dims("test", 1, 33).unwrap_err();
-        assert!(format!("{err}").contains("cols > 32"));
+    fn softmax_dim_validation_accepts_wide_rows() {
+        // CUDA kernel now supports arbitrary column counts via shared memory reduction
+        assert!(validate_softmax_dims("test", 1, 33).is_ok());
+        assert!(validate_softmax_dims("test", 4, 1024).is_ok());
+        assert!(validate_softmax_dims("test", 8, 4096).is_ok());
     }
 
     #[test]

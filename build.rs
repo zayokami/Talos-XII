@@ -5,9 +5,12 @@ use std::env;
 use std::path::Path;
 
 fn main() {
+    // Declare expected cfgs unconditionally so rustc/rust-analyzer don't warn
+    println!("cargo::rustc-check-cfg=cfg(cuda)");
+    println!("cargo:rerun-if-changed=cuda/");
+
     // Only compile CUDA code when the "cuda" feature is enabled
     if env::var("CARGO_FEATURE_CUDA").is_err() {
-        println!("cargo:rerun-if-changed=cuda/");
         return;
     }
     println!("cargo:rustc-cfg=cuda");

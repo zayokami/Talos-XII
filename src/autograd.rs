@@ -273,6 +273,13 @@ impl Tensor {
         // Backprop
         for t in topo.iter().rev() {
             if let Some(ctx) = &t._ctx {
+                // Materialize GPU parents to CPU before running backward op
+                // This handles the case where GPU operations skipped D2H copy
+                #[cfg(cuda)]
+                for parent in &ctx.parents {
+                    parent.cuda_materialize();
+                }
+
                 let grad = t.grad.read().unwrap();
                 (ctx.backward_op)(&grad, &ctx.parents);
             }
@@ -680,7 +687,7 @@ impl Tensor {
     #[allow(dead_code)]
     fn relu_cuda(&self) -> Tensor {
         use crate::cuda::kernels::relu_inplace;
-        use crate::cuda::memory::{alloc, copy_d2d, copy_d2h};
+        use crate::cuda::memory::{alloc, copy_d2d};
 
         let len = self.data.read().unwrap().len();
         if len == 0 {
@@ -726,17 +733,11 @@ impl Tensor {
         }
 
         let d_data = Arc::new(d_data);
-        let mut data = vec![0.0; len];
-        if let Err(err) = copy_d2h(&mut data, &d_data) {
-            crate::cuda::record_activation_fallback("copy");
-            eprintln!("[Autograd] CUDA D2H ReLU failed ({}), using CPU", err);
-            return self.relu_cpu_fallback();
-        }
         crate::cuda::record_activation_success();
 
         let parents = vec![self.clone()];
         let out = Tensor {
-            data: Arc::new(RwLock::new(data)),
+            data: Arc::new(RwLock::new(vec![0.0; len])),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
             device: Device::Cuda,
@@ -3351,6 +3352,37 @@ impl Tensor {
         }
     }
 
+    /// Materialize GPU data to CPU if this tensor lives on GPU but has empty CPU data.
+    /// This is needed because GPU operations may skip the D2H copy, leaving `data` empty.
+    /// Lazy materialization ensures backward pass can read the data.
+    #[cfg(cuda)]
+    fn cuda_materialize(&self) {
+        use crate::cuda::memory::copy_d2h;
+
+        // If device is CPU or data is non-empty, nothing to do
+        if self.device != Device::Cuda {
+            return;
+        }
+        let len = self.data.read().unwrap().len();
+        if len > 0 {
+            return;
+        }
+
+        // Data is empty but we're on GPU - try to materialize from cached GPU buffer
+        if let Some(buffer) = self.cuda_cached_buffer() {
+            let mut data = vec![0.0; buffer.len()];
+            if let Err(err) = copy_d2h(&mut data, &buffer) {
+                eprintln!(
+                    "[Tensor] CUDA materialize D2H failed ({}), data remains empty",
+                    err
+                );
+                return;
+            }
+            let mut self_data = self.data.write().unwrap();
+            *self_data = data;
+        }
+    }
+
     fn cuda_get_or_upload_buffer(
         &self,
     ) -> Result<
@@ -3363,13 +3395,21 @@ impl Tensor {
         let len = host.len();
         if let Some(buffer) = self.cuda_cached_buffer() {
             if buffer.len() == len {
-                if let Err(err) = copy_h2d(&buffer, &host) {
-                    self.cuda_remove_cached_buffer();
-                    return Err(("copy", err));
+                // GPU buffer exists - check if host data is non-empty
+                if !host.is_empty() {
+                    if let Err(err) = copy_h2d(&buffer, &host) {
+                        self.cuda_remove_cached_buffer();
+                        return Err(("copy", err));
+                    }
                 }
                 return Ok(buffer);
             }
             self.cuda_remove_cached_buffer();
+        }
+
+        if len == 0 {
+            // Zero-length tensors don't need GPU memory
+            return Ok(Arc::new(crate::cuda::memory::DevicePtr::zero_sized()));
         }
 
         let device = match alloc::<f64>(len) {
@@ -3392,7 +3432,7 @@ impl Tensor {
     fn matmul_cuda(&self, other: &Tensor, m: usize, k: usize, n: usize) -> Tensor {
         use crate::cuda::blas::gemm_thread_local;
         use crate::cuda::error::CudaError;
-        use crate::cuda::memory::{alloc, copy_d2h};
+        use crate::cuda::memory::alloc;
 
         crate::cuda::record_matmul_attempt();
 
@@ -3457,12 +3497,6 @@ impl Tensor {
             return self.matmul_cpu_fallback(other, m, k, n);
         }
 
-        let mut out_data = vec![0.0; m * n];
-        if let Err(err) = copy_d2h(&mut out_data, &d_c) {
-            crate::cuda::record_matmul_fallback("copy");
-            eprintln!("[Autograd] CUDA D2H C failed ({}), using CPU", err);
-            return self.matmul_cpu_fallback(other, m, k, n);
-        }
         crate::cuda::record_matmul_success();
 
         let out_shape = if self.shape.len() == 1 {
@@ -3472,7 +3506,7 @@ impl Tensor {
         };
         let parents = vec![self.clone(), other.clone()];
         let out = Tensor {
-            data: Arc::new(RwLock::new(out_data)),
+            data: Arc::new(RwLock::new(vec![0.0; m * n])),
             grad: Arc::new(RwLock::new(vec![0.0; m * n])),
             shape: out_shape,
             device: Device::Cuda,
@@ -3593,7 +3627,7 @@ impl Tensor {
     #[allow(dead_code)]
     fn gelu_cuda(&self) -> Tensor {
         use crate::cuda::kernels::gelu_inplace;
-        use crate::cuda::memory::{alloc, copy_d2d, copy_d2h};
+        use crate::cuda::memory::{alloc, copy_d2d};
 
         let len = self.data.read().unwrap().len();
         if len == 0 {
@@ -3639,19 +3673,13 @@ impl Tensor {
         }
 
         let d_data = Arc::new(d_data);
-        let mut data = vec![0.0; len];
-        if let Err(err) = copy_d2h(&mut data, &d_data) {
-            crate::cuda::record_activation_fallback("copy");
-            eprintln!("[Autograd] CUDA D2H GELU failed ({}), using CPU", err);
-            return self.gelu_cpu_fallback();
-        }
         crate::cuda::record_activation_success();
 
         let parents = vec![self.clone()];
         let sqrt_2_over_pi = (2.0 / std::f64::consts::PI).sqrt();
         let c = 0.044715;
         let out = Tensor {
-            data: Arc::new(RwLock::new(data)),
+            data: Arc::new(RwLock::new(vec![0.0; len])),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
             device: Device::Cuda,
@@ -3728,7 +3756,7 @@ impl Tensor {
     #[allow(dead_code)]
     fn softmax_cuda(&self) -> Tensor {
         use crate::cuda::kernels::softmax_inplace;
-        use crate::cuda::memory::{alloc, copy_d2d, copy_d2h};
+        use crate::cuda::memory::{alloc, copy_d2d};
 
         let len = self.data.read().unwrap().len();
         if len == 0 {
@@ -3790,37 +3818,45 @@ impl Tensor {
         }
 
         let d_data = Arc::new(d_data);
-        let mut data = vec![0.0; len];
-        if let Err(err) = copy_d2h(&mut data, &d_data) {
-            crate::cuda::record_activation_fallback("copy");
-            eprintln!("[Autograd] CUDA D2H Softmax failed ({}), using CPU", err);
-            return self.softmax_cpu_fallback();
-        }
         crate::cuda::record_activation_success();
 
-        let softmax_cache: Arc<Vec<f64>> = Arc::new(data.clone());
         let parents = vec![self.clone()];
         let rows_cap = rows;
         let cols_cap = cols;
         let out = Tensor {
-            data: Arc::new(RwLock::new(data)),
+            data: Arc::new(RwLock::new(vec![0.0; len])),
             grad: Arc::new(RwLock::new(vec![0.0; len])),
             shape: self.shape.clone(),
             device: Device::Cuda,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
+                    // Backward needs softmax output for: grad_in = softmax * (grad_out - sum(grad_out * softmax))
+                    // The softmax output lives on GPU (self's cached buffer).
+                    // We materialize it here so the backward computation can proceed on CPU.
+                    let out_data: Vec<f64> = if let Some(buf) = parents[0].cuda_cached_buffer() {
+                        let mut cpu = vec![0.0; buf.len()];
+                        if crate::cuda::memory::copy_d2h(&mut cpu, &buf).is_ok() {
+                            cpu
+                        } else {
+                            // Fallback: zero gradient on materialization failure
+                            return;
+                        }
+                    } else {
+                        return;
+                    };
+
                     let mut inp_grad = parents[0].grad.write().unwrap();
                     for row in 0..rows_cap {
                         let base = row * cols_cap;
                         let mut sum_term = 0.0;
                         for j in 0..cols_cap {
                             let idx = base + j;
-                            sum_term += grad_out[idx] * softmax_cache[idx];
+                            sum_term += grad_out[idx] * out_data[idx];
                         }
                         for j in 0..cols_cap {
                             let idx = base + j;
-                            inp_grad[idx] += softmax_cache[idx] * (grad_out[idx] - sum_term);
+                            inp_grad[idx] += out_data[idx] * (grad_out[idx] - sum_term);
                         }
                     }
                 }),

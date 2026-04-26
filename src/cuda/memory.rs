@@ -26,6 +26,15 @@ impl<T> DevicePtr<T> {
     pub fn as_raw(&self) -> usize {
         self.ptr
     }
+
+    /// Create a zero-sized device pointer (no GPU allocation)
+    pub fn zero_sized() -> Self {
+        DevicePtr {
+            ptr: 0,
+            size: 0,
+            _phantom: std::marker::PhantomData,
+        }
+    }
 }
 
 impl<T> Drop for DevicePtr<T> {
