@@ -3880,6 +3880,126 @@ impl Tensor {
         cpu_view.softmax()
     }
 
+    /// GPU-accelerated causal softmax (forward only, no materialization).
+    /// Causal mask is applied inside the kernel (no separate mask step).
+    #[cfg(cuda)]
+    #[allow(dead_code)]
+    fn softmax_causal_cuda(&self) -> Tensor {
+        use crate::cuda::kernels::softmax_causal_inplace;
+        use crate::cuda::memory::{alloc, copy_d2d};
+
+        let len = self.data.read().unwrap().len();
+        if len == 0 {
+            return self.softmax_cpu_fallback();
+        }
+        let cols = self.shape.last().copied().unwrap_or(len.max(1));
+        if cols == 0 {
+            crate::cuda::record_activation_fallback("kernel");
+            eprintln!("[Autograd] CUDA CausalSoftmax invalid last dimension (cols=0), using CPU");
+            return self.softmax_cpu_fallback();
+        }
+        let rows = len / cols;
+        if rows.checked_mul(cols) != Some(len) {
+            crate::cuda::record_activation_fallback("kernel");
+            eprintln!(
+                "[Autograd] CUDA CausalSoftmax shape mismatch (len={}, rows={}, cols={}), using CPU",
+                len, rows, cols
+            );
+            return self.softmax_cpu_fallback();
+        }
+        crate::cuda::record_activation_attempt();
+
+        let d_src = match self.cuda_get_or_upload_buffer() {
+            Ok(buf) => buf,
+            Err((stage, err)) => {
+                crate::cuda::record_activation_fallback(stage);
+                eprintln!(
+                    "[Autograd] CUDA prepare CausalSoftmax input failed ({}), using CPU",
+                    err
+                );
+                return self.softmax_cpu_fallback();
+            }
+        };
+        let d_data = match alloc::<f64>(len) {
+            Ok(buf) => buf,
+            Err(err) => {
+                crate::cuda::record_activation_fallback("alloc");
+                eprintln!(
+                    "[Autograd] CUDA alloc CausalSoftmax buffer failed ({}), using CPU",
+                    err
+                );
+                return self.softmax_cpu_fallback();
+            }
+        };
+
+        if let Err(err) = copy_d2d(&d_data, &d_src) {
+            crate::cuda::record_activation_fallback("copy");
+            eprintln!(
+                "[Autograd] CUDA D2D CausalSoftmax input copy failed ({}), using CPU",
+                err
+            );
+            return self.softmax_cpu_fallback();
+        }
+
+        if let Err(err) = softmax_causal_inplace(&d_data, rows, cols) {
+            crate::cuda::record_activation_fallback("kernel");
+            eprintln!(
+                "[Autograd] CUDA CausalSoftmax kernel failed ({}), using CPU",
+                err
+            );
+            return self.softmax_cpu_fallback();
+        }
+
+        let d_data = Arc::new(d_data);
+        crate::cuda::record_activation_success();
+
+        let parents = vec![self.clone()];
+        let rows_cap = rows;
+        let cols_cap = cols;
+        let out = Tensor {
+            data: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            shape: self.shape.clone(),
+            device: Device::Cuda,
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    // Causal softmax backward: grad_in = out * (grad_out - sum(grad_out * out))
+                    // Masked positions (j > i) have out = 0, so grad_in = 0 for them.
+                    let out_data: Vec<f64> = if let Some(buf) = parents[0].cuda_cached_buffer() {
+                        let mut cpu = vec![0.0; buf.len()];
+                        if crate::cuda::memory::copy_d2h(&mut cpu, &buf).is_ok() {
+                            cpu
+                        } else {
+                            return;
+                        }
+                    } else {
+                        return;
+                    };
+
+                    let mut inp_grad = parents[0].grad.write().unwrap();
+                    for row in 0..rows_cap {
+                        let base = row * cols_cap;
+                        let mut sum_term = 0.0;
+                        for j in 0..cols_cap {
+                            let idx = base + j;
+                            sum_term += grad_out[idx] * out_data[idx];
+                        }
+                        for j in 0..cols_cap {
+                            let idx = base + j;
+                            // Causal mask: j > row positions were -inf in forward,
+                            // their output is 0, so gradient contribution is also 0.
+                            // The formula handles this naturally since out_data[idx] = 0.
+                            inp_grad[idx] += out_data[idx] * (grad_out[idx] - sum_term);
+                        }
+                    }
+                }),
+            })),
+        };
+        out.cuda_set_cached_buffer(d_data);
+        out
+    }
+
     /// GPU-accelerated log-softmax for the last dimension.
     #[cfg(cuda)]
     #[allow(dead_code)]
