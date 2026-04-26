@@ -64,62 +64,56 @@ __global__ void softmax_kernel(
     if (row >= rows) return;
 
     // ---- Pass 1: Find row max ----
+    // Each thread finds local max in register (no shared memory, no bank conflicts).
     double thread_max = -HUGE_VAL;
     for (int c = tid; c < cols; c += block_size) {
         double val = data[row * cols + c];
         thread_max = (val > thread_max) ? val : thread_max;
     }
-    sdata[tid] = thread_max;
+
+    // Reduce 256 local maxes → 8 warp maxes → 1 final max
+    // Warp-level max: each warp reduces 32 values to 1 (no shared memory)
+    double warp_max = WARP_MAX(thread_max);
+    sdata[tid] = (tid < 32) ? warp_max : -HUGE_VAL;
     __syncthreads();
 
-    // Tree reduction (stride-1 sequential → no bank conflict)
-    for (int s = block_size >> 1; s > 32; s >>= 1) {
+    // Final tree reduction of 8 warp results (stride-1, no bank conflict)
+    for (int s = 4; s >= 1; s >>= 1) {
         if (tid < s) {
             sdata[tid] = (sdata[tid] > sdata[tid + s]) ? sdata[tid] : sdata[tid + s];
         }
         __syncthreads();
     }
-    // Warp-level reduction + broadcast
-    double row_max;
-    if (tid < 32) {
-        row_max = WARP_MAX(sdata[tid]);
-        if (tid == 0) sdata[0] = row_max;
-    }
-    __syncthreads();
-    row_max = sdata[0];
+    double row_max = sdata[0];
 
     // ---- Pass 2: exp(x - max) + sum ----
+    // Accumulate per-thread local sum in register (no shared memory traffic,
+    // no bank conflicts). Final warp-level reduction combines across threads.
     double thread_sum = 0.0;
     for (int base = 0; base < cols; base += block_size) {
         int c = base + tid;
         if (c < cols) {
             double val = exp(data[row * cols + c] - row_max);
             data[row * cols + c] = val;       // write-back (coalesced per iteration)
-            sdata[tid] = val;                  // local accum in shared memory
-        } else {
-            sdata[tid] = 0.0;
+            thread_sum += val;                 // accumulate in register
+        }
+    }
+
+    // Reduce 256 per-thread sums → 8 warp sums → 1 total
+    // Step 1: warp-level reduction (each warp reduces 32 values to 1)
+    double warp_sum = WARP_SUM(thread_sum);
+    sdata[tid] = (tid < 32) ? warp_sum : 0.0;  // only warps 0-7 write their sums
+    __syncthreads();
+
+    // Step 2: final tree reduction of 8 warp sums (no bank conflict, only 8 elements)
+    // stride-1 within warp, only 1 warp active → 7 adds, 2 syncs
+    for (int s = 4; s >= 1; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
         }
         __syncthreads();
-
-        // Reduce within block (tree, stride-1)
-        for (int s = block_size >> 1; s >= 1; s >>= 1) {
-            if (tid < s) {
-                sdata[tid] += sdata[tid + s];
-            }
-            __syncthreads();
-        }
-        thread_sum += sdata[0];
     }
-
-    // Final warp-level sum reduction + broadcast
-    double row_sum;
-    if (tid < 32) {
-        row_sum = (tid < block_size) ? thread_sum : 0.0;
-        row_sum = WARP_SUM(row_sum);
-        if (tid == 0) sdata[0] = row_sum;
-    }
-    __syncthreads();
-    row_sum = sdata[0];
+    double row_sum = sdata[0];
 
     // ---- Pass 3: Normalize ----
     if (row_sum > 0.0) {
@@ -163,22 +157,18 @@ __global__ void softmax_kernel_small_batch(
             double val = data[row * cols + c];
             thread_max = (val > thread_max) ? val : thread_max;
         }
-        sdata[tid] = thread_max;
+
+        double warp_max = WARP_MAX(thread_max);
+        sdata[tid] = (tid < 32) ? warp_max : -HUGE_VAL;
         __syncthreads();
 
-        for (int s = block_size >> 1; s > 32; s >>= 1) {
+        for (int s = 4; s >= 1; s >>= 1) {
             if (tid < s) {
                 sdata[tid] = (sdata[tid] > sdata[tid + s]) ? sdata[tid] : sdata[tid + s];
             }
             __syncthreads();
         }
-        double row_max;
-        if (tid < 32) {
-            row_max = WARP_MAX(sdata[tid]);
-            if (tid == 0) sdata[0] = row_max;
-        }
-        __syncthreads();
-        row_max = sdata[0];
+        double row_max = sdata[0];
 
         // ---- Pass 2: exp(x - max) + sum ----
         double thread_sum = 0.0;
@@ -187,29 +177,21 @@ __global__ void softmax_kernel_small_batch(
             if (c < cols) {
                 double val = exp(data[row * cols + c] - row_max);
                 data[row * cols + c] = val;
-                sdata[tid] = val;
-            } else {
-                sdata[tid] = 0.0;
+                thread_sum += val;
+            }
+        }
+
+        double warp_sum = WARP_SUM(thread_sum);
+        sdata[tid] = (tid < 32) ? warp_sum : 0.0;
+        __syncthreads();
+
+        for (int s = 4; s >= 1; s >>= 1) {
+            if (tid < s) {
+                sdata[tid] += sdata[tid + s];
             }
             __syncthreads();
-
-            for (int s = block_size >> 1; s >= 1; s >>= 1) {
-                if (tid < s) {
-                    sdata[tid] += sdata[tid + s];
-                }
-                __syncthreads();
-            }
-            thread_sum += sdata[0];
         }
-
-        double row_sum;
-        if (tid < 32) {
-            row_sum = (tid < block_size) ? thread_sum : 0.0;
-            row_sum = WARP_SUM(row_sum);
-            if (tid == 0) sdata[0] = row_sum;
-        }
-        __syncthreads();
-        row_sum = sdata[0];
+        double row_sum = sdata[0];
 
         // ---- Pass 3: Normalize ----
         if (row_sum > 0.0) {
@@ -246,59 +228,49 @@ __global__ void softmax_causal_kernel(
     int row_limit = (row < cols - 1) ? row : cols - 1;
 
     // ---- Pass 1: Find row max (only valid positions col <= row) ----
+    // Register-based local max, warp-level reduction → no bank conflicts.
     double thread_max = -HUGE_VAL;
     for (int c = tid; c <= row_limit; c += block_size) {
         double val = data[row * cols + c];
         thread_max = (val > thread_max) ? val : thread_max;
     }
-    sdata[tid] = thread_max;
+
+    double warp_max = WARP_MAX(thread_max);
+    sdata[tid] = (tid < 32) ? warp_max : -HUGE_VAL;
     __syncthreads();
 
-    for (int s = block_size >> 1; s > 32; s >>= 1) {
+    for (int s = 4; s >= 1; s >>= 1) {
         if (tid < s) {
             sdata[tid] = (sdata[tid] > sdata[tid + s]) ? sdata[tid] : sdata[tid + s];
         }
         __syncthreads();
     }
-    double row_max;
-    if (tid < 32) {
-        row_max = WARP_MAX(sdata[tid]);
-        if (tid == 0) sdata[0] = row_max;
-    }
-    __syncthreads();
-    row_max = sdata[0];
+    double row_max = sdata[0];
 
     // ---- Pass 2: exp(x - max) + sum (causal mask) ----
     // Only iterate over valid positions (col <= row_limit)
+    // Accumulate in register, then warp-level reduction.
     double thread_sum = 0.0;
     for (int base = 0; base <= row_limit; base += block_size) {
         int c = base + tid;
         if (c <= row_limit && c < cols) {
             double val = exp(data[row * cols + c] - row_max);
             data[row * cols + c] = val;
-            sdata[tid] = val;
-        } else {
-            sdata[tid] = 0.0;
+            thread_sum += val;
+        }
+    }
+
+    double warp_sum = WARP_SUM(thread_sum);
+    sdata[tid] = (tid < 32) ? warp_sum : 0.0;
+    __syncthreads();
+
+    for (int s = 4; s >= 1; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
         }
         __syncthreads();
-
-        for (int s = block_size >> 1; s >= 1; s >>= 1) {
-            if (tid < s) {
-                sdata[tid] += sdata[tid + s];
-            }
-            __syncthreads();
-        }
-        thread_sum += sdata[0];
     }
-
-    double row_sum;
-    if (tid < 32) {
-        row_sum = (tid < block_size) ? thread_sum : 0.0;
-        row_sum = WARP_SUM(row_sum);
-        if (tid == 0) sdata[0] = row_sum;
-    }
-    __syncthreads();
-    row_sum = sdata[0];
+    double row_sum = sdata[0];
 
     // ---- Pass 3: Normalize (only valid positions col <= row_limit) ----
     if (row_sum > 0.0) {
@@ -329,56 +301,47 @@ __global__ void log_softmax_kernel(
     if (row >= rows) return;
 
     // ---- Pass 1: Find row max ----
+    // Register-based local max, warp-level reduction → no bank conflicts.
     double thread_max = -HUGE_VAL;
     for (int c = tid; c < cols; c += block_size) {
         double val = logits[row * cols + c];
         thread_max = (val > thread_max) ? val : thread_max;
     }
-    sdata[tid] = thread_max;
+
+    double warp_max = WARP_MAX(thread_max);
+    sdata[tid] = (tid < 32) ? warp_max : -HUGE_VAL;
     __syncthreads();
 
-    for (int s = block_size >> 1; s > 32; s >>= 1) {
+    for (int s = 4; s >= 1; s >>= 1) {
         if (tid < s) {
             sdata[tid] = (sdata[tid] > sdata[tid + s]) ? sdata[tid] : sdata[tid + s];
         }
         __syncthreads();
     }
-    double row_max;
-    if (tid < 32) {
-        row_max = WARP_MAX(sdata[tid]);
-        if (tid == 0) sdata[0] = row_max;
-    }
-    __syncthreads();
-    row_max = sdata[0];
+    double row_max = sdata[0];
 
     // ---- Pass 2: Compute exp(x - max) and sum ----
+    // Accumulate per-thread local sum in register, then warp-level reduction.
+    // This eliminates per-iteration shared memory tree reduction (bank conflicts).
     double thread_sum = 0.0;
     for (int base = 0; base < cols; base += block_size) {
         int c = base + tid;
         if (c < cols) {
-            sdata[tid] = exp(logits[row * cols + c] - row_max);
-        } else {
-            sdata[tid] = 0.0;
+            thread_sum += exp(logits[row * cols + c] - row_max);
+        }
+    }
+
+    double warp_sum = WARP_SUM(thread_sum);
+    sdata[tid] = (tid < 32) ? warp_sum : 0.0;
+    __syncthreads();
+
+    for (int s = 4; s >= 1; s >>= 1) {
+        if (tid < s) {
+            sdata[tid] += sdata[tid + s];
         }
         __syncthreads();
-
-        for (int s = block_size >> 1; s >= 1; s >>= 1) {
-            if (tid < s) {
-                sdata[tid] += sdata[tid + s];
-            }
-            __syncthreads();
-        }
-        thread_sum += sdata[0];
     }
-
-    double row_sum;
-    if (tid < 32) {
-        row_sum = (tid < block_size) ? thread_sum : 0.0;
-        row_sum = WARP_SUM(row_sum);
-        if (tid == 0) sdata[0] = row_sum;
-    }
-    __syncthreads();
-    row_sum = sdata[0];
+    double row_sum = sdata[0];
 
     // ---- Pass 3: Write log-softmax values ----
     double log_sum = row_max + log(row_sum);
