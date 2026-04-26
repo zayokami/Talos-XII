@@ -3884,7 +3884,7 @@ impl Tensor {
     /// Causal mask is applied inside the kernel (no separate mask step).
     #[cfg(cuda)]
     #[allow(dead_code)]
-    fn softmax_causal_cuda(&self) -> Tensor {
+    pub(crate) fn softmax_causal_cuda(&self) -> Tensor {
         use crate::cuda::kernels::softmax_causal_inplace;
         use crate::cuda::memory::{alloc, copy_d2d};
 

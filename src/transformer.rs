@@ -1659,6 +1659,12 @@ impl MultiHeadLatentAttention {
     fn softmax(&self, t: &Tensor, seq_len: usize) -> Tensor {
         // t: [B, Seq, Seq]
         // Softmax along last dimension
+        // CUDA routing: if tensor is on GPU, use fused causal softmax kernel
+        #[cfg(cuda)]
+        if t.device == crate::autograd::Device::Cuda {
+            return t.softmax_causal_cuda();
+        }
+
         let data = t.data.read().unwrap();
 
         let new_data: Vec<f64> = data
