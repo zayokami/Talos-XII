@@ -133,6 +133,97 @@ __global__ void softmax_kernel(
 }
 
 //==============================================================================
+// Softmax kernel for small batches (rows < SM count)
+// Uses 2D block: blockDim.x = 256 (cols), blockDim.y = 4 (multi-row per block)
+// Each block processes 4 rows via grid-stride in blockIdx.x
+// This improves GPU utilization when batch size is small (1-4 rows)
+//==============================================================================
+#define SMALL_BATCH_BLOCK_Y 4
+
+__global__ void softmax_kernel_small_batch(
+    double* __restrict__ data,
+    int rows, int cols
+) {
+    extern __shared__ double sdata[];
+    int tid = threadIdx.x;
+    int block_size = blockDim.x;
+    // Rows per block = blockDim.y
+    int rows_per_block = blockDim.y;
+    // Grid-stride: each block processes rows_per_block rows, strided by gridDim.y
+    int start_row = blockIdx.x * rows_per_block;
+    int row_stride = gridDim.x * rows_per_block;
+
+    for (int ri = 0; ri < rows_per_block; ri += 1) {
+        int row = start_row + ri;
+        if (row >= rows) continue;
+
+        // ---- Pass 1: Find row max ----
+        double thread_max = -HUGE_VAL;
+        for (int c = tid; c < cols; c += block_size) {
+            double val = data[row * cols + c];
+            thread_max = (val > thread_max) ? val : thread_max;
+        }
+        sdata[tid] = thread_max;
+        __syncthreads();
+
+        for (int s = block_size >> 1; s > 32; s >>= 1) {
+            if (tid < s) {
+                sdata[tid] = (sdata[tid] > sdata[tid + s]) ? sdata[tid] : sdata[tid + s];
+            }
+            __syncthreads();
+        }
+        double row_max;
+        if (tid < 32) {
+            row_max = WARP_MAX(sdata[tid]);
+            if (tid == 0) sdata[0] = row_max;
+        }
+        __syncthreads();
+        row_max = sdata[0];
+
+        // ---- Pass 2: exp(x - max) + sum ----
+        double thread_sum = 0.0;
+        for (int base = 0; base < cols; base += block_size) {
+            int c = base + tid;
+            if (c < cols) {
+                double val = exp(data[row * cols + c] - row_max);
+                data[row * cols + c] = val;
+                sdata[tid] = val;
+            } else {
+                sdata[tid] = 0.0;
+            }
+            __syncthreads();
+
+            for (int s = block_size >> 1; s >= 1; s >>= 1) {
+                if (tid < s) {
+                    sdata[tid] += sdata[tid + s];
+                }
+                __syncthreads();
+            }
+            thread_sum += sdata[0];
+        }
+
+        double row_sum;
+        if (tid < 32) {
+            row_sum = (tid < block_size) ? thread_sum : 0.0;
+            row_sum = WARP_SUM(row_sum);
+            if (tid == 0) sdata[0] = row_sum;
+        }
+        __syncthreads();
+        row_sum = sdata[0];
+
+        // ---- Pass 3: Normalize ----
+        if (row_sum > 0.0) {
+            for (int base = 0; base < cols; base += block_size) {
+                int c = base + tid;
+                if (c < cols) {
+                    data[row * cols + c] /= row_sum;
+                }
+            }
+        }
+    }
+}
+
+//==============================================================================
 // Softmax with causal mask (for autoregressive attention)
 // Mask: positions where col > row should be 0 (future positions)
 // In-place operation on data array
@@ -160,10 +251,6 @@ __global__ void softmax_causal_kernel(
         double val = data[row * cols + c];
         thread_max = (val > thread_max) ? val : thread_max;
     }
-    // Process remaining columns > row_limit (definitely masked)
-    for (int c = row_limit + 1 + tid; c < cols; c += block_size) {
-        // All these are masked → skip
-    }
     sdata[tid] = thread_max;
     __syncthreads();
 
@@ -182,15 +269,15 @@ __global__ void softmax_causal_kernel(
     row_max = sdata[0];
 
     // ---- Pass 2: exp(x - max) + sum (causal mask) ----
+    // Only iterate over valid positions (col <= row_limit)
     double thread_sum = 0.0;
-    for (int base = 0; base < cols; base += block_size) {
+    for (int base = 0; base <= row_limit; base += block_size) {
         int c = base + tid;
-        if (c <= row_limit) {
+        if (c <= row_limit && c < cols) {
             double val = exp(data[row * cols + c] - row_max);
             data[row * cols + c] = val;
             sdata[tid] = val;
         } else {
-            data[row * cols + c] = 0.0;
             sdata[tid] = 0.0;
         }
         __syncthreads();
@@ -213,11 +300,11 @@ __global__ void softmax_causal_kernel(
     __syncthreads();
     row_sum = sdata[0];
 
-    // ---- Pass 3: Normalize ----
+    // ---- Pass 3: Normalize (only valid positions col <= row_limit) ----
     if (row_sum > 0.0) {
-        for (int base = 0; base < cols; base += block_size) {
+        for (int base = 0; base <= row_limit; base += block_size) {
             int c = base + tid;
-            if (c < cols) {
+            if (c <= row_limit && c < cols) {
                 data[row * cols + c] /= row_sum;
             }
         }
@@ -317,6 +404,29 @@ extern "C" int softmax(
     size_t shmem = SOFTMAX_BLOCK * sizeof(double);
 
     softmax_kernel<<<grid_dim, block_dim, shmem, 0>>>(dev_data, rows, cols);
+    cudaError_t err = cudaPeekAtLastError();
+    return (int)err;
+}
+
+//==============================================================================
+// Host wrapper for softmax (small batch, rows < SM count)
+// Uses 2D block: blockDim.x=256, blockDim.y=SMALL_BATCH_BLOCK_Y
+// Grid is sized so total blocks >= rows, with rows-per-block=Y dimension
+//==============================================================================
+extern "C" int softmax_small_batch(
+    double* data,
+    int rows, int cols,
+    int* d_data
+) {
+    double* dev_data = (double*)d_data;
+    // blocks_y = rows (one block per row conceptually), but with blockDim.y
+    // threads cooperating per block, we need ceil(rows / SMALL_BATCH_BLOCK_Y) blocks
+    int grid_rows = (rows + SMALL_BATCH_BLOCK_Y - 1) / SMALL_BATCH_BLOCK_Y;
+    dim3 grid_dim(grid_rows);
+    dim3 block_dim(SOFTMAX_BLOCK, SMALL_BATCH_BLOCK_Y);
+    size_t shmem = SOFTMAX_BLOCK * sizeof(double);
+
+    softmax_kernel_small_batch<<<grid_dim, block_dim, shmem, 0>>>(dev_data, rows, cols);
     cudaError_t err = cudaPeekAtLastError();
     return (int)err;
 }
