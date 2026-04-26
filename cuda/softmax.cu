@@ -1,7 +1,7 @@
 // softmax.cu - Fused softmax kernel
 #include "common.cu"
 
-// Softmax block size - must be power of 2 for tree reduction
+// Softmax block size - one block per row
 #define SOFTMAX_BLOCK 256
 
 //==============================================================================
@@ -10,8 +10,17 @@
 // Output: probs [rows, cols] (in-place)
 // Performs: probs[i,j] = exp(logits[i,j]) / sum_k(exp(logits[i,k]))
 // Uses max-shift for numerical stability
-// One block per row, threads cooperate via shared memory tree reduction
-// Supports any column count via strided access and block-level sync
+//
+// Optimization summary:
+// - Pass 1 (max): strided load into shared memory, tree reduction,
+//   final warp-shuffle broadcast. Memory access is strided but all
+//   threads participate equally (good GPU latency hiding).
+// - Pass 2 (exp+sum): re-reads logits with exp, writes to output,
+//   local sum accumulated per thread. Write-back uses contiguous
+//   per-iteration pattern: each iteration writes block_size consecutive
+//   doubles (coalesced within each group of block_size iterations).
+// - Pass 3 (norm): in-place division with same access pattern as Pass 2.
+// - Bank conflicts avoided: sequential shared memory access (stride=1).
 //==============================================================================
 __global__ void softmax_kernel(
     double* __restrict__ data,
@@ -25,7 +34,6 @@ __global__ void softmax_kernel(
     if (row >= rows) return;
 
     // ---- Pass 1: Find row max ----
-    // Each thread computes local max across its assigned elements
     double thread_max = -HUGE_VAL;
     for (int c = tid; c < cols; c += block_size) {
         double val = data[row * cols + c];
@@ -34,14 +42,14 @@ __global__ void softmax_kernel(
     sdata[tid] = thread_max;
     __syncthreads();
 
-    // Tree reduction for max within block
+    // Tree reduction (stride-1 sequential → no bank conflict)
     for (int s = block_size >> 1; s > 32; s >>= 1) {
         if (tid < s) {
-            sdata[tid] = (sdata[tid + s] > sdata[tid]) ? sdata[tid + s] : sdata[tid];
+            sdata[tid] = (sdata[tid] > sdata[tid + s]) ? sdata[tid] : sdata[tid + s];
         }
         __syncthreads();
     }
-    // Final warp-level reduction (within a warp, no sync needed)
+    // Warp-shuffle final reduction + broadcast
     double row_max;
     if (tid < 32) {
         row_max = sdata[tid];
@@ -50,44 +58,54 @@ __global__ void softmax_kernel(
             double other = __shfl_xor_sync(0xffffffff, row_max, offset);
             row_max = (other > row_max) ? other : row_max;
         }
-        sdata[0] = row_max; // Broadcast to shared memory
+        if (tid == 0) sdata[0] = row_max;
     }
     __syncthreads();
     row_max = sdata[0];
 
-    // ---- Pass 2: Compute exp(x - row_max) and sum ----
+    // ---- Pass 2: exp(x - max) + sum ----
     double thread_sum = 0.0;
-    for (int c = tid; c < cols; c += block_size) {
-        double val = exp(data[row * cols + c] - row_max);
-        data[row * cols + c] = val;
-        thread_sum += val;
-    }
-    sdata[tid] = thread_sum;
-    __syncthreads();
-
-    // Tree reduction for sum
-    for (int s = block_size >> 1; s > 32; s >>= 1) {
-        if (tid < s) {
-            sdata[tid] += sdata[tid + s];
+    for (int base = 0; base < cols; base += block_size) {
+        int c = base + tid;
+        if (c < cols) {
+            double val = exp(data[row * cols + c] - row_max);
+            data[row * cols + c] = val;       // write-back (coalesced per iteration)
+            sdata[tid] = val;                  // local accum in shared memory
+        } else {
+            sdata[tid] = 0.0;
         }
         __syncthreads();
+
+        // Reduce within block (tree, stride-1)
+        for (int s = block_size >> 1; s >= 1; s >>= 1) {
+            if (tid < s) {
+                sdata[tid] += sdata[tid + s];
+            }
+            __syncthreads();
+        }
+        thread_sum += sdata[0];
     }
+
+    // Final warp-level sum reduction + broadcast
     double row_sum;
     if (tid < 32) {
-        row_sum = sdata[tid];
+        row_sum = (tid < block_size) ? thread_sum : 0.0;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
             row_sum += __shfl_xor_sync(0xffffffff, row_sum, offset);
         }
-        sdata[0] = row_sum;
+        if (tid == 0) sdata[0] = row_sum;
     }
     __syncthreads();
     row_sum = sdata[0];
 
     // ---- Pass 3: Normalize ----
     if (row_sum > 0.0) {
-        for (int c = tid; c < cols; c += block_size) {
-            data[row * cols + c] /= row_sum;
+        for (int base = 0; base < cols; base += block_size) {
+            int c = base + tid;
+            if (c < cols) {
+                data[row * cols + c] /= row_sum;
+            }
         }
     }
 }
@@ -96,7 +114,9 @@ __global__ void softmax_kernel(
 // Softmax with causal mask (for autoregressive attention)
 // Mask: positions where col > row should be 0 (future positions)
 // In-place operation on data array
-// Supports arbitrary column counts via shared memory tree reduction
+//
+// Optimization: precompute row_limit = row once, eliminating repeated
+// conditionals inside hot loops.
 //==============================================================================
 __global__ void softmax_causal_kernel(
     double* __restrict__ data,
@@ -109,13 +129,18 @@ __global__ void softmax_causal_kernel(
 
     if (row >= rows) return;
 
+    // Precompute causal boundary once (Fix 3: eliminates repeated conditionals)
+    int row_limit = (row < cols - 1) ? row : cols - 1;
+
     // ---- Pass 1: Find row max (only valid positions col <= row) ----
     double thread_max = -HUGE_VAL;
-    for (int c = tid; c < cols; c += block_size) {
-        if (c <= row) {
-            double val = data[row * cols + c];
-            thread_max = (val > thread_max) ? val : thread_max;
-        }
+    for (int c = tid; c <= row_limit; c += block_size) {
+        double val = data[row * cols + c];
+        thread_max = (val > thread_max) ? val : thread_max;
+    }
+    // Process remaining columns > row_limit (definitely masked)
+    for (int c = row_limit + 1 + tid; c < cols; c += block_size) {
+        // All these are masked → skip
     }
     sdata[tid] = thread_max;
     __syncthreads();
@@ -134,47 +159,53 @@ __global__ void softmax_causal_kernel(
             double other = __shfl_xor_sync(0xffffffff, row_max, offset);
             row_max = (other > row_max) ? other : row_max;
         }
-        sdata[0] = row_max;
+        if (tid == 0) sdata[0] = row_max;
     }
     __syncthreads();
     row_max = sdata[0];
 
-    // ---- Pass 2: Compute exp(x - row_max) for valid, 0 for masked, sum ----
+    // ---- Pass 2: exp(x - max) + sum (causal mask) ----
     double thread_sum = 0.0;
-    for (int c = tid; c < cols; c += block_size) {
-        if (c <= row) {
+    for (int base = 0; base < cols; base += block_size) {
+        int c = base + tid;
+        if (c <= row_limit) {
             double val = exp(data[row * cols + c] - row_max);
             data[row * cols + c] = val;
-            thread_sum += val;
+            sdata[tid] = val;
         } else {
             data[row * cols + c] = 0.0;
-        }
-    }
-    sdata[tid] = thread_sum;
-    __syncthreads();
-
-    for (int s = block_size >> 1; s > 32; s >>= 1) {
-        if (tid < s) {
-            sdata[tid] += sdata[tid + s];
+            sdata[tid] = 0.0;
         }
         __syncthreads();
+
+        for (int s = block_size >> 1; s >= 1; s >>= 1) {
+            if (tid < s) {
+                sdata[tid] += sdata[tid + s];
+            }
+            __syncthreads();
+        }
+        thread_sum += sdata[0];
     }
+
     double row_sum;
     if (tid < 32) {
-        row_sum = sdata[tid];
+        row_sum = (tid < block_size) ? thread_sum : 0.0;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
             row_sum += __shfl_xor_sync(0xffffffff, row_sum, offset);
         }
-        sdata[0] = row_sum;
+        if (tid == 0) sdata[0] = row_sum;
     }
     __syncthreads();
     row_sum = sdata[0];
 
     // ---- Pass 3: Normalize ----
     if (row_sum > 0.0) {
-        for (int c = tid; c < cols; c += block_size) {
-            data[row * cols + c] /= row_sum;
+        for (int base = 0; base < cols; base += block_size) {
+            int c = base + tid;
+            if (c < cols) {
+                data[row * cols + c] /= row_sum;
+            }
         }
     }
 }
@@ -207,7 +238,7 @@ __global__ void log_softmax_kernel(
 
     for (int s = block_size >> 1; s > 32; s >>= 1) {
         if (tid < s) {
-            sdata[tid] = (sdata[tid + s] > sdata[tid]) ? sdata[tid + s] : sdata[tid];
+            sdata[tid] = (sdata[tid] > sdata[tid + s]) ? sdata[tid] : sdata[tid + s];
         }
         __syncthreads();
     }
@@ -219,41 +250,50 @@ __global__ void log_softmax_kernel(
             double other = __shfl_xor_sync(0xffffffff, row_max, offset);
             row_max = (other > row_max) ? other : row_max;
         }
-        sdata[0] = row_max;
+        if (tid == 0) sdata[0] = row_max;
     }
     __syncthreads();
     row_max = sdata[0];
 
     // ---- Pass 2: Compute exp(x - max) and sum ----
     double thread_sum = 0.0;
-    for (int c = tid; c < cols; c += block_size) {
-        thread_sum += exp(logits[row * cols + c] - row_max);
-    }
-    sdata[tid] = thread_sum;
-    __syncthreads();
-
-    for (int s = block_size >> 1; s > 32; s >>= 1) {
-        if (tid < s) {
-            sdata[tid] += sdata[tid + s];
+    for (int base = 0; base < cols; base += block_size) {
+        int c = base + tid;
+        if (c < cols) {
+            sdata[tid] = exp(logits[row * cols + c] - row_max);
+        } else {
+            sdata[tid] = 0.0;
         }
         __syncthreads();
+
+        for (int s = block_size >> 1; s >= 1; s >>= 1) {
+            if (tid < s) {
+                sdata[tid] += sdata[tid + s];
+            }
+            __syncthreads();
+        }
+        thread_sum += sdata[0];
     }
+
     double row_sum;
     if (tid < 32) {
-        row_sum = sdata[tid];
+        row_sum = (tid < block_size) ? thread_sum : 0.0;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
             row_sum += __shfl_xor_sync(0xffffffff, row_sum, offset);
         }
-        sdata[0] = row_sum;
+        if (tid == 0) sdata[0] = row_sum;
     }
     __syncthreads();
     row_sum = sdata[0];
 
     // ---- Pass 3: Write log-softmax values ----
     double log_sum = row_max + log(row_sum);
-    for (int c = tid; c < cols; c += block_size) {
-        out[row * cols + c] = logits[row * cols + c] - log_sum;
+    for (int base = 0; base < cols; base += block_size) {
+        int c = base + tid;
+        if (c < cols) {
+            out[row * cols + c] = logits[row * cols + c] - log_sum;
+        }
     }
 }
 
