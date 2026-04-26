@@ -112,6 +112,64 @@ pub fn softmax_inplace(data: &DevicePtr<f64>, rows: usize, cols: usize) -> CudaR
     }
 }
 
+/// Threshold for using the small-batch cooperative kernel.
+/// When rows <= this value, the 2D block kernel (256x4 threads per block)
+/// provides better GPU utilization than one block per row.
+const SOFTMAX_SMALL_BATCH_THRESHOLD: usize = 16;
+
+#[cfg(cuda)]
+pub fn softmax_inplace_auto(data: &DevicePtr<f64>, rows: usize, cols: usize) -> CudaResult<()> {
+    if rows <= SOFTMAX_SMALL_BATCH_THRESHOLD && rows > 1 {
+        softmax_small_batch_inplace(data, rows, cols)
+    } else {
+        softmax_inplace(data, rows, cols)
+    }
+}
+
+#[cfg(cuda)]
+pub fn softmax_small_batch_inplace(
+    data: &DevicePtr<f64>,
+    rows: usize,
+    cols: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let expected = rows.checked_mul(cols).ok_or(CudaError::SizeOverflow {
+        op: "cuda::kernels::softmax_small_batch_inplace(rows*cols)",
+        count: rows,
+        elem_size: cols,
+    })?;
+    if expected != data.len() {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::softmax_small_batch_inplace",
+            expected,
+            actual: data.len(),
+        });
+    }
+    validate_softmax_dims("cuda::kernels::softmax_small_batch_inplace", rows, cols)?;
+    if expected == 0 {
+        return Ok(());
+    }
+
+    let rows_i32 = to_i32_len("cuda::kernels::softmax_small_batch_inplace(rows)", rows)?;
+    let cols_i32 = to_i32_len("cuda::kernels::softmax_small_batch_inplace(cols)", cols)?;
+    let status = unsafe {
+        bindings::cuda_softmax_small_batch(
+            std::ptr::null_mut(),
+            rows_i32,
+            cols_i32,
+            data.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::softmax_small_batch_inplace",
+            code: status as u32,
+        })
+    }
+}
+
 #[cfg(cuda)]
 pub fn softmax_causal_inplace(data: &DevicePtr<f64>, rows: usize, cols: usize) -> CudaResult<()> {
     crate::cuda::init()?;

@@ -3755,7 +3755,7 @@ impl Tensor {
     #[cfg(cuda)]
     #[allow(dead_code)]
     fn softmax_cuda(&self) -> Tensor {
-        use crate::cuda::kernels::softmax_inplace;
+        use crate::cuda::kernels::softmax_inplace_auto;
         use crate::cuda::memory::{alloc, copy_d2d};
 
         let len = self.data.read().unwrap().len();
@@ -3811,7 +3811,7 @@ impl Tensor {
             return self.softmax_cpu_fallback();
         }
 
-        if let Err(err) = softmax_inplace(&d_data, rows, cols) {
+        if let Err(err) = softmax_inplace_auto(&d_data, rows, cols) {
             crate::cuda::record_activation_fallback("kernel");
             eprintln!("[Autograd] CUDA Softmax kernel failed ({}), using CPU", err);
             return self.softmax_cpu_fallback();

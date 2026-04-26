@@ -143,6 +143,14 @@ extern "C" {
         d_data: *mut c_int,
     ) -> c_int;
 
+    #[link_name = "softmax_small_batch"]
+    pub fn cuda_softmax_small_batch(
+        data: *mut f64,
+        rows: c_int,
+        cols: c_int,
+        d_data: *mut c_int,
+    ) -> c_int;
+
     #[link_name = "log_softmax"]
     pub fn cuda_log_softmax(
         h_logits: *const f64,
