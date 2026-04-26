@@ -5,6 +5,36 @@
 #define SOFTMAX_BLOCK 256
 
 //==============================================================================
+// Warp-level reduction primitives (CUDA 9+, CC 7.0+)
+// __reduce_max_sync / __reduce_add_sync perform butterfly reduction across
+// the warp and return the result to all active threads.
+// Falls back to manual __shfl_xor butterfly on older archs.
+//==============================================================================
+#if CUDA_ARCH_MAJOR >= 7
+    #define WARP_MAX(val) __reduce_max_sync(0xffffffff, val)
+    #define WARP_SUM(val) __reduce_add_sync(0xffffffff, val)
+#else
+    // Manual butterfly using __shfl_xor (works on all CC 3.0+)
+    #define WARP_MAX(val) __warp_max_manual(val)
+    #define WARP_SUM(val) __warp_sum_manual(val)
+    __device__ double __warp_max_manual(double val) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            double other = __shfl_xor_sync(0xffffffff, val, offset);
+            val = (other > val) ? other : val;
+        }
+        return val;
+    }
+    __device__ double __warp_sum_manual(double val) {
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            val += __shfl_xor_sync(0xffffffff, val, offset);
+        }
+        return val;
+    }
+#endif
+
+//==============================================================================
 // Softmax forward kernel (row-wise softmax) - arbitrary column width
 // Input:  logits [rows, cols]
 // Output: probs [rows, cols] (in-place)
@@ -49,15 +79,10 @@ __global__ void softmax_kernel(
         }
         __syncthreads();
     }
-    // Warp-shuffle final reduction + broadcast
+    // Warp-level reduction + broadcast
     double row_max;
     if (tid < 32) {
-        row_max = sdata[tid];
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            double other = __shfl_xor_sync(0xffffffff, row_max, offset);
-            row_max = (other > row_max) ? other : row_max;
-        }
+        row_max = WARP_MAX(sdata[tid]);
         if (tid == 0) sdata[0] = row_max;
     }
     __syncthreads();
@@ -90,10 +115,7 @@ __global__ void softmax_kernel(
     double row_sum;
     if (tid < 32) {
         row_sum = (tid < block_size) ? thread_sum : 0.0;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            row_sum += __shfl_xor_sync(0xffffffff, row_sum, offset);
-        }
+        row_sum = WARP_SUM(row_sum);
         if (tid == 0) sdata[0] = row_sum;
     }
     __syncthreads();
@@ -147,18 +169,13 @@ __global__ void softmax_causal_kernel(
 
     for (int s = block_size >> 1; s > 32; s >>= 1) {
         if (tid < s) {
-            sdata[tid] = (sdata[tid + s] > sdata[tid]) ? sdata[tid + s] : sdata[tid];
+            sdata[tid] = (sdata[tid] > sdata[tid + s]) ? sdata[tid] : sdata[tid + s];
         }
         __syncthreads();
     }
     double row_max;
     if (tid < 32) {
-        row_max = sdata[tid];
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            double other = __shfl_xor_sync(0xffffffff, row_max, offset);
-            row_max = (other > row_max) ? other : row_max;
-        }
+        row_max = WARP_MAX(sdata[tid]);
         if (tid == 0) sdata[0] = row_max;
     }
     __syncthreads();
@@ -190,10 +207,7 @@ __global__ void softmax_causal_kernel(
     double row_sum;
     if (tid < 32) {
         row_sum = (tid < block_size) ? thread_sum : 0.0;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            row_sum += __shfl_xor_sync(0xffffffff, row_sum, offset);
-        }
+        row_sum = WARP_SUM(row_sum);
         if (tid == 0) sdata[0] = row_sum;
     }
     __syncthreads();
@@ -244,12 +258,7 @@ __global__ void log_softmax_kernel(
     }
     double row_max;
     if (tid < 32) {
-        row_max = sdata[tid];
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            double other = __shfl_xor_sync(0xffffffff, row_max, offset);
-            row_max = (other > row_max) ? other : row_max;
-        }
+        row_max = WARP_MAX(sdata[tid]);
         if (tid == 0) sdata[0] = row_max;
     }
     __syncthreads();
@@ -278,10 +287,7 @@ __global__ void log_softmax_kernel(
     double row_sum;
     if (tid < 32) {
         row_sum = (tid < block_size) ? thread_sum : 0.0;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            row_sum += __shfl_xor_sync(0xffffffff, row_sum, offset);
-        }
+        row_sum = WARP_SUM(row_sum);
         if (tid == 0) sdata[0] = row_sum;
     }
     __syncthreads();

@@ -97,6 +97,25 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CUDA_ARCH");
     println!("cargo:warning=Using CUDA architecture: {}", cuda_arch);
 
+    // Parse sm_XX → major/minor for use as preprocessor constants in .cu files
+    let (arch_major, arch_minor) = if let Some(stripped) = cuda_arch.strip_prefix("sm_") {
+        let parts: Vec<&str> = stripped.split('_').collect();
+        (
+            parts.first().and_then(|s| s.parse().ok()).unwrap_or(75),
+            parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0),
+        )
+    } else {
+        (75, 0)
+    };
+    let arch_defines = format!(
+        "-DCUDA_ARCH_MAJOR={} -DCUDA_ARCH_MINOR={}",
+        arch_major, arch_minor
+    );
+    println!(
+        "Defining CUDA arch constants: major={}, minor={}",
+        arch_major, arch_minor
+    );
+
     // CUDA source files
     let cuda_files = &[
         "cuda/common.cu",
@@ -129,6 +148,10 @@ fn main() {
                 .arg(&cuda_arch_flag);
             // Add defines
             cmd.arg("-D").arg("CUDA_VERSION=12000");
+            // Pass CUDA arch as preprocessor constants (major/minor)
+            for def in arch_defines.split_whitespace() {
+                cmd.arg(def);
+            }
 
             println!("Compiling {}...", f);
             let output = cmd.output().expect("Failed to execute nvcc");
