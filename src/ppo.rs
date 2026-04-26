@@ -455,6 +455,8 @@ pub struct Ppo {
     reward_normalizer: RunningMeanStd,
     distill_ema_decay: f64,
     distill_kl_coef: f64,
+    distill_warmup_steps: usize,
+    distill_update_counter: usize,
 }
 
 impl Ppo {
@@ -490,6 +492,8 @@ impl Ppo {
             reward_normalizer: RunningMeanStd::new(),
             distill_ema_decay: 0.995,
             distill_kl_coef: 0.0,
+            distill_warmup_steps: 500,
+            distill_update_counter: 0,
         }
     }
 
@@ -499,22 +503,31 @@ impl Ppo {
             self.ema_policy = Some(self.policy.clone());
             self.distill_ema_decay = config.distill_ema_decay;
             self.distill_kl_coef = config.distill_kl_coef;
+            self.distill_warmup_steps = config.distill_warmup_steps;
+            self.distill_update_counter = 0;
             println!(
-                "[PPO] Distillation enabled: EMA decay={}, KL coef={}",
-                self.distill_ema_decay, self.distill_kl_coef
+                "[PPO] Distillation enabled: EMA decay={}, KL coef={}, warmup={}",
+                self.distill_ema_decay, self.distill_kl_coef, self.distill_warmup_steps
             );
         }
     }
 
     /// Update EMA teacher weights: teacher = decay * teacher + (1 - decay) * student
+    /// The per-update decay is derived from distill_ema_decay per batch:
+    ///   effective_decay_per_step = distill_ema_decay ^ (1/batch_size)
+    /// With batch_size=64 and distill_ema_decay=0.995:
+    ///   effective_decay = 0.995^(1/64) ≈ 0.99922 per step
     fn update_ema_teacher(&mut self) {
         let Some(ref mut ema) = self.ema_policy else {
             return;
         };
+        self.distill_update_counter += 1;
+
+        // During warmup, teacher evolves without distillation penalty (freeema phase).
+        // Distillation loss is only applied after warmup_steps updates.
         let decay = self.distill_ema_decay;
         let inv = 1.0 - decay;
 
-        // Iterate through all parameters and update EMA
         let student_params = self.policy.parameters();
         let ema_params = ema.parameters();
 
@@ -525,6 +538,25 @@ impl Ppo {
                 *e = decay * (*e) + inv * (*s);
             }
         }
+    }
+
+    /// Precompute teacher logits for an entire chunk to avoid redundant per-sample forward passes.
+    /// Returns a Vec of (teacher_logits, teacher_value) tuples, one per sample index in the chunk.
+    fn compute_teacher_logits_chunk(
+        &self,
+        states: &[Tensor],
+        pities: &[Vec<usize>],
+        chunk: &[usize],
+    ) -> Vec<(Tensor, Tensor)> {
+        chunk
+            .iter()
+            .map(|&i| {
+                self.ema_policy
+                    .as_ref()
+                    .unwrap()
+                    .forward_actor_critic(&states[i], &pities[i])
+            })
+            .collect()
     }
 
     pub(crate) fn store_raw(&mut self, input: PpoStoreRawInput) {
@@ -619,12 +651,20 @@ impl Ppo {
             for chunk in indices.chunks(self.batch_size) {
                 self.optimizer.zero_grad();
 
-                let mut loss_accum = Tensor::zeros(vec![1]);
-                let mut distill_accum = Tensor::zeros(vec![1]); // Distillation loss accumulator
                 let batch_len = chunk.len();
                 let inv_batch = 1.0 / batch_len as f64;
 
-                for &i in chunk {
+                // Precompute teacher logits for the entire chunk once (avoids per-sample forward redundancy)
+                let teacher_outputs = if self.distill_kl_coef > 0.0 && self.ema_policy.is_some() {
+                    Some(self.compute_teacher_logits_chunk(&states, &pities, chunk))
+                } else {
+                    None
+                };
+
+                let mut loss_accum = Tensor::zeros(vec![1]);
+                let mut distill_accum = Tensor::zeros(vec![1]);
+
+                for (chunk_idx, &i) in chunk.iter().enumerate() {
                     let state = &states[i];
                     let pity = &pities[i];
                     let action_idx = actions[i];
@@ -668,30 +708,25 @@ impl Ppo {
 
                     loss_accum = loss_accum + loss;
 
-                    // Distillation: compute KL(student || teacher) if EMA teacher exists
-                    if self.distill_kl_coef > 0.0 {
-                        if let Some(ref ema) = self.ema_policy {
-                            let (teacher_logits, _) = ema.forward_actor_critic(state, pity);
-                            // KL(student || teacher) = sum(student_prob * (log_student_prob - log_teacher_prob))
-                            let student_probs = p.clone();
-                            let student_log_probs = all_log_probs.clone();
-                            let teacher_log_probs = teacher_logits.log_softmax();
-                            // KL = sum(p_student * (log_p_student - log_p_teacher))
-                            let kl_vals = student_probs * (student_log_probs - teacher_log_probs);
-                            let kl_div_scalar = kl_vals.sum();
-                            // Scalar * Tensor creates a Tensor, so we add it to distill_accum
-                            distill_accum = distill_accum + kl_div_scalar;
-                        }
+                    // Distillation: KL(student || teacher) using precomputed teacher logits
+                    if let Some(ref teacher_out) = teacher_outputs {
+                        let (teacher_logits, _) = &teacher_out[chunk_idx];
+                        let student_probs = p.clone();
+                        let student_log_probs = all_log_probs.clone();
+                        let teacher_log_probs = teacher_logits.log_softmax();
+                        let kl_vals = student_probs * (student_log_probs - teacher_log_probs);
+                        distill_accum = distill_accum + kl_vals.sum();
                     }
                 }
 
                 let batch_size_tensor = Tensor::new(vec![inv_batch], vec![1]);
                 let mut final_loss = loss_accum * batch_size_tensor.clone();
-                // Add distillation loss: distill_coef * (1/batch_size) * sum(kl_divs)
-                // This equals (distill_accum * distill_coef) * batch_size_tensor
-                if self.distill_kl_coef > 0.0 && self.ema_policy.is_some() {
+                // Add distillation loss after warmup: distill_coef * mean(kl_divs)
+                if teacher_outputs.is_some()
+                    && self.distill_update_counter >= self.distill_warmup_steps
+                {
                     let distill_coef_tensor = Tensor::new(vec![self.distill_kl_coef], vec![1]);
-                    let distill_term = (distill_accum * distill_coef_tensor) * batch_size_tensor;
+                    let distill_term = distill_accum * distill_coef_tensor * batch_size_tensor;
                     final_loss = final_loss + distill_term;
                 }
                 if let Some(reg) = self.policy.achf_orthogonal_penalty() {

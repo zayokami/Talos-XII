@@ -470,6 +470,7 @@ pub struct Config {
     pub distill_enabled: bool,
     pub distill_ema_decay: f64,
     pub distill_kl_coef: f64,
+    pub distill_warmup_steps: usize,
     pub worker_max_threads: usize,
     pub worker_reserve_cores: usize,
     pub worker_priority: String,
@@ -527,6 +528,7 @@ impl Default for Config {
             distill_enabled: false,
             distill_ema_decay: 0.995,
             distill_kl_coef: 0.1,
+            distill_warmup_steps: 500,
             worker_max_threads: 0,
             worker_reserve_cores: 1,
             worker_priority: "time_critical".to_string(),
@@ -723,6 +725,9 @@ impl Config {
             }
             if let Some(v) = map.get("distill_kl_coef") {
                 config.distill_kl_coef = v.as_f64().unwrap_or(0.1);
+            }
+            if let Some(v) = map.get("distill_warmup_steps") {
+                config.distill_warmup_steps = v.as_f64().unwrap_or(500.0).round() as usize;
             }
             if let Some(v) = map.get("worker_max_threads") {
                 config.worker_max_threads = v.as_f64().unwrap_or(0.0).round() as usize;
@@ -1126,6 +1131,7 @@ fn warn_unknown_fields(map: &serde_json::Map<String, JsonValue>) {
         "distill_enabled",
         "distill_ema_decay",
         "distill_kl_coef",
+        "distill_warmup_steps",
         "worker_max_threads",
         "worker_reserve_cores",
         "worker_priority",
