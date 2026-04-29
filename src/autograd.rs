@@ -198,6 +198,17 @@ impl Tensor {
         Tensor::new(vec![0.0; len], shape)
     }
 
+    /// Fill tensor with a scalar value in-place.
+    pub fn fill_(&mut self, value: f64) -> &mut Self {
+        {
+            let mut data = self.data.write().unwrap();
+            for d in data.iter_mut() {
+                *d = value;
+            }
+        }
+        self
+    }
+
     /// Generate a tensor with uniformly distributed random values in [min, max).
     pub fn rand(shape: Vec<usize>, min: f64, max: f64, seed: u64) -> Self {
         use crate::rng::Rng;
@@ -1230,10 +1241,11 @@ impl Tensor {
                 sum_sq += diff * diff;
             }
             var[i] = sum_sq / last_dim as f64;
-            let std = (var[i] + eps).sqrt();
-            for j in 0..last_dim {
-                output[base + j] = (self_data[base + j] - m) / std;
-            }
+            // inv_std = 1/sqrt(var + eps) precomputed to avoid sqrt in inner loop
+            let inv_std = 1.0 / (var[i] + eps).sqrt();
+            let slice = &self_data[base..base + last_dim];
+            let normalized = crate::simd::layer_norm(slice, m, inv_std, &[], &[]);
+            output[base..base + last_dim].copy_from_slice(&normalized);
         }
 
         // Store input data in Arc so backward pass can access it

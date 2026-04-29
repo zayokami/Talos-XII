@@ -39,6 +39,27 @@ thread_local! {
         RefCell::new(CachedStepScratch::default());
 }
 
+/// Pre-allocated scalar tensors for training loop to avoid per-sample heap allocations.
+struct TrainingScratch {
+    old_log_prob: Tensor,
+    advantage: Tensor,
+    return_val: Tensor,
+}
+
+impl Default for TrainingScratch {
+    fn default() -> Self {
+        TrainingScratch {
+            old_log_prob: Tensor::zeros(vec![1]),
+            advantage: Tensor::zeros(vec![1]),
+            return_val: Tensor::zeros(vec![1]),
+        }
+    }
+}
+
+thread_local! {
+    static TRAINING_SCRATCH: RefCell<TrainingScratch> = RefCell::new(TrainingScratch::default());
+}
+
 // Softmax + categorical sample over fixed ACTION_SPACE logits.
 // Returns (action_index, log_prob_of_action).
 // If top_k > 0, only the top_k logits are kept (others set to -inf).
@@ -683,11 +704,20 @@ impl Ppo {
                     approx_kl += (ratio_val - 1.0) - log_ratio_val;
                     batch_count += 1.0;
 
-                    let old_log_prob_tensor = Tensor::new(vec![old_log_prob], vec![1]);
+                    // Use scratch tensors to avoid per-sample heap allocations
+                    let old_log_prob_tensor = TRAINING_SCRATCH.with(|s| {
+                        let mut scratch = s.borrow_mut();
+                        scratch.old_log_prob.fill_(old_log_prob);
+                        scratch.old_log_prob.clone()
+                    });
                     let log_ratio = log_prob - old_log_prob_tensor;
                     let ratio = log_ratio.exp();
 
-                    let adv_tensor = Tensor::new(vec![advantage], vec![1]);
+                    let adv_tensor = TRAINING_SCRATCH.with(|s| {
+                        let mut scratch = s.borrow_mut();
+                        scratch.advantage.fill_(advantage);
+                        scratch.advantage.clone()
+                    });
                     let surr1 = ratio.clone() * adv_tensor.clone();
                     let ratio_clipped = ratio.clip(1.0 - CLIP_EPSILON, 1.0 + CLIP_EPSILON);
                     let surr2 = ratio_clipped * adv_tensor;
@@ -696,7 +726,11 @@ impl Ppo {
                     let s2_val = surr2.data.read().unwrap()[0];
                     let policy_loss = if s1_val < s2_val { surr1 } else { surr2 };
 
-                    let ret_tensor = Tensor::new(vec![return_val], vec![1]);
+                    let ret_tensor = TRAINING_SCRATCH.with(|s| {
+                        let mut scratch = s.borrow_mut();
+                        scratch.return_val.fill_(return_val);
+                        scratch.return_val.clone()
+                    });
                     let value_err = value - ret_tensor;
                     let v_loss = (value_err.clone() * value_err).sum();
 

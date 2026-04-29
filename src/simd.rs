@@ -1630,3 +1630,264 @@ unsafe fn vector_fma_neon(dst: &mut [f64], a: &[f64], b: &[f64]) {
         i += 1;
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Public API: layer_norm  —  y = (x - mean) * inv_std * gamma + beta
+//  inv_std = 1/sqrt(variance + eps) precomputed by caller
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[inline(always)]
+pub fn layer_norm(data: &[f64], mean: f64, inv_std: f64, gamma: &[f64], beta: &[f64]) -> Vec<f64> {
+    let mut output = data.to_vec();
+    layer_norm_inplace(&mut output, mean, inv_std, gamma, beta);
+    output
+}
+
+#[inline(always)]
+pub fn layer_norm_inplace(data: &mut [f64], mean: f64, inv_std: f64, gamma: &[f64], beta: &[f64]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let t = tier::get();
+        unsafe {
+            if t >= tier::AVX512 {
+                layer_norm_avx512(data, mean, inv_std, gamma, beta);
+                return;
+            }
+            if t >= tier::AVX2_FMA {
+                layer_norm_avx2_fma(data, mean, inv_std, gamma, beta);
+                return;
+            }
+            if t >= tier::AVX2 {
+                layer_norm_avx2(data, mean, inv_std, gamma, beta);
+            }
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            layer_norm_neon(data, mean, inv_std, gamma, beta);
+        }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        layer_norm_scalar(data, mean, inv_std, gamma, beta);
+    }
+}
+
+#[allow(dead_code)]
+#[inline(always)]
+fn layer_norm_scalar(data: &mut [f64], mean: f64, inv_std: f64, gamma: &[f64], beta: &[f64]) {
+    let has_gamma = !gamma.is_empty();
+    let has_beta = !beta.is_empty();
+    let g0 = if has_gamma { gamma[0] } else { 1.0 };
+    let b0 = if has_beta { beta[0] } else { 0.0 };
+    for item in data.iter_mut() {
+        let mut y = (*item - mean) * inv_std;
+        if has_gamma {
+            y *= g0;
+        }
+        if has_beta {
+            y += b0;
+        }
+        *item = y;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  AVX-512 Layer Norm  —  8-wide FMA
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn layer_norm_avx512(
+    data: &mut [f64],
+    mean: f64,
+    inv_std: f64,
+    gamma: &[f64],
+    beta: &[f64],
+) {
+    let len = data.len();
+    let mean_vec = _mm512_set1_pd(mean);
+    let inv_vec = _mm512_set1_pd(inv_std);
+    let has_gamma = !gamma.is_empty();
+    let has_beta = !beta.is_empty();
+    let g0 = if has_gamma { gamma[0] } else { 1.0 };
+    let b0 = if has_beta { beta[0] } else { 0.0 };
+    let mut i = 0;
+
+    while i + 8 <= len {
+        let ptr = data.as_mut_ptr().add(i);
+        let x = _mm512_loadu_pd(ptr);
+        let diff = _mm512_sub_pd(x, mean_vec);
+        let norm = _mm512_mul_pd(diff, inv_vec);
+
+        let result = if has_gamma && has_beta {
+            _mm512_fmadd_pd(norm, _mm512_set1_pd(g0), _mm512_set1_pd(b0))
+        } else if has_gamma {
+            _mm512_mul_pd(norm, _mm512_set1_pd(g0))
+        } else if has_beta {
+            _mm512_add_pd(norm, _mm512_set1_pd(b0))
+        } else {
+            norm
+        };
+        _mm512_storeu_pd(ptr, result);
+        i += 8;
+    }
+    while i < len {
+        let mut y = (data[i] - mean) * inv_std;
+        if has_gamma {
+            y *= g0;
+        }
+        if has_beta {
+            y += b0;
+        }
+        data[i] = y;
+        i += 1;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  AVX2 Layer Norm  —  4-wide FMA
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn layer_norm_avx2_fma(
+    data: &mut [f64],
+    mean: f64,
+    inv_std: f64,
+    gamma: &[f64],
+    beta: &[f64],
+) {
+    let len = data.len();
+    let mean_vec = _mm256_set1_pd(mean);
+    let inv_vec = _mm256_set1_pd(inv_std);
+    let has_gamma = !gamma.is_empty();
+    let has_beta = !beta.is_empty();
+    let g0 = if has_gamma { gamma[0] } else { 1.0 };
+    let b0 = if has_beta { beta[0] } else { 0.0 };
+    let mut i = 0;
+
+    while i + 4 <= len {
+        let ptr = data.as_mut_ptr().add(i);
+        let x = _mm256_loadu_pd(ptr);
+        let diff = _mm256_sub_pd(x, mean_vec);
+        let norm = _mm256_mul_pd(diff, inv_vec);
+
+        let result = if has_gamma && has_beta {
+            _mm256_fmadd_pd(norm, _mm256_set1_pd(g0), _mm256_set1_pd(b0))
+        } else if has_gamma {
+            _mm256_mul_pd(norm, _mm256_set1_pd(g0))
+        } else if has_beta {
+            _mm256_add_pd(norm, _mm256_set1_pd(b0))
+        } else {
+            norm
+        };
+        _mm256_storeu_pd(ptr, result);
+        i += 4;
+    }
+    while i < len {
+        let mut y = (data[i] - mean) * inv_std;
+        if has_gamma {
+            y *= g0;
+        }
+        if has_beta {
+            y += b0;
+        }
+        data[i] = y;
+        i += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn layer_norm_avx2(data: &mut [f64], mean: f64, inv_std: f64, gamma: &[f64], beta: &[f64]) {
+    let len = data.len();
+    let mean_vec = _mm256_set1_pd(mean);
+    let inv_vec = _mm256_set1_pd(inv_std);
+    let has_gamma = !gamma.is_empty();
+    let has_beta = !beta.is_empty();
+    let g0 = if has_gamma { gamma[0] } else { 1.0 };
+    let b0 = if has_beta { beta[0] } else { 0.0 };
+    let mut i = 0;
+
+    while i + 4 <= len {
+        let ptr = data.as_mut_ptr().add(i);
+        let x = _mm256_loadu_pd(ptr);
+        let diff = _mm256_sub_pd(x, mean_vec);
+        let norm = _mm256_mul_pd(diff, inv_vec);
+
+        let result = if has_gamma && has_beta {
+            let scaled = _mm256_mul_pd(norm, _mm256_set1_pd(g0));
+            _mm256_add_pd(scaled, _mm256_set1_pd(b0))
+        } else if has_gamma {
+            _mm256_mul_pd(norm, _mm256_set1_pd(g0))
+        } else if has_beta {
+            _mm256_add_pd(norm, _mm256_set1_pd(b0))
+        } else {
+            norm
+        };
+        _mm256_storeu_pd(ptr, result);
+        i += 4;
+    }
+    while i < len {
+        let mut y = (data[i] - mean) * inv_std;
+        if has_gamma {
+            y *= g0;
+        }
+        if has_beta {
+            y += b0;
+        }
+        data[i] = y;
+        i += 1;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  NEON Layer Norm  —  2-wide operations
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn layer_norm_neon(data: &mut [f64], mean: f64, inv_std: f64, gamma: &[f64], beta: &[f64]) {
+    use core::arch::aarch64::*;
+    let len = data.len();
+    let mean_vec = vdupq_n_f64(mean);
+    let inv_vec = vdupq_n_f64(inv_std);
+    let has_gamma = !gamma.is_empty();
+    let has_beta = !beta.is_empty();
+    let g0 = if has_gamma { gamma[0] } else { 1.0 };
+    let b0 = if has_beta { beta[0] } else { 0.0 };
+    let mut i = 0;
+
+    while i + 2 <= len {
+        let ptr = data.as_mut_ptr().add(i);
+        let x = vld1q_f64(ptr);
+        let diff = vsubq_f64(x, mean_vec);
+        let norm = vmulq_f64(diff, inv_vec);
+
+        let result = if has_gamma && has_beta {
+            let scaled = vmulq_f64(norm, vdupq_n_f64(g0));
+            vaddq_f64(scaled, vdupq_n_f64(b0))
+        } else if has_gamma {
+            vmulq_f64(norm, vdupq_n_f64(g0))
+        } else if has_beta {
+            vaddq_f64(norm, vdupq_n_f64(b0))
+        } else {
+            norm
+        };
+        vst1q_f64(ptr, result);
+        i += 2;
+    }
+    while i < len {
+        let mut y = (data[i] - mean) * inv_std;
+        if has_gamma {
+            y *= g0;
+        }
+        if has_beta {
+            y += b0;
+        }
+        data[i] = y;
+        i += 1;
+    }
+}
