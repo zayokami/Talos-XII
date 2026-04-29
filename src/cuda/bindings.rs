@@ -160,6 +160,33 @@ extern "C" {
         d_logits: *mut c_int,
         d_out: *mut c_int,
     ) -> c_int;
+
+    #[link_name = "cuda_rope"]
+    pub fn cuda_rope(
+        data: *mut f64,
+        cos_cache: *const f64,
+        sin_cache: *const f64,
+        seq_len: c_int,
+        dim: c_int,
+        total_batches: c_int,
+        start_pos: c_int,
+        d_data: *mut c_int,
+        d_cos_cache: *mut c_int,
+        d_sin_cache: *mut c_int,
+    ) -> c_int;
+
+    #[link_name = "attention_weighted_sum"]
+    pub fn cuda_attention_weighted_sum(
+        h_attn: *mut f64,
+        h_values: *mut f64,
+        h_output: *mut f64,
+        rows: c_int,
+        cols: c_int,
+        head_dim: c_int,
+        d_attn: *mut c_int,
+        d_values: *mut c_int,
+        d_output: *mut c_int,
+    ) -> c_int;
 }
 
 // =============================================================================

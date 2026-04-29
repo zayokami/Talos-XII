@@ -122,6 +122,8 @@ fn main() {
         "cuda/matmul.cu",
         "cuda/softmax.cu",
         "cuda/gelu.cu",
+        "cuda/rope.cu",
+        "cuda/attention_output.cu",
     ];
 
     // Output directory for compiled objects

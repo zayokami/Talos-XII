@@ -1,11 +1,11 @@
 [package]
 name = "talos_xii"
-version = "0.6.0"
+version = "0.6.10"
 edition = "2021"
 rust-version = "1.89.0"
 
 [dependencies]
-rayon = "1.10"
+rayon = "1.11.0"
 rand = "0.10"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"

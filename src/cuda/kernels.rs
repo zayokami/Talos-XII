@@ -264,6 +264,173 @@ pub fn log_softmax(
     }
 }
 
+#[cfg(cuda)]
+pub fn rope_inplace(
+    data: &DevicePtr<f64>,
+    cos_cache: &DevicePtr<f64>,
+    sin_cache: &DevicePtr<f64>,
+    seq_len: usize,
+    dim: usize,
+    total_batches: usize,
+    start_pos: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let half_dim = dim / 2;
+    let expected_data_len = total_batches
+        .checked_mul(seq_len)
+        .and_then(|v| v.checked_mul(dim))
+        .ok_or(CudaError::SizeOverflow {
+            op: "cuda::kernels::rope_inplace(data_len)",
+            count: total_batches,
+            elem_size: seq_len * dim,
+        })?;
+    if expected_data_len != data.len() {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::rope_inplace(data)",
+            expected: expected_data_len,
+            actual: data.len(),
+        });
+    }
+    let expected_cache_len =
+        (seq_len + start_pos)
+            .checked_mul(half_dim)
+            .ok_or(CudaError::SizeOverflow {
+                op: "cuda::kernels::rope_inplace(cache_len)",
+                count: seq_len + start_pos,
+                elem_size: half_dim,
+            })?;
+    if expected_cache_len > cos_cache.len() || expected_cache_len > sin_cache.len() {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::rope_inplace(cache)",
+            expected: expected_cache_len,
+            actual: cos_cache.len().min(sin_cache.len()),
+        });
+    }
+    if dim % 2 != 0 {
+        return Err(CudaError::InvalidInput {
+            op: "cuda::kernels::rope_inplace",
+            message: "dim must be even for RoPE",
+        });
+    }
+
+    let seq_len_i32 = to_i32_len("cuda::kernels::rope_inplace(seq_len)", seq_len)?;
+    let dim_i32 = to_i32_len("cuda::kernels::rope_inplace(dim)", dim)?;
+    let total_batches_i32 =
+        to_i32_len("cuda::kernels::rope_inplace(total_batches)", total_batches)?;
+    let start_pos_i32 = to_i32_len("cuda::kernels::rope_inplace(start_pos)", start_pos)?;
+
+    let status = unsafe {
+        bindings::cuda_rope(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+            seq_len_i32,
+            dim_i32,
+            total_batches_i32,
+            start_pos_i32,
+            data.as_raw() as *mut std::os::raw::c_int,
+            cos_cache.as_raw() as *mut std::os::raw::c_int,
+            sin_cache.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::rope_inplace",
+            code: status as u32,
+        })
+    }
+}
+
+/// Attention weighted sum: out[row, d] = sum_k(attn[row, k] * values[k, d])
+/// where attn_weights is [rows x cols] and values is [cols x head_dim]
+/// output is [rows x head_dim]
+#[cfg(cuda)]
+pub fn attention_weighted_sum(
+    attn_weights: &DevicePtr<f64>,
+    values: &DevicePtr<f64>,
+    output: &DevicePtr<f64>,
+    rows: usize,
+    cols: usize,
+    head_dim: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+
+    // Validate dimensions
+    let expected_attn_len = rows.checked_mul(cols).ok_or(CudaError::SizeOverflow {
+        op: "cuda::kernels::attention_weighted_sum(attn_weights_len)",
+        count: rows,
+        elem_size: cols,
+    })?;
+    if expected_attn_len != attn_weights.len() {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::attention_weighted_sum(attn_weights)",
+            expected: expected_attn_len,
+            actual: attn_weights.len(),
+        });
+    }
+
+    let expected_values_len = cols.checked_mul(head_dim).ok_or(CudaError::SizeOverflow {
+        op: "cuda::kernels::attention_weighted_sum(values_len)",
+        count: cols,
+        elem_size: head_dim,
+    })?;
+    if expected_values_len != values.len() {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::attention_weighted_sum(values)",
+            expected: expected_values_len,
+            actual: values.len(),
+        });
+    }
+
+    let expected_output_len = rows.checked_mul(head_dim).ok_or(CudaError::SizeOverflow {
+        op: "cuda::kernels::attention_weighted_sum(output_len)",
+        count: rows,
+        elem_size: head_dim,
+    })?;
+    if expected_output_len != output.len() {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::attention_weighted_sum(output)",
+            expected: expected_output_len,
+            actual: output.len(),
+        });
+    }
+
+    if cols == 0 || head_dim == 0 {
+        return Err(CudaError::InvalidInput {
+            op: "cuda::kernels::attention_weighted_sum",
+            message: "cols and head_dim must be greater than zero",
+        });
+    }
+
+    let rows_i32 = to_i32_len("cuda::kernels::attention_weighted_sum(rows)", rows)?;
+    let cols_i32 = to_i32_len("cuda::kernels::attention_weighted_sum(cols)", cols)?;
+    let head_dim_i32 = to_i32_len("cuda::kernels::attention_weighted_sum(head_dim)", head_dim)?;
+
+    let status = unsafe {
+        bindings::cuda_attention_weighted_sum(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            rows_i32,
+            cols_i32,
+            head_dim_i32,
+            attn_weights.as_raw() as *mut std::os::raw::c_int,
+            values.as_raw() as *mut std::os::raw::c_int,
+            output.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::attention_weighted_sum",
+            code: status as u32,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::validate_softmax_dims;
