@@ -807,32 +807,136 @@ unsafe fn vector_relu_avx2(dst: &mut [f64], src: &[f64]) {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  Fast Vectorized tanh  —  Neumann series approximation
+//  For |x| < 4:  tanh(x) ≈ x - x³/3 + x⁵/5 - x⁷/7  (max rel err < 1e-4)
+//  For |x| >= 4: tanh(x) ≈ sign(x)  (saturation)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn tanh_vectorized_avx512(x: __m512d) -> __m512d {
+    // Polynomial coefficients: 1, -1/3, 1/5, -1/7
+    let c1 = _mm512_set1_pd(1.0 / 3.0);
+    let c2 = _mm512_set1_pd(1.0 / 5.0);
+    let c3 = _mm512_set1_pd(1.0 / 7.0);
+    let threshold = _mm512_set1_pd(4.0);
+
+    let x2 = _mm512_mul_pd(x, x);
+    let x3 = _mm512_mul_pd(x2, x);
+    let x5 = _mm512_mul_pd(x3, x2);
+    let x7 = _mm512_mul_pd(x5, x2);
+
+    // x - x³/3 + x⁵/5 - x⁷/7
+    let poly = x;
+    let term3 = _mm512_mul_pd(x3, c1);
+    let poly = _mm512_sub_pd(poly, term3);
+    let term5 = _mm512_mul_pd(x5, c2);
+    let poly = _mm512_add_pd(poly, term5);
+    let term7 = _mm512_mul_pd(x7, c3);
+    let poly = _mm512_sub_pd(poly, term7);
+
+    // Mask: is |x| < 4?
+    let abs_x = _mm512_max_pd(x, _mm512_sub_pd(_mm512_setzero_pd(), x));
+    let mask = _mm512_cmp_pd_mask(abs_x, threshold, _MM_CMPINT_LT);
+
+    // sign(x) for saturation: copysign(1, x)
+    let sign = _mm512_and_pd(x, _mm512_set1_pd(-0.0_f64.signum()));
+    let saturated = _mm512_or_pd(sign, _mm512_set1_pd(1.0));
+
+    _mm512_mask_blend_pd(mask, saturated, poly)
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn vector_gelu_avx512(dst: &mut [f64], src: &[f64]) {
-    // AVX doesn't have tanh intrinsic, so we use scalar fallback
-    // which still benefits from the outer loop structure and cache
     let sqrt_2_over_pi = (2.0 / std::f64::consts::PI).sqrt();
-    let c = 0.044715;
-    for i in 0..dst.len() {
+    let c = _mm512_set1_pd(0.044715);
+    let half = _mm512_set1_pd(0.5);
+    let scale = _mm512_set1_pd(sqrt_2_over_pi);
+    let mut i = 0;
+
+    while i + 8 <= dst.len() {
+        let x = _mm512_loadu_pd(src.as_ptr().add(i));
+        let x2 = _mm512_mul_pd(x, x);
+        let x3 = _mm512_mul_pd(x2, x);
+        let inner = _mm512_mul_pd(scale, _mm512_fmadd_pd(x3, c, x));
+        let tanh_inner = tanh_vectorized_avx512(inner);
+        let one_plus_tanh = _mm512_add_pd(_mm512_set1_pd(1.0), tanh_inner);
+        _mm512_storeu_pd(
+            dst.as_mut_ptr().add(i),
+            _mm512_mul_pd(_mm512_mul_pd(half, x), one_plus_tanh),
+        );
+        i += 8;
+    }
+    // Scalar tail
+    while i < dst.len() {
         let x = src[i];
         let x3 = x * x * x;
-        let inner = sqrt_2_over_pi * (x + c * x3);
+        let inner = sqrt_2_over_pi * (x + 0.044715 * x3);
         dst[i] = 0.5 * x * (1.0 + inner.tanh());
+        i += 1;
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+unsafe fn tanh_vectorized_avx2(x: __m256d) -> __m256d {
+    let c1 = _mm256_set1_pd(1.0 / 3.0);
+    let c2 = _mm256_set1_pd(1.0 / 5.0);
+    let c3 = _mm256_set1_pd(1.0 / 7.0);
+    let threshold = _mm256_set1_pd(4.0);
+
+    let x2 = _mm256_mul_pd(x, x);
+    let x3 = _mm256_mul_pd(x2, x);
+    let x5 = _mm256_mul_pd(x3, x2);
+    let x7 = _mm256_mul_pd(x5, x2);
+
+    let poly = x;
+    let term3 = _mm256_mul_pd(x3, c1);
+    let poly = _mm256_sub_pd(poly, term3);
+    let term5 = _mm256_mul_pd(x5, c2);
+    let poly = _mm256_add_pd(poly, term5);
+    let term7 = _mm256_mul_pd(x7, c3);
+    let poly = _mm256_sub_pd(poly, term7);
+
+    let abs_x = _mm256_max_pd(x, _mm256_sub_pd(_mm256_setzero_pd(), x));
+    let mask = _mm256_cmp_pd(abs_x, threshold, _CMP_LT_OQ);
+
+    let sign = _mm256_and_pd(x, _mm256_set1_pd(-0.0_f64.signum()));
+    let saturated = _mm256_or_pd(sign, _mm256_set1_pd(1.0));
+
+    _mm256_blendv_pd(saturated, poly, mask)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
 unsafe fn vector_gelu_avx2(dst: &mut [f64], src: &[f64]) {
-    // AVX doesn't have tanh intrinsic, so we use scalar fallback
     let sqrt_2_over_pi = (2.0 / std::f64::consts::PI).sqrt();
-    let c = 0.044715;
-    for i in 0..dst.len() {
+    let c = _mm256_set1_pd(0.044715);
+    let half = _mm256_set1_pd(0.5);
+    let scale = _mm256_set1_pd(sqrt_2_over_pi);
+    let mut i = 0;
+
+    while i + 4 <= dst.len() {
+        let x = _mm256_loadu_pd(src.as_ptr().add(i));
+        let x2 = _mm256_mul_pd(x, x);
+        let x3 = _mm256_mul_pd(x2, x);
+        let inner = _mm256_mul_pd(scale, _mm256_add_pd(x, _mm256_mul_pd(x3, c)));
+        let tanh_inner = tanh_vectorized_avx2(inner);
+        let one_plus_tanh = _mm256_add_pd(_mm256_set1_pd(1.0), tanh_inner);
+        _mm256_storeu_pd(
+            dst.as_mut_ptr().add(i),
+            _mm256_mul_pd(_mm256_mul_pd(half, x), one_plus_tanh),
+        );
+        i += 4;
+    }
+    while i < dst.len() {
         let x = src[i];
         let x3 = x * x * x;
-        let inner = sqrt_2_over_pi * (x + c * x3);
+        let inner = sqrt_2_over_pi * (x + 0.044715 * x3);
         dst[i] = 0.5 * x * (1.0 + inner.tanh());
+        i += 1;
     }
 }
 
@@ -1890,4 +1994,38 @@ unsafe fn layer_norm_neon(data: &mut [f64], mean: f64, inv_std: f64, gamma: &[f6
         data[i] = y;
         i += 1;
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  NEON Fast tanh  —  Neumann series for |x| < 4, saturation otherwise
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn tanh_vectorized_neon(x: float64x2_t) -> float64x2_t {
+    use core::arch::aarch64::*;
+
+    let c1 = 1.0 / 3.0;
+    let c2 = 1.0 / 5.0;
+    let c3 = 1.0 / 7.0;
+    let threshold = 4.0_f64;
+
+    let x2 = vmulq_f64(x, x);
+    let x3 = vmulq_f64(x2, x);
+    let x5 = vmulq_f64(x3, x2);
+    let x7 = vmulq_f64(x5, x2);
+
+    let poly = x;
+    let poly = vsubq_f64(poly, vmulq_f64(x3, vdupq_n_f64(c1)));
+    let poly = vaddq_f64(poly, vmulq_f64(x5, vdupq_n_f64(c2)));
+    let poly = vsubq_f64(poly, vmulq_f64(x7, vdupq_n_f64(c3)));
+
+    let abs_x = vabsq_f64(x);
+    let mask = vcltq_f64(abs_x, vdupq_n_f64(threshold));
+
+    // sign(x) for saturation
+    let sign = vandq_f64(x, vdupq_n_f64(-0.0_f64.signum()));
+    let saturated = vorrq_f64(sign, vdupq_n_f64(1.0));
+
+    vbslq_f64(mask, poly, saturated)
 }

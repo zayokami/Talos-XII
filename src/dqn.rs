@@ -27,6 +27,9 @@ const PER_BETA_START: f64 = 0.4;
 const PER_BETA_END: f64 = 1.0;
 const PER_EPSILON: f64 = 1e-6;
 
+// Constant tensor data for reuse - avoids per-step allocation
+const ONES_5_1_DATA: [f64; 5] = [1.0; 5];
+
 // --- Layers ---
 // Linear layer is now imported from crate::nn
 
@@ -704,6 +707,10 @@ fn train_dqn_impl(
     let snapshot_every = (total_steps / 200).max(1);
     let mut last_train_loss = 0.0_f64;
 
+    // Pre-allocated scratch buffers to avoid per-step heap allocations
+    let mut scratch = DqnTrainerScratch::new();
+    let ones_5_1 = Tensor::new(ONES_5_1_DATA.to_vec(), vec![5, 1]);
+
     let pb = create_bar(total_steps as u64, "DQN Training");
 
     for step in 0..total_steps {
@@ -836,27 +843,24 @@ fn train_dqn_impl(
             let start_forward = std::time::Instant::now();
             optimizer.zero_grad();
 
-            let mut states_vec = Vec::with_capacity(BATCH_SIZE * DIM);
-            let mut next_states_vec = Vec::with_capacity(BATCH_SIZE * DIM);
-            let mut actions_vec = Vec::with_capacity(BATCH_SIZE * ACTION_SPACE);
-            let mut rewards_vec = Vec::with_capacity(BATCH_SIZE);
-            let mut dones_vec = Vec::with_capacity(BATCH_SIZE);
+            scratch.reset();
 
             for exp in &per_sample.experiences {
-                states_vec.extend_from_slice(&exp.state);
-                next_states_vec.extend_from_slice(&exp.next_state);
-
-                let mut mask = vec![0.0; ACTION_SPACE];
-                mask[exp.action] = 1.0;
-                actions_vec.extend_from_slice(&mask);
-
-                rewards_vec.push(exp.reward);
-                dones_vec.push(if exp.done { 1.0 } else { 0.0 });
+                scratch.states_vec.extend_from_slice(&exp.state);
+                scratch.next_states_vec.extend_from_slice(&exp.next_state);
+                // Build action mask: all zeros except exp.action which is 1.0
+                let mask_start = scratch.actions_vec.len();
+                scratch.actions_vec.resize(mask_start + ACTION_SPACE, 0.0);
+                scratch.actions_vec[mask_start + exp.action] = 1.0;
+                scratch.rewards_vec.push(exp.reward);
+                scratch.dones_vec.push(if exp.done { 1.0 } else { 0.0 });
             }
 
-            let batch_state = Tensor::new(states_vec, vec![BATCH_SIZE, DIM]);
-            let batch_next_state = Tensor::new(next_states_vec, vec![BATCH_SIZE, DIM]);
-            let batch_mask = Tensor::new(actions_vec, vec![BATCH_SIZE, ACTION_SPACE]);
+            let batch_state = Tensor::new(scratch.states_vec.clone(), vec![BATCH_SIZE, DIM]);
+            let batch_next_state =
+                Tensor::new(scratch.next_states_vec.clone(), vec![BATCH_SIZE, DIM]);
+            let batch_mask =
+                Tensor::new(scratch.actions_vec.clone(), vec![BATCH_SIZE, ACTION_SPACE]);
 
             // 2. Policy Forward
             let q_values = policy_net.forward(&batch_state); // (B, 5)
@@ -864,7 +868,6 @@ fn train_dqn_impl(
             // Select Action Q-Values: (B, 5) * (B, 5) -> (B, 5) [one non-zero per row]
             // Sum across dim 1 to get (B, 1)
             // MatMul by ones(5, 1) -> (B, 1)
-            let ones_5_1 = Tensor::new(vec![1.0; 5], vec![5, 1]);
             let q_actions = (q_values * batch_mask).matmul(&ones_5_1); // (B, 1)
 
             // 3. Compute Targets (Double DQN)
@@ -878,8 +881,6 @@ fn train_dqn_impl(
             let guards = TensorReadGuard::new(&[&q_next_eval, &q_next_target]);
             let q_next_eval_data = guards.get(0);
             let q_next_target_data = guards.get(1);
-
-            let mut target_vals = Vec::with_capacity(BATCH_SIZE);
 
             for i in 0..BATCH_SIZE {
                 let start = i * ACTION_SPACE;
@@ -899,14 +900,14 @@ fn train_dqn_impl(
                 // Value from Target Net
                 let next_q_val = q_next_target_data[start + max_idx];
 
-                let r = rewards_vec[i];
-                let d = dones_vec[i];
+                let r = scratch.rewards_vec[i];
+                let d = scratch.dones_vec[i];
                 // if done (d=1.0), target = r. else r + gamma * next_q_val
                 let target = r + GAMMA * next_q_val * (1.0 - d);
-                target_vals.push(target);
+                scratch.target_vals.push(target);
             }
 
-            let target_tensor = Tensor::new(target_vals, vec![BATCH_SIZE, 1]);
+            let target_tensor = Tensor::new(scratch.target_vals.clone(), vec![BATCH_SIZE, 1]);
 
             // IS-weighted loss: w_i * (q - target)^2, normalized
             let is_weights_tensor = Tensor::new(per_sample.is_weights.clone(), vec![BATCH_SIZE, 1]);
@@ -1042,6 +1043,38 @@ pub fn train_dqn_with_metrics(
     train_dqn_impl(initial_model, rng, dbn, config, metrics_tx)
 }
 
+/// Scratch buffers for DQN training to avoid per-step heap allocations.
+struct DqnTrainerScratch {
+    states_vec: Vec<f64>,
+    next_states_vec: Vec<f64>,
+    actions_vec: Vec<f64>,
+    rewards_vec: Vec<f64>,
+    dones_vec: Vec<f64>,
+    target_vals: Vec<f64>,
+}
+
+impl DqnTrainerScratch {
+    fn new() -> Self {
+        Self {
+            states_vec: Vec::with_capacity(BATCH_SIZE * DIM),
+            next_states_vec: Vec::with_capacity(BATCH_SIZE * DIM),
+            actions_vec: Vec::with_capacity(BATCH_SIZE * ACTION_SPACE),
+            rewards_vec: Vec::with_capacity(BATCH_SIZE),
+            dones_vec: Vec::with_capacity(BATCH_SIZE),
+            target_vals: Vec::with_capacity(BATCH_SIZE),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.states_vec.clear();
+        self.next_states_vec.clear();
+        self.actions_vec.clear();
+        self.rewards_vec.clear();
+        self.dones_vec.clear();
+        self.target_vals.clear();
+    }
+}
+
 /// Incremental DQN trainer for online learning during interactive mode.
 pub struct OnlineDqnTrainer {
     policy: DuelingQNetwork,
@@ -1049,6 +1082,7 @@ pub struct OnlineDqnTrainer {
     optimizer: Adam,
     replay_buffer: ReplayBuffer,
     steps_done: usize,
+    scratch: DqnTrainerScratch,
 }
 
 impl OnlineDqnTrainer {
@@ -1063,6 +1097,7 @@ impl OnlineDqnTrainer {
             optimizer,
             replay_buffer: ReplayBuffer::new(BUFFER_CAPACITY),
             steps_done: 0,
+            scratch: DqnTrainerScratch::new(),
         }
     }
 
@@ -1081,28 +1116,35 @@ impl OnlineDqnTrainer {
         let per_sample = self.replay_buffer.sample(rng, BATCH_SIZE, beta);
         self.optimizer.zero_grad();
 
-        let mut states_vec = Vec::with_capacity(BATCH_SIZE * DIM);
-        let mut next_states_vec = Vec::with_capacity(BATCH_SIZE * DIM);
-        let mut actions_vec = Vec::with_capacity(BATCH_SIZE * ACTION_SPACE);
-        let mut rewards_vec = Vec::with_capacity(BATCH_SIZE);
-        let mut dones_vec = Vec::with_capacity(BATCH_SIZE);
+        self.scratch.reset();
 
         for exp in &per_sample.experiences {
-            states_vec.extend_from_slice(&exp.state);
-            next_states_vec.extend_from_slice(&exp.next_state);
-            let mut mask = vec![0.0; ACTION_SPACE];
-            mask[exp.action] = 1.0;
-            actions_vec.extend_from_slice(&mask);
-            rewards_vec.push(exp.reward);
-            dones_vec.push(if exp.done { 1.0 } else { 0.0 });
+            self.scratch.states_vec.extend_from_slice(&exp.state);
+            self.scratch
+                .next_states_vec
+                .extend_from_slice(&exp.next_state);
+            // Build action mask: all zeros except exp.action which is 1.0
+            let mask_start = self.scratch.actions_vec.len();
+            self.scratch
+                .actions_vec
+                .resize(mask_start + ACTION_SPACE, 0.0);
+            self.scratch.actions_vec[mask_start + exp.action] = 1.0;
+            self.scratch.rewards_vec.push(exp.reward);
+            self.scratch
+                .dones_vec
+                .push(if exp.done { 1.0 } else { 0.0 });
         }
 
-        let batch_state = Tensor::new(states_vec, vec![BATCH_SIZE, DIM]);
-        let batch_next_state = Tensor::new(next_states_vec, vec![BATCH_SIZE, DIM]);
-        let batch_mask = Tensor::new(actions_vec, vec![BATCH_SIZE, ACTION_SPACE]);
+        let batch_state = Tensor::new(self.scratch.states_vec.clone(), vec![BATCH_SIZE, DIM]);
+        let batch_next_state =
+            Tensor::new(self.scratch.next_states_vec.clone(), vec![BATCH_SIZE, DIM]);
+        let batch_mask = Tensor::new(
+            self.scratch.actions_vec.clone(),
+            vec![BATCH_SIZE, ACTION_SPACE],
+        );
 
         let q_values = self.policy.forward(&batch_state);
-        let ones_5_1 = Tensor::new(vec![1.0; 5], vec![5, 1]);
+        let ones_5_1 = Tensor::new(ONES_5_1_DATA.to_vec(), vec![5, 1]);
         let q_actions = (q_values * batch_mask).matmul(&ones_5_1);
 
         let q_next_eval = self.policy.forward(&batch_next_state);
@@ -1113,7 +1155,6 @@ impl OnlineDqnTrainer {
         let q_next_eval_data = guards.get(0);
         let q_next_target_data = guards.get(1);
 
-        let mut target_vals = Vec::with_capacity(BATCH_SIZE);
         for i in 0..BATCH_SIZE {
             let start = i * ACTION_SPACE;
             let end = start + ACTION_SPACE;
@@ -1127,12 +1168,12 @@ impl OnlineDqnTrainer {
                 }
             }
             let next_q_val = q_next_target_data[start + max_idx];
-            let r = rewards_vec[i];
-            let d = dones_vec[i];
+            let r = self.scratch.rewards_vec[i];
+            let d = self.scratch.dones_vec[i];
             let target = r + GAMMA * next_q_val * (1.0 - d);
-            target_vals.push(target);
+            self.scratch.target_vals.push(target);
         }
-        let target_tensor = Tensor::new(target_vals, vec![BATCH_SIZE, 1]);
+        let target_tensor = Tensor::new(self.scratch.target_vals.clone(), vec![BATCH_SIZE, 1]);
         let is_weights_tensor = Tensor::new(per_sample.is_weights.clone(), vec![BATCH_SIZE, 1]);
         let mut loss = q_actions.weighted_mse_loss(&target_tensor, &is_weights_tensor);
         if let Some(reg) = self.policy.achf_orthogonal_penalty() {

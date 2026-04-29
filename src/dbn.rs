@@ -97,6 +97,12 @@ pub struct Rbm {
     pub d_weights: Matrix,
     pub d_vbias: Vec<f64>,
     pub d_hbias: Vec<f64>,
+
+    // Reusable buffers for cd_k_batch to avoid per-call heap allocations
+    grad_w_buf: Vec<f64>,
+    grad_vb_buf: Vec<f64>,
+    grad_hb_buf: Vec<f64>,
+    hk_buf: Vec<f64>,
 }
 
 impl Rbm {
@@ -121,6 +127,10 @@ impl Rbm {
             d_weights: Matrix::new(visible, hidden),
             d_vbias: vec![0.0; visible],
             d_hbias: vec![0.0; hidden],
+            grad_w_buf: vec![0.0; visible * hidden],
+            grad_vb_buf: vec![0.0; visible],
+            grad_hb_buf: vec![0.0; hidden],
+            hk_buf: vec![0.0; hidden],
         }
     }
 
@@ -180,10 +190,10 @@ impl Rbm {
             return 0.0;
         }
 
-        // Gradient Accumulators
-        let mut grad_w = vec![0.0; self.weights.data.len()];
-        let mut grad_vb = vec![0.0; self.visible_size];
-        let mut grad_hb = vec![0.0; self.hidden_size];
+        // Gradient Accumulators - reuse struct buffers
+        self.grad_w_buf.fill(0.0);
+        self.grad_vb_buf.fill(0.0);
+        self.grad_hb_buf.fill(0.0);
         let mut total_error = 0.0;
 
         for input in inputs {
@@ -191,16 +201,17 @@ impl Rbm {
 
             let (h0_probs, h0_samples) = self.sample_h_given_v(input, rng);
 
-            let mut hk_samples = h0_samples.clone();
+            // Reuse hk_buf instead of cloning
+            self.hk_buf.copy_from_slice(&h0_samples);
             let mut vk_probs = vec![];
             let mut vk_samples = vec![];
 
             for _ in 0..k {
-                let (vp, vs) = self.sample_v_given_h(&hk_samples, rng);
+                let (vp, vs) = self.sample_v_given_h(&self.hk_buf, rng);
                 vk_probs = vp;
                 vk_samples = vs;
                 let (_, hs) = self.sample_h_given_v(&vk_samples, rng);
-                hk_samples = hs;
+                self.hk_buf.copy_from_slice(&hs);
             }
 
             let (hk_probs, _) = self.sample_h_given_v(&vk_samples, rng);
@@ -234,13 +245,18 @@ impl Rbm {
                     unsafe {
                         let pos_grad = input_i * *h0_probs.get_unchecked(j);
                         let neg_grad = vk_sample_i * *hk_probs.get_unchecked(j);
-                        grad_w[row_offset + j] += pos_grad - neg_grad;
+                        self.grad_w_buf[row_offset + j] += pos_grad - neg_grad;
                     }
                 }
-                grad_vb[i] += input_i - vk_sample_i;
+                self.grad_vb_buf[i] += input_i - vk_sample_i;
             }
 
-            for (j, grad_val) in grad_hb.iter_mut().enumerate().take(self.hidden_size) {
+            for (j, grad_val) in self
+                .grad_hb_buf
+                .iter_mut()
+                .enumerate()
+                .take(self.hidden_size)
+            {
                 unsafe {
                     *grad_val += *h0_probs.get_unchecked(j) - *hk_probs.get_unchecked(j);
                 }
@@ -258,7 +274,7 @@ impl Rbm {
         let batch_size = inputs.len() as f64;
 
         // Update Weights
-        for (i, g) in grad_w.iter().enumerate() {
+        for (i, g) in self.grad_w_buf.iter().enumerate() {
             unsafe {
                 let avg_grad = g / batch_size;
                 // Standard Momentum Update
@@ -273,7 +289,7 @@ impl Rbm {
         }
 
         // Update Visible Bias
-        for (i, g) in grad_vb.iter().enumerate() {
+        for (i, g) in self.grad_vb_buf.iter().enumerate() {
             unsafe {
                 let avg_grad = g / batch_size;
                 let d_vbias = momentum * *self.d_vbias.get_unchecked(i) + lr * avg_grad;
@@ -283,7 +299,7 @@ impl Rbm {
         }
 
         // Update Hidden Bias
-        for (i, g) in grad_hb.iter().enumerate() {
+        for (i, g) in self.grad_hb_buf.iter().enumerate() {
             unsafe {
                 let avg_grad = g / batch_size;
                 let d_hbias = momentum * *self.d_hbias.get_unchecked(i) + lr * avg_grad;
