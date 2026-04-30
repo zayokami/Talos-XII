@@ -486,21 +486,33 @@ impl RoPE {
         // x: [Batch, Seq, Heads, Dim] or [Batch, Seq, Dim]
         // We assume x is [..., Seq, HeadDim]
         // RoPE applies to the last dimension.
-        // Simplified: just apply to the last dimension assuming it matches self.dim
 
         let shape = &x.shape;
         let dim = shape[shape.len() - 1];
         assert_eq!(dim, self.dim);
         let seq_len = shape[shape.len() - 2]; // Assumes ..., Seq, Dim
+        let num_elements = x.data.read().unwrap().len();
+        let total_batches = num_elements / (seq_len * dim);
 
+        // GPU path: if tensor is on CUDA, use the optimized kernel
+        #[cfg(cuda)]
+        if x.device == crate::autograd::Device::Cuda {
+            return x.rope_cuda(
+                &self.cos_cache,
+                &self.sin_cache,
+                seq_len,
+                dim,
+                total_batches,
+                start_pos,
+            );
+        }
+
+        // CPU path
         let x_data = x.data.read().unwrap();
         let mut out_data = x_data.clone(); // Copy
 
         // Apply rotation
         // This is a naive CPU implementation
-        let num_elements = x_data.len();
-
-        let total_batches = num_elements / (seq_len * dim);
 
         for b in 0..total_batches {
             for t in 0..seq_len {
@@ -1507,6 +1519,14 @@ impl MultiHeadLatentAttention {
         // probs: [B, Seq, Seq], v: [B, Seq, DimV]
         // out[b, i, d] = sum_j (probs[b, i, j] * v[b, j, d])
 
+        // GPU path: if both tensors are on CUDA, use the optimized kernel
+        #[cfg(cuda)]
+        if probs.device == crate::autograd::Device::Cuda
+            && v.device == crate::autograd::Device::Cuda
+        {
+            return self.batched_matmul_probs_v_cuda(probs, v, b, seq, dim_v);
+        }
+
         // Use batch lock for better performance
         let guards = TensorReadGuard::new(&[probs, v]);
         let p_data = guards.get(0);
@@ -1582,6 +1602,199 @@ impl MultiHeadLatentAttention {
                                         p_g_chunk[i * seq + j] += g * v_slice[j * dim_v + d];
 
                                         // dL/dV[b, j, d] += g * P[b, i, j]
+                                        v_g_chunk[j * dim_v + d] += g * p_slice[i * seq + j];
+                                    }
+                                }
+                            }
+                        });
+                }),
+            })),
+        }
+    }
+
+    /// GPU-accelerated batched matmul: probs * v -> out
+    /// probs: [B, Seq, Seq], v: [B, Seq, DimV], out: [B, Seq, DimV]
+    #[cfg(cuda)]
+    fn batched_matmul_probs_v_cuda(
+        &self,
+        probs: &Tensor,
+        v: &Tensor,
+        b: usize,
+        seq: usize,
+        dim_v: usize,
+    ) -> Tensor {
+        use crate::cuda::kernels::attention_weighted_sum;
+        use crate::cuda::memory::{alloc, copy_d2h, copy_h2d};
+
+        let p_len = probs.data.read().unwrap().len();
+        let v_len = v.data.read().unwrap().len();
+        let out_len = b * seq * dim_v;
+
+        // Upload to GPU
+        let d_probs = match probs.cuda_get_or_upload_buffer() {
+            Ok(buf) => buf,
+            Err((stage, err)) => {
+                eprintln!("[MLA] CUDA probs upload failed ({}), using CPU path", err);
+                return self.batched_matmul_probs_v_cpu_fallback(probs, v, b, seq, dim_v);
+            }
+        };
+        let d_v = match v.cuda_get_or_upload_buffer() {
+            Ok(buf) => buf,
+            Err((stage, err)) => {
+                eprintln!("[MLA] CUDA v upload failed ({}), using CPU path", err);
+                return self.batched_matmul_probs_v_cpu_fallback(probs, v, b, seq, dim_v);
+            }
+        };
+        let d_out = match alloc::<f64>(out_len) {
+            Ok(buf) => buf,
+            Err(err) => {
+                eprintln!("[MLA] CUDA alloc failed ({})", err);
+                return self.batched_matmul_probs_v_cpu_fallback(probs, v, b, seq, dim_v);
+            }
+        };
+
+        if let Err(err) = attention_weighted_sum(&d_probs, &d_v, &d_out, b, seq, dim_v) {
+            eprintln!("[MLA] CUDA attention_weighted_sum failed ({})", err);
+            return self.batched_matmul_probs_v_cpu_fallback(probs, v, b, seq, dim_v);
+        }
+
+        let d_out = Arc::new(d_out);
+
+        // Copy result back to CPU for backward pass and tensor ops
+        let mut out_data = vec![0.0; out_len];
+        if let Err(err) = copy_d2h(&mut out_data, &d_out) {
+            eprintln!("[MLA] CUDA D2H copy failed ({})", err);
+            return self.batched_matmul_probs_v_cpu_fallback(probs, v, b, seq, dim_v);
+        }
+
+        // Store probs and v data for backward
+        let p_data = probs.data.read().unwrap().clone();
+        let v_data = v.data.read().unwrap().clone();
+        let b_cap = b;
+        let seq_cap = seq;
+        let dim_v_cap = dim_v;
+
+        let parents = vec![probs.clone(), v.clone()];
+        Tensor {
+            data: Arc::new(RwLock::new(out_data)),
+            grad: Arc::new(RwLock::new(vec![0.0; out_len])),
+            shape: vec![b, seq, dim_v],
+            device: crate::autograd::Device::Cpu,
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    let p_in = &parents[0];
+                    let v_in = &parents[1];
+                    let mut p_grad = p_in.grad.write().unwrap();
+                    let mut v_grad = v_in.grad.write().unwrap();
+
+                    let chunk_size_p = seq_cap * seq_cap;
+                    let chunk_size_v = seq_cap * dim_v_cap;
+                    let chunk_size_grad = seq_cap * dim_v_cap;
+
+                    p_grad
+                        .par_chunks_mut(chunk_size_p)
+                        .zip(v_grad.par_chunks_mut(chunk_size_v))
+                        .zip(grad_out.par_chunks(chunk_size_grad))
+                        .enumerate()
+                        .for_each(|(batch_idx, ((p_g_chunk, v_g_chunk), g_out_chunk))| {
+                            let base_p = batch_idx * seq_cap * seq_cap;
+                            let base_v = batch_idx * seq_cap * dim_v_cap;
+                            let p_slice = &p_data[base_p..base_p + chunk_size_p];
+                            let v_slice = &v_data[base_v..base_v + chunk_size_v];
+
+                            for i in 0..seq_cap {
+                                for d in 0..dim_v_cap {
+                                    let g = g_out_chunk[i * dim_v_cap + d];
+                                    for j in 0..seq_cap {
+                                        p_g_chunk[i * seq_cap + j] +=
+                                            g * v_slice[j * dim_v_cap + d];
+                                        v_g_chunk[j * dim_v_cap + d] +=
+                                            g * p_slice[i * seq_cap + j];
+                                    }
+                                }
+                            }
+                        });
+                }),
+            })),
+        }
+    }
+
+    /// CPU fallback for batched_matmul_probs_v (used when CUDA fails)
+    #[cfg(cuda)]
+    fn batched_matmul_probs_v_cpu_fallback(
+        &self,
+        probs: &Tensor,
+        v: &Tensor,
+        b: usize,
+        seq: usize,
+        dim_v: usize,
+    ) -> Tensor {
+        use crate::simd::add_scaled_row;
+        let guards = TensorReadGuard::new(&[probs, v]);
+        let p_data = guards.get(0);
+        let v_data = guards.get(1);
+
+        let out_data: Vec<f64> = (0..b)
+            .into_par_iter()
+            .flat_map_iter(|batch_idx| {
+                let base_p = batch_idx * seq * seq;
+                let base_v = batch_idx * seq * dim_v;
+                let mut batch_out = vec![0.0; seq * dim_v];
+
+                for i in 0..seq {
+                    let out_row = &mut batch_out[i * dim_v..(i + 1) * dim_v];
+                    for j in 0..seq {
+                        let p_val = p_data[base_p + i * seq + j];
+                        if p_val.abs() < 1e-9 {
+                            continue;
+                        }
+                        let v_row = &v_data[base_v + j * dim_v..base_v + (j + 1) * dim_v];
+                        add_scaled_row(out_row, v_row, p_val);
+                    }
+                }
+                batch_out
+            })
+            .collect();
+
+        let parents = vec![probs.clone(), v.clone()];
+        Tensor {
+            data: Arc::new(RwLock::new(out_data)),
+            grad: Arc::new(RwLock::new(vec![0.0; b * seq * dim_v])),
+            shape: vec![b, seq, dim_v],
+            device: crate::autograd::Device::Cpu,
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    let p_in = &parents[0];
+                    let v_in = &parents[1];
+                    let guards = TensorReadGuard::new(&[p_in, v_in]);
+                    let p_data = guards.get(0);
+                    let v_data = guards.get(1);
+
+                    let mut p_grad = p_in.grad.write().unwrap();
+                    let mut v_grad = v_in.grad.write().unwrap();
+
+                    let chunk_size_p = seq * seq;
+                    let chunk_size_v = seq * dim_v;
+                    let chunk_size_grad = seq * dim_v;
+
+                    p_grad
+                        .par_chunks_mut(chunk_size_p)
+                        .zip(v_grad.par_chunks_mut(chunk_size_v))
+                        .zip(grad_out.par_chunks(chunk_size_grad))
+                        .enumerate()
+                        .for_each(|(batch_idx, ((p_g_chunk, v_g_chunk), g_out_chunk))| {
+                            let base_p = batch_idx * seq * seq;
+                            let base_v = batch_idx * seq * dim_v;
+                            let p_slice = &p_data[base_p..base_p + chunk_size_p];
+                            let v_slice = &v_data[base_v..base_v + chunk_size_v];
+
+                            for i in 0..seq {
+                                for d in 0..dim_v {
+                                    let g = g_out_chunk[i * dim_v + d];
+                                    for j in 0..seq {
+                                        p_g_chunk[i * seq + j] += g * v_slice[j * dim_v + d];
                                         v_g_chunk[j * dim_v + d] += g * p_slice[i * seq + j];
                                     }
                                 }

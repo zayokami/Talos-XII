@@ -4012,6 +4012,148 @@ impl Tensor {
         out
     }
 
+    /// GPU-accelerated RoPE forward.
+    #[cfg(cuda)]
+    #[allow(dead_code)]
+    pub(crate) fn rope_cuda(
+        &self,
+        cos_cache: &[f64],
+        sin_cache: &[f64],
+        seq_len: usize,
+        dim: usize,
+        total_batches: usize,
+        start_pos: usize,
+    ) -> Tensor {
+        use crate::cuda::kernels::rope_inplace;
+        use crate::cuda::memory::{alloc, copy_d2d};
+
+        let len = self.data.read().unwrap().len();
+        if len == 0 {
+            return self.clone();
+        }
+        let expected = total_batches * seq_len * dim;
+        if len != expected {
+            return self.clone();
+        }
+        crate::cuda::record_activation_attempt();
+
+        let d_src = match self.cuda_get_or_upload_buffer() {
+            Ok(buf) => buf,
+            Err((stage, err)) => {
+                crate::cuda::record_activation_fallback(stage);
+                eprintln!("[Autograd] CUDA RoPE upload failed ({}), using CPU", err);
+                return self.clone();
+            }
+        };
+        let d_data = match alloc::<f64>(len) {
+            Ok(buf) => buf,
+            Err(err) => {
+                crate::cuda::record_activation_fallback("alloc");
+                return self.clone();
+            }
+        };
+
+        if let Err(err) = copy_d2d(&d_data, &d_src) {
+            crate::cuda::record_activation_fallback("copy");
+            return self.clone();
+        }
+
+        // Upload cos/sin caches
+        let d_cos = match alloc::<f64>(cos_cache.len()) {
+            Ok(buf) => buf,
+            Err(_) => {
+                crate::cuda::record_activation_fallback("alloc_cos");
+                return self.clone();
+            }
+        };
+        let d_sin = match alloc::<f64>(sin_cache.len()) {
+            Ok(buf) => buf,
+            Err(_) => {
+                crate::cuda::record_activation_fallback("alloc_sin");
+                return self.clone();
+            }
+        };
+        if let Err(e) = copy_h2d(&d_cos, cos_cache) {
+            crate::cuda::record_activation_fallback("copy_cos");
+            return self.clone();
+        }
+        if let Err(e) = copy_h2d(&d_sin, sin_cache) {
+            crate::cuda::record_activation_fallback("copy_sin");
+            return self.clone();
+        }
+
+        if let Err(err) = rope_inplace(
+            &d_data,
+            &d_cos,
+            &d_sin,
+            seq_len,
+            dim,
+            total_batches,
+            start_pos,
+        ) {
+            crate::cuda::record_activation_fallback("kernel");
+            eprintln!("[Autograd] CUDA RoPE kernel failed ({}), using CPU", err);
+            return self.clone();
+        }
+        crate::cuda::record_activation_success();
+
+        let d_data = Arc::new(d_data);
+        let parents = vec![self.clone()];
+        let dim_cap = dim;
+        let cos_cache = cos_cache.to_vec();
+        let sin_cache = sin_cache.to_vec();
+        let seq_len_cap = seq_len;
+        let total_batches_cap = total_batches;
+        let start_pos_cap = start_pos;
+
+        let out = Tensor {
+            data: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            shape: self.shape.clone(),
+            device: Device::Cuda,
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    let cos_cache = cos_cache.clone();
+                    let sin_cache = sin_cache.clone();
+                    let grad_out_data: Vec<f64> = if let Some(buf) = parents[0].cuda_cached_buffer()
+                    {
+                        let mut cpu = vec![0.0; buf.len()];
+                        if crate::cuda::memory::copy_d2h(&mut cpu, &buf).is_ok() {
+                            cpu
+                        } else {
+                            return;
+                        }
+                    } else {
+                        return;
+                    };
+                    let mut inp_grad = parents[0].grad.write().unwrap();
+                    let half_dim = dim_cap / 2;
+                    for b in 0..total_batches_cap {
+                        for t in 0..seq_len_cap {
+                            let pos = start_pos_cap + t;
+                            if pos * half_dim >= cos_cache.len() {
+                                continue;
+                            }
+                            let cache_idx = pos * half_dim;
+                            let base_idx = b * (seq_len_cap * dim_cap) + t * dim_cap;
+                            for i in 0..half_dim {
+                                let c = cos_cache[cache_idx + i];
+                                let s = sin_cache[cache_idx + i];
+                                let g1 = grad_out_data[base_idx + 2 * i];
+                                let g2 = grad_out_data[base_idx + 2 * i + 1];
+                                inp_grad[base_idx + 2 * i] += g1 * c + g2 * s;
+                                inp_grad[base_idx + 2 * i + 1] += -g1 * s + g2 * c;
+                            }
+                        }
+                    }
+                }),
+            })),
+        };
+        out.cuda_set_cached_buffer(d_data);
+        out
+    }
+
     /// GPU-accelerated log-softmax for the last dimension.
     #[cfg(cuda)]
     #[allow(dead_code)]
