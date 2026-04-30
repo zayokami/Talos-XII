@@ -2001,9 +2001,11 @@ unsafe fn layer_norm_neon(data: &mut [f64], mean: f64, inv_std: f64, gamma: &[f6
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[cfg(target_arch = "aarch64")]
+use core::arch::aarch64::*;
+
+#[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn tanh_vectorized_neon(x: float64x2_t) -> float64x2_t {
-    use core::arch::aarch64::*;
 
     let c1 = 1.0 / 3.0;
     let c2 = 1.0 / 5.0;
