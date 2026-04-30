@@ -1,10 +1,10 @@
 use crate::autograd::Tensor;
 use crate::config::Config;
-use crate::dbn::Dbn;
+use crate::env_net::EnvNet;
 use crate::neural::DIM;
 use crate::nn::{Linear, Module};
 use crate::rng::Rng;
-use crate::sim::{build_features, dbn_env, prob_6, PpoExperience, PullState};
+use crate::sim::{build_features, env_net_env, prob_6, PpoExperience, PullState};
 use crate::transformer::{KVCache, LuckTransformer};
 use crate::utils::{
     create_bar, normalize_slice, sum_f64, sum_sq_diff, ACTIONS, ACTION_SPACE, EPISODE_MAX_PULLS,
@@ -821,7 +821,7 @@ impl PpoEnvState {
     #[allow(clippy::too_many_arguments)]
     fn new(
         seed: u64,
-        dbn: &Dbn,
+        env_net: &EnvNet,
         context_len: usize,
         num_heads: usize,
         num_layers: usize,
@@ -831,7 +831,7 @@ impl PpoEnvState {
         max_seq_len: usize,
     ) -> Self {
         let mut rng = Rng::from_seed(seed);
-        let (env_noise, env_bias) = dbn_env(dbn, &mut rng);
+        let (env_noise, env_bias) = env_net_env(env_net, &mut rng, 0, 0, 0, 0);
         let mut caches: Vec<_> = (0..num_layers).map(|_| KVCache::new(num_heads)).collect();
         for cache in &mut caches {
             cache.preallocate(
@@ -863,7 +863,7 @@ impl PpoEnvState {
         }
     }
 
-    fn reset(&mut self, dbn: &Dbn) {
+    fn reset(&mut self, env_net: &EnvNet) {
         self.history_buffer.clear();
         self.pity_buffer.clear();
         for cache in self.kv_cache.iter_mut() {
@@ -876,7 +876,7 @@ impl PpoEnvState {
             streak_4_star: 0,
             loss_streak: 0,
         };
-        let (env_noise, env_bias) = dbn_env(dbn, &mut self.rng);
+        let (env_noise, env_bias) = env_net_env(env_net, &mut self.rng, 0, 0, 0, 0);
         self.env_noise = env_noise;
         self.env_bias = env_bias;
         self.pulls_done = 0;
@@ -886,7 +886,7 @@ impl PpoEnvState {
     fn step(
         &mut self,
         policy: &ActorCritic,
-        dbn: &Dbn,
+        env_net: &EnvNet,
         config: &Config,
         context_len: usize,
     ) -> PpoStepResult {
@@ -1017,7 +1017,7 @@ impl PpoEnvState {
 
         let finished_reward = if done {
             let r = self.episode_reward;
-            self.reset(dbn);
+            self.reset(env_net);
             Some(r)
         } else {
             None
@@ -1036,7 +1036,7 @@ struct PpoStepResult {
 }
 
 /// Train a PPO agent with multi-environment rollouts.
-pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
+pub fn train_ppo(rng: &mut Rng, env_net: &EnvNet, config: &Config) -> ActorCritic {
     println!("\n[PPO] Initializing PPO Training (Actor-Critic)...");
     let fast_mode = config.fast_init || config.ppo_mode == "fast";
     let total_steps = if config.ppo_total_steps > 0 {
@@ -1089,7 +1089,7 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
         .map(|seed| {
             PpoEnvState::new(
                 seed,
-                dbn,
+                env_net,
                 context_len,
                 mla_cfg.num_heads,
                 ppo.policy.backbone.blocks.len(),
@@ -1125,7 +1125,7 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
             let step_results: Vec<PpoStepResult> = worker
                 .execute(|| {
                     envs.par_iter_mut()
-                        .map(|env| env.step(&ppo.policy, dbn, config, context_len))
+                        .map(|env| env.step(&ppo.policy, env_net, config, context_len))
                         .collect()
                 })
                 .unwrap_or_else(|msg| {
@@ -1164,7 +1164,7 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
             let start = remainder_offset % num_envs;
             for i in 0..remainder {
                 let idx = (start + i) % num_envs;
-                let result = envs[idx].step(&ppo.policy, dbn, config, context_len);
+                let result = envs[idx].step(&ppo.policy, env_net, config, context_len);
                 ppo.store_raw(result.experience);
                 if let Some(done_reward) = result.finished_reward {
                     _episode_count += 1;
@@ -1233,7 +1233,7 @@ pub fn train_ppo(rng: &mut Rng, dbn: &Dbn, config: &Config) -> ActorCritic {
 /// Train PPO with optional metrics collection for benchmarking.
 pub fn train_ppo_with_metrics(
     rng: &mut Rng,
-    dbn: &Dbn,
+    env_net: &EnvNet,
     config: &Config,
     metrics_tx: Option<std::sync::mpsc::Sender<crate::bench::StepSnapshot>>,
 ) -> ActorCritic {
@@ -1289,7 +1289,7 @@ pub fn train_ppo_with_metrics(
         .map(|seed| {
             PpoEnvState::new(
                 seed,
-                dbn,
+                env_net,
                 context_len,
                 mla_cfg.num_heads,
                 ppo.policy.backbone.blocks.len(),
@@ -1323,7 +1323,7 @@ pub fn train_ppo_with_metrics(
             let step_results: Vec<PpoStepResult> = worker
                 .execute(|| {
                     envs.par_iter_mut()
-                        .map(|env| env.step(&ppo.policy, dbn, config, context_len))
+                        .map(|env| env.step(&ppo.policy, env_net, config, context_len))
                         .collect()
                 })
                 .unwrap_or_else(|msg| {
@@ -1362,7 +1362,7 @@ pub fn train_ppo_with_metrics(
             let start = remainder_offset % num_envs;
             for i in 0..remainder {
                 let idx = (start + i) % num_envs;
-                let result = envs[idx].step(&ppo.policy, dbn, config, context_len);
+                let result = envs[idx].step(&ppo.policy, env_net, config, context_len);
                 ppo.store_raw(result.experience);
                 if let Some(done_reward) = result.finished_reward {
                     _episode_count += 1;

@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::dbn::Dbn;
+use crate::env_net::EnvNet;
 use crate::neural::{NeuralLuckOptimizer, DIM};
 use crate::rng::Rng;
 use crate::sim::{
@@ -29,7 +29,7 @@ const EVAL_BIG_PITY_PENALTY: f64 = 200.0;
 pub fn train_linear_regression(
     neural_opt: &NeuralLuckOptimizer,
     rng: &mut Rng,
-    dbn: &Dbn,
+    env_net: &EnvNet,
     config: &Config,
 ) -> ([f64; DIM], f64) {
     let mut base = neural_opt.clone();
@@ -47,7 +47,7 @@ pub fn train_linear_regression(
         200
     };
     // This will generate ~10k to 40k data points (50 * 200 = 10000)
-    let data = simulate_for_data_collection(sim_count, rng, &base, dbn, config);
+    let data = simulate_for_data_collection(sim_count, rng, &base, env_net, config);
 
     println!(
         "[Linear] Collected {} samples from realistic simulation trajectories.",
@@ -99,7 +99,7 @@ pub fn train_linear_regression(
 fn evaluate_manifold_reward(
     model: &NeuralLuckOptimizer,
     rng: &mut Rng,
-    dbn: &Dbn,
+    env_net: &EnvNet,
     config: &Config,
 ) -> f64 {
     let sims = if cfg!(debug_assertions) { 2000 } else { 6000 };
@@ -107,7 +107,7 @@ fn evaluate_manifold_reward(
         neural_opt: model,
         dqn_policy: None,
         ppo_policy: None,
-        dbn,
+        env_net,
         config,
         exp_sender: None,
         neural_sender: None,
@@ -133,7 +133,7 @@ fn evaluate_manifold_reward(
 pub fn train_manifold_rl(
     base: &NeuralLuckOptimizer,
     rng: &mut Rng,
-    dbn: &Dbn,
+    env_net: &EnvNet,
     config: &Config,
     worker: &GoodJobWorker,
 ) -> NeuralLuckOptimizer {
@@ -244,9 +244,9 @@ pub fn train_manifold_rl(
                     let mut sim_rng_neg = Rng::from_seed(local_rng.next_u64());
 
                     let mut r_pos =
-                        evaluate_manifold_reward(&opt_pos, &mut sim_rng_pos, dbn, config);
+                        evaluate_manifold_reward(&opt_pos, &mut sim_rng_pos, env_net, config);
                     let mut r_neg =
-                        evaluate_manifold_reward(&opt_neg, &mut sim_rng_neg, dbn, config);
+                        evaluate_manifold_reward(&opt_neg, &mut sim_rng_neg, env_net, config);
 
                     // Add L1 Penalty for Sparsity
                     let l1_pos: f64 = params_pos.iter().map(|x| x.abs()).sum();
@@ -367,7 +367,7 @@ pub fn train_manifold_rl(
 /// Train neural luck optimizer using genetic algorithm.
 pub fn train_neural_optimizer(
     seed: u64,
-    dbn: &Dbn,
+    env_net: &EnvNet,
     config: &Config,
     worker: &GoodJobWorker,
 ) -> NeuralLuckOptimizer {
@@ -421,7 +421,7 @@ pub fn train_neural_optimizer(
                         neural_opt: &population[idx],
                         dqn_policy: None,
                         ppo_policy: None,
-                        dbn,
+                        env_net,
                         config,
                         exp_sender: None,
                         neural_sender: None,

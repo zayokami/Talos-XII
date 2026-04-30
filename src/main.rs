@@ -10,6 +10,7 @@ mod config;
 mod cuda;
 mod dbn;
 mod dqn;
+mod env_net;
 #[cfg(test)]
 mod grad_check;
 mod i18n;
@@ -31,8 +32,8 @@ use clap::{Parser, Subcommand};
 use collect::{add_session_interactive, import_from_json, print_stats, PlayerDatabase};
 use colored::Colorize;
 use config::{ComputeDevice, Config, LuckMode};
-use dbn::Dbn;
 use dqn::{train_dqn, DuelingQNetwork, Experience, OnlineDqnTrainer};
+use env_net::EnvNet;
 use i18n::{I18n, Language};
 use log::info;
 use neural::{NeuralLuckOptimizer, DIM};
@@ -266,7 +267,7 @@ struct F2pAnalysisCtx<'a> {
     neural_opt: &'a NeuralLuckOptimizer,
     dqn_policy: Option<&'a DuelingQNetwork>,
     ppo_policy: Option<&'a ActorCritic>,
-    dbn: &'a Dbn,
+    env_net: &'a EnvNet,
     worker: &'a GoodJobWorker,
     lang: Language,
 }
@@ -303,7 +304,7 @@ fn run_f2p_analysis(ctx: &F2pAnalysisCtx<'_>, rng: &mut Rng) {
         neural_opt: ctx.neural_opt,
         dqn_policy: f2p_dqn_policy,
         ppo_policy: f2p_ppo_policy,
-        dbn: ctx.dbn,
+        env_net: ctx.env_net,
         config: &f2p_config,
         worker: ctx.worker,
         exp_sender: None,
@@ -443,7 +444,7 @@ fn benchmark_simulation(
     neural_opt: &NeuralLuckOptimizer,
     dqn_policy: Option<&DuelingQNetwork>,
     ppo_policy: Option<&ActorCritic>,
-    dbn: &Dbn,
+    env_net: &EnvNet,
     config: &Config,
     lang: Language,
 ) {
@@ -451,7 +452,7 @@ fn benchmark_simulation(
         neural_opt,
         dqn_policy,
         ppo_policy,
-        dbn,
+        env_net,
         config,
         exp_sender: None,
         neural_sender: None,
@@ -506,7 +507,7 @@ fn initialize_system(
     args: &Args,
 ) -> (
     Config,
-    Dbn,
+    EnvNet,
     NeuralLuckOptimizer,
     DuelingQNetwork,
     ActorCritic,
@@ -523,19 +524,7 @@ fn initialize_system(
 
     let worker = GoodJobWorker::new_with_config(&config);
 
-    let mut dbn = Dbn::new(&[32, 128, 64, 32], &mut rng);
-    let (dbn_data_count, dbn_epochs) = if config.fast_init {
-        if cfg!(debug_assertions) {
-            (64, 2)
-        } else {
-            (256, 4)
-        }
-    } else if cfg!(debug_assertions) {
-        (256, 5)
-    } else {
-        (1024, 20)
-    };
-    dbn.train(&mut rng, dbn_data_count, dbn_epochs);
+    let env_net = EnvNet::new(&mut rng);
 
     let mut trained_neural_opt = if !args.force {
         if let Some(cached) = load_neural_cache(NEURAL_CACHE_PATH) {
@@ -543,19 +532,20 @@ fn initialize_system(
             cached
         } else {
             info!("[Neural Core] Cache not found. Training new weights...");
-            train_neural_optimizer(rng.next_u64(), &dbn, &config, &worker)
+            train_neural_optimizer(rng.next_u64(), &env_net, &config, &worker)
         }
     } else {
         info!("[Neural Core] Force training new weights...");
-        train_neural_optimizer(rng.next_u64(), &dbn, &config, &worker)
+        train_neural_optimizer(rng.next_u64(), &env_net, &config, &worker)
     };
 
     info!("[Linear] Training linear regression...");
-    let (lin_w, lin_b) = train_linear_regression(&trained_neural_opt, &mut rng, &dbn, &config);
+    let (lin_w, lin_b) = train_linear_regression(&trained_neural_opt, &mut rng, &env_net, &config);
     trained_neural_opt.set_linear_params(lin_w, lin_b);
 
     info!("[RL] Manifold Optimization (Parallel)...");
-    trained_neural_opt = train_manifold_rl(&trained_neural_opt, &mut rng, &dbn, &config, &worker);
+    trained_neural_opt =
+        train_manifold_rl(&trained_neural_opt, &mut rng, &env_net, &config, &worker);
 
     // Save Neural Cache
     if save_neural_cache(NEURAL_CACHE_PATH, &trained_neural_opt) {
@@ -572,13 +562,13 @@ fn initialize_system(
             cached
         } else {
             info!("[DQN] Training new model...");
-            let d = train_dqn(&trained_neural_opt, &mut rng, &dbn, &config);
+            let d = train_dqn(&trained_neural_opt, &mut rng, &env_net, &config);
             save_model(&d, "dqn.cache", "DQN");
             d
         }
     } else {
         info!("[DQN] Force training new model...");
-        let d = train_dqn(&trained_neural_opt, &mut rng, &dbn, &config);
+        let d = train_dqn(&trained_neural_opt, &mut rng, &env_net, &config);
         save_model(&d, "dqn.cache", "DQN");
         d
     };
@@ -591,14 +581,14 @@ fn initialize_system(
             cached
         } else {
             info!("[PPO] Training new model...");
-            let p = train_ppo(&mut rng, &dbn, &config);
+            let p = train_ppo(&mut rng, &env_net, &config);
             println!("[PPO] Saving model...");
             save_model(&p, "ppo.cache", "PPO");
             p
         }
     } else {
         info!("[PPO] Force training new model...");
-        let p = train_ppo(&mut rng, &dbn, &config);
+        let p = train_ppo(&mut rng, &env_net, &config);
         println!("[PPO] Saving model...");
         save_model(&p, "ppo.cache", "PPO");
         p
@@ -606,7 +596,7 @@ fn initialize_system(
 
     (
         config,
-        dbn,
+        env_net,
         trained_neural_opt,
         dqn_policy,
         ppo_policy,
@@ -752,7 +742,7 @@ fn main() {
         return;
     }
 
-    let (mut config, dbn, trained_neural_opt, dqn_policy, ppo_policy, worker, mut rng) =
+    let (mut config, env_net, trained_neural_opt, dqn_policy, ppo_policy, worker, mut rng) =
         initialize_system(&args);
     let lang = Language::from_config(&config);
 
@@ -774,7 +764,7 @@ fn main() {
         Commands::Interactive => {
             run_interactive(RunInteractiveArgs {
                 config,
-                dbn,
+                env_net,
                 trained_neural_opt,
                 dqn_policy,
                 ppo_policy,
@@ -790,7 +780,7 @@ fn main() {
                 neural_opt: &trained_neural_opt,
                 dqn_policy: Some(&dqn_policy),
                 ppo_policy: Some(&ppo_policy),
-                dbn: &dbn,
+                env_net: &env_net,
                 config: &config,
                 worker: &worker,
                 exp_sender: None,
@@ -859,7 +849,7 @@ fn main() {
                     &trained_neural_opt,
                     Some(&dqn_policy),
                     Some(&ppo_policy),
-                    &dbn,
+                    &env_net,
                     &config,
                     lang,
                 );
@@ -872,7 +862,7 @@ fn main() {
                 neural_opt: &trained_neural_opt,
                 dqn_policy: Some(&dqn_policy),
                 ppo_policy: Some(&ppo_policy),
-                dbn: &dbn,
+                env_net: &env_net,
                 worker: &worker,
                 lang,
             };
@@ -884,7 +874,7 @@ fn main() {
 
 struct RunInteractiveArgs {
     config: Config,
-    dbn: Dbn,
+    env_net: EnvNet,
     trained_neural_opt: NeuralLuckOptimizer,
     dqn_policy: DuelingQNetwork,
     ppo_policy: ActorCritic,
@@ -897,7 +887,7 @@ struct RunInteractiveArgs {
 fn run_interactive(args: RunInteractiveArgs) {
     let RunInteractiveArgs {
         mut config,
-        dbn,
+        env_net,
         trained_neural_opt,
         dqn_policy,
         ppo_policy,
@@ -1237,7 +1227,7 @@ fn run_interactive(args: RunInteractiveArgs) {
             &neural_guard,
             Some(&dqn_guard),
             Some(&ppo_guard),
-            &dbn,
+            &env_net,
             &config,
             lang,
         );
@@ -1254,7 +1244,7 @@ fn run_interactive(args: RunInteractiveArgs) {
             neural_opt: &neural_guard,
             dqn_policy: Some(&*dqn_guard),
             ppo_policy: Some(&*ppo_guard),
-            dbn: &dbn,
+            env_net: &env_net,
             worker: &worker,
             lang,
         };
@@ -1426,7 +1416,7 @@ fn run_interactive(args: RunInteractiveArgs) {
                         &neural_guard,
                         Some(&dqn_guard),
                         Some(&ppo_guard),
-                        &dbn,
+                        &env_net,
                         &config,
                         lang,
                     );
@@ -1809,7 +1799,7 @@ fn run_interactive(args: RunInteractiveArgs) {
                         neural_opt: &neural_guard,
                         dqn_policy: Some(&dqn_guard),
                         ppo_policy: active_ppo,
-                        dbn: &dbn,
+                        env_net: &env_net,
                         config: &pool_config,
                         worker: &worker,
                         exp_sender: None,
@@ -1847,7 +1837,7 @@ fn run_interactive(args: RunInteractiveArgs) {
                     neural_opt: &neural_guard,
                     dqn_policy: Some(&dqn_guard),
                     ppo_policy: active_ppo,
-                    dbn: &dbn,
+                    env_net: &env_net,
                     config: &config,
                     worker: &worker,
                     exp_sender: None,
@@ -1901,7 +1891,7 @@ fn run_interactive(args: RunInteractiveArgs) {
                         neural_opt: &neural_guard,
                         dqn_policy: Some(&dqn_guard),
                         ppo_policy: active_ppo,
-                        dbn: &dbn,
+                        env_net: &env_net,
                         config: &pool_config,
                         worker: &worker,
                         exp_sender: None,
@@ -1928,7 +1918,7 @@ fn run_interactive(args: RunInteractiveArgs) {
                 neural_opt: &neural_guard,
                 dqn_policy: Some(&dqn_guard),
                 ppo_policy: active_ppo,
-                dbn: &dbn,
+                env_net: &env_net,
                 config: &config,
                 exp_sender: dqn_sender.as_ref(),
                 neural_sender: neural_sender.as_ref(),
@@ -2037,12 +2027,12 @@ mod tests {
     use crate::config::PoolConfig;
     use sim::{simulate_core, simulate_fast, simulate_one, SimControl, SimModelContext};
 
-    fn build_context() -> (Config, Dbn, NeuralLuckOptimizer) {
+    fn build_context() -> (Config, EnvNet, NeuralLuckOptimizer) {
         let config = Config::load("data/config.json");
         let mut rng = Rng::from_seed(1234);
-        let dbn = Dbn::new(&[32, 128, 64, 32], &mut rng);
+        let env_net = EnvNet::new(&mut rng);
         let neural_opt = NeuralLuckOptimizer::new(5678);
-        (config, dbn, neural_opt)
+        (config, env_net, neural_opt)
     }
 
     #[test]
@@ -2124,7 +2114,7 @@ mod tests {
 
     #[test]
     fn simulate_fast_costs_and_free_pulls_match() {
-        let (config, dbn, neural_opt) = build_context();
+        let (config, env_net, neural_opt) = build_context();
         let mut rng = Rng::from_seed(1);
         let num_pulls = 200;
         let free_pulls = FREE_PULLS_WELFARE;
@@ -2132,7 +2122,7 @@ mod tests {
             neural_opt: &neural_opt,
             dqn_policy: None,
             ppo_policy: None,
-            dbn: &dbn,
+            env_net: &env_net,
             config: &config,
             exp_sender: None,
             neural_sender: None,
@@ -2147,7 +2137,7 @@ mod tests {
 
     #[test]
     fn simulate_one_counts_match_pulls() {
-        let (config, dbn, neural_opt) = build_context();
+        let (config, env_net, neural_opt) = build_context();
         let mut rng = Rng::from_seed(2);
         let num_pulls = 120;
         let free_pulls = FREE_PULLS_WELFARE;
@@ -2155,7 +2145,7 @@ mod tests {
             neural_opt: &neural_opt,
             dqn_policy: None,
             ppo_policy: None,
-            dbn: &dbn,
+            env_net: &env_net,
             config: &config,
             exp_sender: None,
             neural_sender: None,
@@ -2174,7 +2164,7 @@ mod tests {
 
     #[test]
     fn simulate_core_f2p_clearing_always_hits_up() {
-        let (config, dbn, neural_opt) = build_context();
+        let (config, env_net, neural_opt) = build_context();
         let mut rng = Rng::from_seed(3);
         let control = SimControl {
             max_pulls: None,
@@ -2192,7 +2182,7 @@ mod tests {
             neural_opt: &neural_opt,
             dqn_policy: None,
             ppo_policy: None,
-            dbn: &dbn,
+            env_net: &env_net,
             config: &config,
             exp_sender: None,
             neural_sender: None,
@@ -2204,10 +2194,10 @@ mod tests {
 
     #[test]
     fn dqn_training_produces_valid_q_values() {
-        let (mut config, dbn, neural_opt) = build_context();
+        let (mut config, env_net, neural_opt) = build_context();
         config.fast_init = true;
         let mut rng = Rng::from_seed(7777);
-        let dqn = train_dqn(&neural_opt, &mut rng, &dbn, &config);
+        let dqn = train_dqn(&neural_opt, &mut rng, &env_net, &config);
         let state = AutoTensor::new(vec![0.5; DIM], vec![DIM]);
         let q_values = dqn.forward(&state);
         let q_data = q_values.data.read().unwrap();
@@ -2223,13 +2213,13 @@ mod tests {
 
     #[test]
     fn benchmark_simulate_fast_throughput() {
-        let (config, dbn, neural_opt) = build_context();
+        let (config, env_net, neural_opt) = build_context();
         let mut rng = Rng::from_seed(42);
         let ctx = SimModelContext {
             neural_opt: &neural_opt,
             dqn_policy: None,
             ppo_policy: None,
-            dbn: &dbn,
+            env_net: &env_net,
             config: &config,
             exp_sender: None,
             neural_sender: None,

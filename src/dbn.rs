@@ -1,3 +1,6 @@
+//! DBN (Deep Belief Network) - kept for reference, replaced by EnvNet
+#![allow(dead_code, unused)]
+
 use crate::rng::Rng;
 use crate::simd::{add_scaled_row, dot_product};
 

@@ -1,11 +1,11 @@
 use crate::achf::AchfLayer;
 use crate::autograd::{Tensor, TensorReadGuard};
 use crate::config::{AchfConfig, Config};
-use crate::dbn::Dbn;
+use crate::env_net::EnvNet;
 use crate::neural::{NeuralLuckOptimizer, DIM};
 use crate::nn::{Linear, Module};
 use crate::rng::Rng;
-use crate::sim::{build_features, dbn_env, prob_6, PullState};
+use crate::sim::{build_features, env_net_env, prob_6, PullState};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 
@@ -664,16 +664,16 @@ impl ReplayBuffer {
 pub fn train_dqn(
     _initial_model: &NeuralLuckOptimizer,
     rng: &mut Rng,
-    dbn: &Dbn,
+    env_net: &EnvNet,
     config: &Config,
 ) -> DuelingQNetwork {
-    train_dqn_impl(_initial_model, rng, dbn, config, None)
+    train_dqn_impl(_initial_model, rng, env_net, config, None)
 }
 
 fn train_dqn_impl(
     _initial_model: &NeuralLuckOptimizer,
     rng: &mut Rng,
-    dbn: &Dbn,
+    env_net: &EnvNet,
     config: &Config,
     metrics_tx: Option<std::sync::mpsc::Sender<crate::bench::StepSnapshot>>,
 ) -> DuelingQNetwork {
@@ -696,7 +696,7 @@ fn train_dqn_impl(
         streak_4_star: 0,
         loss_streak: 0,
     };
-    let (mut env_noise, mut env_bias) = dbn_env(dbn, rng);
+    let (mut env_noise, mut env_bias) = env_net_env(env_net, rng, 0, 0, 0, 0);
     let mut pulls_done = 0;
 
     let mut episode_reward = 0.0;
@@ -972,7 +972,7 @@ fn train_dqn_impl(
                 streak_4_star: 0,
                 loss_streak: 0,
             };
-            let new_env = dbn_env(dbn, rng);
+            let new_env = env_net_env(env_net, rng, 0, 0, 0, 0);
             env_noise = new_env.0;
             env_bias = new_env.1;
             pulls_done = 0;
@@ -1036,11 +1036,11 @@ fn train_dqn_impl(
 pub fn train_dqn_with_metrics(
     initial_model: &NeuralLuckOptimizer,
     rng: &mut Rng,
-    dbn: &Dbn,
+    env_net: &EnvNet,
     config: &Config,
     metrics_tx: Option<std::sync::mpsc::Sender<crate::bench::StepSnapshot>>,
 ) -> DuelingQNetwork {
-    train_dqn_impl(initial_model, rng, dbn, config, metrics_tx)
+    train_dqn_impl(initial_model, rng, env_net, config, metrics_tx)
 }
 
 /// Scratch buffers for DQN training to avoid per-step heap allocations.

@@ -2006,7 +2006,6 @@ use core::arch::aarch64::*;
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn tanh_vectorized_neon(x: float64x2_t) -> float64x2_t {
-
     let c1 = 1.0 / 3.0;
     let c2 = 1.0 / 5.0;
     let c3 = 1.0 / 7.0;

@@ -1,7 +1,7 @@
 use crate::autograd::Tensor as AutoTensor;
 use crate::config::{Config, LuckMode};
-use crate::dbn::Dbn;
 use crate::dqn::{DuelingQNetwork, Experience};
+use crate::env_net::EnvNet;
 use crate::neural::{NeuralLuckOptimizer, Tensor, DIM};
 use crate::ppo::ActorCritic;
 use crate::rng::Rng;
@@ -13,7 +13,7 @@ use std::collections::VecDeque;
 use std::sync::mpsc::Sender;
 
 // Constants
-pub const DBN_GIBBS_STEPS: usize = 10;
+// DBN_GIBBS_STEPS removed - EnvNet replaces DBN for env noise generation
 /// Jade cost per single pull (in-game currency).
 pub const COST_PER_PULL: u32 = 500;
 /// Number of free pulls available to F2P players per banner cycle.
@@ -420,12 +420,25 @@ pub struct SimControl {
     pub fast_inference: bool,
 }
 
-pub fn dbn_env(dbn: &Dbn, rng: &mut Rng) -> (f64, f64) {
-    let v = dbn.sample(rng, DBN_GIBBS_STEPS);
-    let sum = v.iter().sum::<f64>();
-    let mean = sum / v.len() as f64;
-    let var = v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / v.len() as f64;
-    (mean * 2.0 - 1.0, var)
+/// Generate (env_noise, env_bias) using EnvNet instead of DBN.
+/// Input features: [rng_random, pity_6_norm, total_pulls_norm, streak_norm, loss_streak_norm]
+pub fn env_net_env(
+    env_net: &EnvNet,
+    rng: &mut Rng,
+    pity: usize,
+    total_pulls: usize,
+    streak: usize,
+    loss_streak: usize,
+) -> (f64, f64) {
+    let rng_val = rng.next_f64();
+    // Normalize to [0, 1] range (using same norms as build_features)
+    let pity_norm = (pity as f64 / 80.0).clamp(0.0, 2.0);
+    let total_norm = ((total_pulls % 180) as f64 / 180.0).clamp(0.0, 1.0);
+    let streak_norm = (streak as f64 / 20.0).clamp(0.0, 2.0);
+    let loss_norm = (loss_streak as f64 / 3.0).clamp(0.0, 2.0);
+
+    let input = [rng_val, pity_norm, total_norm, streak_norm, loss_norm];
+    env_net.forward_infer(&input)
 }
 
 /// Calculate 6-star probability at a given pity count.
@@ -684,7 +697,7 @@ pub struct SimModelContext<'a> {
     pub neural_opt: &'a NeuralLuckOptimizer,
     pub dqn_policy: Option<&'a DuelingQNetwork>,
     pub ppo_policy: Option<&'a ActorCritic>,
-    pub dbn: &'a Dbn,
+    pub env_net: &'a EnvNet,
     pub config: &'a Config,
     pub exp_sender: Option<&'a Sender<Experience>>,
     pub neural_sender: Option<&'a Sender<NeuralSample>>,
@@ -729,7 +742,6 @@ fn simulate_core_with_context(
 
     let mut max_loss_streak = 0;
 
-    let (env_noise, env_bias) = dbn_env(ctx.dbn, rng);
     let mut state = PullState {
         pity_6: 0,
         total_pulls_in_pool: 0,
@@ -737,6 +749,15 @@ fn simulate_core_with_context(
         streak_4_star: 0,
         loss_streak: 0,
     };
+
+    let (env_noise, env_bias) = env_net_env(
+        ctx.env_net,
+        rng,
+        state.pity_6,
+        state.total_pulls_in_pool,
+        state.streak_4_star,
+        state.loss_streak,
+    );
 
     let non_up_six = if control.collect_details {
         build_non_up_six(ctx.config)
@@ -1108,7 +1129,7 @@ pub struct SimRunContext<'a> {
     pub neural_opt: &'a NeuralLuckOptimizer,
     pub dqn_policy: Option<&'a DuelingQNetwork>,
     pub ppo_policy: Option<&'a ActorCritic>,
-    pub dbn: &'a Dbn,
+    pub env_net: &'a EnvNet,
     pub config: &'a Config,
     pub worker: &'a GoodJobWorker,
     pub exp_sender: Option<&'a Sender<Experience>>,
@@ -1142,7 +1163,7 @@ pub fn simulate_stats_with_progress(
         neural_opt: ctx.neural_opt,
         dqn_policy: ctx.dqn_policy,
         ppo_policy: ctx.ppo_policy,
-        dbn: ctx.dbn,
+        env_net: ctx.env_net,
         config: ctx.config,
         exp_sender: ctx.exp_sender,
         neural_sender: ctx.neural_sender,
@@ -1235,7 +1256,7 @@ pub fn simulate_f2p_clearing_with_progress(
         neural_opt: ctx.neural_opt,
         dqn_policy: ctx.dqn_policy,
         ppo_policy: ctx.ppo_policy,
-        dbn: ctx.dbn,
+        env_net: ctx.env_net,
         config: ctx.config,
         exp_sender: ctx.exp_sender,
         neural_sender: ctx.neural_sender,
@@ -1314,7 +1335,7 @@ pub fn simulate_for_data_collection(
     num_sims: usize,
     rng: &mut Rng,
     neural_opt: &NeuralLuckOptimizer,
-    dbn: &Dbn,
+    env_net: &EnvNet,
     config: &Config,
 ) -> Vec<(Tensor, f64)> {
     let mut data = Vec::with_capacity(num_sims * 80); // Estimate ~80 pulls per sim on average
@@ -1329,7 +1350,14 @@ pub fn simulate_for_data_collection(
             streak_4_star: 0,
             loss_streak: 0,
         };
-        let (env_noise, env_bias) = dbn_env(dbn, rng);
+        let (env_noise, env_bias) = env_net_env(
+            env_net,
+            rng,
+            state.pity_6,
+            state.total_pulls_in_pool,
+            state.streak_4_star,
+            state.loss_streak,
+        );
         let mut pulls_done = 0;
 
         // Run until we get a few 6-stars or hit a limit to get a good trajectory
@@ -1420,17 +1448,17 @@ pub fn format_avg_extra_cost_line(
 mod tests {
     use super::*;
 
-    fn build_context() -> (Config, Dbn, NeuralLuckOptimizer) {
+    fn build_context() -> (Config, EnvNet, NeuralLuckOptimizer) {
         let config = Config::load("data/config.json");
         let mut rng = Rng::from_seed(1234);
-        let dbn = Dbn::new(&[32, 128, 64, 32], &mut rng);
+        let env_net = EnvNet::from_config(&config, &mut rng);
         let neural_opt = NeuralLuckOptimizer::new(5678);
-        (config, dbn, neural_opt)
+        (config, env_net, neural_opt)
     }
 
     #[test]
     fn simulate_core_triggers_big_pity() {
-        let (config, dbn, neural_opt) = build_context();
+        let (config, env_net, neural_opt) = build_context();
         let mut rng = Rng::from_seed(3);
         let control = SimControl {
             max_pulls: Some(config.big_pity_cumulative),
@@ -1445,7 +1473,7 @@ mod tests {
             neural_opt: &neural_opt,
             dqn_policy: None,
             ppo_policy: None,
-            dbn: &dbn,
+            env_net: &env_net,
             config: &config,
             exp_sender: None,
             neural_sender: None,
@@ -1588,7 +1616,7 @@ mod tests {
 
     #[test]
     fn roll_one_respects_up_rate_zero() {
-        let (mut config, _dbn, neural_opt) = build_context();
+        let (mut config, _env_net, neural_opt) = build_context();
         config.up_rate = 0.0;
         let mut rng = Rng::from_seed(999);
         let mut state = PullState {
@@ -1622,7 +1650,7 @@ mod tests {
 
     #[test]
     fn stop_after_total_pulls_exact_count() {
-        let (config, dbn, neural_opt) = build_context();
+        let (config, env_net, neural_opt) = build_context();
         let mut rng = Rng::from_seed(42);
         let limit = 10usize;
         let control = SimControl {
@@ -1638,7 +1666,7 @@ mod tests {
             neural_opt: &neural_opt,
             dqn_policy: None,
             ppo_policy: None,
-            dbn: &dbn,
+            env_net: &env_net,
             config: &config,
             exp_sender: None,
             neural_sender: None,
@@ -1656,7 +1684,7 @@ mod tests {
 
     #[test]
     fn simulate_f2p_clearing_respects_up_pity_soft_when_big_pity_off() {
-        let (mut config, dbn, neural_opt) = build_context();
+        let (mut config, env_net, neural_opt) = build_context();
         config.big_pity_cumulative = 0;
         config.up_pity_soft = FREE_PULLS_WELFARE as usize + 15;
         config.small_pity_guarantee = config.up_pity_soft + 100;
@@ -1671,7 +1699,7 @@ mod tests {
             neural_opt: &neural_opt,
             dqn_policy: None,
             ppo_policy: None,
-            dbn: &dbn,
+            env_net: &env_net,
             config: &config,
             worker: &worker,
             exp_sender: None,

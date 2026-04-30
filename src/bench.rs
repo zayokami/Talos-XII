@@ -1,8 +1,8 @@
 use crate::achf::AchfCacheStats;
 use crate::chart::{self, ChartFormat};
 use crate::config::Config;
-use crate::dbn::Dbn;
 use crate::dqn::{train_dqn_with_metrics, DuelingQNetwork};
+use crate::env_net::EnvNet;
 use crate::neural::NeuralLuckOptimizer;
 use crate::ppo::{train_ppo_with_metrics, ActorCritic};
 use crate::rng::Rng;
@@ -125,34 +125,31 @@ fn build_base_models_with_worker(
     config: &Config,
     rng: &mut Rng,
     worker: &GoodJobWorker,
-) -> (Dbn, NeuralLuckOptimizer) {
-    let mut dbn = Dbn::new(&[32, 128, 64, 32], rng);
-    let (count, epochs) = if config.fast_init {
-        (256, 4)
-    } else {
-        (1024, 20)
-    };
-    dbn.train(rng, count, epochs);
+) -> (EnvNet, NeuralLuckOptimizer) {
+    let env_net = EnvNet::new(rng);
 
-    let mut neural_opt = train_neural_optimizer(rng.next_u64(), &dbn, config, worker);
-    let (w, b) = train_linear_regression(&neural_opt, rng, &dbn, config);
+    let mut neural_opt = train_neural_optimizer(rng.next_u64(), &env_net, config, worker);
+    let (w, b) = train_linear_regression(&neural_opt, rng, &env_net, config);
     neural_opt.set_linear_params(w, b);
-    neural_opt = train_manifold_rl(&neural_opt, rng, &dbn, config, worker);
+    neural_opt = train_manifold_rl(&neural_opt, rng, &env_net, config, worker);
 
-    (dbn, neural_opt)
+    (env_net, neural_opt)
 }
 
-fn build_base_models(config: &Config, rng: &mut Rng) -> (Dbn, NeuralLuckOptimizer, GoodJobWorker) {
+fn build_base_models(
+    config: &Config,
+    rng: &mut Rng,
+) -> (EnvNet, NeuralLuckOptimizer, GoodJobWorker) {
     let worker = GoodJobWorker::new_with_config(config);
-    let (dbn, neural_opt) = build_base_models_with_worker(config, rng, &worker);
-    (dbn, neural_opt, worker)
+    let (env_net, neural_opt) = build_base_models_with_worker(config, rng, &worker);
+    (env_net, neural_opt, worker)
 }
 
 struct ThroughputParams<'a> {
     neural_opt: &'a NeuralLuckOptimizer,
     dqn: Option<&'a DuelingQNetwork>,
     ppo: Option<&'a ActorCritic>,
-    dbn: &'a Dbn,
+    env_net: &'a EnvNet,
     config: &'a Config,
     sims: usize,
     pulls: usize,
@@ -163,7 +160,7 @@ fn measure_inference_throughput(rng: &mut Rng, params: &ThroughputParams<'_>) ->
         neural_opt: params.neural_opt,
         dqn_policy: params.dqn,
         ppo_policy: params.ppo,
-        dbn: params.dbn,
+        env_net: params.env_net,
         config: params.config,
         exp_sender: None,
         neural_sender: None,
@@ -360,8 +357,8 @@ fn run_path_comparison(base_config: &Config, seed: u64) -> Vec<(String, Vec<f64>
     cfg.ppo_steps_per_update = cfg.ppo_steps_per_update.min(256);
     cfg.ppo_k_epochs = cfg.ppo_k_epochs.min(2);
 
-    let (dbn, _neural_opt, _worker) = build_base_models(&cfg, &mut rng);
-    let ppo = train_ppo_with_metrics(&mut rng, &dbn, &cfg, None);
+    let (env_net, _neural_opt, _worker) = build_base_models(&cfg, &mut rng);
+    let ppo = train_ppo_with_metrics(&mut rng, &env_net, &cfg, None);
 
     let input_dim = crate::neural::DIM;
     let sample_input: Vec<f64> = (0..input_dim).map(|i| (i as f64) * 0.1 + 0.05).collect();
@@ -400,11 +397,11 @@ fn run_gate_curve(base_config: &Config, seed: u64) -> BenchRunResult {
     cfg.ppo_steps_per_update = cfg.ppo_steps_per_update.min(256);
     cfg.ppo_k_epochs = cfg.ppo_k_epochs.min(2);
 
-    let (dbn, _neural_opt, _worker) = build_base_models(&cfg, &mut rng);
+    let (env_net, _neural_opt, _worker) = build_base_models(&cfg, &mut rng);
 
     let (snapshots_tx, snapshots_rx) = std::sync::mpsc::channel();
     let start = Instant::now();
-    let ppo = train_ppo_with_metrics(&mut rng, &dbn, &cfg, Some(snapshots_tx));
+    let ppo = train_ppo_with_metrics(&mut rng, &env_net, &cfg, Some(snapshots_tx));
     let elapsed = start.elapsed();
 
     let snapshots: Vec<StepSnapshot> = snapshots_rx.try_iter().collect();
@@ -488,10 +485,10 @@ fn run_convergence(base_config: &Config, seed: u64, nt: usize) -> Vec<Aggregated
             cfg.ppo_total_steps = cfg.ppo_total_steps.min(4000);
             cfg.ppo_steps_per_update = cfg.ppo_steps_per_update.min(256);
             cfg.ppo_k_epochs = cfg.ppo_k_epochs.min(2);
-            let (dbn, _neural_opt, _worker) = build_base_models(&cfg, &mut rng);
+            let (env_net, _neural_opt, _worker) = build_base_models(&cfg, &mut rng);
             let (tx, rx) = std::sync::mpsc::channel();
             let start = Instant::now();
-            let ppo = train_ppo_with_metrics(&mut rng, &dbn, &cfg, Some(tx));
+            let ppo = train_ppo_with_metrics(&mut rng, &env_net, &cfg, Some(tx));
             let elapsed = start.elapsed();
             let snapshots: Vec<StepSnapshot> = rx.try_iter().collect();
             let final_reward = snapshots.last().map_or(0.0, |s| s.reward);
@@ -538,12 +535,12 @@ fn train_and_measure(label: &str, config: &Config, seed: u64) -> BenchRunResult 
         cfg.ppo_steps_per_update = cfg.ppo_steps_per_update.min(256);
         cfg.ppo_k_epochs = cfg.ppo_k_epochs.min(2);
     }
-    let (dbn, neural_opt, _worker) = build_base_models(&cfg, &mut rng);
+    let (env_net, neural_opt, _worker) = build_base_models(&cfg, &mut rng);
 
     let (tx, rx) = std::sync::mpsc::channel();
     let train_start = Instant::now();
-    let dqn = train_dqn_with_metrics(&neural_opt, &mut rng, &dbn, &cfg, None);
-    let ppo = train_ppo_with_metrics(&mut rng, &dbn, &cfg, Some(tx));
+    let dqn = train_dqn_with_metrics(&neural_opt, &mut rng, &env_net, &cfg, None);
+    let ppo = train_ppo_with_metrics(&mut rng, &env_net, &cfg, Some(tx));
     let train_elapsed = train_start.elapsed();
 
     let snapshots: Vec<StepSnapshot> = rx.try_iter().collect();
@@ -554,7 +551,7 @@ fn train_and_measure(label: &str, config: &Config, seed: u64) -> BenchRunResult 
             neural_opt: &neural_opt,
             dqn: Some(&dqn),
             ppo: Some(&ppo),
-            dbn: &dbn,
+            env_net: &env_net,
             config,
             sims: 200,
             pulls: 100,
