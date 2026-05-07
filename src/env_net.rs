@@ -989,8 +989,23 @@ impl EnvNet {
     }
 
     /// Serialize the entire network to JSON.
+    /// Schema version for cache compatibility.
+    const SCHEMA_VERSION: u32 = 1;
+    /// Architecture signature: "in_h1_h2_h3_out" (e.g., "5_64_32_16_2").
+    const ARCH_SIG: &str = "5_64_32_16_2";
+
     pub fn to_json(&self) -> String {
         let mut obj = serde_json::Map::new();
+
+        // Metadata for version/architecture validation
+        obj.insert(
+            "schema_version".to_string(),
+            serde_json::to_value(Self::SCHEMA_VERSION).unwrap(),
+        );
+        obj.insert(
+            "arch_sig".to_string(),
+            serde_json::to_value(Self::ARCH_SIG).unwrap(),
+        );
 
         // FC layers
         obj.insert(
@@ -1225,18 +1240,47 @@ impl EnvNet {
         serde_json::to_string(&obj).unwrap()
     }
 
-    /// Deserialize from JSON.
-    pub fn from_json(json_str: &str, rng: &mut Rng) -> Option<Self> {
+    /// Deserialize from JSON with version/architecture validation.
+    pub fn from_json(json_str: &str, _rng: &mut Rng) -> Option<Self> {
         let map: serde_json::Map<String, serde_json::Value> =
             serde_json::from_str(json_str).ok()?;
 
+        // ── Version / architecture validation ─────────────────────────────
+        let schema_version = map.get("schema_version")?.as_u64()? as u32;
+        if schema_version != Self::SCHEMA_VERSION {
+            eprintln!(
+                "[EnvNet] Cache schema version mismatch: expected {}, got {}. Rebuilding.",
+                Self::SCHEMA_VERSION,
+                schema_version
+            );
+            return None;
+        }
+        let arch_sig = map.get("arch_sig")?.as_str()?;
+        if arch_sig != Self::ARCH_SIG {
+            eprintln!(
+                "[EnvNet] Cache architecture mismatch: expected '{}', got '{}'. Rebuilding.",
+                Self::ARCH_SIG,
+                arch_sig
+            );
+            return None;
+        }
+
         macro_rules! get_vec {
-            ($key:expr) => {{
-                map.get($key)?
+            ($key:expr, $expected_len:expr) => {{
+                let v: Vec<f64> = map
+                    .get($key)?
                     .as_array()?
                     .iter()
                     .filter_map(|v| v.as_f64())
-                    .collect::<Vec<f64>>()
+                    .collect();
+                if v.len() != $expected_len {
+                    eprintln!(
+                        "[EnvNet] Cache dimension mismatch for '{}': expected {}, got {}. Rebuilding.",
+                        $key, $expected_len, v.len()
+                    );
+                    return None;
+                }
+                v
             }};
         }
         macro_rules! get_usize {
@@ -1245,44 +1289,44 @@ impl EnvNet {
             }};
         }
 
-        let fc1_w: Vec<f64> = get_vec!("fc1_w");
-        let fc1_b: Vec<f64> = get_vec!("fc1_b");
-        let fc2_w: Vec<f64> = get_vec!("fc2_w");
-        let fc2_b: Vec<f64> = get_vec!("fc2_b");
-        let fc3_w: Vec<f64> = get_vec!("fc3_w");
-        let fc3_b: Vec<f64> = get_vec!("fc3_b");
-        let fc4_w: Vec<f64> = get_vec!("fc4_w");
-        let fc4_b: Vec<f64> = get_vec!("fc4_b");
+        let fc1_w = get_vec!("fc1_w", 5 * 64);
+        let fc1_b = get_vec!("fc1_b", 64);
+        let fc2_w = get_vec!("fc2_w", 64 * 32);
+        let fc2_b = get_vec!("fc2_b", 32);
+        let fc3_w = get_vec!("fc3_w", 32 * 16);
+        let fc3_b = get_vec!("fc3_b", 16);
+        let fc4_w = get_vec!("fc4_w", 16 * 2);
+        let fc4_b = get_vec!("fc4_b", 2);
 
-        let bn1_gamma: Vec<f64> = get_vec!("bn1_gamma");
-        let bn1_beta: Vec<f64> = get_vec!("bn1_beta");
-        let bn1_rm: Vec<f64> = get_vec!("bn1_rm");
-        let bn1_rv: Vec<f64> = get_vec!("bn1_rv");
+        let bn1_gamma = get_vec!("bn1_gamma", 64);
+        let bn1_beta = get_vec!("bn1_beta", 64);
+        let bn1_rm = get_vec!("bn1_rm", 64);
+        let bn1_rv = get_vec!("bn1_rv", 64);
 
-        let bn2_gamma: Vec<f64> = get_vec!("bn2_gamma");
-        let bn2_beta: Vec<f64> = get_vec!("bn2_beta");
-        let bn2_rm: Vec<f64> = get_vec!("bn2_rm");
-        let bn2_rv: Vec<f64> = get_vec!("bn2_rv");
+        let bn2_gamma = get_vec!("bn2_gamma", 32);
+        let bn2_beta = get_vec!("bn2_beta", 32);
+        let bn2_rm = get_vec!("bn2_rm", 32);
+        let bn2_rv = get_vec!("bn2_rv", 32);
 
-        let bn3_gamma: Vec<f64> = get_vec!("bn3_gamma");
-        let bn3_beta: Vec<f64> = get_vec!("bn3_beta");
-        let bn3_rm: Vec<f64> = get_vec!("bn3_rm");
-        let bn3_rv: Vec<f64> = get_vec!("bn3_rv");
+        let bn3_gamma = get_vec!("bn3_gamma", 16);
+        let bn3_beta = get_vec!("bn3_beta", 16);
+        let bn3_rm = get_vec!("bn3_rm", 16);
+        let bn3_rv = get_vec!("bn3_rv", 16);
 
-        // Build layers
-        let mut fc1 = LinearLayer::new(5, 64, rng);
+        // Build layers with validated dimensions
+        let mut fc1 = LinearLayer::new(5, 64, _rng);
         fc1.weights.copy_from_slice(&fc1_w);
         fc1.bias.copy_from_slice(&fc1_b);
 
-        let mut fc2 = LinearLayer::new(64, 32, rng);
+        let mut fc2 = LinearLayer::new(64, 32, _rng);
         fc2.weights.copy_from_slice(&fc2_w);
         fc2.bias.copy_from_slice(&fc2_b);
 
-        let mut fc3 = LinearLayer::new(32, 16, rng);
+        let mut fc3 = LinearLayer::new(32, 16, _rng);
         fc3.weights.copy_from_slice(&fc3_w);
         fc3.bias.copy_from_slice(&fc3_b);
 
-        let mut fc4 = LinearLayer::new(16, 2, rng);
+        let mut fc4 = LinearLayer::new(16, 2, _rng);
         fc4.weights.copy_from_slice(&fc4_w);
         fc4.bias.copy_from_slice(&fc4_b);
 
@@ -1304,49 +1348,49 @@ impl EnvNet {
         bn3.running_mean.copy_from_slice(&bn3_rm);
         bn3.running_var.copy_from_slice(&bn3_rv);
 
-        // Adam optimizer states (separate for weights and biases)
-        let opt1_w_m: Vec<f64> = get_vec!("opt1_w_m");
-        let opt1_w_v: Vec<f64> = get_vec!("opt1_w_v");
+        // Adam optimizer states (validated dimensions)
+        let opt1_w_m = get_vec!("opt1_w_m", 5 * 64);
+        let opt1_w_v = get_vec!("opt1_w_v", 5 * 64);
         let opt1_w_t = get_usize!("opt1_w_t");
 
-        let opt1_b_m: Vec<f64> = get_vec!("opt1_b_m");
-        let opt1_b_v: Vec<f64> = get_vec!("opt1_b_v");
+        let opt1_b_m = get_vec!("opt1_b_m", 64);
+        let opt1_b_v = get_vec!("opt1_b_v", 64);
         let opt1_b_t = get_usize!("opt1_b_t");
 
-        let opt2_w_m: Vec<f64> = get_vec!("opt2_w_m");
-        let opt2_w_v: Vec<f64> = get_vec!("opt2_w_v");
+        let opt2_w_m = get_vec!("opt2_w_m", 64 * 32);
+        let opt2_w_v = get_vec!("opt2_w_v", 64 * 32);
         let opt2_w_t = get_usize!("opt2_w_t");
 
-        let opt2_b_m: Vec<f64> = get_vec!("opt2_b_m");
-        let opt2_b_v: Vec<f64> = get_vec!("opt2_b_v");
+        let opt2_b_m = get_vec!("opt2_b_m", 32);
+        let opt2_b_v = get_vec!("opt2_b_v", 32);
         let opt2_b_t = get_usize!("opt2_b_t");
 
-        let opt3_w_m: Vec<f64> = get_vec!("opt3_w_m");
-        let opt3_w_v: Vec<f64> = get_vec!("opt3_w_v");
+        let opt3_w_m = get_vec!("opt3_w_m", 32 * 16);
+        let opt3_w_v = get_vec!("opt3_w_v", 32 * 16);
         let opt3_w_t = get_usize!("opt3_w_t");
 
-        let opt3_b_m: Vec<f64> = get_vec!("opt3_b_m");
-        let opt3_b_v: Vec<f64> = get_vec!("opt3_b_v");
+        let opt3_b_m = get_vec!("opt3_b_m", 16);
+        let opt3_b_v = get_vec!("opt3_b_v", 16);
         let opt3_b_t = get_usize!("opt3_b_t");
 
-        let opt4_w_m: Vec<f64> = get_vec!("opt4_w_m");
-        let opt4_w_v: Vec<f64> = get_vec!("opt4_w_v");
+        let opt4_w_m = get_vec!("opt4_w_m", 16 * 2);
+        let opt4_w_v = get_vec!("opt4_w_v", 16 * 2);
         let opt4_w_t = get_usize!("opt4_w_t");
 
-        let opt4_b_m: Vec<f64> = get_vec!("opt4_b_m");
-        let opt4_b_v: Vec<f64> = get_vec!("opt4_b_v");
+        let opt4_b_m = get_vec!("opt4_b_m", 2);
+        let opt4_b_v = get_vec!("opt4_b_v", 2);
         let opt4_b_t = get_usize!("opt4_b_t");
 
-        let opt_bn1_m: Vec<f64> = get_vec!("opt_bn1_m");
-        let opt_bn1_v: Vec<f64> = get_vec!("opt_bn1_v");
+        let opt_bn1_m = get_vec!("opt_bn1_m", 64);
+        let opt_bn1_v = get_vec!("opt_bn1_v", 64);
         let opt_bn1_t = get_usize!("opt_bn1_t");
 
-        let opt_bn2_m: Vec<f64> = get_vec!("opt_bn2_m");
-        let opt_bn2_v: Vec<f64> = get_vec!("opt_bn2_v");
+        let opt_bn2_m = get_vec!("opt_bn2_m", 32);
+        let opt_bn2_v = get_vec!("opt_bn2_v", 32);
         let opt_bn2_t = get_usize!("opt_bn2_t");
 
-        let opt_bn3_m: Vec<f64> = get_vec!("opt_bn3_m");
-        let opt_bn3_v: Vec<f64> = get_vec!("opt_bn3_v");
+        let opt_bn3_m = get_vec!("opt_bn3_m", 16);
+        let opt_bn3_v = get_vec!("opt_bn3_v", 16);
         let opt_bn3_t = get_usize!("opt_bn3_t");
 
         fn make_opt(m: Vec<f64>, v: Vec<f64>, t: usize) -> AdamOptimizer {

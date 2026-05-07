@@ -25,6 +25,7 @@ target/
 *.bin
 data/neural_cache.bin
 neural.cache
+env_net.cache
 
 # Logs
 *.log

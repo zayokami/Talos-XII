@@ -69,23 +69,53 @@ pub fn save_model<T: serde::Serialize>(model: &T, path: &str, label: &str) {
 }
 
 pub fn load_env_net_cache(path: &str) -> Option<EnvNet> {
-    let bytes = read_cache_bytes(path)?;
-    let json_str = std::str::from_utf8(&bytes).ok()?;
-    // EnvNet::from_json needs an rng, but we can create a dummy one
-    // since from_json fully reconstructs the network state
+    let bytes = match read_cache_bytes(path) {
+        Some(b) => b,
+        None => {
+            log::debug!("[EnvNet] Cache file not found: {}", path);
+            return None;
+        }
+    };
+    let json_str = match std::str::from_utf8(&bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("[EnvNet] Cache file is not valid UTF-8: {}. Rebuilding.", e);
+            return None;
+        }
+    };
     let mut rng = crate::rng::Rng::from_seed(0);
-    EnvNet::from_json(json_str, &mut rng)
+    match EnvNet::from_json(json_str, &mut rng) {
+        Some(net) => Some(net),
+        None => {
+            log::warn!(
+                "[EnvNet] Cache deserialization failed (version/arch/dim mismatch). Rebuilding."
+            );
+            None
+        }
+    }
 }
 
+/// Atomically save EnvNet cache to avoid corruption on crash.
+/// Writes to a temp file first, then renames.
 pub fn save_env_net_cache(path: &str, env_net: &EnvNet) -> bool {
     let json = env_net.to_json();
-    if std::fs::write(path, json.as_bytes()).is_ok() {
-        return true;
+    let tmp_path = format!("{}.tmp", path);
+
+    // Write to temp file
+    if let Err(e) = std::fs::write(&tmp_path, json.as_bytes()) {
+        log::warn!("[EnvNet] Failed to write temp cache {}: {}", tmp_path, e);
+        return false;
     }
-    match safe_parent_fallback(path) {
-        Some(alt) => std::fs::write(alt, json.as_bytes()).is_ok(),
-        None => false,
+
+    // Atomic rename
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        log::warn!("[EnvNet] Failed to rename temp cache to {}: {}", path, e);
+        // Clean up temp file
+        let _ = std::fs::remove_file(&tmp_path);
+        return false;
     }
+
+    true
 }
 
 pub fn load_model<T: serde::de::DeserializeOwned>(path: &str, label: &str) -> Option<T> {
