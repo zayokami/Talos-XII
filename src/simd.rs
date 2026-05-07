@@ -402,14 +402,17 @@ pub fn vector_gelu(dst: &mut [f64], src: &[f64]) {
         return;
     }
 
-    // Scalar fallback using accurate GELU formula
-    let sqrt_2_over_pi = (2.0 / std::f64::consts::PI).sqrt();
-    let c = 0.044715f64;
-    for i in 0..len {
-        let x = src[i];
-        let x3 = x * x * x;
-        let inner = sqrt_2_over_pi * (x + c * x3);
-        dst[i] = 0.5 * x * (1.0 + inner.tanh());
+    // Scalar fallback for non-SIMD targets and x86_64 without AVX2
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let sqrt_2_over_pi = (2.0 / std::f64::consts::PI).sqrt();
+        let c = 0.044715f64;
+        for i in 0..len {
+            let x = src[i];
+            let x3 = x * x * x;
+            let inner = sqrt_2_over_pi * (x + c * x3);
+            dst[i] = 0.5 * x * (1.0 + inner.tanh());
+        }
     }
 }
 
