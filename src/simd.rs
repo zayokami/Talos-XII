@@ -399,7 +399,6 @@ pub fn vector_gelu(dst: &mut [f64], src: &[f64]) {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         vector_gelu_neon(dst, src);
-        return;
     }
 
     // Scalar fallback for non-SIMD targets and x86_64 without AVX2
