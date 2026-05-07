@@ -820,6 +820,174 @@ impl EnvNet {
         Self::new(rng)
     }
 
+    /// Pre-train EnvNet by generating synthetic simulation data.
+    /// Runs `num_episodes` gacha simulations, collects (state, residual) pairs,
+    /// and trains EnvNet via supervised MSE loss.
+    pub fn pretrain(&mut self, rng: &mut Rng, config: &Config, num_episodes: usize, epochs: usize) {
+        use crate::sim::{env_net_env, prob_6, PullState};
+
+        const BATCH_SIZE: usize = 32;
+        const EPISODE_PULLS: usize = 200;
+
+        // ── 1. Generate training data ─────────────────────────────────────
+        let mut inputs: Vec<[f64; 5]> = Vec::with_capacity(num_episodes * 10);
+        let mut targets: Vec<[f64; 2]> = Vec::with_capacity(num_episodes * 10);
+
+        for ep in 0..num_episodes {
+            let mut state = PullState {
+                pity_6: 0,
+                total_pulls_in_pool: 0,
+                has_obtained_up: false,
+                streak_4_star: 0,
+                loss_streak: 0,
+            };
+
+            let ep_seed = rng.next_u64().wrapping_add(ep as u64 * 7919);
+            let mut local_rng = crate::rng::Rng::from_seed(ep_seed);
+
+            // Run a short episode and record per-pull statistics
+            let mut episode_six_count = 0usize;
+            let mut signed_deviations = Vec::with_capacity(EPISODE_PULLS);
+
+            for _ in 0..EPISODE_PULLS {
+                let base_prob = prob_6(state.pity_6, config);
+
+                // Get current env_noise/env_bias from the *current* network
+                // (even if randomly initialized, this gives us a starting point)
+                let (env_noise, env_bias) = env_net_env(
+                    self,
+                    &mut local_rng,
+                    state.pity_6,
+                    state.total_pulls_in_pool,
+                    state.streak_4_star,
+                    state.loss_streak,
+                );
+
+                let rng_val = local_rng.next_f64();
+                let pity_norm = (state.pity_6 as f64 / 80.0).clamp(0.0, 2.0);
+                let total_norm = ((state.total_pulls_in_pool % 180) as f64 / 180.0).clamp(0.0, 1.0);
+                let streak_norm = (state.streak_4_star as f64 / 20.0).clamp(0.0, 2.0);
+                let loss_norm = (state.loss_streak as f64 / 3.0).clamp(0.0, 2.0);
+
+                let input = [rng_val, pity_norm, total_norm, streak_norm, loss_norm];
+
+                // Simulate one pull using base probability (no policy modifier)
+                let r = local_rng.next_f64();
+                let is_six = r < base_prob;
+
+                // Observed noise: log-odds deviation from expected
+                let p_observed = if is_six { 1.0 } else { 0.0 };
+                let p_expected = base_prob.clamp(1e-8, 1.0 - 1e-8);
+                let log_odds_obs = (p_observed / (1.0f64 - p_observed)).ln();
+                let log_odds_exp = (p_expected / (1.0f64 - p_expected)).ln();
+                let observed_noise = log_odds_obs - log_odds_exp;
+
+                // Signed deviation from expected probability
+                let signed_dev = p_observed - p_expected;
+                signed_deviations.push(signed_dev);
+
+                inputs.push(input);
+
+                // Advance state
+                if is_six {
+                    episode_six_count += 1;
+                    state.pity_6 = 0;
+                    state.streak_4_star = 0;
+                    if config.up_rate > 0.0
+                        && !config.up_six.is_empty()
+                        && local_rng.next_f64() < config.up_rate
+                    {
+                        state.loss_streak = 0;
+                    } else {
+                        state.loss_streak += 1;
+                    }
+                } else {
+                    state.pity_6 += 1;
+                    state.total_pulls_in_pool += 1;
+                    let force_5 = config.always_5_star
+                        || (config.five_star_pity > 0
+                            && state.streak_4_star >= config.five_star_pity - 1);
+                    if force_5 || r < (base_prob + config.prob_5_base).min(1.0) {
+                        state.streak_4_star = 0;
+                    } else {
+                        state.streak_4_star += 1;
+                    }
+                }
+            }
+
+            // Observed bias: mean signed deviation across the episode
+            let observed_bias = if signed_deviations.is_empty() {
+                0.0
+            } else {
+                signed_deviations.iter().sum::<f64>() / signed_deviations.len() as f64
+            };
+
+            // Store targets for all pulls in this episode (they share the episode bias)
+            let start_idx = targets.len();
+            for (i, _) in signed_deviations.iter().enumerate() {
+                // Per-pull noise is the individual deviation, bias is episode-level
+                let per_pull_noise = signed_deviations[i];
+                // Scale noise to be comparable to what the network should output
+                let scaled_noise = per_pull_noise * 10.0; // amplify small deviations
+                targets.push([scaled_noise, observed_bias * 10.0]);
+            }
+
+            // Sanity check
+            assert_eq!(
+                inputs.len(),
+                targets.len(),
+                "Input/target mismatch after episode {}",
+                ep
+            );
+        }
+
+        if inputs.is_empty() {
+            log::warn!("[EnvNet] No training data generated, skipping pre-training.");
+            return;
+        }
+
+        // ── 2. Train for `epochs` epochs ──────────────────────────────────
+        let data_len = inputs.len();
+        let mut indices: Vec<usize> = (0..data_len).collect();
+        let num_batches = data_len.div_ceil(BATCH_SIZE);
+
+        for epoch in 0..epochs {
+            // Shuffle indices each epoch
+            for i in (1..data_len).rev() {
+                let j = (rng.next_u64() as usize) % (i + 1);
+                indices.swap(i, j);
+            }
+
+            let mut epoch_loss = 0.0;
+
+            for batch_idx in 0..num_batches {
+                let start = batch_idx * BATCH_SIZE;
+                let end = ((batch_idx + 1) * BATCH_SIZE).min(data_len);
+
+                let mut batch_loss = 0.0;
+                for &idx in &indices[start..end] {
+                    let loss = self.train_step(&inputs[idx], &targets[idx]);
+                    batch_loss += loss;
+                }
+                epoch_loss += batch_loss;
+            }
+
+            let avg_loss = epoch_loss / data_len as f64;
+            if epoch == 0 || epoch == epochs - 1 || (epoch + 1) % 10 == 0 {
+                log::info!(
+                    "[EnvNet] Pre-train epoch {}/{}: loss={:.6} ({} samples)",
+                    epoch + 1,
+                    epochs,
+                    avg_loss,
+                    data_len
+                );
+            }
+        }
+
+        // Set to inference mode after training
+        self.set_train(false);
+    }
+
     /// Serialize the entire network to JSON.
     pub fn to_json(&self) -> String {
         let mut obj = serde_json::Map::new();

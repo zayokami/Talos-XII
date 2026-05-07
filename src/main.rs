@@ -174,7 +174,10 @@ fn prompt_yes_no(prompt: &str, default_yes: bool) -> bool {
     default_yes
 }
 
-use model_io::{load_model, load_neural_cache, save_model, save_neural_cache};
+use model_io::{
+    load_env_net_cache, load_model, load_neural_cache, save_env_net_cache, save_model,
+    save_neural_cache,
+};
 use utils::{
     INPUT_CAP, MAX_DRAIN_PER_TICK, ONLINE_REPORT_INTERVAL_SECS, PPO_ONLINE_LR, PULL_DISPLAY_LIMIT,
     SIM_HISTORY_CAPACITY,
@@ -524,7 +527,30 @@ fn initialize_system(
 
     let worker = GoodJobWorker::new_with_config(&config);
 
-    let env_net = EnvNet::new(&mut rng);
+    let env_net = if !args.force {
+        if let Some(cached) = load_env_net_cache("env_net.cache") {
+            info!("[EnvNet] Cache loaded.");
+            cached
+        } else {
+            info!("[EnvNet] Pre-training environment noise model...");
+            let mut env_net = EnvNet::new(&mut rng);
+            let (count, epochs) = if config.fast_init {
+                (256, 10)
+            } else {
+                (1024, 50)
+            };
+            env_net.pretrain(&mut rng, &config, count, epochs);
+            if save_env_net_cache("env_net.cache", &env_net) {
+                info!("[EnvNet] Cache saved.");
+            }
+            env_net
+        }
+    } else {
+        info!("[EnvNet] Force pre-training...");
+        let mut env_net = EnvNet::new(&mut rng);
+        env_net.pretrain(&mut rng, &config, 1024, 50);
+        env_net
+    };
 
     let mut trained_neural_opt = if !args.force {
         if let Some(cached) = load_neural_cache(NEURAL_CACHE_PATH) {

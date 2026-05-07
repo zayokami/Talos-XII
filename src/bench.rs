@@ -3,6 +3,7 @@ use crate::chart::{self, ChartFormat};
 use crate::config::Config;
 use crate::dqn::{train_dqn_with_metrics, DuelingQNetwork};
 use crate::env_net::EnvNet;
+use crate::model_io::{load_env_net_cache, save_env_net_cache};
 use crate::neural::NeuralLuckOptimizer;
 use crate::ppo::{train_ppo_with_metrics, ActorCritic};
 use crate::rng::Rng;
@@ -126,7 +127,20 @@ fn build_base_models_with_worker(
     rng: &mut Rng,
     worker: &GoodJobWorker,
 ) -> (EnvNet, NeuralLuckOptimizer) {
-    let env_net = EnvNet::new(rng);
+    let mut env_net = if let Some(cached) = load_env_net_cache("env_net.cache") {
+        cached
+    } else {
+        let mut net = EnvNet::new(rng);
+        let (count, epochs) = if config.fast_init {
+            (256, 10)
+        } else {
+            (1024, 50)
+        };
+        net.pretrain(rng, config, count, epochs);
+        let _ = save_env_net_cache("env_net.cache", &net);
+        net
+    };
+    env_net.set_train(false);
 
     let mut neural_opt = train_neural_optimizer(rng.next_u64(), &env_net, config, worker);
     let (w, b) = train_linear_regression(&neural_opt, rng, &env_net, config);

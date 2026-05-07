@@ -1,4 +1,5 @@
 use crate::binary_codec;
+use crate::env_net::EnvNet;
 use crate::neural::NeuralLuckOptimizer;
 use log::info;
 use std::path::{Component, Path};
@@ -65,6 +66,26 @@ pub fn save_model<T: serde::Serialize>(model: &T, path: &str, label: &str) {
     // JSON debug dump disabled — binary format is authoritative and JSON serialization
     // of large neural network models (PPO/DQN with millions of f64 weights) takes
     // tens of seconds, causing the program to appear frozen after training.
+}
+
+pub fn load_env_net_cache(path: &str) -> Option<EnvNet> {
+    let bytes = read_cache_bytes(path)?;
+    let json_str = std::str::from_utf8(&bytes).ok()?;
+    // EnvNet::from_json needs an rng, but we can create a dummy one
+    // since from_json fully reconstructs the network state
+    let mut rng = crate::rng::Rng::from_seed(0);
+    EnvNet::from_json(json_str, &mut rng)
+}
+
+pub fn save_env_net_cache(path: &str, env_net: &EnvNet) -> bool {
+    let json = env_net.to_json();
+    if std::fs::write(path, json.as_bytes()).is_ok() {
+        return true;
+    }
+    match safe_parent_fallback(path) {
+        Some(alt) => std::fs::write(alt, json.as_bytes()).is_ok(),
+        None => false,
+    }
 }
 
 pub fn load_model<T: serde::de::DeserializeOwned>(path: &str, label: &str) -> Option<T> {
