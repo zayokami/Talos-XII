@@ -2024,9 +2024,9 @@ unsafe fn tanh_vectorized_neon(x: float64x2_t) -> float64x2_t {
     let abs_x = vabsq_f64(x);
     let mask = vcltq_f64(abs_x, vdupq_n_f64(threshold));
 
-    // sign(x) for saturation
-    let sign = vandq_f64(x, vdupq_n_f64(-0.0_f64.signum()));
-    let saturated = vorrq_f64(sign, vdupq_n_f64(1.0));
+    // Saturated value: copysign(1.0, x)
+    let is_positive = vcgeq_f64(x, vdupq_n_f64(0.0));
+    let saturated = vbslq_f64(is_positive, vdupq_n_f64(1.0), vdupq_n_f64(-1.0));
 
     vbslq_f64(mask, poly, saturated)
 }
