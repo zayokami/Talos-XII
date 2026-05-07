@@ -2022,7 +2022,7 @@ unsafe fn tanh_vectorized_neon(x: float64x2_t) -> float64x2_t {
     let x2 = vmulq_f64(x, x);
     let num = vmulq_f64(x, vaddq_f64(vdupq_n_f64(27.0), x2));
     let den = vaddq_f64(vdupq_n_f64(27.0), vmulq_f64(vdupq_n_f64(9.0), x2));
-    
+
     // Safe divide
     let pade = vdivq_f64(num, den);
 
