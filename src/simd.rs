@@ -396,6 +396,12 @@ pub fn vector_gelu(dst: &mut [f64], src: &[f64]) {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        vector_gelu_neon(dst, src);
+        return;
+    }
+
     // Scalar fallback using accurate GELU formula
     let sqrt_2_over_pi = (2.0 / std::f64::consts::PI).sqrt();
     let c = 0.044715f64;
@@ -2029,4 +2035,36 @@ unsafe fn tanh_vectorized_neon(x: float64x2_t) -> float64x2_t {
     let saturated = vbslq_f64(is_positive, vdupq_n_f64(1.0), vdupq_n_f64(-1.0));
 
     vbslq_f64(mask, poly, saturated)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn vector_gelu_neon(dst: &mut [f64], src: &[f64]) {
+    let sqrt_2_over_pi = (2.0 / std::f64::consts::PI).sqrt();
+    let c = vdupq_n_f64(0.044715);
+    let half = vdupq_n_f64(0.5);
+    let scale = vdupq_n_f64(sqrt_2_over_pi);
+    let mut i = 0;
+
+    while i + 2 <= dst.len() {
+        let x = vld1q_f64(src.as_ptr().add(i));
+        let x2 = vmulq_f64(x, x);
+        let x3 = vmulq_f64(x2, x);
+        let inner = vmulq_f64(scale, vaddq_f64(x, vmulq_f64(x3, c)));
+        let tanh_inner = tanh_vectorized_neon(inner);
+        let one_plus_tanh = vaddq_f64(vdupq_n_f64(1.0), tanh_inner);
+        vst1q_f64(
+            dst.as_mut_ptr().add(i),
+            vmulq_f64(vmulq_f64(half, x), one_plus_tanh),
+        );
+        i += 2;
+    }
+    // Scalar tail
+    while i < dst.len() {
+        let x = src[i];
+        let x3 = x * x * x;
+        let inner = sqrt_2_over_pi * (x + 0.044715 * x3);
+        dst[i] = 0.5 * x * (1.0 + inner.tanh());
+        i += 1;
+    }
 }
