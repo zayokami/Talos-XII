@@ -2015,29 +2015,24 @@ use core::arch::aarch64::*;
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 unsafe fn tanh_vectorized_neon(x: float64x2_t) -> float64x2_t {
-    let c1 = 1.0 / 3.0;
-    let c2 = 1.0 / 5.0;
-    let c3 = 1.0 / 7.0;
     let threshold = 4.0_f64;
 
+    // Padé [3/3] approximation: more accurate than Taylor near boundary
+    // tanh(x) ≈ x(27 + x²) / (27 + 9x²)
     let x2 = vmulq_f64(x, x);
-    let x3 = vmulq_f64(x2, x);
-    let x5 = vmulq_f64(x3, x2);
-    let x7 = vmulq_f64(x5, x2);
-
-    let poly = x;
-    let poly = vsubq_f64(poly, vmulq_f64(x3, vdupq_n_f64(c1)));
-    let poly = vaddq_f64(poly, vmulq_f64(x5, vdupq_n_f64(c2)));
-    let poly = vsubq_f64(poly, vmulq_f64(x7, vdupq_n_f64(c3)));
+    let num = vmulq_f64(x, vaddq_f64(vdupq_n_f64(27.0), x2));
+    let den = vaddq_f64(vdupq_n_f64(27.0), vmulq_f64(vdupq_n_f64(9.0), x2));
+    
+    // Safe divide
+    let pade = vdivq_f64(num, den);
 
     let abs_x = vabsq_f64(x);
     let mask = vcltq_f64(abs_x, vdupq_n_f64(threshold));
 
-    // Saturated value: copysign(1.0, x)
     let is_positive = vcgeq_f64(x, vdupq_n_f64(0.0));
     let saturated = vbslq_f64(is_positive, vdupq_n_f64(1.0), vdupq_n_f64(-1.0));
 
-    vbslq_f64(mask, poly, saturated)
+    vbslq_f64(mask, pade, saturated)
 }
 
 #[cfg(target_arch = "aarch64")]
