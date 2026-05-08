@@ -10,7 +10,7 @@
 // This works on all CUDA architectures (CC 3.0+). Register-based, no shared
 // memory traffic. Throughput-limited by warp shuffle bandwidth.
 //==============================================================================
-__device__ double warp_reduce_max(double val) {
+__forceinline__ __device__ double warp_reduce_max(double val) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         double other = __shfl_xor_sync(0xffffffff, val, offset);
@@ -18,7 +18,7 @@ __device__ double warp_reduce_max(double val) {
     }
     return val;
 }
-__device__ double warp_reduce_sum(double val) {
+__forceinline__ __device__ double warp_reduce_sum(double val) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         val += __shfl_xor_sync(0xffffffff, val, offset);

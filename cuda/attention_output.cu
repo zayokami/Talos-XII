@@ -4,7 +4,7 @@
 #define ATTN_BLOCK 256
 #define TILE_THRESHOLD 64
 
-__device__ double warp_reduce_sum(double val) {
+__forceinline__ __device__ double warp_reduce_sum(double val) {
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         val += __shfl_xor_sync(0xffffffff, val, offset);
