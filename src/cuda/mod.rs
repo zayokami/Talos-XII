@@ -17,12 +17,26 @@ pub mod memory;
 pub mod stream;
 
 use self::error::{CudaError, CudaResult};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg(cuda)]
 use std::{ffi::c_char, ffi::CStr};
 
 /// Indicates whether CUDA is available and initialized
 static CUDA_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// Raw pointer to the primary CUDA context (stored as usize for Sync).
+#[cfg(cuda)]
+static CUDA_CONTEXT_PTR: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(cuda)]
+fn get_cuda_context() -> Option<bindings::CUcontext> {
+    let ptr = CUDA_CONTEXT_PTR.load(Ordering::SeqCst);
+    if ptr == 0 {
+        None
+    } else {
+        Some(ptr as bindings::CUcontext)
+    }
+}
 static CUDA_MATMUL_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static CUDA_MATMUL_SUCCESSES: AtomicU64 = AtomicU64::new(0);
 static CUDA_MATMUL_FALLBACK_INIT: AtomicU64 = AtomicU64::new(0);
@@ -193,11 +207,20 @@ pub struct CudaDevice {
     pub total_memory: usize,
 }
 
-/// Initialize CUDA runtime
-/// Returns Ok(()) if CUDA is available, Err(()) otherwise
+/// Initialize CUDA runtime and create a primary context.
+/// Must be called (directly or transitively) before any driver-API operation.
+/// Thread-safe: context is created once; on subsequent calls the same context
+/// is pushed onto the current thread.
 #[cfg(cuda)]
 pub fn init() -> CudaResult<()> {
     if CUDA_INITIALIZED.load(Ordering::SeqCst) {
+        // Context already created — ensure it is current on this thread
+        // (CUDA contexts are thread-local).
+        if let Some(ctx) = get_cuda_context() {
+            unsafe {
+                bindings::cuCtxSetCurrent(ctx);
+            }
+        }
         return Ok(());
     }
 
@@ -223,6 +246,34 @@ pub fn init() -> CudaResult<()> {
                 op: "cuDeviceGetCount",
             });
         }
+
+        let mut device: bindings::CUdevice = 0;
+        let get_result = bindings::cuDeviceGet(&mut device, 0);
+        if get_result != bindings::CUDA_SUCCESS {
+            return Err(CudaError::Runtime {
+                op: "cuDeviceGet",
+                code: get_result,
+            });
+        }
+
+        let mut ctx: bindings::CUcontext = std::ptr::null_mut();
+        let ctx_result = bindings::cuCtxCreate(&mut ctx, 0, device);
+        if ctx_result != bindings::CUDA_SUCCESS {
+            return Err(CudaError::Runtime {
+                op: "cuCtxCreate",
+                code: ctx_result,
+            });
+        }
+
+        let set_result = bindings::cuCtxSetCurrent(ctx);
+        if set_result != bindings::CUDA_SUCCESS {
+            return Err(CudaError::Runtime {
+                op: "cuCtxSetCurrent",
+                code: set_result,
+            });
+        }
+
+        CUDA_CONTEXT_PTR.store(ctx as usize, Ordering::SeqCst);
     }
 
     CUDA_INITIALIZED.store(true, Ordering::SeqCst);

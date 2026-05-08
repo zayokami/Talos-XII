@@ -23,6 +23,7 @@ pub struct Cublas {
 impl Cublas {
     /// Create a new cuBLAS context
     pub fn new() -> CudaResult<Self> {
+        crate::cuda::init()?;
         unsafe {
             let mut handle: cublasHandle_t = std::ptr::null_mut();
             let result = cublasCreate_v2(&mut handle);

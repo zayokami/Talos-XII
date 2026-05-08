@@ -76,6 +76,7 @@ impl<T> Drop for DevicePtr<T> {
 /// Allocate GPU memory for `count` elements of type T
 #[cfg(cuda)]
 pub fn alloc<T>(count: usize) -> CudaResult<DevicePtr<T>> {
+    crate::cuda::init()?;
     if count == 0 {
         return Err(CudaError::InvalidInput {
             op: "cuMemAlloc",
@@ -114,6 +115,7 @@ pub fn alloc<T>(count: usize) -> CudaResult<DevicePtr<T>> {
 /// The returned buffer returns to the pool on Drop instead of being freed.
 #[cfg(cuda)]
 pub fn alloc_pooled<T>(count: usize) -> CudaResult<DevicePtr<T>> {
+    crate::cuda::init()?;
     if count == 0 {
         return Err(CudaError::InvalidInput {
             op: "cuMemAlloc",
@@ -172,6 +174,7 @@ pub fn free<T>(_device: &DevicePtr<T>) -> CudaResult<()> {
 /// Copy data from host (CPU) to device (GPU) - synchronous
 #[cfg(cuda)]
 pub fn copy_h2d<T: Copy>(device: &DevicePtr<T>, host: &[T]) -> CudaResult<()> {
+    crate::cuda::init()?;
     if host.len() != device.size {
         return Err(CudaError::SizeMismatch {
             op: "cuMemcpyHtoD",
@@ -204,6 +207,7 @@ pub fn copy_h2d<T: Copy>(device: &DevicePtr<T>, host: &[T]) -> CudaResult<()> {
 /// Copy data from device (GPU) to host (CPU) - synchronous
 #[cfg(cuda)]
 pub fn copy_d2h<T: Copy>(host: &mut [T], device: &DevicePtr<T>) -> CudaResult<()> {
+    crate::cuda::init()?;
     if host.len() != device.size {
         return Err(CudaError::SizeMismatch {
             op: "cuMemcpyDtoH",
@@ -236,6 +240,7 @@ pub fn copy_d2h<T: Copy>(host: &mut [T], device: &DevicePtr<T>) -> CudaResult<()
 /// Copy data from device (GPU) to device (GPU) - synchronous
 #[cfg(cuda)]
 pub fn copy_d2d<T: Copy>(dst: &DevicePtr<T>, src: &DevicePtr<T>) -> CudaResult<()> {
+    crate::cuda::init()?;
     if dst.size != src.size {
         return Err(CudaError::SizeMismatch {
             op: "cuMemcpyDtoD",

@@ -1,2 +1,6 @@
 [build]
 rustflags = ["-C", "target-cpu=native"]
+
+[alias]
+gpu = "build --release --features cuda --target-dir target/gpu"
+gpu-test = "test --features cuda --target-dir target/gpu"
