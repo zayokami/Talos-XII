@@ -190,6 +190,16 @@ impl ActorCritic {
         (logits, value)
     }
 
+    /// Batched forward for training efficiency.
+    /// `states` should be `[Batch, Seq, Dim]`.
+    pub fn forward_actor_critic_batch(&self, states: &Tensor) -> (Tensor, Tensor) {
+        let seq = self.backbone.forward(states, &[]);
+        let last = self.backbone.last_token(&seq);
+        let logits = self.actor_head.forward(&last);
+        let value = self.critic_head.forward(&last);
+        (logits, value)
+    }
+
     pub fn parameters(&self) -> Vec<Tensor> {
         let mut p = self.backbone.parameters();
         p.extend(self.actor_head.parameters());
@@ -561,25 +571,6 @@ impl Ppo {
         }
     }
 
-    /// Precompute teacher logits for an entire chunk to avoid redundant per-sample forward passes.
-    /// Returns a Vec of (teacher_logits, teacher_value) tuples, one per sample index in the chunk.
-    fn compute_teacher_logits_chunk(
-        &self,
-        states: &[Tensor],
-        pities: &[Vec<usize>],
-        chunk: &[usize],
-    ) -> Vec<(Tensor, Tensor)> {
-        chunk
-            .iter()
-            .map(|&i| {
-                self.ema_policy
-                    .as_ref()
-                    .unwrap()
-                    .forward_actor_critic(&states[i], &pities[i])
-            })
-            .collect()
-    }
-
     pub(crate) fn store_raw(&mut self, input: PpoStoreRawInput) {
         let PpoStoreRawInput {
             state,
@@ -614,7 +605,7 @@ impl Ppo {
         let len = self.memory.states_raw.len();
         let states_raw = std::mem::take(&mut self.memory.states_raw);
         let state_lens = std::mem::take(&mut self.memory.state_lens);
-        let pities = std::mem::take(&mut self.memory.pities);
+        let _pities = std::mem::take(&mut self.memory.pities);
         let actions = std::mem::take(&mut self.memory.actions);
         let log_probs = std::mem::take(&mut self.memory.log_probs);
         let rewards = std::mem::take(&mut self.memory.rewards);
@@ -675,28 +666,53 @@ impl Ppo {
                 let batch_len = chunk.len();
                 let inv_batch = 1.0 / batch_len as f64;
 
-                // Precompute teacher logits for the entire chunk once (avoids per-sample forward redundancy)
-                let teacher_outputs = if self.distill_kl_coef > 0.0 && self.ema_policy.is_some() {
-                    Some(self.compute_teacher_logits_chunk(&states, &pities, chunk))
-                } else {
-                    None
-                };
+                // Batched forward: pad states to max seq_len and stack
+                let max_seq_len = chunk.iter().map(|&i| states[i].shape[0]).max().unwrap_or(1);
+                let mut batch_data = Vec::with_capacity(batch_len * max_seq_len * DIM);
+                for &i in chunk {
+                    let state_data = states[i].data.read().unwrap();
+                    let seq_len = states[i].shape[0];
+                    batch_data.extend_from_slice(&state_data);
+                    if seq_len < max_seq_len {
+                        batch_data.resize(batch_data.len() + (max_seq_len - seq_len) * DIM, 0.0);
+                    }
+                }
+                let batch_states = Tensor::new(batch_data, vec![batch_len, max_seq_len, DIM]);
+                let (batch_logits, batch_values) =
+                    self.policy.forward_actor_critic_batch(&batch_states);
+                let batch_log_probs = batch_logits.log_softmax();
+                let batch_log_probs_copy = batch_log_probs.clone();
+                let batch_probs = batch_log_probs_copy.exp();
+                let ones_action_1 = Tensor::new(vec![1.0; ACTION_SPACE], vec![ACTION_SPACE, 1]);
+                let batch_entropy =
+                    -(batch_probs.clone() * batch_log_probs_copy).matmul(&ones_action_1);
+
+                // Batched teacher forward (if distilling)
+                let teacher_batch_logits =
+                    if self.distill_kl_coef > 0.0 {
+                        if let Some(ema) = self.ema_policy.as_ref() {
+                            let (t_logits, _) = ema.forward_actor_critic_batch(&batch_states);
+                            Some(t_logits)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
 
                 let mut loss_accum = Tensor::zeros(vec![1]);
                 let mut distill_accum = Tensor::zeros(vec![1]);
 
                 for (chunk_idx, &i) in chunk.iter().enumerate() {
-                    let state = &states[i];
-                    let pity = &pities[i];
                     let action_idx = actions[i];
                     let old_log_prob = log_probs[i];
                     let advantage = norm_advantages[i];
                     let return_val = returns[i];
 
-                    let (logits, value) = self.policy.forward_actor_critic(state, pity);
-
-                    let all_log_probs = logits.log_softmax();
-                    let log_prob = all_log_probs.index_select(action_idx);
+                    let log_prob =
+                        batch_log_probs.index_select(chunk_idx * ACTION_SPACE + action_idx);
+                    let value = batch_values.index_select(chunk_idx);
+                    let entropy = batch_entropy.index_select(chunk_idx);
 
                     let log_prob_val = log_prob.data.read().unwrap()[0];
                     let log_ratio_val = log_prob_val - old_log_prob;
@@ -734,29 +750,24 @@ impl Ppo {
                     let value_err = value - ret_tensor;
                     let v_loss = (value_err.clone() * value_err).sum();
 
-                    let p = all_log_probs.exp();
-                    let entropy = -(p.clone() * all_log_probs.clone()).sum();
-
                     let loss = -policy_loss + v_loss * value_coef_tensor.clone()
                         - entropy * entropy_coef_tensor.clone();
 
                     loss_accum = loss_accum + loss;
+                }
 
-                    // Distillation: KL(student || teacher) using precomputed teacher logits
-                    if let Some(ref teacher_out) = teacher_outputs {
-                        let (teacher_logits, _) = &teacher_out[chunk_idx];
-                        let student_probs = p.clone();
-                        let student_log_probs = all_log_probs.clone();
-                        let teacher_log_probs = teacher_logits.log_softmax();
-                        let kl_vals = student_probs * (student_log_probs - teacher_log_probs);
-                        distill_accum = distill_accum + kl_vals.sum();
-                    }
+                // Batched distillation KL after the per-sample loop
+                if let Some(ref teacher_logits) = teacher_batch_logits {
+                    let teacher_log_probs = teacher_logits.log_softmax();
+                    let kl_elements = batch_probs * (batch_log_probs.clone() - teacher_log_probs);
+                    let total_kl = kl_elements.matmul(&ones_action_1).sum();
+                    distill_accum = total_kl;
                 }
 
                 let batch_size_tensor = Tensor::new(vec![inv_batch], vec![1]);
                 let mut final_loss = loss_accum * batch_size_tensor.clone();
                 // Add distillation loss after warmup: distill_coef * mean(kl_divs)
-                if teacher_outputs.is_some()
+                if teacher_batch_logits.is_some()
                     && self.distill_update_counter >= self.distill_warmup_steps
                 {
                     let distill_coef_tensor = Tensor::new(vec![self.distill_kl_coef], vec![1]);

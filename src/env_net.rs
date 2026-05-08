@@ -7,6 +7,7 @@
 
 use crate::config::Config;
 use crate::rng::Rng;
+use crate::simd::{add_scaled_row, dot_product};
 
 // =============================================================================
 // BatchNorm1d
@@ -96,6 +97,52 @@ impl BatchNorm1d {
                 output.push(self.gamma[i] * norm + self.beta[i]);
             }
             output
+        }
+    }
+
+    /// Forward pass writing into a pre-allocated buffer. Returns stats for backward.
+    pub fn forward_into(&mut self, x: &[f64], output: &mut [f64]) -> BnStats {
+        let dim = x.len();
+        assert_eq!(self.gamma.len(), dim);
+        assert_eq!(output.len(), dim);
+
+        let sum: f64 = x.iter().sum();
+        let mean = sum / dim as f64;
+
+        let var_sum = x
+            .iter()
+            .map(|v| {
+                let d = v - mean;
+                d * d
+            })
+            .sum::<f64>();
+        let var = var_sum / dim as f64;
+        let std_dev = (var + self.eps).sqrt();
+
+        // Update running stats
+        for i in 0..dim {
+            self.running_mean[i] =
+                self.momentum * self.running_mean[i] + (1.0 - self.momentum) * mean;
+            self.running_var[i] = self.momentum * self.running_var[i] + (1.0 - self.momentum) * var;
+        }
+
+        for i in 0..dim {
+            let norm = (x[i] - mean) / std_dev;
+            output[i] = self.gamma[i] * norm + self.beta[i];
+        }
+
+        BnStats { mean, var, std_dev }
+    }
+
+    /// Inference forward writing into a pre-allocated buffer.
+    pub fn forward_infer_into(&self, x: &[f64], output: &mut [f64]) {
+        let dim = x.len();
+        assert_eq!(output.len(), dim);
+
+        for i in 0..dim {
+            let std_dev = (self.running_var[i] + self.eps).sqrt();
+            let norm = (x[i] - self.running_mean[i]) / std_dev;
+            output[i] = self.gamma[i] * norm + self.beta[i];
         }
     }
 
@@ -320,12 +367,30 @@ impl LinearLayer {
 
         let mut output = self.bias.clone();
         for (i, &in_val) in input.iter().enumerate() {
-            let row_start = i * self.out_features;
-            for j in 0..self.out_features {
-                output[j] += in_val * self.weights[row_start + j];
+            if in_val == 0.0 {
+                continue;
             }
+            let row_start = i * self.out_features;
+            let row = &self.weights[row_start..row_start + self.out_features];
+            add_scaled_row(&mut output, row, in_val);
         }
         output
+    }
+
+    /// Forward pass writing into a pre-allocated buffer.
+    fn forward_into(&self, input: &[f64], output: &mut [f64]) {
+        assert_eq!(input.len(), self.in_features);
+        assert_eq!(output.len(), self.out_features);
+
+        output.copy_from_slice(&self.bias);
+        for (i, &in_val) in input.iter().enumerate() {
+            if in_val == 0.0 {
+                continue;
+            }
+            let row_start = i * self.out_features;
+            let row = &self.weights[row_start..row_start + self.out_features];
+            add_scaled_row(output, row, in_val);
+        }
     }
 
     /// Compute gradients w.r.t. weights, bias, and input.
@@ -351,12 +416,48 @@ impl LinearLayer {
         let mut grad_x = vec![0.0; self.in_features];
         for i in 0..self.in_features {
             let row_start = i * self.out_features;
-            for j in 0..self.out_features {
-                grad_x[i] += self.weights[row_start + j] * upstream[j];
-            }
+            let row = &self.weights[row_start..row_start + self.out_features];
+            grad_x[i] = dot_product(row, upstream);
         }
 
         (grad_w, grad_b, grad_x)
+    }
+
+    /// Backward pass writing into pre-allocated buffers.
+    fn backward_into(
+        &self,
+        input: &[f64],
+        upstream: &[f64],
+        grad_w: &mut [f64],
+        grad_b: &mut [f64],
+        grad_x: &mut [f64],
+    ) {
+        assert_eq!(upstream.len(), self.out_features);
+        assert_eq!(input.len(), self.in_features);
+        assert_eq!(grad_w.len(), self.in_features * self.out_features);
+        assert_eq!(grad_b.len(), self.out_features);
+        assert_eq!(grad_x.len(), self.in_features);
+
+        // dL/dW = x^T @ dL/dy
+        grad_w.fill(0.0);
+        for i in 0..self.in_features {
+            let base = i * self.out_features;
+            let xi = input[i];
+            for j in 0..self.out_features {
+                grad_w[base + j] = xi * upstream[j];
+            }
+        }
+
+        // dL/db = dL/dy
+        grad_b.copy_from_slice(upstream);
+
+        // dL/dx = dL/dy @ W
+        grad_x.fill(0.0);
+        for i in 0..self.in_features {
+            let row_start = i * self.out_features;
+            let row = &self.weights[row_start..row_start + self.out_features];
+            grad_x[i] = dot_product(row, upstream);
+        }
     }
 
     /// Apply gradients to weights and bias in-place (no optimizer, raw SGD).
@@ -387,7 +488,7 @@ impl LinearLayer {
 // =============================================================================
 
 /// Stats for BN backward (mean, var, std_dev computed during forward pass).
-struct BnStats {
+pub(crate) struct BnStats {
     mean: f64,
     var: f64,
     std_dev: f64,
@@ -689,6 +790,273 @@ impl EnvNet {
         loss
     }
 
+    /// Training step for a mini-batch: MSE loss + backward + Adam step.
+    ///
+    /// Accumulates gradients over the entire batch, then performs a single Adam update.
+    /// Returns the average loss value for monitoring.
+    pub fn train_step_batch(&mut self, inputs: &[[f64; 5]], targets: &[[f64; 2]]) -> f64 {
+        assert!(!inputs.is_empty());
+        assert_eq!(inputs.len(), targets.len());
+        self.set_train(true);
+
+        // Reusable forward buffers
+        let mut h1 = vec![0.0; 64];
+        let mut h1_relu = vec![0.0; 64];
+        let mut h1_bn = vec![0.0; 64];
+        let mut h2 = vec![0.0; 32];
+        let mut h2_relu = vec![0.0; 32];
+        let mut h2_bn = vec![0.0; 32];
+        let mut h3 = vec![0.0; 16];
+        let mut h3_relu = vec![0.0; 16];
+        let mut h3_bn = vec![0.0; 16];
+        let mut output = vec![0.0; 2];
+
+        // Reusable backward buffers
+        let mut loss_grad = vec![0.0; 2];
+        let mut grad_h3_bn = vec![0.0; 16];
+        let mut grad_h3_relu = vec![0.0; 16];
+        let mut grad_h3 = vec![0.0; 16];
+        let mut grad_h2_bn = vec![0.0; 32];
+        let mut grad_h2_relu = vec![0.0; 32];
+        let mut grad_h2 = vec![0.0; 32];
+        let mut grad_h1_bn = vec![0.0; 64];
+        let mut grad_h1_relu = vec![0.0; 64];
+        let mut grad_h1 = vec![0.0; 64];
+        let mut grad_input = vec![0.0; 5];
+
+        // Gradient accumulators
+        let mut acc_w1 = vec![0.0; self.fc1.weights.len()];
+        let mut acc_b1 = vec![0.0; self.fc1.bias.len()];
+        let mut acc_w2 = vec![0.0; self.fc2.weights.len()];
+        let mut acc_b2 = vec![0.0; self.fc2.bias.len()];
+        let mut acc_w3 = vec![0.0; self.fc3.weights.len()];
+        let mut acc_b3 = vec![0.0; self.fc3.bias.len()];
+        let mut acc_w4 = vec![0.0; self.fc4.weights.len()];
+        let mut acc_b4 = vec![0.0; self.fc4.bias.len()];
+        let mut acc_bn1_gamma = vec![0.0; 64];
+        let mut acc_bn1_beta = vec![0.0; 64];
+        let mut acc_bn2_gamma = vec![0.0; 32];
+        let mut acc_bn2_beta = vec![0.0; 32];
+        let mut acc_bn3_gamma = vec![0.0; 16];
+        let mut acc_bn3_beta = vec![0.0; 16];
+
+        let mut total_loss = 0.0;
+
+        for (input, target) in inputs.iter().zip(targets.iter()) {
+            // ---- Forward pass ----
+            self.fc1.forward_into(input, &mut h1);
+            for i in 0..64 {
+                h1_relu[i] = if h1[i] > 0.0 { h1[i] } else { 0.0 };
+            }
+            let bn1_stats = self.bn1.forward_into(&h1_relu, &mut h1_bn);
+
+            self.fc2.forward_into(&h1_bn, &mut h2);
+            for i in 0..32 {
+                h2_relu[i] = if h2[i] > 0.0 { h2[i] } else { 0.0 };
+            }
+            let bn2_stats = self.bn2.forward_into(&h2_relu, &mut h2_bn);
+
+            self.fc3.forward_into(&h2_bn, &mut h3);
+            for i in 0..16 {
+                h3_relu[i] = if h3[i] > 0.0 { h3[i] } else { 0.0 };
+            }
+            let bn3_stats = self.bn3.forward_into(&h3_relu, &mut h3_bn);
+
+            self.fc4.forward_into(&h3_bn, &mut output);
+
+            // ---- Compute MSE loss ----
+            let mut loss = 0.0;
+            for i in 0..2 {
+                let err = output[i] - target[i];
+                loss += 0.5 * err * err;
+                loss_grad[i] = err;
+            }
+            total_loss += loss;
+
+            // ---- Backward pass ----
+            self.fc4.backward_into(
+                &h3_bn,
+                &loss_grad,
+                &mut acc_w4,
+                &mut acc_b4,
+                &mut grad_h3_bn,
+            );
+
+            Self::bn_backward_x_buf(
+                &self.bn3,
+                &h3_relu,
+                &bn3_stats,
+                &grad_h3_bn,
+                &mut grad_h3_relu,
+            );
+            for i in 0..16 {
+                grad_h3[i] = if h3[i] > 0.0 { grad_h3_relu[i] } else { 0.0 };
+            }
+
+            self.fc3
+                .backward_into(&h2_bn, &grad_h3, &mut acc_w3, &mut acc_b3, &mut grad_h2_bn);
+
+            Self::bn_backward_x_buf(
+                &self.bn2,
+                &h2_relu,
+                &bn2_stats,
+                &grad_h2_bn,
+                &mut grad_h2_relu,
+            );
+            for i in 0..32 {
+                grad_h2[i] = if h2[i] > 0.0 { grad_h2_relu[i] } else { 0.0 };
+            }
+
+            self.fc2
+                .backward_into(&h1_bn, &grad_h2, &mut acc_w2, &mut acc_b2, &mut grad_h1_bn);
+
+            Self::bn_backward_x_buf(
+                &self.bn1,
+                &h1_relu,
+                &bn1_stats,
+                &grad_h1_bn,
+                &mut grad_h1_relu,
+            );
+            for i in 0..64 {
+                grad_h1[i] = if h1[i] > 0.0 { grad_h1_relu[i] } else { 0.0 };
+            }
+
+            self.fc1
+                .backward_into(input, &grad_h1, &mut acc_w1, &mut acc_b1, &mut grad_input);
+
+            // BN gamma/beta gradients
+            let (g1_g, g1_b) =
+                Self::bn_backward_gamma_beta_buf(&self.bn1, &h1_relu, &bn1_stats, &grad_h1_relu);
+            let (g2_g, g2_b) =
+                Self::bn_backward_gamma_beta_buf(&self.bn2, &h2_relu, &bn2_stats, &grad_h2_relu);
+            let (g3_g, g3_b) =
+                Self::bn_backward_gamma_beta_buf(&self.bn3, &h3_relu, &bn3_stats, &grad_h3_relu);
+
+            for i in 0..64 {
+                acc_bn1_gamma[i] += g1_g[i];
+                acc_bn1_beta[i] += g1_b[i];
+            }
+            for i in 0..32 {
+                acc_bn2_gamma[i] += g2_g[i];
+                acc_bn2_beta[i] += g2_b[i];
+            }
+            for i in 0..16 {
+                acc_bn3_gamma[i] += g3_g[i];
+                acc_bn3_beta[i] += g3_b[i];
+            }
+        }
+
+        // ---- Average gradients ----
+        let n = inputs.len() as f64;
+        for v in acc_w1.iter_mut() {
+            *v /= n;
+        }
+        for v in acc_b1.iter_mut() {
+            *v /= n;
+        }
+        for v in acc_w2.iter_mut() {
+            *v /= n;
+        }
+        for v in acc_b2.iter_mut() {
+            *v /= n;
+        }
+        for v in acc_w3.iter_mut() {
+            *v /= n;
+        }
+        for v in acc_b3.iter_mut() {
+            *v /= n;
+        }
+        for v in acc_w4.iter_mut() {
+            *v /= n;
+        }
+        for v in acc_b4.iter_mut() {
+            *v /= n;
+        }
+        for v in acc_bn1_gamma.iter_mut() {
+            *v /= n;
+        }
+        for v in acc_bn1_beta.iter_mut() {
+            *v /= n;
+        }
+        for v in acc_bn2_gamma.iter_mut() {
+            *v /= n;
+        }
+        for v in acc_bn2_beta.iter_mut() {
+            *v /= n;
+        }
+        for v in acc_bn3_gamma.iter_mut() {
+            *v /= n;
+        }
+        for v in acc_bn3_beta.iter_mut() {
+            *v /= n;
+        }
+
+        // ---- Adam updates ----
+        self.opt1_w.step(&mut self.fc1.weights, &acc_w1);
+        self.opt1_b.step(&mut self.fc1.bias, &acc_b1);
+        self.opt2_w.step(&mut self.fc2.weights, &acc_w2);
+        self.opt2_b.step(&mut self.fc2.bias, &acc_b2);
+        self.opt3_w.step(&mut self.fc3.weights, &acc_w3);
+        self.opt3_b.step(&mut self.fc3.bias, &acc_b3);
+        self.opt4_w.step(&mut self.fc4.weights, &acc_w4);
+        self.opt4_b.step(&mut self.fc4.bias, &acc_b4);
+        self.opt_bn1.step(&mut self.bn1.gamma, &acc_bn1_gamma);
+        self.opt_bn1.step(&mut self.bn1.beta, &acc_bn1_beta);
+        self.opt_bn2.step(&mut self.bn2.gamma, &acc_bn2_gamma);
+        self.opt_bn2.step(&mut self.bn2.beta, &acc_bn2_beta);
+        self.opt_bn3.step(&mut self.bn3.gamma, &acc_bn3_gamma);
+        self.opt_bn3.step(&mut self.bn3.beta, &acc_bn3_beta);
+
+        total_loss / n
+    }
+
+    /// BN backward: compute gradient w.r.t. input (buffer version).
+    fn bn_backward_x_buf(
+        bn: &BatchNorm1d,
+        x: &[f64],
+        stats: &BnStats,
+        grad_out: &[f64],
+        grad_x: &mut [f64],
+    ) {
+        let dim = x.len();
+        assert_eq!(grad_out.len(), dim);
+        assert_eq!(bn.gamma.len(), dim);
+        assert_eq!(grad_x.len(), dim);
+
+        let sum_grad_out: f64 = grad_out.iter().sum();
+        let mean_grad_out = sum_grad_out / dim as f64;
+
+        let mean_grad_x = grad_out
+            .iter()
+            .zip(x.iter())
+            .map(|(&go, &xi)| go * (xi - stats.mean))
+            .sum::<f64>()
+            / dim as f64;
+
+        for i in 0..dim {
+            let term1 = grad_out[i] - mean_grad_out;
+            let term2 = (x[i] - stats.mean) * mean_grad_x / (stats.var + bn.eps);
+            grad_x[i] = bn.gamma[i] / stats.std_dev * (term1 - term2);
+        }
+    }
+
+    /// BN backward: compute gradients w.r.t. gamma and beta (buffer version).
+    fn bn_backward_gamma_beta_buf(
+        bn: &BatchNorm1d,
+        x: &[f64],
+        stats: &BnStats,
+        grad_out: &[f64],
+    ) -> (Vec<f64>, Vec<f64>) {
+        let dim = x.len();
+        let mut grad_gamma = vec![0.0; dim];
+        let mut grad_beta = vec![0.0; dim];
+        for i in 0..dim {
+            grad_gamma[i] = grad_out[i] * (x[i] - stats.mean) / stats.std_dev;
+            grad_beta[i] = grad_out[i];
+        }
+        (grad_gamma, grad_beta)
+    }
+
     /// Forward with stats collection (for training).
     fn bn_forward_with_stats(bn: &mut BatchNorm1d, x: &[f64]) -> (Vec<f64>, BnStats) {
         let dim = x.len();
@@ -825,121 +1193,116 @@ impl EnvNet {
     /// and trains EnvNet via supervised MSE loss.
     pub fn pretrain(&mut self, rng: &mut Rng, config: &Config, num_episodes: usize, epochs: usize) {
         use crate::sim::{env_net_env, prob_6, PullState};
+        use rayon::prelude::*;
 
         const BATCH_SIZE: usize = 32;
         const EPISODE_PULLS: usize = 200;
 
-        // ── 1. Generate training data ─────────────────────────────────────
-        let mut inputs: Vec<[f64; 5]> = Vec::with_capacity(num_episodes * 10);
-        let mut targets: Vec<[f64; 2]> = Vec::with_capacity(num_episodes * 10);
+        // ── 1. Generate training data in parallel ─────────────────────────
+        let base_seed = rng.next_u64();
+        let (inputs, targets) = {
+            let net = &*self;
+            type EpisodeData = Vec<(Vec<[f64; 5]>, Vec<[f64; 2]>)>;
+            let episode_data: EpisodeData = (0..num_episodes)
+                .into_par_iter()
+                .map(|ep| {
+                    let mut state = PullState {
+                        pity_6: 0,
+                        total_pulls_in_pool: 0,
+                        has_obtained_up: false,
+                        streak_4_star: 0,
+                        loss_streak: 0,
+                    };
 
-        for ep in 0..num_episodes {
-            let mut state = PullState {
-                pity_6: 0,
-                total_pulls_in_pool: 0,
-                has_obtained_up: false,
-                streak_4_star: 0,
-                loss_streak: 0,
-            };
+                    let ep_seed = base_seed.wrapping_add(ep as u64 * 7919);
+                    let mut local_rng = crate::rng::Rng::from_seed(ep_seed);
 
-            let ep_seed = rng.next_u64().wrapping_add(ep as u64 * 7919);
-            let mut local_rng = crate::rng::Rng::from_seed(ep_seed);
+                    let mut episode_inputs = Vec::with_capacity(EPISODE_PULLS);
+                    let mut signed_deviations = Vec::with_capacity(EPISODE_PULLS);
 
-            // Run a short episode and record per-pull statistics
-            let mut episode_six_count = 0usize;
-            let mut signed_deviations = Vec::with_capacity(EPISODE_PULLS);
+                    for _ in 0..EPISODE_PULLS {
+                        let base_prob = prob_6(state.pity_6, config);
 
-            for _ in 0..EPISODE_PULLS {
-                let base_prob = prob_6(state.pity_6, config);
+                        // Advance RNG state (env_net_env may consume randomness)
+                        let _ = env_net_env(
+                            net,
+                            &mut local_rng,
+                            state.pity_6,
+                            state.total_pulls_in_pool,
+                            state.streak_4_star,
+                            state.loss_streak,
+                        );
 
-                // Get current env_noise/env_bias from the *current* network
-                // (even if randomly initialized, this gives us a starting point)
-                let (env_noise, env_bias) = env_net_env(
-                    self,
-                    &mut local_rng,
-                    state.pity_6,
-                    state.total_pulls_in_pool,
-                    state.streak_4_star,
-                    state.loss_streak,
-                );
+                        let rng_val = local_rng.next_f64();
+                        let pity_norm = (state.pity_6 as f64 / 80.0).clamp(0.0, 2.0);
+                        let total_norm =
+                            ((state.total_pulls_in_pool % 180) as f64 / 180.0).clamp(0.0, 1.0);
+                        let streak_norm = (state.streak_4_star as f64 / 20.0).clamp(0.0, 2.0);
+                        let loss_norm = (state.loss_streak as f64 / 3.0).clamp(0.0, 2.0);
 
-                let rng_val = local_rng.next_f64();
-                let pity_norm = (state.pity_6 as f64 / 80.0).clamp(0.0, 2.0);
-                let total_norm = ((state.total_pulls_in_pool % 180) as f64 / 180.0).clamp(0.0, 1.0);
-                let streak_norm = (state.streak_4_star as f64 / 20.0).clamp(0.0, 2.0);
-                let loss_norm = (state.loss_streak as f64 / 3.0).clamp(0.0, 2.0);
+                        let input = [rng_val, pity_norm, total_norm, streak_norm, loss_norm];
 
-                let input = [rng_val, pity_norm, total_norm, streak_norm, loss_norm];
+                        let r = local_rng.next_f64();
+                        let is_six = r < base_prob;
 
-                // Simulate one pull using base probability (no policy modifier)
-                let r = local_rng.next_f64();
-                let is_six = r < base_prob;
+                        let p_observed = if is_six { 1.0 } else { 0.0 };
+                        let p_expected = base_prob.clamp(1e-8, 1.0 - 1e-8);
+                        let signed_dev = p_observed - p_expected;
+                        signed_deviations.push(signed_dev);
 
-                // Observed noise: log-odds deviation from expected
-                let p_observed = if is_six { 1.0 } else { 0.0 };
-                let p_expected = base_prob.clamp(1e-8, 1.0 - 1e-8);
-                let log_odds_obs = (p_observed / (1.0f64 - p_observed)).ln();
-                let log_odds_exp = (p_expected / (1.0f64 - p_expected)).ln();
-                let observed_noise = log_odds_obs - log_odds_exp;
+                        episode_inputs.push(input);
 
-                // Signed deviation from expected probability
-                let signed_dev = p_observed - p_expected;
-                signed_deviations.push(signed_dev);
-
-                inputs.push(input);
-
-                // Advance state
-                if is_six {
-                    episode_six_count += 1;
-                    state.pity_6 = 0;
-                    state.streak_4_star = 0;
-                    if config.up_rate > 0.0
-                        && !config.up_six.is_empty()
-                        && local_rng.next_f64() < config.up_rate
-                    {
-                        state.loss_streak = 0;
-                    } else {
-                        state.loss_streak += 1;
+                        // Advance state
+                        if is_six {
+                            state.pity_6 = 0;
+                            state.streak_4_star = 0;
+                            if config.up_rate > 0.0
+                                && !config.up_six.is_empty()
+                                && local_rng.next_f64() < config.up_rate
+                            {
+                                state.loss_streak = 0;
+                            } else {
+                                state.loss_streak += 1;
+                            }
+                        } else {
+                            state.pity_6 += 1;
+                            state.total_pulls_in_pool += 1;
+                            let force_5 = config.always_5_star
+                                || (config.five_star_pity > 0
+                                    && state.streak_4_star >= config.five_star_pity - 1);
+                            if force_5 || r < (base_prob + config.prob_5_base).min(1.0) {
+                                state.streak_4_star = 0;
+                            } else {
+                                state.streak_4_star += 1;
+                            }
+                        }
                     }
-                } else {
-                    state.pity_6 += 1;
-                    state.total_pulls_in_pool += 1;
-                    let force_5 = config.always_5_star
-                        || (config.five_star_pity > 0
-                            && state.streak_4_star >= config.five_star_pity - 1);
-                    if force_5 || r < (base_prob + config.prob_5_base).min(1.0) {
-                        state.streak_4_star = 0;
+
+                    let observed_bias = if signed_deviations.is_empty() {
+                        0.0
                     } else {
-                        state.streak_4_star += 1;
+                        signed_deviations.iter().sum::<f64>() / signed_deviations.len() as f64
+                    };
+
+                    let mut episode_targets = Vec::with_capacity(signed_deviations.len());
+                    for &signed_dev in &signed_deviations {
+                        let scaled_noise = signed_dev * 10.0;
+                        episode_targets.push([scaled_noise, observed_bias * 10.0]);
                     }
-                }
+
+                    (episode_inputs, episode_targets)
+                })
+                .collect();
+
+            let total_samples = episode_data.iter().map(|(i, _)| i.len()).sum();
+            let mut inputs = Vec::with_capacity(total_samples);
+            let mut targets = Vec::with_capacity(total_samples);
+            for (inp, tgt) in episode_data {
+                inputs.extend(inp);
+                targets.extend(tgt);
             }
-
-            // Observed bias: mean signed deviation across the episode
-            let observed_bias = if signed_deviations.is_empty() {
-                0.0
-            } else {
-                signed_deviations.iter().sum::<f64>() / signed_deviations.len() as f64
-            };
-
-            // Store targets for all pulls in this episode (they share the episode bias)
-            let start_idx = targets.len();
-            for (i, _) in signed_deviations.iter().enumerate() {
-                // Per-pull noise is the individual deviation, bias is episode-level
-                let per_pull_noise = signed_deviations[i];
-                // Scale noise to be comparable to what the network should output
-                let scaled_noise = per_pull_noise * 10.0; // amplify small deviations
-                targets.push([scaled_noise, observed_bias * 10.0]);
-            }
-
-            // Sanity check
-            assert_eq!(
-                inputs.len(),
-                targets.len(),
-                "Input/target mismatch after episode {}",
-                ep
-            );
-        }
+            (inputs, targets)
+        };
 
         if inputs.is_empty() {
             log::warn!("[EnvNet] No training data generated, skipping pre-training.");
@@ -964,12 +1327,16 @@ impl EnvNet {
                 let start = batch_idx * BATCH_SIZE;
                 let end = ((batch_idx + 1) * BATCH_SIZE).min(data_len);
 
-                let mut batch_loss = 0.0;
-                for &idx in &indices[start..end] {
-                    let loss = self.train_step(&inputs[idx], &targets[idx]);
-                    batch_loss += loss;
+                let batch_size = end - start;
+                let mut batch_inputs = vec![[0.0; 5]; batch_size];
+                let mut batch_targets = vec![[0.0; 2]; batch_size];
+                for i in 0..batch_size {
+                    batch_inputs[i] = inputs[indices[start + i]];
+                    batch_targets[i] = targets[indices[start + i]];
                 }
-                epoch_loss += batch_loss;
+
+                let batch_loss = self.train_step_batch(&batch_inputs, &batch_targets);
+                epoch_loss += batch_loss * batch_size as f64;
             }
 
             let avg_loss = epoch_loss / data_len as f64;

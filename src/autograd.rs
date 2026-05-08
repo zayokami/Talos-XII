@@ -1,6 +1,6 @@
 use crate::simd::{
-    add_scaled_row, dot_product, horizontal_sum, prefetch_read_l1, vector_add, vector_fma,
-    vector_gelu, vector_grad_acc, vector_mul, vector_relu, vector_sub,
+    add_scaled_row, dot_product, horizontal_sum, prefetch_read_l1, softmax_exp_sum, vector_add,
+    vector_fma, vector_gelu, vector_grad_acc, vector_mul, vector_relu, vector_sub,
 };
 use memmap2::Mmap;
 use rayon::prelude::*;
@@ -1071,15 +1071,10 @@ impl Tensor {
         let mut data = vec![0.0; len];
         for row in 0..rows {
             let base = row * cols;
-            let row_slice = &self_data[base..base + cols];
-            let max_val = row_slice.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-            let sum_exp: f64 = row_slice
-                .iter()
-                .map(|&x| (x - max_val).exp())
-                .sum::<f64>()
-                .max(f64::MIN_POSITIVE);
+            data[base..base + cols].copy_from_slice(&self_data[base..base + cols]);
+            let sum_exp = softmax_exp_sum(&mut data[base..base + cols]);
             for j in 0..cols {
-                data[base + j] = (row_slice[j] - max_val).exp() / sum_exp;
+                data[base + j] /= sum_exp;
             }
         }
 
@@ -1135,30 +1130,57 @@ impl Tensor {
 
         // Row-major arbitrary-dim indexing:
         // idx = outer_idx * (dim_size * inner) + dim_idx * inner + inner_idx
-        for outer_idx in 0..outer {
-            let base_outer = outer_idx * dim_size * inner;
-            for inner_idx in 0..inner {
+        if inner == 1 {
+            // Fast path: contiguous rows (common case for last-dim softmax)
+            for outer_idx in 0..outer {
+                let base = outer_idx * dim_size;
                 let mut max_val = f64::NEG_INFINITY;
                 for dim_idx in 0..dim_size {
-                    let idx = base_outer + dim_idx * inner + inner_idx;
-                    if self_data[idx] > max_val {
-                        max_val = self_data[idx];
+                    let v = self_data[base + dim_idx];
+                    if v > max_val {
+                        max_val = v;
                     }
                 }
-
                 let mut sum_exp = 0.0;
                 for dim_idx in 0..dim_size {
-                    let idx = base_outer + dim_idx * inner + inner_idx;
-                    sum_exp += (self_data[idx] - max_val).exp();
+                    let e = (self_data[base + dim_idx] - max_val).exp();
+                    softmax_values[base + dim_idx] = e;
+                    sum_exp += e;
                 }
                 sum_exp = sum_exp.max(f64::MIN_POSITIVE);
                 let log_sum_exp = sum_exp.ln() + max_val;
-
                 for dim_idx in 0..dim_size {
-                    let idx = base_outer + dim_idx * inner + inner_idx;
-                    let softmax_val = (self_data[idx] - max_val).exp() / sum_exp;
+                    let idx = base + dim_idx;
                     data[idx] = self_data[idx] - log_sum_exp;
-                    softmax_values[idx] = softmax_val;
+                    softmax_values[idx] /= sum_exp;
+                }
+            }
+        } else {
+            for outer_idx in 0..outer {
+                let base_outer = outer_idx * dim_size * inner;
+                for inner_idx in 0..inner {
+                    let mut max_val = f64::NEG_INFINITY;
+                    for dim_idx in 0..dim_size {
+                        let idx = base_outer + dim_idx * inner + inner_idx;
+                        if self_data[idx] > max_val {
+                            max_val = self_data[idx];
+                        }
+                    }
+
+                    let mut sum_exp = 0.0;
+                    for dim_idx in 0..dim_size {
+                        let idx = base_outer + dim_idx * inner + inner_idx;
+                        sum_exp += (self_data[idx] - max_val).exp();
+                    }
+                    sum_exp = sum_exp.max(f64::MIN_POSITIVE);
+                    let log_sum_exp = sum_exp.ln() + max_val;
+
+                    for dim_idx in 0..dim_size {
+                        let idx = base_outer + dim_idx * inner + inner_idx;
+                        let softmax_val = (self_data[idx] - max_val).exp() / sum_exp;
+                        data[idx] = self_data[idx] - log_sum_exp;
+                        softmax_values[idx] = softmax_val;
+                    }
                 }
             }
         }
@@ -1179,18 +1201,34 @@ impl Tensor {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
                     let mut inp_grad = parents[0].grad.write().unwrap();
-                    for outer_idx in 0..outer_cap {
-                        let base_outer = outer_idx * dim_size_cap * inner_cap;
-                        for inner_idx in 0..inner_cap {
+                    if inner_cap == 1 {
+                        for outer_idx in 0..outer_cap {
+                            let base = outer_idx * dim_size_cap;
                             let mut sum_term = 0.0;
                             for dim_idx in 0..dim_size_cap {
-                                let idx = base_outer + dim_idx * inner_cap + inner_idx;
+                                let idx = base + dim_idx;
                                 sum_term += grad_out[idx] * softmax_cache_for_backward[idx];
                             }
                             for dim_idx in 0..dim_size_cap {
-                                let idx = base_outer + dim_idx * inner_cap + inner_idx;
+                                let idx = base + dim_idx;
                                 inp_grad[idx] +=
                                     softmax_cache_for_backward[idx] * (grad_out[idx] - sum_term);
+                            }
+                        }
+                    } else {
+                        for outer_idx in 0..outer_cap {
+                            let base_outer = outer_idx * dim_size_cap * inner_cap;
+                            for inner_idx in 0..inner_cap {
+                                let mut sum_term = 0.0;
+                                for dim_idx in 0..dim_size_cap {
+                                    let idx = base_outer + dim_idx * inner_cap + inner_idx;
+                                    sum_term += grad_out[idx] * softmax_cache_for_backward[idx];
+                                }
+                                for dim_idx in 0..dim_size_cap {
+                                    let idx = base_outer + dim_idx * inner_cap + inner_idx;
+                                    inp_grad[idx] += softmax_cache_for_backward[idx]
+                                        * (grad_out[idx] - sum_term);
+                                }
                             }
                         }
                     }
@@ -1362,7 +1400,7 @@ impl Tensor {
         let sum_val: f64 = if len >= PAR_THRESHOLD {
             self_data.par_iter().sum()
         } else {
-            self_data.iter().sum()
+            horizontal_sum(&self_data)
         };
         let parents = vec![self.clone()];
 

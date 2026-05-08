@@ -856,11 +856,18 @@ fn train_dqn_impl(
                 scratch.dones_vec.push(if exp.done { 1.0 } else { 0.0 });
             }
 
-            let batch_state = Tensor::new(scratch.states_vec.clone(), vec![BATCH_SIZE, DIM]);
-            let batch_next_state =
-                Tensor::new(scratch.next_states_vec.clone(), vec![BATCH_SIZE, DIM]);
-            let batch_mask =
-                Tensor::new(scratch.actions_vec.clone(), vec![BATCH_SIZE, ACTION_SPACE]);
+            let batch_state = Tensor::new(
+                std::mem::take(&mut scratch.states_vec),
+                vec![BATCH_SIZE, DIM],
+            );
+            let batch_next_state = Tensor::new(
+                std::mem::take(&mut scratch.next_states_vec),
+                vec![BATCH_SIZE, DIM],
+            );
+            let batch_mask = Tensor::new(
+                std::mem::take(&mut scratch.actions_vec),
+                vec![BATCH_SIZE, ACTION_SPACE],
+            );
 
             // 2. Policy Forward
             let q_values = policy_net.forward(&batch_state); // (B, 5)
@@ -907,7 +914,10 @@ fn train_dqn_impl(
                 scratch.target_vals.push(target);
             }
 
-            let target_tensor = Tensor::new(scratch.target_vals.clone(), vec![BATCH_SIZE, 1]);
+            let target_tensor = Tensor::new(
+                std::mem::take(&mut scratch.target_vals),
+                vec![BATCH_SIZE, 1],
+            );
 
             // IS-weighted loss: w_i * (q - target)^2, normalized
             let is_weights_tensor = Tensor::new(per_sample.is_weights.clone(), vec![BATCH_SIZE, 1]);
@@ -932,12 +942,14 @@ fn train_dqn_impl(
             {
                 let q_data = q_actions.data.read().unwrap();
                 let t_data = target_tensor.data.read().unwrap();
-                let td_errors: Vec<f64> = q_data
-                    .iter()
-                    .zip(t_data.iter())
-                    .map(|(&q, &t)| (q - t).abs())
-                    .collect();
-                replay_buffer.update_priorities(&per_sample.indices, &td_errors);
+                scratch.td_errors.clear();
+                scratch.td_errors.extend(
+                    q_data
+                        .iter()
+                        .zip(t_data.iter())
+                        .map(|(&q, &t)| (q - t).abs()),
+                );
+                replay_buffer.update_priorities(&per_sample.indices, &scratch.td_errors);
             }
 
             // Soft Update Target Network
@@ -1051,6 +1063,7 @@ struct DqnTrainerScratch {
     rewards_vec: Vec<f64>,
     dones_vec: Vec<f64>,
     target_vals: Vec<f64>,
+    td_errors: Vec<f64>,
 }
 
 impl DqnTrainerScratch {
@@ -1062,16 +1075,18 @@ impl DqnTrainerScratch {
             rewards_vec: Vec::with_capacity(BATCH_SIZE),
             dones_vec: Vec::with_capacity(BATCH_SIZE),
             target_vals: Vec::with_capacity(BATCH_SIZE),
+            td_errors: Vec::with_capacity(BATCH_SIZE),
         }
     }
 
     fn reset(&mut self) {
-        self.states_vec.clear();
-        self.next_states_vec.clear();
-        self.actions_vec.clear();
-        self.rewards_vec.clear();
-        self.dones_vec.clear();
-        self.target_vals.clear();
+        self.states_vec = Vec::with_capacity(BATCH_SIZE * DIM);
+        self.next_states_vec = Vec::with_capacity(BATCH_SIZE * DIM);
+        self.actions_vec = Vec::with_capacity(BATCH_SIZE * ACTION_SPACE);
+        self.rewards_vec = Vec::with_capacity(BATCH_SIZE);
+        self.dones_vec = Vec::with_capacity(BATCH_SIZE);
+        self.target_vals = Vec::with_capacity(BATCH_SIZE);
+        self.td_errors = Vec::with_capacity(BATCH_SIZE);
     }
 }
 
