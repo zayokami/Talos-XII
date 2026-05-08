@@ -431,6 +431,264 @@ pub fn attention_weighted_sum(
     }
 }
 
+#[cfg(cuda)]
+pub fn relu_backward(
+    input: &DevicePtr<f64>,
+    grad_out: &DevicePtr<f64>,
+    input_grad: &DevicePtr<f64>,
+    size: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let size_i32 = to_i32_len("cuda::kernels::relu_backward(size)", size)?;
+    if size == 0 {
+        return Ok(());
+    }
+    let status = unsafe {
+        crate::cuda::bindings::cuda_relu_backward(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            size_i32,
+            input.as_raw() as *mut std::os::raw::c_int,
+            grad_out.as_raw() as *mut std::os::raw::c_int,
+            input_grad.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::relu_backward",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn gelu_backward(
+    input: &DevicePtr<f64>,
+    grad_out: &DevicePtr<f64>,
+    input_grad: &DevicePtr<f64>,
+    size: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let size_i32 = to_i32_len("cuda::kernels::gelu_backward(size)", size)?;
+    if size == 0 {
+        return Ok(());
+    }
+    let status = unsafe {
+        crate::cuda::bindings::cuda_gelu_backward(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            size_i32,
+            input.as_raw() as *mut std::os::raw::c_int,
+            grad_out.as_raw() as *mut std::os::raw::c_int,
+            input_grad.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::gelu_backward",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn add_backward(
+    grad_out: &DevicePtr<f64>,
+    a_grad: &DevicePtr<f64>,
+    b_grad: &DevicePtr<f64>,
+    size: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let size_i32 = to_i32_len("cuda::kernels::add_backward(size)", size)?;
+    if size == 0 {
+        return Ok(());
+    }
+    let status = unsafe {
+        crate::cuda::bindings::cuda_add_backward(
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            size_i32,
+            grad_out.as_raw() as *mut std::os::raw::c_int,
+            a_grad.as_raw() as *mut std::os::raw::c_int,
+            b_grad.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::add_backward",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn mul_backward(
+    grad_out: &DevicePtr<f64>,
+    a_data: &DevicePtr<f64>,
+    b_data: &DevicePtr<f64>,
+    a_grad: &DevicePtr<f64>,
+    b_grad: &DevicePtr<f64>,
+    size: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let size_i32 = to_i32_len("cuda::kernels::mul_backward(size)", size)?;
+    if size == 0 {
+        return Ok(());
+    }
+    let status = unsafe {
+        crate::cuda::bindings::cuda_mul_backward(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            size_i32,
+            grad_out.as_raw() as *mut std::os::raw::c_int,
+            a_data.as_raw() as *mut std::os::raw::c_int,
+            b_data.as_raw() as *mut std::os::raw::c_int,
+            a_grad.as_raw() as *mut std::os::raw::c_int,
+            b_grad.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::mul_backward",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn acc_buffer(dst: &DevicePtr<f64>, src: &DevicePtr<f64>, size: usize) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let size_i32 = to_i32_len("cuda::kernels::acc_buffer(size)", size)?;
+    if size == 0 {
+        return Ok(());
+    }
+    let status = unsafe {
+        crate::cuda::bindings::cuda_acc_buffer(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            size_i32,
+            dst.as_raw() as *mut std::os::raw::c_int,
+            src.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::acc_buffer",
+            code: status as u32,
+        })
+    }
+}
+
+macro_rules! define_elementwise_forward {
+    ($name:ident, $binding:ident, $op_name:expr) => {
+        #[cfg(cuda)]
+        pub fn $name(
+            a: &DevicePtr<f64>,
+            b: &DevicePtr<f64>,
+            out: &DevicePtr<f64>,
+            size: usize,
+        ) -> CudaResult<()> {
+            crate::cuda::init()?;
+            let size_i32 = to_i32_len(concat!("cuda::kernels::", $op_name, "(size)"), size)?;
+            if size == 0 {
+                return Ok(());
+            }
+            let status = unsafe {
+                crate::cuda::bindings::$binding(
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    size_i32,
+                    a.as_raw() as *mut std::os::raw::c_int,
+                    b.as_raw() as *mut std::os::raw::c_int,
+                    out.as_raw() as *mut std::os::raw::c_int,
+                )
+            };
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(CudaError::Runtime {
+                    op: concat!("cuda::kernels::", $op_name),
+                    code: status as u32,
+                })
+            }
+        }
+    };
+}
+
+define_elementwise_forward!(add_forward, cuda_add_forward, "add_forward");
+define_elementwise_forward!(sub_forward, cuda_sub_forward, "sub_forward");
+define_elementwise_forward!(mul_forward, cuda_mul_forward, "mul_forward");
+define_elementwise_forward!(div_forward, cuda_div_forward, "div_forward");
+
+#[cfg(cuda)]
+pub fn adam_step(
+    params: &DevicePtr<f64>,
+    grads: &DevicePtr<f64>,
+    m: &DevicePtr<f64>,
+    v: &DevicePtr<f64>,
+    size: usize,
+    lr: f64,
+    beta1: f64,
+    beta2: f64,
+    eps: f64,
+    weight_decay: f64,
+    bias_correction1: f64,
+    bias_correction2: f64,
+    clip_coef: f64,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let size_i32 = to_i32_len("cuda::kernels::adam_step(size)", size)?;
+    if size == 0 {
+        return Ok(());
+    }
+    let status = unsafe {
+        crate::cuda::bindings::cuda_adam_step(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            size_i32,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            weight_decay,
+            bias_correction1,
+            bias_correction2,
+            clip_coef,
+            params.as_raw() as *mut std::os::raw::c_int,
+            grads.as_raw() as *mut std::os::raw::c_int,
+            m.as_raw() as *mut std::os::raw::c_int,
+            v.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::adam_step",
+            code: status as u32,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::validate_softmax_dims;

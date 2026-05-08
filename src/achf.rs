@@ -370,6 +370,17 @@ impl AchfLayer {
         }
     }
 
+    #[cfg(cuda)]
+    pub fn to_cuda(&mut self) {
+        self.weight.to_cuda();
+        if let Some(ref mut d) = self.down {
+            d.to_cuda();
+        }
+        if let Some(ref mut u) = self.up {
+            u.to_cuda();
+        }
+    }
+
     pub fn forward_residual(&self, x: &Tensor) -> Tensor {
         if !self.config.enabled {
             return Tensor::zeros(x.shape.clone());

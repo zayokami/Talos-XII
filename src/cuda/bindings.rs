@@ -187,6 +187,130 @@ extern "C" {
         d_values: *mut c_int,
         d_output: *mut c_int,
     ) -> c_int;
+
+    // Backward kernels
+    #[link_name = "relu_backward"]
+    pub fn cuda_relu_backward(
+        h_input: *const f64,
+        h_grad_out: *const f64,
+        h_input_grad: *mut f64,
+        size: c_int,
+        d_input: *mut c_int,
+        d_grad_out: *mut c_int,
+        d_input_grad: *mut c_int,
+    ) -> c_int;
+
+    #[link_name = "gelu_backward"]
+    pub fn cuda_gelu_backward(
+        h_input: *const f64,
+        h_grad_out: *const f64,
+        h_input_grad: *mut f64,
+        size: c_int,
+        d_input: *mut c_int,
+        d_grad_out: *mut c_int,
+        d_input_grad: *mut c_int,
+    ) -> c_int;
+
+    #[link_name = "add_backward"]
+    pub fn cuda_add_backward(
+        h_grad_out: *const f64,
+        h_a_grad: *mut f64,
+        h_b_grad: *mut f64,
+        size: c_int,
+        d_grad_out: *mut c_int,
+        d_a_grad: *mut c_int,
+        d_b_grad: *mut c_int,
+    ) -> c_int;
+
+    #[link_name = "mul_backward"]
+    pub fn cuda_mul_backward(
+        h_grad_out: *const f64,
+        h_a_data: *const f64,
+        h_b_data: *const f64,
+        h_a_grad: *mut f64,
+        h_b_grad: *mut f64,
+        size: c_int,
+        d_grad_out: *mut c_int,
+        d_a_data: *mut c_int,
+        d_b_data: *mut c_int,
+        d_a_grad: *mut c_int,
+        d_b_grad: *mut c_int,
+    ) -> c_int;
+
+    #[link_name = "acc_buffer"]
+    pub fn cuda_acc_buffer(
+        h_dst: *mut f64,
+        h_src: *const f64,
+        size: c_int,
+        d_dst: *mut c_int,
+        d_src: *mut c_int,
+    ) -> c_int;
+
+    // Element-wise forward kernels
+    #[link_name = "add_forward"]
+    pub fn cuda_add_forward(
+        h_a: *const f64,
+        h_b: *const f64,
+        h_out: *mut f64,
+        size: c_int,
+        d_a: *mut c_int,
+        d_b: *mut c_int,
+        d_out: *mut c_int,
+    ) -> c_int;
+
+    #[link_name = "sub_forward"]
+    pub fn cuda_sub_forward(
+        h_a: *const f64,
+        h_b: *const f64,
+        h_out: *mut f64,
+        size: c_int,
+        d_a: *mut c_int,
+        d_b: *mut c_int,
+        d_out: *mut c_int,
+    ) -> c_int;
+
+    #[link_name = "mul_forward"]
+    pub fn cuda_mul_forward(
+        h_a: *const f64,
+        h_b: *const f64,
+        h_out: *mut f64,
+        size: c_int,
+        d_a: *mut c_int,
+        d_b: *mut c_int,
+        d_out: *mut c_int,
+    ) -> c_int;
+
+    #[link_name = "div_forward"]
+    pub fn cuda_div_forward(
+        h_a: *const f64,
+        h_b: *const f64,
+        h_out: *mut f64,
+        size: c_int,
+        d_a: *mut c_int,
+        d_b: *mut c_int,
+        d_out: *mut c_int,
+    ) -> c_int;
+
+    #[link_name = "adam_step"]
+    pub fn cuda_adam_step(
+        h_params: *mut f64,
+        h_grads: *const f64,
+        h_m: *mut f64,
+        h_v: *mut f64,
+        size: c_int,
+        lr: f64,
+        beta1: f64,
+        beta2: f64,
+        eps: f64,
+        weight_decay: f64,
+        bias_correction1: f64,
+        bias_correction2: f64,
+        clip_coef: f64,
+        d_params: *mut c_int,
+        d_grads: *mut c_int,
+        d_m: *mut c_int,
+        d_v: *mut c_int,
+    ) -> c_int;
 }
 
 // =============================================================================

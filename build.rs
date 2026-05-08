@@ -124,6 +124,7 @@ fn main() {
         "cuda/gelu.cu",
         "cuda/rope.cu",
         "cuda/attention_output.cu",
+        "cuda/backward.cu",
     ];
 
     // Output directory for compiled objects

@@ -207,6 +207,13 @@ impl ActorCritic {
         p
     }
 
+    #[cfg(cuda)]
+    pub fn to_cuda(&mut self) {
+        self.backbone.to_cuda();
+        self.actor_head.to_cuda();
+        self.critic_head.to_cuda();
+    }
+
     pub fn update_achf_after_backward(&self) {
         self.backbone.update_achf_after_backward();
     }
@@ -454,6 +461,146 @@ impl Adam {
     }
 }
 
+#[cfg(cuda)]
+struct GpuAdam {
+    params: Vec<Tensor>,
+    m: Vec<std::sync::Arc<crate::cuda::memory::DevicePtr<f64>>>,
+    v: Vec<std::sync::Arc<crate::cuda::memory::DevicePtr<f64>>>,
+    t: usize,
+    lr: f64,
+    beta1: f64,
+    beta2: f64,
+    eps: f64,
+    weight_decay: f64,
+}
+
+#[cfg(cuda)]
+impl GpuAdam {
+    fn new(params: Vec<Tensor>, lr: f64) -> Option<Self> {
+        let mut m = Vec::with_capacity(params.len());
+        let mut v = Vec::with_capacity(params.len());
+        for p in &params {
+            let len = p.data.read().unwrap().len();
+            if p.device != crate::autograd::Device::Cuda {
+                return None;
+            }
+            let d_m = crate::cuda::memory::alloc::<f64>(len).ok()?;
+            let d_v = crate::cuda::memory::alloc::<f64>(len).ok()?;
+            let zeros = vec![0.0_f64; len];
+            crate::cuda::memory::copy_h2d(&d_m, &zeros).ok()?;
+            crate::cuda::memory::copy_h2d(&d_v, &zeros).ok()?;
+            m.push(std::sync::Arc::new(d_m));
+            v.push(std::sync::Arc::new(d_v));
+        }
+        Some(GpuAdam {
+            params,
+            m,
+            v,
+            t: 0,
+            lr,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            weight_decay: 1e-4,
+        })
+    }
+
+    fn set_lr(&mut self, lr: f64) {
+        self.lr = lr;
+    }
+
+    fn step(&mut self) {
+        self.t += 1;
+
+        // Compute global gradient norm on CPU (copy grads from GPU)
+        let mut total_norm = 0.0;
+        for param in &self.params {
+            let grad = param.grad.read().unwrap();
+            total_norm += crate::simd::dot_product(&grad, &grad);
+        }
+        total_norm = total_norm.sqrt();
+        let clip_coef = if total_norm > 1.0 {
+            1.0 / total_norm
+        } else {
+            1.0
+        };
+
+        let bias_correction1 = 1.0 - self.beta1.powi(self.t as i32);
+        let bias_correction2 = 1.0 - self.beta2.powi(self.t as i32);
+
+        for (i, param) in self.params.iter().enumerate() {
+            let len = param.data.read().unwrap().len();
+            if len == 0 {
+                continue;
+            }
+            let d_params = match param.cuda_get_or_upload_buffer() {
+                Ok(buf) => buf,
+                Err(_) => continue,
+            };
+            let d_grads = match param.cuda_grad_get_or_upload_buffer() {
+                Ok(buf) => buf,
+                Err(_) => continue,
+            };
+            let d_m = &self.m[i];
+            let d_v = &self.v[i];
+
+            let _ = crate::cuda::kernels::adam_step(
+                &*d_params,
+                &*d_grads,
+                &*d_m,
+                &*d_v,
+                len,
+                self.lr,
+                self.beta1,
+                self.beta2,
+                self.eps,
+                self.weight_decay,
+                bias_correction1,
+                bias_correction2,
+                clip_coef,
+            );
+        }
+    }
+
+    fn zero_grad(&self) {
+        for p in &self.params {
+            p.zero_grad();
+        }
+    }
+}
+
+enum Optimizer {
+    Cpu(Adam),
+    #[cfg(cuda)]
+    Gpu(GpuAdam),
+}
+
+impl Optimizer {
+    fn set_lr(&mut self, lr: f64) {
+        match self {
+            Optimizer::Cpu(o) => o.set_lr(lr),
+            #[cfg(cuda)]
+            Optimizer::Gpu(o) => o.set_lr(lr),
+        }
+    }
+
+    fn step(&mut self) {
+        match self {
+            Optimizer::Cpu(o) => o.step(),
+            #[cfg(cuda)]
+            Optimizer::Gpu(o) => o.step(),
+        }
+    }
+
+    fn zero_grad(&self) {
+        match self {
+            Optimizer::Cpu(o) => o.zero_grad(),
+            #[cfg(cuda)]
+            Optimizer::Gpu(o) => o.zero_grad(),
+        }
+    }
+}
+
 // --- PPO Trainer ---
 
 struct Memory {
@@ -482,7 +629,7 @@ pub(crate) struct PpoStoreRawInput {
 pub struct Ppo {
     pub policy: ActorCritic,
     ema_policy: Option<ActorCritic>, // EMA teacher for self-distillation
-    optimizer: Adam,
+    optimizer: Optimizer,
     memory: Memory,
     k_epochs: usize,
     batch_size: usize,
@@ -505,7 +652,19 @@ impl Ppo {
     }
 
     pub fn from_policy(policy: ActorCritic, k_epochs: usize, batch_size: usize) -> Self {
-        let optimizer = Adam::new(policy.parameters(), 0.0003);
+        #[cfg(cuda)]
+        let policy = {
+            let mut p = policy;
+            p.to_cuda();
+            p
+        };
+        let params = policy.parameters();
+        #[cfg(cuda)]
+        let optimizer = GpuAdam::new(params, 0.0003)
+            .map(|o| Optimizer::Gpu(o))
+            .unwrap_or_else(|| Optimizer::Cpu(Adam::new(policy.parameters(), 0.0003)));
+        #[cfg(not(cuda))]
+        let optimizer = Optimizer::Cpu(Adam::new(params, 0.0003));
         let safe_batch_size = batch_size.max(1);
         Ppo {
             policy,
@@ -664,6 +823,32 @@ impl Ppo {
         let mut indices: Vec<usize> = (0..len).collect();
         let value_coef_tensor = Tensor::new(vec![VALUE_COEF], vec![1]);
         let entropy_coef_tensor = Tensor::new(vec![ENTROPY_COEF], vec![1]);
+        #[cfg(cuda)]
+        let value_coef_tensor = match value_coef_tensor.to_cuda() {
+            Ok(t) => t,
+            Err(_) => value_coef_tensor,
+        };
+        #[cfg(cuda)]
+        let entropy_coef_tensor = match entropy_coef_tensor.to_cuda() {
+            Ok(t) => t,
+            Err(_) => entropy_coef_tensor,
+        };
+
+        #[cfg(cuda)]
+        {
+            TRAINING_SCRATCH.with(|s| {
+                let mut scratch = s.borrow_mut();
+                if let Ok(t) = scratch.old_log_prob.to_cuda() {
+                    scratch.old_log_prob = t;
+                }
+                if let Ok(t) = scratch.advantage.to_cuda() {
+                    scratch.advantage = t;
+                }
+                if let Ok(t) = scratch.return_val.to_cuda() {
+                    scratch.return_val = t;
+                }
+            });
+        }
 
         let mut loss_sum = 0.0_f64;
         let mut loss_count = 0usize;
@@ -691,12 +876,22 @@ impl Ppo {
                     }
                 }
                 let batch_states = Tensor::new(batch_data, vec![batch_len, max_seq_len, DIM]);
+                #[cfg(cuda)]
+                let batch_states = match batch_states.to_cuda() {
+                    Ok(t) => t,
+                    Err(_) => batch_states,
+                };
                 let (batch_logits, batch_values) =
                     self.policy.forward_actor_critic_batch(&batch_states);
                 let batch_log_probs = batch_logits.log_softmax();
                 let batch_log_probs_copy = batch_log_probs.clone();
                 let batch_probs = batch_log_probs_copy.exp();
                 let ones_action_1 = Tensor::new(vec![1.0; ACTION_SPACE], vec![ACTION_SPACE, 1]);
+                #[cfg(cuda)]
+                let ones_action_1 = match ones_action_1.to_cuda() {
+                    Ok(t) => t,
+                    Err(_) => ones_action_1,
+                };
                 let batch_entropy =
                     -(batch_probs.clone() * batch_log_probs_copy).matmul(&ones_action_1);
 
@@ -714,6 +909,17 @@ impl Ppo {
 
                 let mut loss_accum = Tensor::zeros(vec![1]);
                 let mut distill_accum = Tensor::zeros(vec![1]);
+                #[cfg(cuda)]
+                {
+                    loss_accum = match loss_accum.to_cuda() {
+                        Ok(t) => t,
+                        Err(_) => loss_accum,
+                    };
+                    distill_accum = match distill_accum.to_cuda() {
+                        Ok(t) => t,
+                        Err(_) => distill_accum,
+                    };
+                }
 
                 for (chunk_idx, &i) in chunk.iter().enumerate() {
                     let action_idx = actions[i];
@@ -777,12 +983,22 @@ impl Ppo {
                 }
 
                 let batch_size_tensor = Tensor::new(vec![inv_batch], vec![1]);
+                #[cfg(cuda)]
+                let batch_size_tensor = match batch_size_tensor.to_cuda() {
+                    Ok(t) => t,
+                    Err(_) => batch_size_tensor,
+                };
                 let mut final_loss = loss_accum * batch_size_tensor.clone();
                 // Add distillation loss after warmup: distill_coef * mean(kl_divs)
                 if teacher_batch_logits.is_some()
                     && self.distill_update_counter >= self.distill_warmup_steps
                 {
                     let distill_coef_tensor = Tensor::new(vec![self.distill_kl_coef], vec![1]);
+                    #[cfg(cuda)]
+                    let distill_coef_tensor = match distill_coef_tensor.to_cuda() {
+                        Ok(t) => t,
+                        Err(_) => distill_coef_tensor,
+                    };
                     let distill_term = distill_accum * distill_coef_tensor * batch_size_tensor;
                     final_loss = final_loss + distill_term;
                 }

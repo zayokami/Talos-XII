@@ -129,6 +129,26 @@ impl LuckTransformer {
         }
     }
 
+    #[cfg(cuda)]
+    pub fn to_cuda(&mut self) {
+        self.embed.to_cuda();
+        for block in &mut self.blocks {
+            block.norm_1.to_cuda();
+            block.mla_layer.to_cuda();
+            if let Some(ref mut achf) = block.achf_attn {
+                achf.to_cuda();
+            }
+            block.norm_2.to_cuda();
+            block.ffn_1.to_cuda();
+            block.ffn_2.to_cuda();
+            if let Some(ref mut achf) = block.achf_ffn {
+                achf.to_cuda();
+            }
+        }
+        self.norm_final.to_cuda();
+        self.out_proj.to_cuda();
+    }
+
     pub fn forward(&self, x: &Tensor, _pity: &[usize]) -> Tensor {
         // x: [Batch, Seq, Dim]
         // Embed
@@ -776,6 +796,17 @@ impl MultiHeadLatentAttention {
         p.extend(self.w_qr.parameters());
         p.extend(self.w_o.parameters());
         p
+    }
+
+    #[cfg(cuda)]
+    pub fn to_cuda(&mut self) {
+        self.w_dkv.to_cuda();
+        self.w_uk.to_cuda();
+        self.w_uv.to_cuda();
+        self.w_q.to_cuda();
+        self.w_kr.to_cuda();
+        self.w_qr.to_cuda();
+        self.w_o.to_cuda();
     }
 
     pub fn forward(&self, x: &Tensor) -> Tensor {

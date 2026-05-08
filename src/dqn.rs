@@ -137,6 +137,17 @@ impl DuelingQNetwork {
             .unwrap_or_default()
     }
 
+    #[cfg(cuda)]
+    pub fn to_cuda(&mut self) {
+        self.l1.to_cuda();
+        self.l2.to_cuda();
+        self.val_head.to_cuda();
+        self.adv_head.to_cuda();
+        if let Some(ref mut achf) = self.achf {
+            achf.to_cuda();
+        }
+    }
+
     pub fn update_achf_after_backward(&self) {
         if let Some(achf) = &self.achf {
             achf.update_after_backward();
@@ -455,6 +466,134 @@ impl Adam {
     }
 }
 
+#[cfg(cuda)]
+struct GpuAdam {
+    params: Vec<Tensor>,
+    m: Vec<std::sync::Arc<crate::cuda::memory::DevicePtr<f64>>>,
+    v: Vec<std::sync::Arc<crate::cuda::memory::DevicePtr<f64>>>,
+    t: usize,
+    lr: f64,
+    beta1: f64,
+    beta2: f64,
+    eps: f64,
+    weight_decay: f64,
+}
+
+#[cfg(cuda)]
+impl GpuAdam {
+    fn new(params: Vec<Tensor>, lr: f64) -> Option<Self> {
+        let mut m = Vec::with_capacity(params.len());
+        let mut v = Vec::with_capacity(params.len());
+        for p in &params {
+            let len = p.data.read().unwrap().len();
+            if p.device != crate::autograd::Device::Cuda {
+                return None;
+            }
+            let d_m = crate::cuda::memory::alloc::<f64>(len).ok()?;
+            let d_v = crate::cuda::memory::alloc::<f64>(len).ok()?;
+            let zeros = vec![0.0_f64; len];
+            crate::cuda::memory::copy_h2d(&d_m, &zeros).ok()?;
+            crate::cuda::memory::copy_h2d(&d_v, &zeros).ok()?;
+            m.push(std::sync::Arc::new(d_m));
+            v.push(std::sync::Arc::new(d_v));
+        }
+        Some(GpuAdam {
+            params,
+            m,
+            v,
+            t: 0,
+            lr,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            weight_decay: 1e-4,
+        })
+    }
+
+    fn step(&mut self) {
+        self.t += 1;
+        let mut total_norm = 0.0;
+        for param in &self.params {
+            let grad = param.grad.read().unwrap();
+            for &g in grad.iter() {
+                total_norm += g * g;
+            }
+        }
+        total_norm = total_norm.sqrt();
+        let clip_coef = if total_norm > 1.0 {
+            1.0 / total_norm
+        } else {
+            1.0
+        };
+
+        let bias_correction1 = 1.0 - self.beta1.powi(self.t as i32);
+        let bias_correction2 = 1.0 - self.beta2.powi(self.t as i32);
+
+        for (i, param) in self.params.iter().enumerate() {
+            let len = param.data.read().unwrap().len();
+            if len == 0 {
+                continue;
+            }
+            let d_params = match param.cuda_get_or_upload_buffer() {
+                Ok(buf) => buf,
+                Err(_) => continue,
+            };
+            let d_grads = match param.cuda_grad_get_or_upload_buffer() {
+                Ok(buf) => buf,
+                Err(_) => continue,
+            };
+            let d_m = &self.m[i];
+            let d_v = &self.v[i];
+
+            let _ = crate::cuda::kernels::adam_step(
+                &*d_params,
+                &*d_grads,
+                &*d_m,
+                &*d_v,
+                len,
+                self.lr,
+                self.beta1,
+                self.beta2,
+                self.eps,
+                self.weight_decay,
+                bias_correction1,
+                bias_correction2,
+                clip_coef,
+            );
+        }
+    }
+
+    fn zero_grad(&self) {
+        for p in &self.params {
+            p.zero_grad();
+        }
+    }
+}
+
+enum Optimizer {
+    Cpu(Adam),
+    #[cfg(cuda)]
+    Gpu(GpuAdam),
+}
+
+impl Optimizer {
+    fn step(&mut self) {
+        match self {
+            Optimizer::Cpu(o) => o.step(),
+            #[cfg(cuda)]
+            Optimizer::Gpu(o) => o.step(),
+        }
+    }
+
+    fn zero_grad(&self) {
+        match self {
+            Optimizer::Cpu(o) => o.zero_grad(),
+            #[cfg(cuda)]
+            Optimizer::Gpu(o) => o.zero_grad(),
+        }
+    }
+}
+
 // --- SumTree for O(log N) proportional PER sampling ---
 
 struct SumTree {
@@ -683,7 +822,23 @@ fn train_dqn_impl(
     let mut target_net = DuelingQNetwork::new(rng.next_u64(), &config.achf);
     target_net.load_state_dict(&policy_net); // Sync weights
 
-    let mut optimizer = Adam::new(policy_net.parameters(), LEARNING_RATE);
+    #[cfg(cuda)]
+    let policy_net = {
+        let mut p = policy_net;
+        p.to_cuda();
+        p
+    };
+    #[cfg(cuda)]
+    {
+        target_net.to_cuda();
+    }
+    let params = policy_net.parameters();
+    #[cfg(cuda)]
+    let mut optimizer = GpuAdam::new(params, LEARNING_RATE)
+        .map(|o| Optimizer::Gpu(o))
+        .unwrap_or_else(|| Optimizer::Cpu(Adam::new(policy_net.parameters(), LEARNING_RATE)));
+    #[cfg(not(cuda))]
+    let mut optimizer = Optimizer::Cpu(Adam::new(params, LEARNING_RATE));
     let mut replay_buffer = ReplayBuffer::new(BUFFER_CAPACITY);
 
     let total_steps = if config.fast_init { 5_000 } else { 50_000 };
@@ -710,6 +865,11 @@ fn train_dqn_impl(
     // Pre-allocated scratch buffers to avoid per-step heap allocations
     let mut scratch = DqnTrainerScratch::new();
     let ones_5_1 = Tensor::new(ONES_5_1_DATA.to_vec(), vec![5, 1]);
+    #[cfg(cuda)]
+    let ones_5_1 = match ones_5_1.to_cuda() {
+        Ok(t) => t,
+        Err(_) => ones_5_1,
+    };
 
     let pb = create_bar(total_steps as u64, "DQN Training");
 
@@ -868,6 +1028,21 @@ fn train_dqn_impl(
                 std::mem::take(&mut scratch.actions_vec),
                 vec![BATCH_SIZE, ACTION_SPACE],
             );
+            #[cfg(cuda)]
+            let batch_state = match batch_state.to_cuda() {
+                Ok(t) => t,
+                Err(_) => batch_state,
+            };
+            #[cfg(cuda)]
+            let batch_next_state = match batch_next_state.to_cuda() {
+                Ok(t) => t,
+                Err(_) => batch_next_state,
+            };
+            #[cfg(cuda)]
+            let batch_mask = match batch_mask.to_cuda() {
+                Ok(t) => t,
+                Err(_) => batch_mask,
+            };
 
             // 2. Policy Forward
             let q_values = policy_net.forward(&batch_state); // (B, 5)
@@ -921,6 +1096,16 @@ fn train_dqn_impl(
 
             // IS-weighted loss: w_i * (q - target)^2, normalized
             let is_weights_tensor = Tensor::new(per_sample.is_weights.clone(), vec![BATCH_SIZE, 1]);
+            #[cfg(cuda)]
+            let target_tensor = match target_tensor.to_cuda() {
+                Ok(t) => t,
+                Err(_) => target_tensor,
+            };
+            #[cfg(cuda)]
+            let is_weights_tensor = match is_weights_tensor.to_cuda() {
+                Ok(t) => t,
+                Err(_) => is_weights_tensor,
+            };
             let mut loss = q_actions.weighted_mse_loss(&target_tensor, &is_weights_tensor);
             if let Some(reg) = policy_net.achf_orthogonal_penalty() {
                 loss = loss + reg;
@@ -1094,7 +1279,7 @@ impl DqnTrainerScratch {
 pub struct OnlineDqnTrainer {
     policy: DuelingQNetwork,
     target: DuelingQNetwork,
-    optimizer: Adam,
+    optimizer: Optimizer,
     replay_buffer: ReplayBuffer,
     steps_done: usize,
     scratch: DqnTrainerScratch,
@@ -1105,7 +1290,23 @@ impl OnlineDqnTrainer {
         let achf = policy.achf_config();
         let mut target = DuelingQNetwork::new(seed, &achf);
         target.load_state_dict(&policy);
-        let optimizer = Adam::new(policy.parameters(), LEARNING_RATE);
+        #[cfg(cuda)]
+        let policy = {
+            let mut p = policy;
+            p.to_cuda();
+            p
+        };
+        #[cfg(cuda)]
+        {
+            target.to_cuda();
+        }
+        let params = policy.parameters();
+        #[cfg(cuda)]
+        let optimizer = GpuAdam::new(params, LEARNING_RATE)
+            .map(|o| Optimizer::Gpu(o))
+            .unwrap_or_else(|| Optimizer::Cpu(Adam::new(policy.parameters(), LEARNING_RATE)));
+        #[cfg(not(cuda))]
+        let optimizer = Optimizer::Cpu(Adam::new(params, LEARNING_RATE));
         Self {
             policy,
             target,
@@ -1157,9 +1358,29 @@ impl OnlineDqnTrainer {
             self.scratch.actions_vec.clone(),
             vec![BATCH_SIZE, ACTION_SPACE],
         );
+        #[cfg(cuda)]
+        let batch_state = match batch_state.to_cuda() {
+            Ok(t) => t,
+            Err(_) => batch_state,
+        };
+        #[cfg(cuda)]
+        let batch_next_state = match batch_next_state.to_cuda() {
+            Ok(t) => t,
+            Err(_) => batch_next_state,
+        };
+        #[cfg(cuda)]
+        let batch_mask = match batch_mask.to_cuda() {
+            Ok(t) => t,
+            Err(_) => batch_mask,
+        };
 
         let q_values = self.policy.forward(&batch_state);
         let ones_5_1 = Tensor::new(ONES_5_1_DATA.to_vec(), vec![5, 1]);
+        #[cfg(cuda)]
+        let ones_5_1 = match ones_5_1.to_cuda() {
+            Ok(t) => t,
+            Err(_) => ones_5_1,
+        };
         let q_actions = (q_values * batch_mask).matmul(&ones_5_1);
 
         let q_next_eval = self.policy.forward(&batch_next_state);
@@ -1190,6 +1411,16 @@ impl OnlineDqnTrainer {
         }
         let target_tensor = Tensor::new(self.scratch.target_vals.clone(), vec![BATCH_SIZE, 1]);
         let is_weights_tensor = Tensor::new(per_sample.is_weights.clone(), vec![BATCH_SIZE, 1]);
+        #[cfg(cuda)]
+        let target_tensor = match target_tensor.to_cuda() {
+            Ok(t) => t,
+            Err(_) => target_tensor,
+        };
+        #[cfg(cuda)]
+        let is_weights_tensor = match is_weights_tensor.to_cuda() {
+            Ok(t) => t,
+            Err(_) => is_weights_tensor,
+        };
         let mut loss = q_actions.weighted_mse_loss(&target_tensor, &is_weights_tensor);
         if let Some(reg) = self.policy.achf_orthogonal_penalty() {
             loss = loss + reg;

@@ -106,6 +106,18 @@ impl Linear {
             }
         }
     }
+
+    #[cfg(cuda)]
+    pub fn to_cuda(&mut self) {
+        if let Ok(t) = self.weight.to_cuda() {
+            self.weight = t;
+        }
+        if let Some(ref mut b) = self.bias {
+            if let Ok(t) = b.to_cuda() {
+                *b = t;
+            }
+        }
+    }
 }
 
 impl Module for Linear {
@@ -221,6 +233,13 @@ impl RMSNorm {
             }
         }
     }
+
+    #[cfg(cuda)]
+    pub fn to_cuda(&mut self) {
+        if let Ok(t) = self.weight.to_cuda() {
+            self.weight = t;
+        }
+    }
 }
 
 impl Module for RMSNorm {
@@ -273,7 +292,7 @@ impl Module for RMSNorm {
             data: Arc::new(RwLock::new(out_data)),
             grad: Arc::new(RwLock::new(vec![0.0; num_elements])),
             shape: shape.clone(),
-            device: crate::autograd::Device::Cpu,
+            device: x.device,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
