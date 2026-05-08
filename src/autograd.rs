@@ -771,15 +771,15 @@ impl Tensor {
                     if input.device == Device::Cuda {
                         if let Some(d_input) = input.cuda_cached_buffer() {
                             if let Ok(d_grad_tmp) =
-                                crate::cuda::memory::alloc::<f64>(grad_out.len())
+                                crate::cuda::memory::alloc_pooled::<f64>(grad_out.len())
                             {
                                 let d_grad_tmp = std::sync::Arc::new(d_grad_tmp);
                                 if crate::cuda::memory::copy_h2d(&d_grad_tmp, grad_out).is_ok() {
                                     if let Some(d_in_grad) = input.cuda_grad_ensure_buffer() {
                                         let _ = crate::cuda::kernels::relu_backward(
-                                            &*d_input,
-                                            &*d_grad_tmp,
-                                            &*d_in_grad,
+                                            &d_input,
+                                            &d_grad_tmp,
+                                            &d_in_grad,
                                             grad_out.len(),
                                         );
                                     }
@@ -3415,19 +3415,20 @@ impl Neg for Tensor {
 }
 
 #[cfg(cuda)]
+#[allow(dead_code)]
 impl Tensor {
     fn cuda_cache_key(&self) -> usize {
         Arc::as_ptr(&self.data) as usize
     }
 
-    fn cuda_cached_buffer(&self) -> Option<Arc<crate::cuda::memory::DevicePtr<f64>>> {
+    pub(crate) fn cuda_cached_buffer(&self) -> Option<Arc<crate::cuda::memory::DevicePtr<f64>>> {
         let key = self.cuda_cache_key();
         let cache = cuda_tensor_buffer_cache();
         let map = cache.lock().ok()?;
         map.get(&key).cloned()
     }
 
-    fn cuda_set_cached_buffer(&self, buffer: Arc<crate::cuda::memory::DevicePtr<f64>>) {
+    pub(crate) fn cuda_set_cached_buffer(&self, buffer: Arc<crate::cuda::memory::DevicePtr<f64>>) {
         let key = self.cuda_cache_key();
         if let Ok(mut map) = cuda_tensor_buffer_cache().lock() {
             map.insert(key, buffer);
@@ -3469,7 +3470,7 @@ impl Tensor {
     }
 
     /// Upload CPU grad to GPU, returning the GPU buffer.
-    fn cuda_grad_get_or_upload_buffer(
+    pub(crate) fn cuda_grad_get_or_upload_buffer(
         &self,
     ) -> Result<
         Arc<crate::cuda::memory::DevicePtr<f64>>,
@@ -3511,7 +3512,9 @@ impl Tensor {
     }
 
     /// Ensure a zero-initialized GPU grad buffer exists for this tensor.
-    fn cuda_grad_ensure_buffer(&self) -> Option<Arc<crate::cuda::memory::DevicePtr<f64>>> {
+    pub(crate) fn cuda_grad_ensure_buffer(
+        &self,
+    ) -> Option<Arc<crate::cuda::memory::DevicePtr<f64>>> {
         use crate::cuda::memory::{alloc, copy_h2d};
 
         let len = self.grad.read().unwrap().len();
@@ -3566,7 +3569,7 @@ impl Tensor {
         }
     }
 
-    fn cuda_get_or_upload_buffer(
+    pub(crate) fn cuda_get_or_upload_buffer(
         &self,
     ) -> Result<
         Arc<crate::cuda::memory::DevicePtr<f64>>,
@@ -3705,7 +3708,7 @@ impl Tensor {
                             (lhs.cuda_cached_buffer(), rhs.cuda_cached_buffer())
                         {
                             if let Ok(d_grad_tmp) =
-                                crate::cuda::memory::alloc::<f64>(grad_out.len())
+                                crate::cuda::memory::alloc_pooled::<f64>(grad_out.len())
                             {
                                 let d_grad_tmp = std::sync::Arc::new(d_grad_tmp);
                                 if crate::cuda::memory::copy_h2d(&d_grad_tmp, grad_out).is_ok() {
@@ -3926,15 +3929,15 @@ impl Tensor {
                     if input.device == Device::Cuda {
                         if let Some(d_input) = input.cuda_cached_buffer() {
                             if let Ok(d_grad_tmp) =
-                                crate::cuda::memory::alloc::<f64>(grad_out.len())
+                                crate::cuda::memory::alloc_pooled::<f64>(grad_out.len())
                             {
                                 let d_grad_tmp = std::sync::Arc::new(d_grad_tmp);
                                 if crate::cuda::memory::copy_h2d(&d_grad_tmp, grad_out).is_ok() {
                                     if let Some(d_in_grad) = input.cuda_grad_ensure_buffer() {
                                         let _ = crate::cuda::kernels::gelu_backward(
-                                            &*d_input,
-                                            &*d_grad_tmp,
-                                            &*d_in_grad,
+                                            &d_input,
+                                            &d_grad_tmp,
+                                            &d_in_grad,
                                             grad_out.len(),
                                         );
                                     }
@@ -4270,7 +4273,7 @@ impl Tensor {
         start_pos: usize,
     ) -> Tensor {
         use crate::cuda::kernels::rope_inplace;
-        use crate::cuda::memory::{alloc, copy_d2d};
+        use crate::cuda::memory::{alloc, copy_d2d, copy_h2d};
 
         let len = self.data.read().unwrap().len();
         if len == 0 {
@@ -4292,13 +4295,13 @@ impl Tensor {
         };
         let d_data = match alloc::<f64>(len) {
             Ok(buf) => buf,
-            Err(err) => {
+            Err(_err) => {
                 crate::cuda::record_activation_fallback("alloc");
                 return self.clone();
             }
         };
 
-        if let Err(err) = copy_d2d(&d_data, &d_src) {
+        if let Err(_err) = copy_d2d(&d_data, &d_src) {
             crate::cuda::record_activation_fallback("copy");
             return self.clone();
         }
@@ -4318,11 +4321,11 @@ impl Tensor {
                 return self.clone();
             }
         };
-        if let Err(e) = copy_h2d(&d_cos, cos_cache) {
+        if let Err(_e) = copy_h2d(&d_cos, cos_cache) {
             crate::cuda::record_activation_fallback("copy_cos");
             return self.clone();
         }
-        if let Err(e) = copy_h2d(&d_sin, sin_cache) {
+        if let Err(_e) = copy_h2d(&d_sin, sin_cache) {
             crate::cuda::record_activation_fallback("copy_sin");
             return self.clone();
         }
@@ -4358,7 +4361,7 @@ impl Tensor {
             device: Device::Cuda,
             _ctx: Some(Arc::new(Context {
                 parents,
-                backward_op: Box::new(move |grad_out, parents| {
+                backward_op: Box::new(move |_grad_out, parents| {
                     let cos_cache = cos_cache.clone();
                     let sin_cache = sin_cache.clone();
                     let grad_out_data: Vec<f64> = if let Some(buf) = parents[0].cuda_cached_buffer()
@@ -4517,6 +4520,7 @@ impl Tensor {
     // --- GPU element-wise helpers ---
 
     #[cfg(cuda)]
+    #[allow(clippy::type_complexity)]
     fn elementwise_op_cuda(
         &self,
         rhs: &Tensor,
@@ -4548,7 +4552,7 @@ impl Tensor {
         let d_out = alloc::<f64>(len).ok()?;
         let d_out = std::sync::Arc::new(d_out);
 
-        if forward_kernel(&*d_a, &*d_b, &*d_out, len).is_err() {
+        if forward_kernel(&d_a, &d_b, &d_out, len).is_err() {
             return None;
         }
 
@@ -4569,7 +4573,7 @@ impl Tensor {
                             (a.cuda_cached_buffer(), b.cuda_cached_buffer())
                         {
                             if let Ok(d_grad_tmp) =
-                                crate::cuda::memory::alloc::<f64>(grad_out.len())
+                                crate::cuda::memory::alloc_pooled::<f64>(grad_out.len())
                             {
                                 let d_grad_tmp = std::sync::Arc::new(d_grad_tmp);
                                 if crate::cuda::memory::copy_h2d(&d_grad_tmp, grad_out).is_ok() {
@@ -4577,11 +4581,11 @@ impl Tensor {
                                         if let Some(d_b_grad) = b.cuda_grad_ensure_buffer() {
                                             if let Some(bk) = backward_kernel {
                                                 let _ = bk(
-                                                    &*d_grad_tmp,
-                                                    &*d_a,
-                                                    &*d_b,
-                                                    &*d_a_grad,
-                                                    &*d_b_grad,
+                                                    &d_grad_tmp,
+                                                    &d_a,
+                                                    &d_b,
+                                                    &d_a_grad,
+                                                    &d_b_grad,
                                                     grad_out.len(),
                                                 );
                                             }
@@ -4610,7 +4614,7 @@ impl Tensor {
         self.elementwise_op_cuda(
             rhs,
             crate::cuda::kernels::add_forward,
-            Some(crate::cuda::kernels::add_backward),
+            None, // Add backward is simple accumulation handled by CPU fallback
         )
     }
 

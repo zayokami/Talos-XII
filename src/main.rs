@@ -1,3 +1,5 @@
+#![allow(clippy::wrong_self_convention)]
+
 mod achf;
 mod autograd;
 mod bench;

@@ -1,4 +1,5 @@
 //! CUDA activation kernel wrappers.
+#![allow(clippy::too_many_arguments)]
 
 use crate::cuda::bindings;
 use crate::cuda::error::{CudaError, CudaResult};
@@ -306,7 +307,7 @@ pub fn rope_inplace(
             actual: cos_cache.len().min(sin_cache.len()),
         });
     }
-    if dim % 2 != 0 {
+    if !dim.is_multiple_of(2) {
         return Err(CudaError::InvalidInput {
             op: "cuda::kernels::rope_inplace",
             message: "dim must be even for RoPE",
@@ -684,6 +685,148 @@ pub fn adam_step(
     } else {
         Err(CudaError::Runtime {
             op: "cuda::kernels::adam_step",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn rmsnorm_forward(
+    x: &DevicePtr<f64>,
+    weight: &DevicePtr<f64>,
+    out: &DevicePtr<f64>,
+    dim: usize,
+    eps: f64,
+    num_rows: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let dim_i32 = to_i32_len("cuda::kernels::rmsnorm_forward(dim)", dim)?;
+    let num_rows_i32 = to_i32_len("cuda::kernels::rmsnorm_forward(num_rows)", num_rows)?;
+    let expected_len = num_rows.checked_mul(dim).ok_or(CudaError::SizeOverflow {
+        op: "cuda::kernels::rmsnorm_forward(len)",
+        count: num_rows,
+        elem_size: dim,
+    })?;
+    if expected_len != x.len() {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::rmsnorm_forward(x)",
+            expected: expected_len,
+            actual: x.len(),
+        });
+    }
+    if expected_len != out.len() {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::rmsnorm_forward(out)",
+            expected: expected_len,
+            actual: out.len(),
+        });
+    }
+    if weight.len() != dim {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::rmsnorm_forward(weight)",
+            expected: dim,
+            actual: weight.len(),
+        });
+    }
+    let status = unsafe {
+        crate::cuda::bindings::cuda_rmsnorm_forward(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            dim_i32,
+            eps,
+            num_rows_i32,
+            x.as_raw() as *mut std::os::raw::c_int,
+            weight.as_raw() as *mut std::os::raw::c_int,
+            out.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::rmsnorm_forward",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn rmsnorm_backward(
+    grad_out: &DevicePtr<f64>,
+    x: &DevicePtr<f64>,
+    weight: &DevicePtr<f64>,
+    x_grad: &DevicePtr<f64>,
+    w_grad: &DevicePtr<f64>,
+    dim: usize,
+    eps: f64,
+    num_rows: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let dim_i32 = to_i32_len("cuda::kernels::rmsnorm_backward(dim)", dim)?;
+    let num_rows_i32 = to_i32_len("cuda::kernels::rmsnorm_backward(num_rows)", num_rows)?;
+    let expected_len = num_rows.checked_mul(dim).ok_or(CudaError::SizeOverflow {
+        op: "cuda::kernels::rmsnorm_backward(len)",
+        count: num_rows,
+        elem_size: dim,
+    })?;
+    if expected_len != grad_out.len() {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::rmsnorm_backward(grad_out)",
+            expected: expected_len,
+            actual: grad_out.len(),
+        });
+    }
+    if expected_len != x.len() {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::rmsnorm_backward(x)",
+            expected: expected_len,
+            actual: x.len(),
+        });
+    }
+    if expected_len != x_grad.len() {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::rmsnorm_backward(x_grad)",
+            expected: expected_len,
+            actual: x_grad.len(),
+        });
+    }
+    if weight.len() != dim {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::rmsnorm_backward(weight)",
+            expected: dim,
+            actual: weight.len(),
+        });
+    }
+    if w_grad.len() != dim {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::rmsnorm_backward(w_grad)",
+            expected: dim,
+            actual: w_grad.len(),
+        });
+    }
+    let status = unsafe {
+        crate::cuda::bindings::cuda_rmsnorm_backward(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dim_i32,
+            eps,
+            num_rows_i32,
+            grad_out.as_raw() as *mut std::os::raw::c_int,
+            x.as_raw() as *mut std::os::raw::c_int,
+            weight.as_raw() as *mut std::os::raw::c_int,
+            x_grad.as_raw() as *mut std::os::raw::c_int,
+            w_grad.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::rmsnorm_backward",
             code: status as u32,
         })
     }

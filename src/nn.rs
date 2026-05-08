@@ -249,11 +249,88 @@ impl Module for RMSNorm {
         let last_dim = shape[shape.len() - 1];
         assert_eq!(last_dim, self.dim, "RMSNorm dim mismatch");
 
+        let num_elements: usize = shape.iter().product();
+        let num_rows = num_elements / self.dim;
+
+        #[cfg(cuda)]
+        if x.device == crate::autograd::Device::Cuda {
+            if let Ok(d_x) = x.cuda_get_or_upload_buffer() {
+                if let Ok(d_weight) = self.weight.cuda_get_or_upload_buffer() {
+                    if let Ok(d_out) = crate::cuda::memory::alloc::<f64>(num_elements) {
+                        let d_out = std::sync::Arc::new(d_out);
+                        if crate::cuda::kernels::rmsnorm_forward(
+                            &d_x, &d_weight, &d_out, self.dim, self.eps, num_rows,
+                        )
+                        .is_ok()
+                        {
+                            let parents = vec![x.clone(), self.weight.clone()];
+                            let dim = self.dim;
+                            let eps = self.eps;
+                            let out = Tensor {
+                                data: Arc::new(RwLock::new(vec![0.0; num_elements])),
+                                grad: Arc::new(RwLock::new(vec![0.0; num_elements])),
+                                shape: shape.clone(),
+                                device: crate::autograd::Device::Cuda,
+                                _ctx: Some(Arc::new(Context {
+                                    parents,
+                                    backward_op: Box::new(move |grad_out, parents| {
+                                        let x_in = &parents[0];
+                                        let w_in = &parents[1];
+
+                                        #[cfg(cuda)]
+                                        if x_in.device == crate::autograd::Device::Cuda {
+                                            if let Ok(d_grad_tmp) =
+                                                crate::cuda::memory::alloc_pooled::<f64>(
+                                                    grad_out.len(),
+                                                )
+                                            {
+                                                let d_grad_tmp = std::sync::Arc::new(d_grad_tmp);
+                                                if crate::cuda::memory::copy_h2d(
+                                                    &d_grad_tmp,
+                                                    grad_out,
+                                                )
+                                                .is_ok()
+                                                {
+                                                    if let (Some(d_x), Some(d_weight)) = (
+                                                        x_in.cuda_cached_buffer(),
+                                                        w_in.cuda_cached_buffer(),
+                                                    ) {
+                                                        if let Some(d_x_grad) =
+                                                            x_in.cuda_grad_ensure_buffer()
+                                                        {
+                                                            if let Some(d_w_grad) =
+                                                                w_in.cuda_grad_ensure_buffer()
+                                                            {
+                                                                let _ = crate::cuda::kernels::rmsnorm_backward(
+                                                                    &d_grad_tmp,
+                                                                    &d_x,
+                                                                    &d_weight,
+                                                                    &d_x_grad,
+                                                                    &d_w_grad,
+                                                                    dim,
+                                                                    eps,
+                                                                    num_rows,
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }),
+                                })),
+                            };
+                            out.cuda_set_cached_buffer(d_out);
+                            return out;
+                        }
+                    }
+                }
+            }
+            eprintln!("[RMSNorm] CUDA forward failed, falling back to CPU");
+        }
+
         let x_data = x.data.read().unwrap();
         let w_data = self.weight.data.read().unwrap();
-
-        let num_elements = x_data.len();
-        let num_rows = num_elements / self.dim;
 
         let mut out_data = vec![0.0; num_elements];
         let mut rms_cache = vec![0.0; num_rows];
@@ -333,19 +410,6 @@ impl Module for RMSNorm {
                         });
 
                     // 2. Accumulate weight gradient (reduction over batch)
-                    // Parallel accumulation for weight grad
-                    // We can't write to w_grad in parallel directly without lock or reduction.
-                    // Simple approach: calculate partial sums and reduce.
-                    // Or serial sum for weight grad (it's small, size Dim).
-
-                    // Serial accumulation for now (safer/easier)
-                    // Optimization: transpose loop orders if dim is large?
-                    // Here dim is small (e.g. 512), rows is large (Batch*Seq).
-                    // We iterate cols then rows.
-
-                    // Using a thread-local accumulator would be better.
-                    // For now, let's keep it simple or use Rayon reduce.
-
                     let num_rows = grad_out.len() / dim;
 
                     // Parallelize over dimension (feature)

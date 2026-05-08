@@ -1655,23 +1655,23 @@ impl MultiHeadLatentAttention {
         dim_v: usize,
     ) -> Tensor {
         use crate::cuda::kernels::attention_weighted_sum;
-        use crate::cuda::memory::{alloc, copy_d2h, copy_h2d};
+        use crate::cuda::memory::{alloc, copy_d2h};
 
-        let p_len = probs.data.read().unwrap().len();
-        let v_len = v.data.read().unwrap().len();
+        let _p_len = probs.data.read().unwrap().len();
+        let _v_len = v.data.read().unwrap().len();
         let out_len = b * seq * dim_v;
 
         // Upload to GPU
         let d_probs = match probs.cuda_get_or_upload_buffer() {
             Ok(buf) => buf,
-            Err((stage, err)) => {
+            Err((_stage, err)) => {
                 eprintln!("[MLA] CUDA probs upload failed ({}), using CPU path", err);
                 return self.batched_matmul_probs_v_cpu_fallback(probs, v, b, seq, dim_v);
             }
         };
         let d_v = match v.cuda_get_or_upload_buffer() {
             Ok(buf) => buf,
-            Err((stage, err)) => {
+            Err((_stage, err)) => {
                 eprintln!("[MLA] CUDA v upload failed ({}), using CPU path", err);
                 return self.batched_matmul_probs_v_cpu_fallback(probs, v, b, seq, dim_v);
             }
@@ -1701,7 +1701,7 @@ impl MultiHeadLatentAttention {
         // Store probs and v data for backward
         let p_data = probs.data.read().unwrap().clone();
         let v_data = v.data.read().unwrap().clone();
-        let b_cap = b;
+        let _b_cap = b;
         let seq_cap = seq;
         let dim_v_cap = dim_v;
 

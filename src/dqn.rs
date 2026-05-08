@@ -546,10 +546,10 @@ impl GpuAdam {
             let d_v = &self.v[i];
 
             let _ = crate::cuda::kernels::adam_step(
-                &*d_params,
-                &*d_grads,
-                &*d_m,
-                &*d_v,
+                &d_params,
+                &d_grads,
+                d_m,
+                d_v,
                 len,
                 self.lr,
                 self.beta1,
@@ -835,7 +835,7 @@ fn train_dqn_impl(
     let params = policy_net.parameters();
     #[cfg(cuda)]
     let mut optimizer = GpuAdam::new(params, LEARNING_RATE)
-        .map(|o| Optimizer::Gpu(o))
+        .map(Optimizer::Gpu)
         .unwrap_or_else(|| Optimizer::Cpu(Adam::new(policy_net.parameters(), LEARNING_RATE)));
     #[cfg(not(cuda))]
     let mut optimizer = Optimizer::Cpu(Adam::new(params, LEARNING_RATE));
@@ -1303,7 +1303,7 @@ impl OnlineDqnTrainer {
         let params = policy.parameters();
         #[cfg(cuda)]
         let optimizer = GpuAdam::new(params, LEARNING_RATE)
-            .map(|o| Optimizer::Gpu(o))
+            .map(Optimizer::Gpu)
             .unwrap_or_else(|| Optimizer::Cpu(Adam::new(policy.parameters(), LEARNING_RATE)));
         #[cfg(not(cuda))]
         let optimizer = Optimizer::Cpu(Adam::new(params, LEARNING_RATE));

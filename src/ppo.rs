@@ -545,10 +545,10 @@ impl GpuAdam {
             let d_v = &self.v[i];
 
             let _ = crate::cuda::kernels::adam_step(
-                &*d_params,
-                &*d_grads,
-                &*d_m,
-                &*d_v,
+                &d_params,
+                &d_grads,
+                d_m,
+                d_v,
                 len,
                 self.lr,
                 self.beta1,
@@ -661,7 +661,7 @@ impl Ppo {
         let params = policy.parameters();
         #[cfg(cuda)]
         let optimizer = GpuAdam::new(params, 0.0003)
-            .map(|o| Optimizer::Gpu(o))
+            .map(Optimizer::Gpu)
             .unwrap_or_else(|| Optimizer::Cpu(Adam::new(policy.parameters(), 0.0003)));
         #[cfg(not(cuda))]
         let optimizer = Optimizer::Cpu(Adam::new(params, 0.0003));

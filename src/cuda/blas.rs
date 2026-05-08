@@ -2,6 +2,7 @@
 //!
 //! Provides GPU matrix multiplication using NVIDIA cuBLAS library.
 #![allow(dead_code)]
+#![allow(clippy::too_many_arguments)]
 
 #[cfg(cuda)]
 use crate::cuda::bindings::{

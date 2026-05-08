@@ -311,6 +311,36 @@ extern "C" {
         d_m: *mut c_int,
         d_v: *mut c_int,
     ) -> c_int;
+
+    #[link_name = "rmsnorm_forward"]
+    pub fn cuda_rmsnorm_forward(
+        h_x: *const f64,
+        h_weight: *const f64,
+        h_out: *mut f64,
+        dim: c_int,
+        eps: f64,
+        num_rows: c_int,
+        d_x: *mut c_int,
+        d_weight: *mut c_int,
+        d_out: *mut c_int,
+    ) -> c_int;
+
+    #[link_name = "rmsnorm_backward"]
+    pub fn cuda_rmsnorm_backward(
+        h_grad_out: *const f64,
+        h_x: *const f64,
+        h_weight: *const f64,
+        h_x_grad: *mut f64,
+        h_w_grad: *mut f64,
+        dim: c_int,
+        eps: f64,
+        num_rows: c_int,
+        d_grad_out: *mut c_int,
+        d_x: *mut c_int,
+        d_weight: *mut c_int,
+        d_x_grad: *mut c_int,
+        d_w_grad: *mut c_int,
+    ) -> c_int;
 }
 
 // =============================================================================

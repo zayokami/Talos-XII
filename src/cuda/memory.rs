@@ -10,11 +10,21 @@ use crate::cuda::bindings::{
 use crate::cuda::error::{CudaError, CudaResult};
 #[cfg(cuda)]
 use std::ffi::c_void;
+use std::sync::Mutex;
+
+/// Size-keyed GPU memory pool for reusing temporary allocations.
+/// Keys are buffer size in bytes; values are lists of raw device pointers.
+#[cfg(cuda)]
+static GPU_BUFFER_POOL: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, Vec<usize>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+const MAX_POOL_ENTRIES_PER_SIZE: usize = 8;
 
 /// Opaque CUDA memory pointer wrapper
 pub struct DevicePtr<T> {
     ptr: usize,
     size: usize,
+    pooled: bool,
     _phantom: std::marker::PhantomData<T>,
 }
 
@@ -32,6 +42,7 @@ impl<T> DevicePtr<T> {
         DevicePtr {
             ptr: 0,
             size: 0,
+            pooled: false,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -41,6 +52,17 @@ impl<T> Drop for DevicePtr<T> {
     fn drop(&mut self) {
         #[cfg(cuda)]
         if self.ptr != 0 {
+            if self.pooled {
+                let size_bytes = self.size * std::mem::size_of::<T>();
+                if let Ok(mut pool) = GPU_BUFFER_POOL.lock() {
+                    let entry = pool.entry(size_bytes).or_default();
+                    if entry.len() < MAX_POOL_ENTRIES_PER_SIZE {
+                        entry.push(self.ptr);
+                        self.ptr = 0;
+                        return;
+                    }
+                }
+            }
             unsafe {
                 let result = cuMemFree(self.ptr);
                 if result != CUDA_SUCCESS {
@@ -83,6 +105,60 @@ pub fn alloc<T>(count: usize) -> CudaResult<DevicePtr<T>> {
     Ok(DevicePtr {
         ptr,
         size: count,
+        pooled: false,
+        _phantom: std::marker::PhantomData,
+    })
+}
+
+/// Allocate GPU memory from pool if available, otherwise allocate fresh.
+/// The returned buffer returns to the pool on Drop instead of being freed.
+#[cfg(cuda)]
+pub fn alloc_pooled<T>(count: usize) -> CudaResult<DevicePtr<T>> {
+    if count == 0 {
+        return Err(CudaError::InvalidInput {
+            op: "cuMemAlloc",
+            message: "count must be greater than zero",
+        });
+    }
+    let elem_size = std::mem::size_of::<T>();
+    let size_bytes = count
+        .checked_mul(elem_size)
+        .ok_or(CudaError::SizeOverflow {
+            op: "cuMemAlloc",
+            count,
+            elem_size,
+        })?;
+
+    // Try pool first
+    if let Ok(mut pool) = GPU_BUFFER_POOL.lock() {
+        if let Some(vec) = pool.get_mut(&size_bytes) {
+            if let Some(ptr) = vec.pop() {
+                return Ok(DevicePtr {
+                    ptr,
+                    size: count,
+                    pooled: true,
+                    _phantom: std::marker::PhantomData,
+                });
+            }
+        }
+    }
+
+    // Fall back to fresh allocation
+    let mut ptr: usize = 0;
+    unsafe {
+        let result = cuMemAlloc(&mut ptr, size_bytes);
+        if result != CUDA_SUCCESS {
+            return Err(CudaError::Runtime {
+                op: "cuMemAlloc",
+                code: result,
+            });
+        }
+    }
+
+    Ok(DevicePtr {
+        ptr,
+        size: count,
+        pooled: true,
         _phantom: std::marker::PhantomData,
     })
 }
@@ -244,12 +320,24 @@ impl<T> DevicePtr<T> {
     pub fn as_raw(&self) -> usize {
         0
     }
+    pub fn zero_sized() -> Self {
+        DevicePtr {
+            _phantom: std::marker::PhantomData,
+        }
+    }
 }
 
 #[cfg(not(cuda))]
 pub fn alloc<T>(_count: usize) -> CudaResult<DevicePtr<T>> {
     Err(CudaError::UnsupportedBuild {
         op: "cuda::memory::alloc",
+    })
+}
+
+#[cfg(not(cuda))]
+pub fn alloc_pooled<T>(_count: usize) -> CudaResult<DevicePtr<T>> {
+    Err(CudaError::UnsupportedBuild {
+        op: "cuda::memory::alloc_pooled",
     })
 }
 
