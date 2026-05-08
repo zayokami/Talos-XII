@@ -229,11 +229,11 @@ impl ActorCritic {
     }
 
     // Fast inference without Autograd graph
-    pub fn step_inference(&self, state: &[f64]) -> usize {
+    pub fn step_inference(&self, state: &[f64], top_k: usize) -> usize {
         let seq = self.backbone.forward_inference(state);
         let last = self.backbone.last_token_inference(&seq);
         let logits = self.actor_head.forward_inference(&last);
-        softmax_sample(&logits, 0).0 // top_k=0 for inference (full softmax)
+        softmax_sample(&logits, top_k).0
     }
 
     pub fn step_inference_cached_with_value(
@@ -241,6 +241,7 @@ impl ActorCritic {
         state: &[f64],
         kv_cache: &mut [KVCache],
         start_pos: usize,
+        top_k: usize,
     ) -> (usize, f64, f64) {
         CACHED_STEP_SCRATCH.with(|scratch_cell| {
             let mut scratch = scratch_cell.borrow_mut();
@@ -253,7 +254,7 @@ impl ActorCritic {
                 .forward_inference_step_into(state, kv_cache, start_pos, last);
             self.actor_head.forward_inference_into(last, logits);
             self.critic_head.forward_inference_into(last, value);
-            let (action_idx, log_prob) = softmax_sample(logits, 0); // top_k=0 for inference
+            let (action_idx, log_prob) = softmax_sample(logits, top_k);
             (action_idx, log_prob, value[0])
         })
     }
@@ -263,6 +264,7 @@ impl ActorCritic {
         state: &[f64],
         kv_cache: &mut [KVCache],
         start_pos: usize,
+        top_k: usize,
     ) -> usize {
         CACHED_STEP_SCRATCH.with(|scratch_cell| {
             let mut scratch = scratch_cell.borrow_mut();
@@ -274,7 +276,7 @@ impl ActorCritic {
             self.backbone
                 .forward_inference_step_into(state, kv_cache, start_pos, last);
             self.actor_head.forward_inference_into(last, logits);
-            softmax_sample(logits, 0).0 // top_k=0 for inference
+            softmax_sample(logits, top_k).0
         })
     }
 
@@ -343,6 +345,7 @@ impl RunningMeanStd {
         self.count = tot_count;
     }
 
+    #[allow(dead_code)]
     fn normalize(&self, x: f64) -> f64 {
         (x - self.mean) / (self.var.sqrt() + 1e-8)
     }
@@ -621,16 +624,26 @@ impl Ppo {
 
         let mut last_gae_lam = 0.0;
 
-        // Normalize rewards for GAE calculation
+        // Batch-normalize rewards for stable GAE (use uniform stats across the batch)
+        let r_mean = sum_f64(&rewards) / len as f64;
+        let r_std = (sum_sq_diff(&rewards, r_mean) / len as f64)
+            .sqrt()
+            .max(1e-8);
         let norm_rewards: Vec<f64> = rewards
             .iter()
-            .map(|&r| self.reward_normalizer.normalize(r).clamp(-10.0, 10.0)) // Clip for stability
+            .map(|&r| ((r - r_mean) / r_std).clamp(-10.0, 10.0))
             .collect();
 
         for t in (0..len).rev() {
             let non_terminal = if is_terminals[t] { 0.0 } else { 1.0 };
             let val_t = values[t];
-            let val_next = if t < len - 1 { values[t + 1] } else { 0.0 };
+            let val_next = if t < len - 1 {
+                values[t + 1]
+            } else if is_terminals[t] {
+                0.0
+            } else {
+                values[t]
+            };
 
             // Use normalized rewards for training signal
             let delta = norm_rewards[t] + GAMMA * val_next * non_terminal - val_t;
@@ -639,7 +652,7 @@ impl Ppo {
             advantages[t] = gae;
             returns[t] = gae + val_t;
 
-            last_gae_lam = gae;
+            last_gae_lam = if is_terminals[t] { 0.0 } else { gae };
         }
 
         let adv_mean: f64 = sum_f64(&advantages) / len as f64;
@@ -688,17 +701,16 @@ impl Ppo {
                     -(batch_probs.clone() * batch_log_probs_copy).matmul(&ones_action_1);
 
                 // Batched teacher forward (if distilling)
-                let teacher_batch_logits =
-                    if self.distill_kl_coef > 0.0 {
-                        if let Some(ema) = self.ema_policy.as_ref() {
-                            let (t_logits, _) = ema.forward_actor_critic_batch(&batch_states);
-                            Some(t_logits)
-                        } else {
-                            None
-                        }
+                let teacher_batch_logits = if self.distill_kl_coef > 0.0 {
+                    if let Some(ema) = self.ema_policy.as_ref() {
+                        let (t_logits, _) = ema.forward_actor_critic_batch(&batch_states);
+                        Some(t_logits)
                     } else {
                         None
-                    };
+                    }
+                } else {
+                    None
+                };
 
                 let mut loss_accum = Tensor::zeros(vec![1]);
                 let mut distill_accum = Tensor::zeros(vec![1]);
@@ -934,8 +946,12 @@ impl PpoEnvState {
             .back()
             .expect("history_buffer should not be empty after push")
             .as_slice();
-        let (action_idx, log_prob, val) =
-            policy.step_inference_cached_with_value(token, &mut self.kv_cache, seq_len - 1);
+        let (action_idx, log_prob, val) = policy.step_inference_cached_with_value(
+            token,
+            &mut self.kv_cache,
+            seq_len - 1,
+            config.ppo_top_k,
+        );
 
         let luck_modifier = ACTIONS[action_idx];
         let base_prob_6 = prob_6(self.state_struct.pity_6, config);

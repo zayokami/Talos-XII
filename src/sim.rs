@@ -336,7 +336,12 @@ fn decide_policy(inputs: PolicyInputs<'_>) -> PolicyDecision {
         if let Some(policy) = ppo_policy {
             if fast_inference {
                 if let Some(cache) = kv_cache {
-                    let idx = policy.step_inference_cached(current_features, cache, start_pos);
+                    let idx = policy.step_inference_cached(
+                        current_features,
+                        cache,
+                        start_pos,
+                        config.ppo_top_k,
+                    );
                     return PolicyDecision {
                         luck_factor: crate::utils::ACTIONS[idx],
                         action: Some(idx),
@@ -345,7 +350,7 @@ fn decide_policy(inputs: PolicyInputs<'_>) -> PolicyDecision {
                     };
                 }
                 if let Some(seq_data) = ppo_seq_data {
-                    let idx = policy.step_inference(seq_data);
+                    let idx = policy.step_inference(seq_data, config.ppo_top_k);
                     return PolicyDecision {
                         luck_factor: crate::utils::ACTIONS[idx],
                         action: Some(idx),
