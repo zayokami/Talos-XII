@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::Read;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 pub use serde_json::Value as JsonValue;
 
@@ -65,18 +65,17 @@ const DEFAULT_BIG_PITY_CUMULATIVE: usize = 120;
 const MAX_SMALL_PITY_GUARANTEE: usize = 10_000;
 const MAX_BIG_PITY_CUMULATIVE: usize = 100_000;
 
-fn fallback_parent_path(path: &str) -> Option<String> {
+fn fallback_parent_path(path: &str, levels: usize) -> Option<String> {
     let requested = Path::new(path);
     if requested.is_absolute() || requested.components().any(|c| c == Component::ParentDir) {
         return None;
     }
-    Some(
-        Path::new("..")
-            .join("..")
-            .join(requested)
-            .to_string_lossy()
-            .into_owned(),
-    )
+    let mut p = PathBuf::new();
+    for _ in 0..levels {
+        p.push("..");
+    }
+    p.push(requested);
+    Some(p.to_string_lossy().into_owned())
 }
 
 fn sanitize_pity_settings(
@@ -516,7 +515,7 @@ impl Default for Config {
             calibrated_path: "data/calibrated.json".to_string(),
             player_data_path: "data/player_data.json".to_string(),
             fast_init: false,
-            device: ComputeDevice::Cpu,
+            device: ComputeDevice::Auto,
             ppo_mode: "balanced".to_string(),
             ppo_total_steps: 0,
             ppo_steps_per_update: 0,
@@ -531,7 +530,7 @@ impl Default for Config {
             distill_warmup_steps: 500,
             worker_max_threads: 0,
             worker_reserve_cores: 1,
-            worker_priority: "time_critical".to_string(),
+            worker_priority: "above_normal".to_string(),
             worker_stack_size_mb: 4,
             f2p_sim_count: 0,
             f2p_sim_count_prob: 0,
@@ -559,46 +558,41 @@ impl Config {
 
         let file_result = File::open(path);
 
-        // Robustness: If file not found, try to look in parent directories (useful for IDE/target builds)
+        // Robustness: If file not found, try to look in parent directories
+        // (useful for IDE/target builds: target/release/exe or target/gpu/release/exe)
         let mut file = match file_result {
             Ok(f) => f,
             Err(_) => {
-                // Try ../../data/config.json (standard cargo layout: target/release/exe vs project/data)
-                if let Some(fallback) = fallback_parent_path(path) {
-                    match File::open(&fallback) {
-                        Ok(f) => {
-                            println!("[System] Config found in parent directory.");
-                            f
-                        }
-                        Err(_) => {
-                            eprintln!("\x1b[1;31m[Error]\x1b[0m Configuration file not found.");
-                            eprintln!("  Looked at: './{path}' and '{fallback}'");
-                            eprintln!(
-                                "  Tip: Use --config <path> or --config default for built-in defaults."
+                // Try 2 and 3 levels up (standard cargo layout with custom target-dir)
+                let mut found = None;
+                for levels in [2, 3] {
+                    if let Some(fallback) = fallback_parent_path(path, levels) {
+                        if let Ok(f) = File::open(&fallback) {
+                            println!(
+                                "[System] Config found in parent directory ({} levels up).",
+                                levels
                             );
-                            if path == "data/config.json" {
-                                eprintln!(
-                                    "\x1b[33m[Warning]\x1b[0m Missing data/config.json. Falling back to built-in defaults."
-                                );
-                                return Config::default();
-                            }
-                            std::process::exit(1);
+                            found = Some(f);
+                            break;
                         }
                     }
-                } else {
-                    eprintln!("\x1b[1;31m[Error]\x1b[0m Configuration file not found.");
-                    eprintln!("  Looked at: './{path}'");
-                    eprintln!("  Skipped '../../' fallback because the path is absolute or contains '..'.");
-                    eprintln!(
-                        "  Tip: Use --config <path> or --config default for built-in defaults."
-                    );
-                    if path == "data/config.json" {
+                }
+                match found {
+                    Some(f) => f,
+                    None => {
+                        eprintln!("\x1b[1;31m[Error]\x1b[0m Configuration file not found.");
+                        eprintln!("  Looked at: './{path}' and parent directories (2-3 levels up)");
                         eprintln!(
-                            "\x1b[33m[Warning]\x1b[0m Missing data/config.json. Falling back to built-in defaults."
+                            "  Tip: Use --config <path> or --config default for built-in defaults."
                         );
-                        return Config::default();
+                        if path == "data/config.json" {
+                            eprintln!(
+                                "\x1b[33m[Warning]\x1b[0m Missing data/config.json. Falling back to built-in defaults."
+                            );
+                            return Config::default();
+                        }
+                        std::process::exit(1);
                     }
-                    std::process::exit(1);
                 }
             }
         };
