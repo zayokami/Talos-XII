@@ -28,8 +28,8 @@ Talos-XII 会在在模拟前先训练 DBN 建模环境噪声、DQN 和 PPO 学�
 | Item | Minimum | Recommended |
 |---|---|---|
 | CPU | Any x86_64 or ARM64 (including Apple Silicon) | x86_64 with AVX2+FMA |
-| RAM | 256 MB free | 512 MB+ |
-| Disk | 5 MB (exe + config) | 10 MB (with cache files) |
+| RAM | 1 GB free | 4 GB+ |
+| Disk | 700 MB (exe + config) | 750 MB (with cache files) |
 | OS | Windows 10+, macOS 11+, Linux kernel 4.0+ | — |
 
 ### GPU Build — Additional Requirements
@@ -336,7 +336,7 @@ Contact: yuokaki1@163.com
 | 项目 | 最低要求 | 推荐配置 |
 |---|---|---|
 | CPU | 任意 x86_64 或 ARM64（含 Apple Silicon） | 支持 AVX2+FMA 的 x86_64 |
-| 内存 | 1 GB 可用 | 4GB + |
+| 内存 | 1 GB 可用 | 4 GB + |
 | 磁盘 | 700 MB（exe + config） | 750 MB（含缓存文件） |
 | 操作系统 | Windows 10+、macOS 11+、Linux kernel 4.0+ | — |
 
