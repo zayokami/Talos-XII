@@ -1126,6 +1126,7 @@ fn warn_unknown_fields(map: &serde_json::Map<String, JsonValue>) {
         "distill_ema_decay",
         "distill_kl_coef",
         "distill_warmup_steps",
+        "device",
         "worker_max_threads",
         "worker_reserve_cores",
         "worker_priority",

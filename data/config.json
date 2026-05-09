@@ -512,7 +512,7 @@
   ],
   "luck_mode": "ppo",
   "fast_init": false,
-  "device": "cpu",
+  "device": "auto",
   "ppo_mode": "balanced",
   "ppo_total_steps": 20000,
   "ppo_steps_per_update": 1024,
