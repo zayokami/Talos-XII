@@ -874,6 +874,9 @@ fn train_dqn_impl(
     let pb = create_bar(total_steps as u64, "DQN Training");
 
     for step in 0..total_steps {
+        if step <= 5 || step % 10 == 0 {
+            // silence
+        }
         // 1. Build State
         let current_state_raw = build_features(
             state_struct.pity_6,
@@ -1002,7 +1005,6 @@ fn train_dqn_impl(
 
             let start_forward = std::time::Instant::now();
             optimizer.zero_grad();
-
             scratch.reset();
 
             for exp in &per_sample.experiences {

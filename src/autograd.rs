@@ -307,9 +307,11 @@ impl Tensor {
     }
 
     pub fn zero_grad(&self) {
-        let mut g = self.grad.write().unwrap();
-        for v in g.iter_mut() {
-            *v = 0.0;
+        {
+            let mut g = self.grad.write().unwrap();
+            for v in g.iter_mut() {
+                *v = 0.0;
+            }
         }
         #[cfg(cuda)]
         if self.device == Device::Cuda {
@@ -386,8 +388,9 @@ impl Tensor {
         #[cfg(cuda)]
         {
             let ops = m * n * k;
-            if ops >= 32768 && self.device == Device::Cuda && other.device == Device::Cuda {
-                // GPU path
+            let use_gpu =
+                ops >= 32768 && self.device == Device::Cuda && other.device == Device::Cuda;
+            if use_gpu {
                 return self.matmul_cuda(other, m, k, n);
             }
         }
@@ -3624,25 +3627,22 @@ impl Tensor {
 
         let d_a = match self.cuda_get_or_upload_buffer() {
             Ok(buf) => buf,
-            Err((stage, err)) => {
+            Err((stage, _err)) => {
                 crate::cuda::record_matmul_fallback(stage);
-                eprintln!("[Autograd] CUDA prepare A failed ({}), using CPU", err);
                 return self.matmul_cpu_fallback(other, m, k, n);
             }
         };
         let d_b = match other.cuda_get_or_upload_buffer() {
             Ok(buf) => buf,
-            Err((stage, err)) => {
+            Err((stage, _err)) => {
                 crate::cuda::record_matmul_fallback(stage);
-                eprintln!("[Autograd] CUDA prepare B failed ({}), using CPU", err);
                 return self.matmul_cpu_fallback(other, m, k, n);
             }
         };
         let d_c = match alloc::<f64>(m * n) {
             Ok(buf) => buf,
-            Err(err) => {
+            Err(_err) => {
                 crate::cuda::record_matmul_fallback("alloc");
-                eprintln!("[Autograd] CUDA alloc C failed ({}), using CPU", err);
                 return self.matmul_cpu_fallback(other, m, k, n);
             }
         };
@@ -3679,7 +3679,6 @@ impl Tensor {
                 _ => "gemm",
             };
             crate::cuda::record_matmul_fallback(stage);
-            eprintln!("[Autograd] CUDA GEMM failed ({}), using CPU", err);
             return self.matmul_cpu_fallback(other, m, k, n);
         }
 

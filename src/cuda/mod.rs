@@ -225,6 +225,7 @@ pub fn init() -> CudaResult<()> {
     }
 
     unsafe {
+        // 1. Initialize driver API (needed for cuCtxGetCurrent / cuCtxSetCurrent)
         let init_result = bindings::cuInit(0);
         if init_result != bindings::CUDA_SUCCESS {
             return Err(CudaError::Runtime {
@@ -247,33 +248,66 @@ pub fn init() -> CudaResult<()> {
             });
         }
 
-        let mut device: bindings::CUdevice = 0;
-        let get_result = bindings::cuDeviceGet(&mut device, 0);
-        if get_result != bindings::CUDA_SUCCESS {
+        // 2. Use CUDA Runtime API to create the primary context.
+        //    This is the context shared by cuBLAS and our nvcc-compiled kernels.
+        let rt_err = bindings::cudaSetDevice(0);
+        if rt_err != 0 {
             return Err(CudaError::Runtime {
-                op: "cuDeviceGet",
+                op: "cudaSetDevice",
+                code: rt_err as u32,
+            });
+        }
+        // Force primary context creation with a dummy allocation
+        let mut dummy: *mut std::ffi::c_void = std::ptr::null_mut();
+        let rt_err = bindings::cudaMalloc(&mut dummy, 1);
+        if rt_err != 0 {
+            return Err(CudaError::Runtime {
+                op: "cudaMalloc(dummy)",
+                code: rt_err as u32,
+            });
+        }
+        let _ = bindings::cudaFree(dummy);
+
+        // 3. Retrieve the Runtime-created primary context via Driver API
+        let mut ctx: bindings::CUcontext = std::ptr::null_mut();
+        let get_result = bindings::cuCtxGetCurrent(&mut ctx);
+        if get_result != bindings::CUDA_SUCCESS || ctx.is_null() {
+            return Err(CudaError::Runtime {
+                op: "cuCtxGetCurrent",
                 code: get_result,
             });
         }
 
-        let mut ctx: bindings::CUcontext = std::ptr::null_mut();
-        let ctx_result = bindings::cuCtxCreate(&mut ctx, 0, device);
-        if ctx_result != bindings::CUDA_SUCCESS {
-            return Err(CudaError::Runtime {
-                op: "cuCtxCreate",
-                code: ctx_result,
-            });
-        }
-
-        let set_result = bindings::cuCtxSetCurrent(ctx);
-        if set_result != bindings::CUDA_SUCCESS {
-            return Err(CudaError::Runtime {
-                op: "cuCtxSetCurrent",
-                code: set_result,
-            });
-        }
-
         CUDA_CONTEXT_PTR.store(ctx as usize, Ordering::SeqCst);
+
+        // 4. cuBLAS warmup: verify cuBLAS can initialize in this context.
+        //    If this fails, the user is missing cuBLAS dependencies (e.g.
+        //    nvfatbin.dll, zlibwapi.dll) even if cublas64_12.dll is present.
+        {
+            let mut handle: crate::cuda::bindings::cublasHandle_t = std::ptr::null_mut();
+            let cublas_result = crate::cuda::bindings::cublasCreate_v2(&mut handle);
+            if cublas_result != 0 {
+                eprintln!(
+                    "[CUDA] CRITICAL: cuBLAS initialization test failed (code={}).",
+                    cublas_result
+                );
+                eprintln!("[CUDA] This usually means a missing cuBLAS dependency DLL.");
+                eprintln!("[CUDA] Ensure the following DLLs are next to talos_xii.exe:");
+                eprintln!("  - cudart64_12.dll");
+                eprintln!("  - cublas64_12.dll");
+                eprintln!("  - cublasLt64_12.dll");
+                eprintln!("[CUDA] Also check for hidden dependencies:");
+                eprintln!("  - nvfatbin.dll   (in CUDA bin directory)");
+                eprintln!("  - zlibwapi.dll   (in CUDA bin directory)");
+                eprintln!("[CUDA] You can find these in your CUDA installation under:");
+                eprintln!("  C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.x/bin/");
+                return Err(CudaError::Blas {
+                    op: "cublasCreate_v2 (warmup)",
+                    code: cublas_result,
+                });
+            }
+            let _ = crate::cuda::bindings::cublasDestroy_v2(handle);
+        }
     }
 
     CUDA_INITIALIZED.store(true, Ordering::SeqCst);

@@ -5,11 +5,14 @@
 
 #[cfg(cuda)]
 use crate::cuda::bindings::{
-    cuMemAlloc, cuMemFree, cuMemcpyDtoD, cuMemcpyDtoH, cuMemcpyHtoD, CUDA_SUCCESS,
+    cudaFree, cudaMalloc, cudaMemcpy, cudaMemcpyDeviceToDevice, cudaMemcpyDeviceToHost,
+    cudaMemcpyHostToDevice, CUDA_SUCCESS,
 };
 use crate::cuda::error::{CudaError, CudaResult};
 #[cfg(cuda)]
 use std::ffi::c_void;
+#[cfg(cuda)]
+use std::os::raw::c_int;
 use std::sync::Mutex;
 
 /// Size-keyed GPU memory pool for reusing temporary allocations.
@@ -64,9 +67,9 @@ impl<T> Drop for DevicePtr<T> {
                 }
             }
             unsafe {
-                let result = cuMemFree(self.ptr);
-                if result != CUDA_SUCCESS {
-                    eprintln!("[CUDA] cuMemFree failed during drop: {}", result);
+                let result = cudaFree(self.ptr as *mut c_void);
+                if result != CUDA_SUCCESS as c_int {
+                    eprintln!("[CUDA] cudaFree failed during drop: {}", result);
                 }
             }
         }
@@ -79,7 +82,7 @@ pub fn alloc<T>(count: usize) -> CudaResult<DevicePtr<T>> {
     crate::cuda::init()?;
     if count == 0 {
         return Err(CudaError::InvalidInput {
-            op: "cuMemAlloc",
+            op: "cudaMalloc",
             message: "count must be greater than zero",
         });
     }
@@ -87,24 +90,24 @@ pub fn alloc<T>(count: usize) -> CudaResult<DevicePtr<T>> {
     let size_bytes = count
         .checked_mul(elem_size)
         .ok_or(CudaError::SizeOverflow {
-            op: "cuMemAlloc",
+            op: "cudaMalloc",
             count,
             elem_size,
         })?;
-    let mut ptr: usize = 0;
+    let mut ptr: *mut c_void = std::ptr::null_mut();
 
     unsafe {
-        let result = cuMemAlloc(&mut ptr, size_bytes);
-        if result != CUDA_SUCCESS {
+        let result = cudaMalloc(&mut ptr, size_bytes);
+        if result != CUDA_SUCCESS as c_int {
             return Err(CudaError::Runtime {
-                op: "cuMemAlloc",
-                code: result,
+                op: "cudaMalloc",
+                code: result as u32,
             });
         }
     }
 
     Ok(DevicePtr {
-        ptr,
+        ptr: ptr as usize,
         size: count,
         pooled: false,
         _phantom: std::marker::PhantomData,
@@ -118,7 +121,7 @@ pub fn alloc_pooled<T>(count: usize) -> CudaResult<DevicePtr<T>> {
     crate::cuda::init()?;
     if count == 0 {
         return Err(CudaError::InvalidInput {
-            op: "cuMemAlloc",
+            op: "cudaMalloc",
             message: "count must be greater than zero",
         });
     }
@@ -126,7 +129,7 @@ pub fn alloc_pooled<T>(count: usize) -> CudaResult<DevicePtr<T>> {
     let size_bytes = count
         .checked_mul(elem_size)
         .ok_or(CudaError::SizeOverflow {
-            op: "cuMemAlloc",
+            op: "cudaMalloc",
             count,
             elem_size,
         })?;
@@ -146,19 +149,19 @@ pub fn alloc_pooled<T>(count: usize) -> CudaResult<DevicePtr<T>> {
     }
 
     // Fall back to fresh allocation
-    let mut ptr: usize = 0;
+    let mut ptr: *mut c_void = std::ptr::null_mut();
     unsafe {
-        let result = cuMemAlloc(&mut ptr, size_bytes);
-        if result != CUDA_SUCCESS {
+        let result = cudaMalloc(&mut ptr, size_bytes);
+        if result != CUDA_SUCCESS as c_int {
             return Err(CudaError::Runtime {
-                op: "cuMemAlloc",
-                code: result,
+                op: "cudaMalloc",
+                code: result as u32,
             });
         }
     }
 
     Ok(DevicePtr {
-        ptr,
+        ptr: ptr as usize,
         size: count,
         pooled: true,
         _phantom: std::marker::PhantomData,
@@ -177,7 +180,7 @@ pub fn copy_h2d<T: Copy>(device: &DevicePtr<T>, host: &[T]) -> CudaResult<()> {
     crate::cuda::init()?;
     if host.len() != device.size {
         return Err(CudaError::SizeMismatch {
-            op: "cuMemcpyHtoD",
+            op: "cudaMemcpy(H2D)",
             expected: device.size,
             actual: host.len(),
         });
@@ -188,16 +191,21 @@ pub fn copy_h2d<T: Copy>(device: &DevicePtr<T>, host: &[T]) -> CudaResult<()> {
         .len()
         .checked_mul(elem_size)
         .ok_or(CudaError::SizeOverflow {
-            op: "cuMemcpyHtoD",
+            op: "cudaMemcpy(H2D)",
             count: host.len(),
             elem_size,
         })?;
     unsafe {
-        let result = cuMemcpyHtoD(device.ptr, host.as_ptr().cast::<c_void>(), size_bytes);
-        if result != CUDA_SUCCESS {
+        let result = cudaMemcpy(
+            device.ptr as *mut c_void,
+            host.as_ptr().cast::<c_void>(),
+            size_bytes,
+            cudaMemcpyHostToDevice,
+        );
+        if result != CUDA_SUCCESS as c_int {
             return Err(CudaError::Runtime {
-                op: "cuMemcpyHtoD",
-                code: result,
+                op: "cudaMemcpy(H2D)",
+                code: result as u32,
             });
         }
     }
@@ -210,7 +218,7 @@ pub fn copy_d2h<T: Copy>(host: &mut [T], device: &DevicePtr<T>) -> CudaResult<()
     crate::cuda::init()?;
     if host.len() != device.size {
         return Err(CudaError::SizeMismatch {
-            op: "cuMemcpyDtoH",
+            op: "cudaMemcpy(D2H)",
             expected: device.size,
             actual: host.len(),
         });
@@ -221,16 +229,21 @@ pub fn copy_d2h<T: Copy>(host: &mut [T], device: &DevicePtr<T>) -> CudaResult<()
         .len()
         .checked_mul(elem_size)
         .ok_or(CudaError::SizeOverflow {
-            op: "cuMemcpyDtoH",
+            op: "cudaMemcpy(D2H)",
             count: host.len(),
             elem_size,
         })?;
     unsafe {
-        let result = cuMemcpyDtoH(host.as_mut_ptr().cast::<c_void>(), device.ptr, size_bytes);
-        if result != CUDA_SUCCESS {
+        let result = cudaMemcpy(
+            host.as_mut_ptr().cast::<c_void>(),
+            device.ptr as *const c_void,
+            size_bytes,
+            cudaMemcpyDeviceToHost,
+        );
+        if result != CUDA_SUCCESS as c_int {
             return Err(CudaError::Runtime {
-                op: "cuMemcpyDtoH",
-                code: result,
+                op: "cudaMemcpy(D2H)",
+                code: result as u32,
             });
         }
     }
@@ -243,7 +256,7 @@ pub fn copy_d2d<T: Copy>(dst: &DevicePtr<T>, src: &DevicePtr<T>) -> CudaResult<(
     crate::cuda::init()?;
     if dst.size != src.size {
         return Err(CudaError::SizeMismatch {
-            op: "cuMemcpyDtoD",
+            op: "cudaMemcpy(D2D)",
             expected: dst.size,
             actual: src.size,
         });
@@ -254,16 +267,21 @@ pub fn copy_d2d<T: Copy>(dst: &DevicePtr<T>, src: &DevicePtr<T>) -> CudaResult<(
         .size
         .checked_mul(elem_size)
         .ok_or(CudaError::SizeOverflow {
-            op: "cuMemcpyDtoD",
+            op: "cudaMemcpy(D2D)",
             count: dst.size,
             elem_size,
         })?;
     unsafe {
-        let result = cuMemcpyDtoD(dst.ptr, src.ptr, size_bytes);
-        if result != CUDA_SUCCESS {
+        let result = cudaMemcpy(
+            dst.ptr as *mut c_void,
+            src.ptr as *const c_void,
+            size_bytes,
+            cudaMemcpyDeviceToDevice,
+        );
+        if result != CUDA_SUCCESS as c_int {
             return Err(CudaError::Runtime {
-                op: "cuMemcpyDtoD",
-                code: result,
+                op: "cudaMemcpy(D2D)",
+                code: result as u32,
             });
         }
     }
@@ -280,13 +298,13 @@ pub unsafe fn copy_d2h_raw<T: Copy>(
 ) -> CudaResult<()> {
     if host.is_null() {
         return Err(CudaError::InvalidInput {
-            op: "cuMemcpyDtoH",
+            op: "cudaMemcpy(D2H)",
             message: "host pointer must not be null",
         });
     }
     if device_ptr == 0 {
         return Err(CudaError::InvalidInput {
-            op: "cuMemcpyDtoH",
+            op: "cudaMemcpy(D2H)",
             message: "device pointer must not be zero",
         });
     }
@@ -294,15 +312,20 @@ pub unsafe fn copy_d2h_raw<T: Copy>(
     let size_bytes = count
         .checked_mul(elem_size)
         .ok_or(CudaError::SizeOverflow {
-            op: "cuMemcpyDtoH",
+            op: "cudaMemcpy(D2H)",
             count,
             elem_size,
         })?;
-    let result = cuMemcpyDtoH(host.cast::<c_void>(), device_ptr, size_bytes);
-    if result != CUDA_SUCCESS {
+    let result = cudaMemcpy(
+        host.cast::<c_void>(),
+        device_ptr as *const c_void,
+        size_bytes,
+        cudaMemcpyDeviceToHost,
+    );
+    if result != CUDA_SUCCESS as c_int {
         return Err(CudaError::Runtime {
-            op: "cuMemcpyDtoH",
-            code: result,
+            op: "cudaMemcpy(D2H)",
+            code: result as u32,
         });
     }
     Ok(())

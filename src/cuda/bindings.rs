@@ -29,9 +29,36 @@ pub const CUDA_SUCCESS: CUresult = 0;
 pub const CUBLAS_STATUS_SUCCESS: cublasStatus_t = 0;
 
 // cublasOperation_t
-pub const CUBLAS_OP_N: cublasOperation_t = 111; // 'N' or 'n'
-pub const CUBLAS_OP_T: cublasOperation_t = 114; // 'T' or 't'
-pub const CUBLAS_OP_C: cublasOperation_t = 99; // 'C' or 'c'
+pub const CUBLAS_OP_N: cublasOperation_t = 0; // non-transpose
+pub const CUBLAS_OP_T: cublasOperation_t = 1; // transpose
+pub const CUBLAS_OP_C: cublasOperation_t = 2; // conjugate transpose
+
+// =============================================================================
+// CUDA Runtime API (libcudart.so / cudart.dll)
+// =============================================================================
+
+// Runtime memory copy directions
+#[allow(non_upper_case_globals)]
+pub const cudaMemcpyHostToHost: c_int = 0;
+#[allow(non_upper_case_globals)]
+pub const cudaMemcpyHostToDevice: c_int = 1;
+#[allow(non_upper_case_globals)]
+pub const cudaMemcpyDeviceToHost: c_int = 2;
+#[allow(non_upper_case_globals)]
+pub const cudaMemcpyDeviceToDevice: c_int = 3;
+
+extern "C" {
+    pub fn cudaSetDevice(device: c_int) -> c_int;
+    pub fn cudaGetLastError() -> c_int;
+    pub fn cudaMalloc(devPtr: *mut *mut std::ffi::c_void, size: usize) -> c_int;
+    pub fn cudaFree(devPtr: *mut std::ffi::c_void) -> c_int;
+    pub fn cudaMemcpy(
+        dst: *mut std::ffi::c_void,
+        src: *const std::ffi::c_void,
+        count: usize,
+        kind: c_int,
+    ) -> c_int;
+}
 
 // =============================================================================
 // CUDA Driver API (libcuda.so / cuda.dll)
@@ -52,11 +79,17 @@ extern "C" {
         device: CUdevice,
     ) -> CUresult;
 
+    // Primary context (shared with CUDA Runtime / cuBLAS)
+    pub fn cuDevicePrimaryCtxRetain(pctx: *mut CUcontext, dev: CUdevice) -> CUresult;
+    pub fn cuDevicePrimaryCtxRelease(dev: CUdevice) -> CUresult;
+
     // Context management
     pub fn cuCtxCreate(ctx: *mut CUcontext, flags: u32, device: CUdevice) -> CUresult;
     pub fn cuCtxDestroy(ctx: CUcontext) -> CUresult;
     pub fn cuCtxSetCurrent(ctx: CUcontext) -> CUresult;
     pub fn cuCtxGetCurrent(ctx: *mut CUcontext) -> CUresult;
+    pub fn cuCtxPushCurrent(ctx: CUcontext) -> CUresult;
+    pub fn cuCtxPopCurrent(pctx: *mut CUcontext) -> CUresult;
 
     // Memory management
     pub fn cuMemAlloc(dptr: *mut CUdeviceptr, bytesize: usize) -> CUresult;
