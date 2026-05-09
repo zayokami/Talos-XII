@@ -598,8 +598,11 @@ impl Config {
         };
 
         let mut contents = String::new();
-        file.read_to_string(&mut contents)
-            .expect("Failed to read config file");
+        if let Err(err) = file.read_to_string(&mut contents) {
+            log::error!("Failed to read config file '{}': {}", path, err);
+            log::warn!("Falling back to default configuration.");
+            return Config::default();
+        }
 
         let stripped = strip_json_comments(&contents);
         let root: JsonValue = match serde_json::from_str(&stripped) {

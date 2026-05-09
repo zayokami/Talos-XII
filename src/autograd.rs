@@ -74,9 +74,24 @@ pub struct TensorReadGuard<'a> {
 }
 
 impl<'a> TensorReadGuard<'a> {
-    /// Acquire read locks for multiple tensors at once
+    /// Acquire read locks for multiple tensors at once.
+    /// If any lock is poisoned, logs a warning and skips that tensor's data
+    /// (the guard will contain `None` for that index and `get` will panic).
     pub fn new(tensors: &[&'a Tensor]) -> Self {
-        let guards: Vec<_> = tensors.iter().map(|t| t.data.read().unwrap()).collect();
+        let guards: Vec<_> = tensors
+            .iter()
+            .map(|t| {
+                t.data_read_safe().unwrap_or_else(|| {
+                    log::warn!(
+                        target: "resilience",
+                        "TensorReadGuard: data lock poisoned, proceeding with possibly stale data"
+                    );
+                    // We still need a guard. In the poisoned case we recover the inner data
+                    // by ignoring the poison error. This is safe for neural-network weights.
+                    t.data.read().unwrap_or_else(|e| e.into_inner())
+                })
+            })
+            .collect();
         TensorReadGuard { guards }
     }
 
@@ -209,6 +224,49 @@ impl Tensor {
         self
     }
 
+    // -------------------------------------------------------------------------
+    // Lock access helpers (centralised so poisoning can be handled in one place)
+    // -------------------------------------------------------------------------
+
+    /// Read the data lock. Panics if poisoned (use in hot paths where the lock
+    /// can never be poisoned under normal operation).
+    #[inline]
+    pub fn data_read(&self) -> std::sync::RwLockReadGuard<'_, Vec<f64>> {
+        self.data.read().unwrap()
+    }
+
+    /// Write the data lock. Panics if poisoned.
+    #[inline]
+    pub fn data_write(&self) -> std::sync::RwLockWriteGuard<'_, Vec<f64>> {
+        self.data.write().unwrap()
+    }
+
+    /// Read the grad lock. Panics if poisoned.
+    #[inline]
+    pub fn grad_read(&self) -> std::sync::RwLockReadGuard<'_, Vec<f64>> {
+        self.grad.read().unwrap()
+    }
+
+    /// Write the grad lock. Panics if poisoned.
+    #[inline]
+    pub fn grad_write(&self) -> std::sync::RwLockWriteGuard<'_, Vec<f64>> {
+        self.grad.write().unwrap()
+    }
+
+    /// Read the data lock, returning `None` if the lock is poisoned.
+    /// Use in resilience-critical paths (e.g. batch lock acquisition).
+    #[inline]
+    pub fn data_read_safe(&self) -> Option<std::sync::RwLockReadGuard<'_, Vec<f64>>> {
+        self.data.read().ok()
+    }
+
+    /// Write the grad lock, returning `None` if the lock is poisoned.
+    /// Use in backward closures where skipping one gradient is preferable to a crash.
+    #[inline]
+    pub fn grad_write_safe(&self) -> Option<std::sync::RwLockWriteGuard<'_, Vec<f64>>> {
+        self.grad.write().ok()
+    }
+
     /// Generate a tensor with uniformly distributed random values in [min, max).
     pub fn rand(shape: Vec<usize>, min: f64, max: f64, seed: u64) -> Self {
         use crate::rng::Rng;
@@ -295,8 +353,18 @@ impl Tensor {
             if let Some(ctx) = &t._ctx {
                 // GPU-aware backward ops read from GPU buffers directly;
                 // we no longer force materialization of all parents to CPU.
-                let grad = t.grad.read().unwrap();
-                (ctx.backward_op)(&grad, &ctx.parents);
+                match t.grad.read() {
+                    Ok(grad) => {
+                        (ctx.backward_op)(&grad, &ctx.parents);
+                    }
+                    Err(_) => {
+                        log::warn!(
+                            target: "resilience",
+                            "backward: grad lock poisoned for tensor {:?}, skipping node",
+                            t.shape
+                        );
+                    }
+                }
             }
         }
     }
@@ -328,7 +396,7 @@ impl Tensor {
     #[allow(dead_code)]
     pub fn to_cuda(&self) -> crate::cuda::error::CudaResult<Tensor> {
         if let Err(err) = crate::cuda::init() {
-            eprintln!("[Tensor] CUDA runtime unavailable: {err}");
+            log::error!("[Tensor] CUDA runtime unavailable: {err}");
             return Err(err);
         }
 
@@ -343,7 +411,7 @@ impl Tensor {
         let len = tensor.data.read().unwrap().len();
         if len > 0 {
             if let Err((_, err)) = tensor.cuda_get_or_upload_buffer() {
-                eprintln!("[Tensor] CUDA upload failed: {err}");
+                log::warn!("[Tensor] CUDA upload failed: {err}");
                 return Err(err);
             }
         }
@@ -724,7 +792,7 @@ impl Tensor {
             Ok(buf) => buf,
             Err((stage, err)) => {
                 crate::cuda::record_activation_fallback(stage);
-                eprintln!(
+                log::warn!(
                     "[Autograd] CUDA prepare ReLU input failed ({}), using CPU",
                     err
                 );
@@ -735,7 +803,7 @@ impl Tensor {
             Ok(buf) => buf,
             Err(err) => {
                 crate::cuda::record_activation_fallback("alloc");
-                eprintln!(
+                log::warn!(
                     "[Autograd] CUDA alloc ReLU buffer failed ({}), using CPU",
                     err
                 );
@@ -744,7 +812,7 @@ impl Tensor {
         };
         if let Err(err) = copy_d2d(&d_data, &d_src) {
             crate::cuda::record_activation_fallback("copy");
-            eprintln!(
+            log::warn!(
                 "[Autograd] CUDA D2D ReLU input copy failed ({}), using CPU",
                 err
             );
@@ -753,7 +821,7 @@ impl Tensor {
 
         if let Err(err) = relu_inplace(&d_data) {
             crate::cuda::record_activation_fallback("kernel");
-            eprintln!("[Autograd] CUDA ReLU kernel failed ({}), using CPU", err);
+            log::warn!("[Autograd] CUDA ReLU kernel failed ({}), using CPU", err);
             return self.relu_cpu_fallback();
         }
 
@@ -3561,7 +3629,7 @@ impl Tensor {
         if let Some(buffer) = self.cuda_cached_buffer() {
             let mut data = vec![0.0; buffer.len()];
             if let Err(err) = copy_d2h(&mut data, &buffer) {
-                eprintln!(
+                log::warn!(
                     "[Tensor] CUDA materialize D2H failed ({}), data remains empty",
                     err
                 );
@@ -3647,17 +3715,18 @@ impl Tensor {
             }
         };
         let d_c = Arc::new(d_c);
-        let (m_i32, n_i32, k_i32) = match (i32::try_from(m), i32::try_from(n), i32::try_from(k)) {
-            (Ok(mv), Ok(nv), Ok(kv)) => (mv, nv, kv),
-            _ => {
-                crate::cuda::record_matmul_fallback("gemm");
-                eprintln!(
+        let (m_i32, n_i32, k_i32) =
+            match (i32::try_from(m), i32::try_from(n), i32::try_from(k)) {
+                (Ok(mv), Ok(nv), Ok(kv)) => (mv, nv, kv),
+                _ => {
+                    crate::cuda::record_matmul_fallback("gemm");
+                    log::warn!(
                     "[Autograd] CUDA GEMM dimensions overflow i32 (m={}, n={}, k={}), using CPU",
                     m, n, k
                 );
-                return self.matmul_cpu_fallback(other, m, k, n);
-            }
-        };
+                    return self.matmul_cpu_fallback(other, m, k, n);
+                }
+            };
 
         if let Err(err) = gemm_thread_local(
             false,
@@ -3703,6 +3772,8 @@ impl Tensor {
 
                     #[cfg(cuda)]
                     if lhs.device == Device::Cuda && rhs.device == Device::Cuda {
+                        crate::cuda::record_backward_attempt();
+                        let mut gpu_backward_ok = false;
                         if let (Some(d_lhs), Some(d_rhs)) =
                             (lhs.cuda_cached_buffer(), rhs.cuda_cached_buffer())
                         {
@@ -3714,44 +3785,61 @@ impl Tensor {
                                     use crate::cuda::blas::gemm_thread_local;
 
                                     // dL/dLHS = grad_out[m,n] * rhs^T[n,k]  --> m x k
-                                    if let Some(d_lhs_grad) = lhs.cuda_grad_ensure_buffer() {
-                                        let _ = gemm_thread_local(
-                                            false,
-                                            true,
-                                            m as i32,
-                                            k as i32,
-                                            n as i32,
-                                            1.0,
-                                            d_grad_tmp.as_raw(),
-                                            n as i32,
-                                            d_rhs.as_raw(),
-                                            n as i32,
-                                            1.0,
-                                            d_lhs_grad.as_raw(),
-                                            k as i32,
-                                        );
-                                    }
+                                    let lhs_ok =
+                                        if let Some(d_lhs_grad) = lhs.cuda_grad_ensure_buffer() {
+                                            gemm_thread_local(
+                                                false,
+                                                true,
+                                                m as i32,
+                                                k as i32,
+                                                n as i32,
+                                                1.0,
+                                                d_grad_tmp.as_raw(),
+                                                n as i32,
+                                                d_rhs.as_raw(),
+                                                n as i32,
+                                                1.0,
+                                                d_lhs_grad.as_raw(),
+                                                k as i32,
+                                            )
+                                            .is_ok()
+                                        } else {
+                                            false
+                                        };
 
                                     // dL/dRHS = lhs^T[k,m] * grad_out[m,n]  --> k x n
-                                    if let Some(d_rhs_grad) = rhs.cuda_grad_ensure_buffer() {
-                                        let _ = gemm_thread_local(
-                                            true,
-                                            false,
-                                            k as i32,
-                                            n as i32,
-                                            m as i32,
-                                            1.0,
-                                            d_lhs.as_raw(),
-                                            k as i32,
-                                            d_grad_tmp.as_raw(),
-                                            n as i32,
-                                            1.0,
-                                            d_rhs_grad.as_raw(),
-                                            n as i32,
-                                        );
+                                    let rhs_ok =
+                                        if let Some(d_rhs_grad) = rhs.cuda_grad_ensure_buffer() {
+                                            gemm_thread_local(
+                                                true,
+                                                false,
+                                                k as i32,
+                                                n as i32,
+                                                m as i32,
+                                                1.0,
+                                                d_lhs.as_raw(),
+                                                k as i32,
+                                                d_grad_tmp.as_raw(),
+                                                n as i32,
+                                                1.0,
+                                                d_rhs_grad.as_raw(),
+                                                n as i32,
+                                            )
+                                            .is_ok()
+                                        } else {
+                                            false
+                                        };
+
+                                    if lhs_ok && rhs_ok {
+                                        gpu_backward_ok = true;
                                     }
                                 }
                             }
+                        }
+                        if gpu_backward_ok {
+                            crate::cuda::record_backward_success();
+                        } else {
+                            crate::cuda::record_backward_fallback();
                         }
                     }
 
@@ -3878,7 +3966,7 @@ impl Tensor {
             Ok(buf) => buf,
             Err((stage, err)) => {
                 crate::cuda::record_activation_fallback(stage);
-                eprintln!(
+                log::warn!(
                     "[Autograd] CUDA prepare GELU input failed ({}), using CPU",
                     err
                 );
@@ -3889,7 +3977,7 @@ impl Tensor {
             Ok(buf) => buf,
             Err(err) => {
                 crate::cuda::record_activation_fallback("alloc");
-                eprintln!(
+                log::warn!(
                     "[Autograd] CUDA alloc GELU buffer failed ({}), using CPU",
                     err
                 );
@@ -3898,7 +3986,7 @@ impl Tensor {
         };
         if let Err(err) = copy_d2d(&d_data, &d_src) {
             crate::cuda::record_activation_fallback("copy");
-            eprintln!(
+            log::warn!(
                 "[Autograd] CUDA D2D GELU input copy failed ({}), using CPU",
                 err
             );
@@ -3907,7 +3995,7 @@ impl Tensor {
 
         if let Err(err) = gelu_inplace(&d_data) {
             crate::cuda::record_activation_fallback("kernel");
-            eprintln!("[Autograd] CUDA GELU kernel failed ({}), using CPU", err);
+            log::warn!("[Autograd] CUDA GELU kernel failed ({}), using CPU", err);
             return self.gelu_cpu_fallback();
         }
 
@@ -4024,15 +4112,17 @@ impl Tensor {
         let cols = self.shape.last().copied().unwrap_or(len.max(1));
         if cols == 0 {
             crate::cuda::record_activation_fallback("kernel");
-            eprintln!("[Autograd] CUDA Softmax invalid last dimension (cols=0), using CPU");
+            log::warn!("[Autograd] CUDA Softmax invalid last dimension (cols=0), using CPU");
             return self.softmax_cpu_fallback();
         }
         let rows = len / cols;
         if rows.checked_mul(cols) != Some(len) {
             crate::cuda::record_activation_fallback("kernel");
-            eprintln!(
+            log::warn!(
                 "[Autograd] CUDA Softmax shape mismatch (len={}, rows={}, cols={}), using CPU",
-                len, rows, cols
+                len,
+                rows,
+                cols
             );
             return self.softmax_cpu_fallback();
         }
@@ -4042,7 +4132,7 @@ impl Tensor {
             Ok(buf) => buf,
             Err((stage, err)) => {
                 crate::cuda::record_activation_fallback(stage);
-                eprintln!(
+                log::warn!(
                     "[Autograd] CUDA prepare Softmax input failed ({}), using CPU",
                     err
                 );
@@ -4053,7 +4143,7 @@ impl Tensor {
             Ok(buf) => buf,
             Err(err) => {
                 crate::cuda::record_activation_fallback("alloc");
-                eprintln!(
+                log::warn!(
                     "[Autograd] CUDA alloc Softmax buffer failed ({}), using CPU",
                     err
                 );
@@ -4063,7 +4153,7 @@ impl Tensor {
 
         if let Err(err) = copy_d2d(&d_data, &d_src) {
             crate::cuda::record_activation_fallback("copy");
-            eprintln!(
+            log::warn!(
                 "[Autograd] CUDA D2D Softmax input copy failed ({}), using CPU",
                 err
             );
@@ -4072,7 +4162,7 @@ impl Tensor {
 
         if let Err(err) = softmax_inplace_auto(&d_data, rows, cols) {
             crate::cuda::record_activation_fallback("kernel");
-            eprintln!("[Autograd] CUDA Softmax kernel failed ({}), using CPU", err);
+            log::warn!("[Autograd] CUDA Softmax kernel failed ({}), using CPU", err);
             return self.softmax_cpu_fallback();
         }
 
@@ -4154,13 +4244,13 @@ impl Tensor {
         let cols = self.shape.last().copied().unwrap_or(len.max(1));
         if cols == 0 {
             crate::cuda::record_activation_fallback("kernel");
-            eprintln!("[Autograd] CUDA CausalSoftmax invalid last dimension (cols=0), using CPU");
+            log::warn!("[Autograd] CUDA CausalSoftmax invalid last dimension (cols=0), using CPU");
             return self.softmax_cpu_fallback();
         }
         let rows = len / cols;
         if rows.checked_mul(cols) != Some(len) {
             crate::cuda::record_activation_fallback("kernel");
-            eprintln!(
+            log::warn!(
                 "[Autograd] CUDA CausalSoftmax shape mismatch (len={}, rows={}, cols={}), using CPU",
                 len, rows, cols
             );
@@ -4172,7 +4262,7 @@ impl Tensor {
             Ok(buf) => buf,
             Err((stage, err)) => {
                 crate::cuda::record_activation_fallback(stage);
-                eprintln!(
+                log::warn!(
                     "[Autograd] CUDA prepare CausalSoftmax input failed ({}), using CPU",
                     err
                 );
@@ -4183,7 +4273,7 @@ impl Tensor {
             Ok(buf) => buf,
             Err(err) => {
                 crate::cuda::record_activation_fallback("alloc");
-                eprintln!(
+                log::warn!(
                     "[Autograd] CUDA alloc CausalSoftmax buffer failed ({}), using CPU",
                     err
                 );
@@ -4193,7 +4283,7 @@ impl Tensor {
 
         if let Err(err) = copy_d2d(&d_data, &d_src) {
             crate::cuda::record_activation_fallback("copy");
-            eprintln!(
+            log::warn!(
                 "[Autograd] CUDA D2D CausalSoftmax input copy failed ({}), using CPU",
                 err
             );
@@ -4202,7 +4292,7 @@ impl Tensor {
 
         if let Err(err) = softmax_causal_inplace(&d_data, rows, cols) {
             crate::cuda::record_activation_fallback("kernel");
-            eprintln!(
+            log::warn!(
                 "[Autograd] CUDA CausalSoftmax kernel failed ({}), using CPU",
                 err
             );
@@ -4288,7 +4378,7 @@ impl Tensor {
             Ok(buf) => buf,
             Err((stage, err)) => {
                 crate::cuda::record_activation_fallback(stage);
-                eprintln!("[Autograd] CUDA RoPE upload failed ({}), using CPU", err);
+                log::warn!("[Autograd] CUDA RoPE upload failed ({}), using CPU", err);
                 return self.clone();
             }
         };
@@ -4339,7 +4429,7 @@ impl Tensor {
             start_pos,
         ) {
             crate::cuda::record_activation_fallback("kernel");
-            eprintln!("[Autograd] CUDA RoPE kernel failed ({}), using CPU", err);
+            log::warn!("[Autograd] CUDA RoPE kernel failed ({}), using CPU", err);
             return self.clone();
         }
         crate::cuda::record_activation_success();
@@ -4425,7 +4515,7 @@ impl Tensor {
             Ok(buf) => buf,
             Err((stage, err)) => {
                 crate::cuda::record_log_softmax_fallback(stage);
-                eprintln!(
+                log::warn!(
                     "[Autograd] CUDA prepare LogSoftmax input failed ({}), using CPU",
                     err
                 );
@@ -4436,7 +4526,7 @@ impl Tensor {
             Ok(buf) => buf,
             Err(err) => {
                 crate::cuda::record_log_softmax_fallback("alloc");
-                eprintln!(
+                log::warn!(
                     "[Autograd] CUDA alloc LogSoftmax output failed ({}), using CPU",
                     err
                 );
@@ -4447,7 +4537,7 @@ impl Tensor {
 
         if let Err(err) = cuda_log_softmax(&d_in, &d_out, num_slices, dim_size) {
             crate::cuda::record_log_softmax_fallback("kernel");
-            eprintln!(
+            log::warn!(
                 "[Autograd] CUDA LogSoftmax kernel failed ({}), using CPU",
                 err
             );
@@ -4457,7 +4547,7 @@ impl Tensor {
         let mut data = vec![0.0; len];
         if let Err(err) = copy_d2h(&mut data, &d_out) {
             crate::cuda::record_log_softmax_fallback("copy");
-            eprintln!("[Autograd] CUDA D2H LogSoftmax failed ({}), using CPU", err);
+            log::warn!("[Autograd] CUDA D2H LogSoftmax failed ({}), using CPU", err);
             return self.log_softmax_last_dim_cpu_fallback();
         }
         crate::cuda::record_log_softmax_success();

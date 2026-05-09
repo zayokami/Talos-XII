@@ -1665,27 +1665,27 @@ impl MultiHeadLatentAttention {
         let d_probs = match probs.cuda_get_or_upload_buffer() {
             Ok(buf) => buf,
             Err((_stage, err)) => {
-                eprintln!("[MLA] CUDA probs upload failed ({}), using CPU path", err);
+                log::warn!("[MLA] CUDA probs upload failed ({}), using CPU path", err);
                 return self.batched_matmul_probs_v_cpu_fallback(probs, v, b, seq, dim_v);
             }
         };
         let d_v = match v.cuda_get_or_upload_buffer() {
             Ok(buf) => buf,
             Err((_stage, err)) => {
-                eprintln!("[MLA] CUDA v upload failed ({}), using CPU path", err);
+                log::warn!("[MLA] CUDA v upload failed ({}), using CPU path", err);
                 return self.batched_matmul_probs_v_cpu_fallback(probs, v, b, seq, dim_v);
             }
         };
         let d_out = match alloc::<f64>(out_len) {
             Ok(buf) => buf,
             Err(err) => {
-                eprintln!("[MLA] CUDA alloc failed ({})", err);
+                log::warn!("[MLA] CUDA alloc failed ({})", err);
                 return self.batched_matmul_probs_v_cpu_fallback(probs, v, b, seq, dim_v);
             }
         };
 
         if let Err(err) = attention_weighted_sum(&d_probs, &d_v, &d_out, b, seq, dim_v) {
-            eprintln!("[MLA] CUDA attention_weighted_sum failed ({})", err);
+            log::warn!("[MLA] CUDA attention_weighted_sum failed ({})", err);
             return self.batched_matmul_probs_v_cpu_fallback(probs, v, b, seq, dim_v);
         }
 
@@ -1694,7 +1694,7 @@ impl MultiHeadLatentAttention {
         // Copy result back to CPU for backward pass and tensor ops
         let mut out_data = vec![0.0; out_len];
         if let Err(err) = copy_d2h(&mut out_data, &d_out) {
-            eprintln!("[MLA] CUDA D2H copy failed ({})", err);
+            log::warn!("[MLA] CUDA D2H copy failed ({})", err);
             return self.batched_matmul_probs_v_cpu_fallback(probs, v, b, seq, dim_v);
         }
 

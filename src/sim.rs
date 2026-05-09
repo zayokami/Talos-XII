@@ -1699,7 +1699,7 @@ mod tests {
         config.up_rate = 0.0;
         config.up_six.clear();
 
-        let worker = GoodJobWorker::new(1);
+        let worker = GoodJobWorker::new(1).expect("Failed to build simulation worker pool");
         let run_ctx = SimRunContext {
             neural_opt: &neural_opt,
             dqn_policy: None,

@@ -19,6 +19,7 @@ mod i18n;
 mod model_io;
 mod neural;
 mod nn;
+mod panic_guard;
 mod ppo;
 mod rng;
 mod sim;
@@ -527,7 +528,24 @@ fn initialize_system(
         Rng::new()
     };
 
-    let worker = GoodJobWorker::new_with_config(&config);
+    let worker = match GoodJobWorker::new_with_config(&config) {
+        Ok(w) => w,
+        Err(e) => {
+            log::error!(
+                "Worker initialization failed: {}. Running without worker pool.",
+                e
+            );
+            // Create a minimal fallback worker with a single thread.
+            // This preserves all functionality but may be slower.
+            match GoodJobWorker::new(1) {
+                Ok(w) => w,
+                Err(_) => {
+                    log::error!("Fallback worker also failed. Exiting.");
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
 
     let env_net = if !args.force {
         if let Some(cached) = load_env_net_cache("env_net.cache") {
@@ -709,6 +727,7 @@ fn apply_compute_device_policy(config: &mut Config) {
 }
 
 fn main() {
+    panic_guard::install();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
 
@@ -1247,9 +1266,9 @@ fn run_interactive(args: RunInteractiveArgs) {
     println!("\n{}", I18n::get(lang, "sys_prng"));
     if cfg!(debug_assertions) && !config.fast_init {
         println!("\n{}", I18n::get(lang, "sys_bench"));
-        let dqn_guard = dqn_shared.read().unwrap();
-        let neural_guard = neural_shared.read().unwrap();
-        let ppo_guard = ppo_shared.read().unwrap();
+        let dqn_guard = panic_guard::read_shared(&dqn_shared);
+        let neural_guard = panic_guard::read_shared(&neural_shared);
+        let ppo_guard = panic_guard::read_shared(&ppo_shared);
         benchmark_simulation(
             &mut rng,
             &neural_guard,
@@ -1264,14 +1283,14 @@ fn run_interactive(args: RunInteractiveArgs) {
 
     // F2P Analysis
     {
-        let dqn_guard = dqn_shared.read().unwrap();
-        let neural_guard = neural_shared.read().unwrap();
-        let ppo_guard = ppo_shared.read().unwrap();
+        let dqn_guard = panic_guard::read_shared(&dqn_shared);
+        let neural_guard = panic_guard::read_shared(&neural_shared);
+        let ppo_guard = panic_guard::read_shared(&ppo_shared);
         let f2p_ctx = F2pAnalysisCtx {
             config: &config,
             neural_opt: &neural_guard,
-            dqn_policy: Some(&*dqn_guard),
-            ppo_policy: Some(&*ppo_guard),
+            dqn_policy: Some(&dqn_guard),
+            ppo_policy: Some(&ppo_guard),
             env_net: &env_net,
             worker: &worker,
             lang,
@@ -1436,9 +1455,9 @@ fn run_interactive(args: RunInteractiveArgs) {
             match sub_lower.as_str() {
                 "quick" | "q" => {
                     println!("{}", I18n::get(lang, "bench_quick_start"));
-                    let dqn_guard = dqn_shared.read().unwrap();
-                    let neural_guard = neural_shared.read().unwrap();
-                    let ppo_guard = ppo_shared.read().unwrap();
+                    let dqn_guard = panic_guard::read_shared(&dqn_shared);
+                    let neural_guard = panic_guard::read_shared(&neural_shared);
+                    let ppo_guard = panic_guard::read_shared(&ppo_shared);
                     benchmark_simulation(
                         &mut rng,
                         &neural_guard,
@@ -1805,9 +1824,9 @@ fn run_interactive(args: RunInteractiveArgs) {
             0
         };
         if sims_n > 1 {
-            let dqn_guard = dqn_shared.read().unwrap();
-            let neural_guard = neural_shared.read().unwrap();
-            let ppo_guard = ppo_shared.read().unwrap();
+            let dqn_guard = panic_guard::read_shared(&dqn_shared);
+            let neural_guard = panic_guard::read_shared(&neural_shared);
+            let ppo_guard = panic_guard::read_shared(&ppo_shared);
             let active_ppo = if use_ppo { Some(&*ppo_guard) } else { None };
             if selected_pool_ids.len() > 1 {
                 for pool_id in selected_pool_ids.iter() {
@@ -1898,9 +1917,9 @@ fn run_interactive(args: RunInteractiveArgs) {
                 });
             }
         } else {
-            let dqn_guard = dqn_shared.read().unwrap();
-            let neural_guard = neural_shared.read().unwrap();
-            let ppo_guard = ppo_shared.read().unwrap();
+            let dqn_guard = panic_guard::read_shared(&dqn_shared);
+            let neural_guard = panic_guard::read_shared(&neural_shared);
+            let ppo_guard = panic_guard::read_shared(&ppo_shared);
             let active_ppo = if use_ppo { Some(&*ppo_guard) } else { None };
             if selected_pool_ids.len() > 1 {
                 for pool_id in selected_pool_ids.iter() {

@@ -511,6 +511,7 @@ impl GpuAdam {
 
     fn step(&mut self) {
         self.t += 1;
+        crate::cuda::record_optimizer_attempt();
 
         // Compute global gradient norm on CPU (copy grads from GPU)
         let mut total_norm = 0.0;
@@ -528,6 +529,7 @@ impl GpuAdam {
         let bias_correction1 = 1.0 - self.beta1.powi(self.t as i32);
         let bias_correction2 = 1.0 - self.beta2.powi(self.t as i32);
 
+        let mut all_ok = true;
         for (i, param) in self.params.iter().enumerate() {
             let len = param.data.read().unwrap().len();
             if len == 0 {
@@ -535,16 +537,24 @@ impl GpuAdam {
             }
             let d_params = match param.cuda_get_or_upload_buffer() {
                 Ok(buf) => buf,
-                Err(_) => continue,
+                Err(_) => {
+                    crate::cuda::record_optimizer_fallback();
+                    all_ok = false;
+                    continue;
+                }
             };
             let d_grads = match param.cuda_grad_get_or_upload_buffer() {
                 Ok(buf) => buf,
-                Err(_) => continue,
+                Err(_) => {
+                    crate::cuda::record_optimizer_fallback();
+                    all_ok = false;
+                    continue;
+                }
             };
             let d_m = &self.m[i];
             let d_v = &self.v[i];
 
-            let _ = crate::cuda::kernels::adam_step(
+            if crate::cuda::kernels::adam_step(
                 &d_params,
                 &d_grads,
                 d_m,
@@ -558,7 +568,15 @@ impl GpuAdam {
                 bias_correction1,
                 bias_correction2,
                 clip_coef,
-            );
+            )
+            .is_err()
+            {
+                crate::cuda::record_optimizer_fallback();
+                all_ok = false;
+            }
+        }
+        if all_ok {
+            crate::cuda::record_optimizer_success();
         }
     }
 
@@ -1320,7 +1338,7 @@ pub fn train_ppo(rng: &mut Rng, env_net: &EnvNet, config: &Config) -> ActorCriti
     } else {
         1
     };
-    let worker = GoodJobWorker::new_with_config(config);
+    let worker = GoodJobWorker::new_with_config(config).expect("Failed to build PPO worker pool");
     let mut ppo = Ppo::new(rng.next_u64(), k_epochs, batch_size, &config.achf);
     ppo.init_distillation(config);
     let mut steps_done = 0;
@@ -1520,7 +1538,7 @@ pub fn train_ppo_with_metrics(
     } else {
         1
     };
-    let worker = GoodJobWorker::new_with_config(config);
+    let worker = GoodJobWorker::new_with_config(config).expect("Failed to build PPO worker pool");
     let mut ppo = Ppo::new(rng.next_u64(), k_epochs, batch_size, &config.achf);
     ppo.init_distillation(config);
     let mut steps_done = 0;

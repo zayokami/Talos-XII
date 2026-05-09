@@ -154,7 +154,8 @@ fn build_base_models(
     config: &Config,
     rng: &mut Rng,
 ) -> (EnvNet, NeuralLuckOptimizer, GoodJobWorker) {
-    let worker = GoodJobWorker::new_with_config(config);
+    let worker =
+        GoodJobWorker::new_with_config(config).expect("Failed to build benchmark worker pool");
     let (env_net, neural_opt) = build_base_models_with_worker(config, rng, &worker);
     (env_net, neural_opt, worker)
 }

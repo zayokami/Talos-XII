@@ -326,7 +326,7 @@ impl Module for RMSNorm {
                     }
                 }
             }
-            eprintln!("[RMSNorm] CUDA forward failed, falling back to CPU");
+            log::warn!("[RMSNorm] CUDA forward failed, falling back to CPU");
         }
 
         let x_data = x.data.read().unwrap();

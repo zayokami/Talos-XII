@@ -512,6 +512,7 @@ impl GpuAdam {
 
     fn step(&mut self) {
         self.t += 1;
+        crate::cuda::record_optimizer_attempt();
         let mut total_norm = 0.0;
         for param in &self.params {
             let grad = param.grad.read().unwrap();
@@ -529,6 +530,7 @@ impl GpuAdam {
         let bias_correction1 = 1.0 - self.beta1.powi(self.t as i32);
         let bias_correction2 = 1.0 - self.beta2.powi(self.t as i32);
 
+        let mut all_ok = true;
         for (i, param) in self.params.iter().enumerate() {
             let len = param.data.read().unwrap().len();
             if len == 0 {
@@ -536,16 +538,24 @@ impl GpuAdam {
             }
             let d_params = match param.cuda_get_or_upload_buffer() {
                 Ok(buf) => buf,
-                Err(_) => continue,
+                Err(_) => {
+                    crate::cuda::record_optimizer_fallback();
+                    all_ok = false;
+                    continue;
+                }
             };
             let d_grads = match param.cuda_grad_get_or_upload_buffer() {
                 Ok(buf) => buf,
-                Err(_) => continue,
+                Err(_) => {
+                    crate::cuda::record_optimizer_fallback();
+                    all_ok = false;
+                    continue;
+                }
             };
             let d_m = &self.m[i];
             let d_v = &self.v[i];
 
-            let _ = crate::cuda::kernels::adam_step(
+            if crate::cuda::kernels::adam_step(
                 &d_params,
                 &d_grads,
                 d_m,
@@ -559,7 +569,15 @@ impl GpuAdam {
                 bias_correction1,
                 bias_correction2,
                 clip_coef,
-            );
+            )
+            .is_err()
+            {
+                crate::cuda::record_optimizer_fallback();
+                all_ok = false;
+            }
+        }
+        if all_ok {
+            crate::cuda::record_optimizer_success();
         }
     }
 

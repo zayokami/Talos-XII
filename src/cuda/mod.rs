@@ -53,6 +53,12 @@ static CUDA_LOGSOFTMAX_SUCCESSES: AtomicU64 = AtomicU64::new(0);
 static CUDA_LOGSOFTMAX_FALLBACK_ALLOC: AtomicU64 = AtomicU64::new(0);
 static CUDA_LOGSOFTMAX_FALLBACK_COPY: AtomicU64 = AtomicU64::new(0);
 static CUDA_LOGSOFTMAX_FALLBACK_KERNEL: AtomicU64 = AtomicU64::new(0);
+static CUDA_BACKWARD_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static CUDA_BACKWARD_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+static CUDA_BACKWARD_FALLBACK_KERNEL: AtomicU64 = AtomicU64::new(0);
+static CUDA_OPTIMIZER_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static CUDA_OPTIMIZER_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+static CUDA_OPTIMIZER_FALLBACK_PARAM: AtomicU64 = AtomicU64::new(0);
 
 /// Runtime observability counters for CUDA matmul routing.
 #[derive(Debug, Clone, Copy)]
@@ -73,6 +79,12 @@ pub struct CudaRuntimeStats {
     pub log_softmax_fallback_alloc: u64,
     pub log_softmax_fallback_copy: u64,
     pub log_softmax_fallback_kernel: u64,
+    pub backward_attempts: u64,
+    pub backward_successes: u64,
+    pub backward_fallback_kernel: u64,
+    pub optimizer_attempts: u64,
+    pub optimizer_successes: u64,
+    pub optimizer_fallback_param: u64,
 }
 
 pub fn record_matmul_attempt() {
@@ -147,6 +159,30 @@ pub fn record_log_softmax_fallback(stage: &'static str) {
     }
 }
 
+pub fn record_backward_attempt() {
+    CUDA_BACKWARD_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_backward_success() {
+    CUDA_BACKWARD_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_backward_fallback() {
+    CUDA_BACKWARD_FALLBACK_KERNEL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_optimizer_attempt() {
+    CUDA_OPTIMIZER_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_optimizer_success() {
+    CUDA_OPTIMIZER_SUCCESSES.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_optimizer_fallback() {
+    CUDA_OPTIMIZER_FALLBACK_PARAM.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn runtime_stats() -> CudaRuntimeStats {
     CudaRuntimeStats {
         matmul_attempts: CUDA_MATMUL_ATTEMPTS.load(Ordering::Relaxed),
@@ -165,6 +201,12 @@ pub fn runtime_stats() -> CudaRuntimeStats {
         log_softmax_fallback_alloc: CUDA_LOGSOFTMAX_FALLBACK_ALLOC.load(Ordering::Relaxed),
         log_softmax_fallback_copy: CUDA_LOGSOFTMAX_FALLBACK_COPY.load(Ordering::Relaxed),
         log_softmax_fallback_kernel: CUDA_LOGSOFTMAX_FALLBACK_KERNEL.load(Ordering::Relaxed),
+        backward_attempts: CUDA_BACKWARD_ATTEMPTS.load(Ordering::Relaxed),
+        backward_successes: CUDA_BACKWARD_SUCCESSES.load(Ordering::Relaxed),
+        backward_fallback_kernel: CUDA_BACKWARD_FALLBACK_KERNEL.load(Ordering::Relaxed),
+        optimizer_attempts: CUDA_OPTIMIZER_ATTEMPTS.load(Ordering::Relaxed),
+        optimizer_successes: CUDA_OPTIMIZER_SUCCESSES.load(Ordering::Relaxed),
+        optimizer_fallback_param: CUDA_OPTIMIZER_FALLBACK_PARAM.load(Ordering::Relaxed),
     }
 }
 

@@ -181,7 +181,7 @@ pub struct GoodJobWorker {
 
 impl GoodJobWorker {
     #[allow(dead_code)]
-    pub fn new(requested_threads: usize) -> Self {
+    pub fn new(requested_threads: usize) -> Result<Self, String> {
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
@@ -193,7 +193,7 @@ impl GoodJobWorker {
         Self::build_pool(num_threads, DEFAULT_STACK_SIZE_BYTES, None, true)
     }
 
-    pub fn new_with_config(config: &Config) -> Self {
+    pub fn new_with_config(config: &Config) -> Result<Self, String> {
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
@@ -219,7 +219,7 @@ impl GoodJobWorker {
         stack_size: usize,
         priority: Option<String>,
         pin_cores: bool,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let priority_level =
             win_platform::priority_from_str(priority.as_deref().unwrap_or("normal"));
 
@@ -254,10 +254,10 @@ impl GoodJobWorker {
                 win_platform::warmup_stack(warmup_bytes);
             })
             .panic_handler(|err| {
-                eprintln!("[GJW] Worker thread panicked: {:?}", err);
+                log::error!("[GJW] Worker thread panicked: {:?}", err);
             })
             .build()
-            .expect("Failed to build worker pool");
+            .map_err(|e| format!("Failed to build worker pool: {}", e))?;
 
         let pinned_info = if pin_cores && !cores_for_info.is_empty() {
             let used: Vec<usize> = (0..num_threads)
@@ -268,7 +268,7 @@ impl GoodJobWorker {
             String::new()
         };
 
-        println!(
+        log::info!(
             "[GJW] Pool ready: {} threads, {}MB stack, pri={}{}",
             num_threads,
             stack_size / (1024 * 1024),
@@ -276,11 +276,11 @@ impl GoodJobWorker {
             pinned_info
         );
 
-        Self {
+        Ok(Self {
             pool,
             num_threads,
             metrics: Arc::new(WorkerMetrics::default()),
-        }
+        })
     }
 
     /// Execute a closure on the worker pool, measuring latency and tracking metrics.

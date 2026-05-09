@@ -336,8 +336,8 @@ Contact: yuokaki1@163.com
 | 项目 | 最低要求 | 推荐配置 |
 |---|---|---|
 | CPU | 任意 x86_64 或 ARM64（含 Apple Silicon） | 支持 AVX2+FMA 的 x86_64 |
-| 内存 | 256 MB 可用 | 512 MB+ |
-| 磁盘 | 5 MB（exe + config） | 10 MB（含缓存文件） |
+| 内存 | 1 GB 可用 | 4GB + |
+| 磁盘 | 700 MB（exe + config） | 750 MB（含缓存文件） |
 | 操作系统 | Windows 10+、macOS 11+、Linux kernel 4.0+ | — |
 
 ### GPU 版 — 附加要求
@@ -386,7 +386,7 @@ GPU 版是**可选**的。纯 CPU 二进制可在所有支持平台上开箱即�
 | 运行时依赖（GPU 版） | NVIDIA 驱动 + CUDA Toolkit 12.0+（编译时）；运行时需 `libcudart.so`/`libcuda.so`/`libcublas.so` |
 | 终端 | 任意支持 ANSI 颜色的终端 |
 | SIMD 加速 | 同 Windows，运行时自动检测 CPU 特征 |
-| 注意事项 | 需自行编译。GPU 加速需要 NVIDIA 专有驱动；Nouveau 开源驱动不支持。 |
+| 注意事项 | 需自行编译。GPU 加速需要 NVIDIA 专有驱动；Nouveau 开源驱动暂不支持。 |
 
 ---
 
