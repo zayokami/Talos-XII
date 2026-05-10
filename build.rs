@@ -126,6 +126,7 @@ fn main() {
         "cuda/attention_output.cu",
         "cuda/backward.cu",
         "cuda/rmsnorm.cu",
+        "cuda/sparse.cu",
     ];
 
     // Output directory for compiled objects

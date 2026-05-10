@@ -832,6 +832,93 @@ pub fn rmsnorm_backward(
     }
 }
 
+#[cfg(cuda)]
+pub fn sparse_matvec(
+    x: &DevicePtr<f64>,
+    w: &DevicePtr<f64>,
+    mask: &DevicePtr<u8>,
+    y: &DevicePtr<f64>,
+    num_rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let num_rows_i32 = to_i32_len("cuda::kernels::sparse_matvec(num_rows)", num_rows)?;
+    let in_dim_i32 = to_i32_len("cuda::kernels::sparse_matvec(in_dim)", in_dim)?;
+    let out_dim_i32 = to_i32_len("cuda::kernels::sparse_matvec(out_dim)", out_dim)?;
+    if num_rows == 0 || in_dim == 0 || out_dim == 0 {
+        return Ok(());
+    }
+    let status = unsafe {
+        bindings::cuda_sparse_matvec(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            num_rows_i32,
+            in_dim_i32,
+            out_dim_i32,
+            x.as_raw() as *mut std::os::raw::c_int,
+            w.as_raw() as *mut std::os::raw::c_int,
+            mask.as_raw() as *mut std::os::raw::c_int,
+            y.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::sparse_matvec",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn sparse_matvec_bias(
+    x: &DevicePtr<f64>,
+    w: &DevicePtr<f64>,
+    mask: &DevicePtr<u8>,
+    bias: &DevicePtr<f64>,
+    y: &DevicePtr<f64>,
+    num_rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let num_rows_i32 = to_i32_len("cuda::kernels::sparse_matvec_bias(num_rows)", num_rows)?;
+    let in_dim_i32 = to_i32_len("cuda::kernels::sparse_matvec_bias(in_dim)", in_dim)?;
+    let out_dim_i32 = to_i32_len("cuda::kernels::sparse_matvec_bias(out_dim)", out_dim)?;
+    if num_rows == 0 || in_dim == 0 || out_dim == 0 {
+        return Ok(());
+    }
+    let status = unsafe {
+        bindings::cuda_sparse_matvec_bias(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            num_rows_i32,
+            in_dim_i32,
+            out_dim_i32,
+            x.as_raw() as *mut std::os::raw::c_int,
+            w.as_raw() as *mut std::os::raw::c_int,
+            mask.as_raw() as *mut std::os::raw::c_int,
+            bias.as_raw() as *mut std::os::raw::c_int,
+            y.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::sparse_matvec_bias",
+            code: status as u32,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::validate_softmax_dims;

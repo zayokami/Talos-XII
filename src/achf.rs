@@ -26,6 +26,10 @@ pub struct AchfLayer {
     /// Sparse weight created by magnitude pruning after training.
     /// When present, inference uses this (with zero-skip) instead of dense weight.
     pub sparse_weight: Option<Linear>,
+    /// CPU mask for sparse weights (1 = non-zero, 0 = pruned).
+    /// Shape: [in_features, out_features]. Used by CUDA sparse kernel.
+    #[serde(default)]
+    pub sparse_mask: Option<Vec<u8>>,
     pub config: AchfConfig,
     #[serde(skip, default = "default_state")]
     pub state: Arc<RwLock<AchfState>>,
@@ -318,6 +322,7 @@ impl AchfLayer {
         let layer = Self {
             weight,
             sparse_weight: None,
+            sparse_mask: None,
             config,
             state: default_state(),
             cache: default_cache(),
@@ -812,6 +817,10 @@ impl AchfLayer {
             .iter()
             .map(|&v| if v.abs() < threshold { 0.0 } else { v })
             .collect();
+        let mask: Vec<u8> = w_data
+            .iter()
+            .map(|&v| if v.abs() < threshold { 0 } else { 1 })
+            .collect();
         drop(w_data);
         let pruned_weight = Tensor::new(
             pruned,
@@ -823,6 +832,7 @@ impl AchfLayer {
             in_features: self.weight.in_features,
             out_features: self.weight.out_features,
         });
+        self.sparse_mask = Some(mask);
     }
 
     fn clear_cache(&self) {

@@ -374,6 +374,39 @@ extern "C" {
         d_x_grad: *mut c_int,
         d_w_grad: *mut c_int,
     ) -> c_int;
+
+    // Sparse matrix-vector multiplication kernels
+    #[link_name = "cuda_sparse_matvec"]
+    pub fn cuda_sparse_matvec(
+        h_x: *const f64,
+        h_w: *const f64,
+        h_mask: *const u8,
+        h_y: *mut f64,
+        num_rows: c_int,
+        in_dim: c_int,
+        out_dim: c_int,
+        d_x: *mut c_int,
+        d_w: *mut c_int,
+        d_mask: *mut c_int,
+        d_y: *mut c_int,
+    ) -> c_int;
+
+    #[link_name = "cuda_sparse_matvec_bias"]
+    pub fn cuda_sparse_matvec_bias(
+        h_x: *const f64,
+        h_w: *const f64,
+        h_mask: *const u8,
+        h_bias: *const f64,
+        h_y: *mut f64,
+        num_rows: c_int,
+        in_dim: c_int,
+        out_dim: c_int,
+        d_x: *mut c_int,
+        d_w: *mut c_int,
+        d_mask: *mut c_int,
+        d_bias: *mut c_int,
+        d_y: *mut c_int,
+    ) -> c_int;
 }
 
 // =============================================================================
