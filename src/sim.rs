@@ -1517,7 +1517,7 @@ mod tests {
         let state_tensor = AutoTensor::new(flat.clone(), vec![seq_len, DIM]);
 
         let slow_logits = policy.forward_actor(&state_tensor, &pity);
-        let slow_data = slow_logits.data.read().unwrap().clone();
+        let slow_data = slow_logits.data_f64().clone();
         let slow_probs = softmax(&slow_data);
 
         let mla_cfg = &policy.backbone.blocks[0].mla_layer.config;

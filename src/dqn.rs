@@ -226,8 +226,8 @@ impl DuelingQNetwork {
     // Copy weights
     pub fn load_state_dict(&mut self, other: &Self) {
         fn copy_tensor(dst: &mut Tensor, src: &Tensor) {
-            let src_data = src.data.read().unwrap().clone();
-            let mut dst_data = dst.data.write().unwrap();
+            let src_data = src.data_f64().clone();
+            let mut dst_data = dst.data_write_f64();
             *dst_data = src_data;
         }
 
@@ -250,8 +250,8 @@ impl DuelingQNetwork {
 
     pub fn soft_update(&mut self, source: &Self, tau: f64) {
         fn interpolate(target: &mut Tensor, source: &Tensor, tau: f64) {
-            let mut t_data = target.data.write().unwrap();
-            let s_data = source.data.read().unwrap();
+            let mut t_data = target.data_write_f64();
+            let s_data = source.data_f64();
             for (t, s) in t_data.iter_mut().zip(s_data.iter()) {
                 *t = *t * (1.0 - tau) + *s * tau;
             }
@@ -278,7 +278,7 @@ impl DuelingQNetwork {
         let q_values = self.forward(state);
         let mut max_val = f64::NEG_INFINITY;
         let mut max_idx = 0;
-        let q_data = q_values.data.read().unwrap();
+        let q_data = q_values.data_f64();
         for (i, &val) in q_data.iter().enumerate() {
             if val > max_val {
                 max_val = val;
@@ -461,11 +461,11 @@ impl Adam {
     fn new(params: Vec<Tensor>, lr: f64) -> Self {
         let m = params
             .iter()
-            .map(|p| vec![0.0; p.data.read().unwrap().len()])
+            .map(|p| vec![0.0; p.data_f64().len()])
             .collect();
         let v = params
             .iter()
-            .map(|p| vec![0.0; p.data.read().unwrap().len()])
+            .map(|p| vec![0.0; p.data_f64().len()])
             .collect();
         Adam {
             params,
@@ -502,7 +502,7 @@ impl Adam {
 
         for (i, param) in self.params.iter_mut().enumerate() {
             let grad = param.grad.read().unwrap();
-            let mut data = param.data.write().unwrap();
+            let mut data = param.data_write_f64();
 
             for j in 0..data.len() {
                 let g = grad[j] * clip_coef;
@@ -543,7 +543,7 @@ impl GpuAdam {
         let mut m = Vec::with_capacity(params.len());
         let mut v = Vec::with_capacity(params.len());
         for p in &params {
-            let len = p.data.read().unwrap().len();
+            let len = p.data_f64().len();
             if p.device != crate::autograd::Device::Cuda {
                 return None;
             }
@@ -590,7 +590,7 @@ impl GpuAdam {
 
         let mut all_ok = true;
         for (i, param) in self.params.iter().enumerate() {
-            let len = param.data.read().unwrap().len();
+            let len = param.data_f64().len();
             if len == 0 {
                 continue;
             }
@@ -974,7 +974,7 @@ fn train_dqn_impl(
             let q_values = policy_net.forward(&current_state_tensor);
             let mut max_val = f64::NEG_INFINITY;
             let mut max_idx = 0;
-            let q_data = q_values.data.read().unwrap();
+            let q_data = q_values.data_f64();
             for (i, &val) in q_data.iter().enumerate() {
                 if val > max_val {
                     max_val = val;
@@ -1189,7 +1189,7 @@ fn train_dqn_impl(
                 loss = loss + reg;
             }
 
-            last_train_loss = loss.data.read().unwrap()[0];
+            last_train_loss = loss.data_f64()[0];
             let forward_time = start_forward.elapsed();
 
             let start_backward = std::time::Instant::now();
@@ -1203,8 +1203,8 @@ fn train_dqn_impl(
 
             // Write back per-sample TD errors for priority update
             {
-                let q_data = q_actions.data.read().unwrap();
-                let t_data = target_tensor.data.read().unwrap();
+                let q_data = q_actions.data_f64();
+                let t_data = target_tensor.data_f64();
                 scratch.td_errors.clear();
                 scratch.td_errors.extend(
                     q_data
@@ -1509,8 +1509,8 @@ impl OnlineDqnTrainer {
 
         // Write back per-sample TD errors for priority update
         {
-            let q_data = q_actions.data.read().unwrap();
-            let t_data = target_tensor.data.read().unwrap();
+            let q_data = q_actions.data_f64();
+            let t_data = target_tensor.data_f64();
             let td_errors: Vec<f64> = q_data
                 .iter()
                 .zip(t_data.iter())

@@ -1,4 +1,5 @@
 use crate::autograd::Tensor;
+use crate::dtype::{Dtype, Storage};
 use std::sync::{Arc, RwLock};
 
 /// Numerical gradient check using finite differences.
@@ -16,7 +17,7 @@ pub fn numerical_grad_check<F>(
 where
     F: Fn(&Tensor) -> Tensor,
 {
-    let original_data = tensor.data.read().unwrap().clone();
+    let original_data = tensor.data_f64().clone();
     let shape = tensor.shape.clone();
     let n = original_data.len();
 
@@ -32,27 +33,29 @@ where
         let mut data_plus = original_data.clone();
         data_plus[i] += epsilon;
         let t_plus = Tensor {
-            data: Arc::new(RwLock::new(data_plus)),
+            data: Storage::F64(Arc::new(RwLock::new(data_plus))),
             grad: Arc::new(RwLock::new(vec![0.0; n])),
             shape: shape.clone(),
             device: crate::autograd::Device::Cpu,
+            dtype: Dtype::F64,
             _ctx: None,
         };
         let loss_plus = loss_fn(&t_plus);
-        let loss_plus_val = loss_plus.data.read().unwrap()[0];
+        let loss_plus_val = loss_plus.data_f64()[0];
 
         // loss at x - eps
         let mut data_minus = original_data.clone();
         data_minus[i] -= epsilon;
         let t_minus = Tensor {
-            data: Arc::new(RwLock::new(data_minus)),
+            data: Storage::F64(Arc::new(RwLock::new(data_minus))),
             grad: Arc::new(RwLock::new(vec![0.0; n])),
             shape: shape.clone(),
             device: crate::autograd::Device::Cpu,
+            dtype: Dtype::F64,
             _ctx: None,
         };
         let loss_minus = loss_fn(&t_minus);
-        let loss_minus_val = loss_minus.data.read().unwrap()[0];
+        let loss_minus_val = loss_minus.data_f64()[0];
 
         // Numerical gradient via centered difference
         let numerical_grad = (loss_plus_val - loss_minus_val) / (2.0 * epsilon);

@@ -755,7 +755,7 @@ impl AchfLayer {
     }
 
     fn project_rowcol(&self) {
-        let mut w = self.weight.weight.data.write().unwrap();
+        let mut w = self.weight.weight.data_write_f64();
         let rows = self.weight.in_features;
         let cols = self.weight.out_features;
         rowcol_project(&mut w, rows, cols);
@@ -771,7 +771,7 @@ impl AchfLayer {
         let row_scales = cache.sinkhorn_row_scales.clone();
         let col_scales = cache.sinkhorn_col_scales.clone();
         drop(cache);
-        let mut w = self.weight.weight.data.write().unwrap();
+        let mut w = self.weight.weight.data_write_f64();
         let (new_row, new_col) = sinkhorn_project(
             &mut w,
             self.weight.in_features,
@@ -812,7 +812,7 @@ impl AchfLayer {
     /// elements below threshold. Idempotent (re-pruning overwrites).
     #[allow(dead_code)]
     pub fn prune(&mut self, threshold: f64) {
-        let w_data = self.weight.weight.data.read().unwrap();
+        let w_data = self.weight.weight.data_f64();
         let pruned: Vec<f64> = w_data
             .iter()
             .map(|&v| if v.abs() < threshold { 0.0 } else { v })
@@ -896,7 +896,7 @@ impl AchfLayer {
         let sparse = self.sparse_weight.as_ref().unwrap();
         let in_dim = sparse.in_features;
         let out_dim = sparse.out_features;
-        let w_data = sparse.weight.data.read().unwrap();
+        let w_data = sparse.weight.data_f64();
         let dense = w_data.clone();
         drop(w_data);
         let mut cache = self.cache.write().unwrap();
@@ -1247,14 +1247,14 @@ pub(crate) fn sinkhorn_project(
 }
 
 fn copy_linear(dst: &mut Linear, src: &Linear) {
-    let src_data = src.weight.data.read().unwrap().clone();
-    let mut dst_data = dst.weight.data.write().unwrap();
+    let src_data = src.weight.data_f64().clone();
+    let mut dst_data = dst.weight.data_write_f64();
     *dst_data = src_data;
 }
 
 fn soft_update_linear(dst: &mut Linear, src: &Linear, tau: f64) {
-    let mut t_data = dst.weight.data.write().unwrap();
-    let s_data = src.weight.data.read().unwrap();
+    let mut t_data = dst.weight.data_write_f64();
+    let s_data = src.weight.data_f64();
     for (t, s) in t_data.iter_mut().zip(s_data.iter()) {
         *t = *t * (1.0 - tau) + *s * tau;
     }
@@ -1293,7 +1293,7 @@ mod tests {
         let layer = AchfLayer::new_square(4, cfg, 7);
         let x = Tensor::rand(vec![1, 4], -0.1, 0.1, 9);
         let _ = layer.forward_residual(&x);
-        let w = layer.weight.weight.data.read().unwrap();
+        let w = layer.weight.weight.data_f64();
         for c in 0..4 {
             let mut sum_sq = 0.0;
             for r in 0..4 {
@@ -1317,10 +1317,10 @@ mod tests {
         let x = Tensor::rand(vec![1, 4], -0.1, 0.1, 12);
         let _ = layer.forward_residual(&x);
         layer.freeze_for_inference();
-        let w_before = layer.weight.weight.data.read().unwrap().clone();
-        let x_data = x.data.read().unwrap().clone();
+        let w_before = layer.weight.weight.data_f64().clone();
+        let x_data = x.data_f64().clone();
         let _ = layer.forward_inference_residual(&x_data);
-        let w_after = layer.weight.weight.data.read().unwrap().clone();
+        let w_after = layer.weight.weight.data_f64().clone();
         assert_eq!(w_before, w_after);
     }
 
@@ -1351,7 +1351,7 @@ mod tests {
         };
         let mut layer = AchfLayer::new_square(4, cfg, 31);
         let x = Tensor::rand(vec![2, 4], -0.1, 0.1, 32);
-        let x_data = x.data.read().unwrap().clone();
+        let x_data = x.data_f64().clone();
         layer.prune(0.01);
         layer.freeze_for_inference();
         let out_cached = layer.forward_inference_residual(&x_data);
@@ -1374,7 +1374,7 @@ mod tests {
         layer.prune(0.01);
         layer.freeze_for_inference();
         let x = Tensor::rand(vec![2, 4], -0.1, 0.1, 42);
-        let x_data = x.data.read().unwrap().clone();
+        let x_data = x.data_f64().clone();
         let out_cached = layer.forward_inference_residual(&x_data);
         layer.clear_cache();
         let out_unfused = layer.forward_inference_residual(&x_data);
@@ -1395,7 +1395,7 @@ mod tests {
         layer.prune(0.01);
         layer.freeze_for_inference();
         let x = Tensor::rand(vec![2, 4], -0.1, 0.1, 52);
-        let x_data = x.data.read().unwrap().clone();
+        let x_data = x.data_f64().clone();
         let _ = layer.forward_inference_residual(&x_data);
         let stats = layer.cache_stats();
         assert_eq!(stats.calls, 1);
@@ -1523,7 +1523,7 @@ mod tests {
         let mut layer = AchfLayer::new_square(4, cfg, 200);
         // Set some weights to known values
         {
-            let mut w = layer.weight.weight.data.write().unwrap();
+            let mut w = layer.weight.weight.data_write_f64();
             w[0] = 0.5; // above threshold
             w[1] = 0.005; // below threshold
             w[2] = -0.5; // above threshold
@@ -1531,7 +1531,7 @@ mod tests {
         }
         layer.prune(0.01);
         let sparse = layer.sparse_weight.as_ref().unwrap();
-        let s = sparse.weight.data.read().unwrap();
+        let s = sparse.weight.data_f64();
         assert_eq!(s[0], 0.5);
         assert_eq!(s[1], 0.0);
         assert_eq!(s[2], -0.5);
@@ -1547,7 +1547,7 @@ mod tests {
         let mut layer = AchfLayer::new_square(4, cfg, 201);
         // Set deterministic weights
         {
-            let mut w = layer.weight.weight.data.write().unwrap();
+            let mut w = layer.weight.weight.data_write_f64();
             for (i, v) in w.iter_mut().enumerate() {
                 *v = ((i as f64) * 0.1) - 0.3;
             }

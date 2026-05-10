@@ -12,6 +12,7 @@ mod config;
 mod cuda;
 mod dbn;
 mod dqn;
+mod dtype;
 mod env_net;
 #[cfg(test)]
 mod grad_check;
@@ -2263,7 +2264,7 @@ mod tests {
         let dqn = train_dqn(&neural_opt, &mut rng, &env_net, &config);
         let state = AutoTensor::new(vec![0.5; DIM], vec![DIM]);
         let q_values = dqn.forward(&state);
-        let q_data = q_values.data.read().unwrap();
+        let q_data = q_values.data_f64();
         assert_eq!(
             q_data.len(),
             5,

@@ -1,4 +1,5 @@
 use crate::autograd::{Context, Tensor};
+use crate::dtype::Storage;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
@@ -51,8 +52,8 @@ impl Linear {
         );
         let num_rows = input.len() / in_dim;
         out.resize(num_rows * out_dim, 0.0);
-        let w_data = self.weight.data.read().unwrap();
-        let b_data = self.bias.as_ref().map(|b| b.data.read().unwrap());
+        let w_data = self.weight.data_f64();
+        let b_data = self.bias.as_ref().map(|b| b.data_f64());
 
         use crate::simd::add_scaled_row;
 
@@ -218,7 +219,7 @@ impl RMSNorm {
         let dim = self.dim;
         let num_rows = input.len() / dim;
         out.resize(input.len(), 0.0);
-        let w_data = self.weight.data.read().unwrap();
+        let w_data = self.weight.data_f64();
 
         for r in 0..num_rows {
             let base = r * dim;
@@ -267,7 +268,7 @@ impl Module for RMSNorm {
                             let dim = self.dim;
                             let eps = self.eps;
                             let out = Tensor {
-                                data: Arc::new(RwLock::new(vec![0.0; num_elements])),
+                                data: Storage::F64(Arc::new(RwLock::new(vec![0.0; num_elements]))),
                                 grad: Arc::new(RwLock::new(vec![0.0; num_elements])),
                                 shape: shape.clone(),
                                 device: crate::autograd::Device::Cuda,
@@ -329,8 +330,8 @@ impl Module for RMSNorm {
             log::warn!("[RMSNorm] CUDA forward failed, falling back to CPU");
         }
 
-        let x_data = x.data.read().unwrap();
-        let w_data = self.weight.data.read().unwrap();
+        let x_data = x.data_f64();
+        let w_data = self.weight.data_f64();
 
         let mut out_data = vec![0.0; num_elements];
         let mut rms_cache = vec![0.0; num_rows];
@@ -366,10 +367,11 @@ impl Module for RMSNorm {
         let x_hat_cache = Arc::new(x_hat_cache);
 
         Tensor {
-            data: Arc::new(RwLock::new(out_data)),
+            data: Storage::F64(Arc::new(RwLock::new(out_data))),
             grad: Arc::new(RwLock::new(vec![0.0; num_elements])),
             shape: shape.clone(),
             device: x.device,
+            dtype: x.dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -378,7 +380,7 @@ impl Module for RMSNorm {
 
                     let mut x_grad = x_in.grad.write().unwrap();
                     let mut w_grad = w_in.grad.write().unwrap();
-                    let w_data = w_in.data.read().unwrap();
+                    let w_data = w_in.data_f64();
 
                     // 1. Calculate dL/dx parallel over rows
                     x_grad

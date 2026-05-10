@@ -248,9 +248,9 @@ impl ActorCritic {
     // Returns (action_idx, log_prob, value)
     pub fn step(&self, state: &Tensor, pity: &[usize], top_k: usize) -> (usize, f64, f64) {
         let (logits, value) = self.forward_actor_critic(state, pity);
-        let logits_data = logits.data.read().unwrap();
+        let logits_data = logits.data_f64();
         let (action_idx, log_prob) = softmax_sample(&logits_data, top_k);
-        let val = value.data.read().unwrap()[0];
+        let val = value.data_f64()[0];
         (action_idx, log_prob, val)
     }
 
@@ -393,11 +393,11 @@ impl Adam {
     fn new(params: Vec<Tensor>, lr: f64) -> Self {
         let m = params
             .iter()
-            .map(|p| vec![0.0; p.data.read().unwrap().len()])
+            .map(|p| vec![0.0; p.data_f64().len()])
             .collect();
         let v = params
             .iter()
-            .map(|p| vec![0.0; p.data.read().unwrap().len()])
+            .map(|p| vec![0.0; p.data_f64().len()])
             .collect();
         Adam {
             params,
@@ -444,7 +444,7 @@ impl Adam {
 
         for (i, param) in self.params.iter_mut().enumerate() {
             let grad = param.grad.read().unwrap();
-            let mut data = param.data.write().unwrap();
+            let mut data = param.data_write_f64();
             let m = &mut self.m[i];
             let v = &mut self.v[i];
             let len = data.len();
@@ -499,7 +499,7 @@ impl GpuAdam {
         let mut m = Vec::with_capacity(params.len());
         let mut v = Vec::with_capacity(params.len());
         for p in &params {
-            let len = p.data.read().unwrap().len();
+            let len = p.data_f64().len();
             if p.device != crate::autograd::Device::Cuda {
                 return None;
             }
@@ -550,7 +550,7 @@ impl GpuAdam {
 
         let mut all_ok = true;
         for (i, param) in self.params.iter().enumerate() {
-            let len = param.data.read().unwrap().len();
+            let len = param.data_f64().len();
             if len == 0 {
                 continue;
             }
@@ -757,8 +757,8 @@ impl Ppo {
         let ema_params = ema.parameters();
 
         for (ema_p, stud_p) in ema_params.iter().zip(student_params.iter()) {
-            let mut ema_data = ema_p.data.write().unwrap();
-            let stud_data = stud_p.data.read().unwrap();
+            let mut ema_data = ema_p.data_write_f64();
+            let stud_data = stud_p.data_f64();
             for (e, s) in ema_data.iter_mut().zip(stud_data.iter()) {
                 *e = decay * (*e) + inv * (*s);
             }
@@ -900,7 +900,7 @@ impl Ppo {
                 let max_seq_len = chunk.iter().map(|&i| states[i].shape[0]).max().unwrap_or(1);
                 let mut batch_data = Vec::with_capacity(batch_len * max_seq_len * DIM);
                 for &i in chunk {
-                    let state_data = states[i].data.read().unwrap();
+                    let state_data = states[i].data_f64();
                     let seq_len = states[i].shape[0];
                     batch_data.extend_from_slice(&state_data);
                     if seq_len < max_seq_len {
@@ -964,7 +964,7 @@ impl Ppo {
                     let value = batch_values.index_select(chunk_idx);
                     let entropy = batch_entropy.index_select(chunk_idx);
 
-                    let log_prob_val = log_prob.data.read().unwrap()[0];
+                    let log_prob_val = log_prob.data_f64()[0];
                     let log_ratio_val = log_prob_val - old_log_prob;
                     let ratio_val = log_ratio_val.exp();
                     approx_kl += (ratio_val - 1.0) - log_ratio_val;
@@ -988,8 +988,8 @@ impl Ppo {
                     let ratio_clipped = ratio.clip(1.0 - CLIP_EPSILON, 1.0 + CLIP_EPSILON);
                     let surr2 = ratio_clipped * adv_tensor;
 
-                    let s1_val = surr1.data.read().unwrap()[0];
-                    let s2_val = surr2.data.read().unwrap()[0];
+                    let s1_val = surr1.data_f64()[0];
+                    let s2_val = surr2.data_f64()[0];
                     let policy_loss = if s1_val < s2_val { surr1 } else { surr2 };
 
                     let ret_tensor = TRAINING_SCRATCH.with(|s| {
@@ -1037,7 +1037,7 @@ impl Ppo {
                 if let Some(reg) = self.policy.achf_orthogonal_penalty() {
                     final_loss = final_loss + reg;
                 }
-                loss_sum += final_loss.data.read().unwrap()[0];
+                loss_sum += final_loss.data_f64()[0];
                 loss_count += 1;
                 final_loss.backward();
                 self.policy.update_achf_after_backward();
@@ -1889,14 +1889,10 @@ mod tests {
     #[test]
     fn online_trainer_from_policy_preserves_initial_weights() {
         let policy = ActorCritic::new(42, &crate::config::AchfConfig::default());
-        let expected = policy.parameters()[0].data.read().unwrap().clone();
+        let expected = policy.parameters()[0].data_f64().clone();
 
         let trainer = OnlinePpoTrainer::from_policy(policy, 2, 128);
-        let got = trainer.ppo.policy.parameters()[0]
-            .data
-            .read()
-            .unwrap()
-            .clone();
+        let got = trainer.ppo.policy.parameters()[0].data_f64().clone();
 
         assert_eq!(got, expected);
     }
@@ -1913,14 +1909,12 @@ mod tests {
 
         // Capture original teacher values (initial = policy values since same seed)
         let teacher_before = ppo.ema_policy.as_ref().unwrap().parameters()[0]
-            .data
-            .read()
-            .unwrap()
+            .data_f64()
             .clone();
 
         // Modify student first parameter to 1.0
         let params = ppo.policy.parameters();
-        let mut data = params[0].data.write().unwrap();
+        let mut data = params[0].data_write_f64();
         for val in data.iter_mut() {
             *val = 1.0;
         }
@@ -1932,9 +1926,7 @@ mod tests {
 
         // With decay=0.5, teacher_new = 0.5 * teacher_old + 0.5 * student
         let teacher_after = ppo.ema_policy.as_ref().unwrap().parameters()[0]
-            .data
-            .read()
-            .unwrap()
+            .data_f64()
             .clone();
 
         for (before, after) in teacher_before.iter().zip(teacher_after.iter()) {
@@ -1957,19 +1949,15 @@ mod tests {
 
         // Record first and last tensor values before update
         let before_first = ppo.ema_policy.as_ref().unwrap().parameters()[0]
-            .data
-            .read()
-            .unwrap()
+            .data_f64()
             .clone();
         let before_last = ppo.ema_policy.as_ref().unwrap().parameters()[num_params - 1]
-            .data
-            .read()
-            .unwrap()
+            .data_f64()
             .clone();
 
         // Set all student parameters to 2.0
         for param in ppo.policy.parameters() {
-            let mut data = param.data.write().unwrap();
+            let mut data = param.data_write_f64();
             for val in data.iter_mut() {
                 *val = 2.0;
             }
@@ -1979,14 +1967,10 @@ mod tests {
 
         // Check first and last tensor values after update
         let after_first = ppo.ema_policy.as_ref().unwrap().parameters()[0]
-            .data
-            .read()
-            .unwrap()
+            .data_f64()
             .clone();
         let after_last = ppo.ema_policy.as_ref().unwrap().parameters()[num_params - 1]
-            .data
-            .read()
-            .unwrap()
+            .data_f64()
             .clone();
 
         // First tensor should have changed
@@ -2015,7 +1999,7 @@ mod tests {
 
         // Set all student params to 10.0
         for param in ppo.policy.parameters() {
-            let mut data = param.data.write().unwrap();
+            let mut data = param.data_write_f64();
             for val in data.iter_mut() {
                 *val = 10.0;
             }
@@ -2028,9 +2012,7 @@ mod tests {
 
         // After 100 updates with decay=0.5, EMA should be very close to student (10.0)
         let teacher_final = ppo.ema_policy.as_ref().unwrap().parameters()[0]
-            .data
-            .read()
-            .unwrap()
+            .data_f64()
             .clone();
 
         for val in teacher_final.iter() {

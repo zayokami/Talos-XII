@@ -1,6 +1,7 @@
 use crate::achf::{aggregate_cache_stats_iter, AchfCacheStats, AchfLayer};
 use crate::autograd::{Context, Tensor, TensorReadGuard};
 use crate::config::{AchfConfig, Config};
+use crate::dtype::{Dtype, Storage};
 use crate::nn::{Linear, Module, RMSNorm};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -71,7 +72,7 @@ impl MhcResidual {
         }
         let h_res = Linear::new(dim * n, dim * n, false, seed.wrapping_add(200));
         {
-            let mut w = h_res.weight.data.write().unwrap();
+            let mut w = h_res.weight.data_write_f64();
             // Sinkhorn-Knopp requires strictly positive entries
             for v in w.iter_mut() {
                 *v = v.abs();
@@ -201,7 +202,7 @@ fn concat_last_dim(tensors: &[Tensor]) -> Tensor {
 
     for p in 0..prefix_len {
         for (i, t) in tensors.iter().enumerate() {
-            let t_data = t.data.read().unwrap();
+            let t_data = t.data_f64();
             let src_start = p * last_dim;
             let dst_start = p * out_last_dim + i * last_dim;
             out_data[dst_start..dst_start + last_dim]
@@ -228,7 +229,7 @@ fn split_last_dim(tensor: &Tensor, n: usize) -> Vec<Tensor> {
         n
     );
     let split_dim = last_dim / n;
-    let t_data = tensor.data.read().unwrap();
+    let t_data = tensor.data_f64();
 
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
@@ -447,7 +448,7 @@ impl LuckTransformer {
         let seq_len = shape[1];
         let dim = shape[2];
 
-        let x_data = x.data.read().unwrap();
+        let x_data = x.data_f64();
         let mut out_data = Vec::with_capacity(batch_size * dim);
 
         for b in 0..batch_size {
@@ -742,7 +743,7 @@ impl RoPE {
         let dim = shape[shape.len() - 1];
         assert_eq!(dim, self.dim);
         let seq_len = shape[shape.len() - 2]; // Assumes ..., Seq, Dim
-        let num_elements = x.data.read().unwrap().len();
+        let num_elements = x.data_f64().len();
         let total_batches = num_elements / (seq_len * dim);
 
         // GPU path: if tensor is on CUDA, use the optimized kernel
@@ -759,7 +760,7 @@ impl RoPE {
         }
 
         // CPU path
-        let x_data = x.data.read().unwrap();
+        let x_data = x.data_f64();
         let mut out_data = x_data.clone(); // Copy
 
         // Apply rotation
@@ -795,10 +796,11 @@ impl RoPE {
         let start_pos_cap = start_pos;
 
         Tensor {
-            data: Arc::new(RwLock::new(out_data)),
+            data: Storage::F64(Arc::new(RwLock::new(out_data))),
             grad: Arc::new(RwLock::new(vec![0.0; num_elements])),
             shape: shape.clone(),
             device: crate::autograd::Device::Cpu,
+            dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -1721,10 +1723,11 @@ impl MultiHeadLatentAttention {
         let parents = vec![q.clone(), k.clone()];
 
         Tensor {
-            data: Arc::new(RwLock::new(out_data)),
+            data: Storage::F64(Arc::new(RwLock::new(out_data))),
             grad: Arc::new(RwLock::new(vec![0.0; b * seq * seq])),
             shape: vec![b, seq, seq],
             device: crate::autograd::Device::Cpu,
+            dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -1824,10 +1827,11 @@ impl MultiHeadLatentAttention {
         let parents = vec![probs.clone(), v.clone()];
 
         Tensor {
-            data: Arc::new(RwLock::new(out_data)),
+            data: Storage::F64(Arc::new(RwLock::new(out_data))),
             grad: Arc::new(RwLock::new(vec![0.0; b * seq * dim_v])),
             shape: vec![b, seq, dim_v],
             device: crate::autograd::Device::Cpu,
+            dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -1888,8 +1892,8 @@ impl MultiHeadLatentAttention {
         use crate::cuda::kernels::attention_weighted_sum;
         use crate::cuda::memory::{alloc, copy_d2h};
 
-        let _p_len = probs.data.read().unwrap().len();
-        let _v_len = v.data.read().unwrap().len();
+        let _p_len = probs.data_f64().len();
+        let _v_len = v.data_f64().len();
         let out_len = b * seq * dim_v;
 
         // Upload to GPU
@@ -1930,18 +1934,19 @@ impl MultiHeadLatentAttention {
         }
 
         // Store probs and v data for backward
-        let p_data = probs.data.read().unwrap().clone();
-        let v_data = v.data.read().unwrap().clone();
+        let p_data = probs.data_f64().clone();
+        let v_data = v.data_f64().clone();
         let _b_cap = b;
         let seq_cap = seq;
         let dim_v_cap = dim_v;
 
         let parents = vec![probs.clone(), v.clone()];
         Tensor {
-            data: Arc::new(RwLock::new(out_data)),
+            data: Storage::F64(Arc::new(RwLock::new(out_data))),
             grad: Arc::new(RwLock::new(vec![0.0; out_len])),
             shape: vec![b, seq, dim_v],
             device: crate::autograd::Device::Cpu,
+            dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -2021,10 +2026,11 @@ impl MultiHeadLatentAttention {
 
         let parents = vec![probs.clone(), v.clone()];
         Tensor {
-            data: Arc::new(RwLock::new(out_data)),
+            data: Storage::F64(Arc::new(RwLock::new(out_data))),
             grad: Arc::new(RwLock::new(vec![0.0; b * seq * dim_v])),
             shape: vec![b, seq, dim_v],
             device: crate::autograd::Device::Cpu,
+            dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -2070,7 +2076,7 @@ impl MultiHeadLatentAttention {
     // Apply causal mask: set positions where j > i to -inf (upper triangle excluding diagonal).
     // Input shape: [BH, Seq, Seq]. Backward zeroes out masked gradient positions.
     fn apply_causal_mask(&self, t: &Tensor, seq_len: usize) -> Tensor {
-        let data = t.data.read().unwrap();
+        let data = t.data_f64();
         let bh = data.len() / (seq_len * seq_len);
         let mut new_data = data.clone();
 
@@ -2084,10 +2090,11 @@ impl MultiHeadLatentAttention {
 
         let parents = vec![t.clone()];
         Tensor {
-            data: Arc::new(RwLock::new(new_data)),
+            data: Storage::F64(Arc::new(RwLock::new(new_data))),
             grad: Arc::new(RwLock::new(vec![0.0; data.len()])),
             shape: t.shape.clone(),
             device: crate::autograd::Device::Cpu,
+            dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -2109,15 +2116,16 @@ impl MultiHeadLatentAttention {
     }
 
     fn scale_tensor(&self, t: &Tensor, scale: f64) -> Tensor {
-        let data = t.data.read().unwrap();
+        let data = t.data_f64();
         let new_data: Vec<f64> = data.par_iter().map(|&x| x * scale).collect();
 
         let parents = vec![t.clone()];
         Tensor {
-            data: Arc::new(RwLock::new(new_data)),
+            data: Storage::F64(Arc::new(RwLock::new(new_data))),
             grad: Arc::new(RwLock::new(vec![0.0; data.len()])),
             shape: t.shape.clone(),
             device: crate::autograd::Device::Cpu,
+            dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -2140,7 +2148,7 @@ impl MultiHeadLatentAttention {
             return t.softmax_causal_cuda();
         }
 
-        let data = t.data.read().unwrap();
+        let data = t.data_f64();
 
         let new_data: Vec<f64> = data
             .par_chunks(seq_len)
@@ -2156,10 +2164,11 @@ impl MultiHeadLatentAttention {
         let out_data_clone = new_data.clone();
 
         Tensor {
-            data: Arc::new(RwLock::new(new_data)),
+            data: Storage::F64(Arc::new(RwLock::new(new_data))),
             grad: Arc::new(RwLock::new(vec![0.0; data.len()])),
             shape: t.shape.clone(),
             device: crate::autograd::Device::Cpu,
+            dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -2220,13 +2229,14 @@ impl MultiHeadLatentAttention {
         let parents = vec![a.clone(), b.clone()];
 
         Tensor {
-            data: Arc::new(RwLock::new(new_data)),
+            data: Storage::F64(Arc::new(RwLock::new(new_data))),
             grad: Arc::new(RwLock::new(vec![
                 0.0;
                 total_elements * (last_dim_a + last_dim_b)
             ])),
             shape: new_shape,
             device: crate::autograd::Device::Cpu,
+            dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -2266,18 +2276,18 @@ mod tests {
 
         // Zero-copy reshape: data is shared via Arc
         {
-            let data_reshaped = t_reshaped.data.read().unwrap();
+            let data_reshaped = t_reshaped.data_f64();
             assert_eq!(data_reshaped[0], 1.0);
             assert_eq!(data_reshaped[3], 4.0);
         }
 
         // Verify data is shared (zero-copy): mutating original is visible through reshaped
         {
-            let mut data = t.data.write().unwrap();
+            let mut data = t.data_write_f64();
             data[0] = 10.0;
         }
         {
-            let data_reshaped_after = t_reshaped.data.read().unwrap();
+            let data_reshaped_after = t_reshaped.data_f64();
             assert_eq!(data_reshaped_after[0], 10.0); // Shared �?reflects mutation
         }
     }
@@ -2289,7 +2299,7 @@ mod tests {
         let t_t = t.transpose(0, 1);
         // [[1, 4], [2, 5], [3, 6]]
         assert_eq!(t_t.shape, vec![3, 2]);
-        let data = t_t.data.read().unwrap();
+        let data = t_t.data_f64();
         assert_eq!(data[0], 1.0);
         assert_eq!(data[1], 4.0);
         assert_eq!(data[2], 2.0);
@@ -2422,17 +2432,17 @@ mod tests {
         // Run 1: input_a = [t0, t1, t2, t3]
         let input_a = Tensor::rand(vec![1, seq_len, dim], -0.1, 0.1, 100);
         let out_a = mla.forward(&input_a);
-        let out_a_data = out_a.data.read().unwrap().clone();
+        let out_a_data = out_a.data_f64().clone();
 
         // Run 2: same t0, but t2 and t3 are different
-        let mut input_b_raw = input_a.data.read().unwrap().clone();
+        let mut input_b_raw = input_a.data_f64().clone();
         // Overwrite positions 2 and 3 (indices 2*dim .. 4*dim) with different values
         for val in input_b_raw.iter_mut().take(4 * dim).skip(2 * dim) {
             *val = 99.0 - *val;
         }
         let input_b = Tensor::new(input_b_raw, vec![1, seq_len, dim]);
         let out_b = mla.forward(&input_b);
-        let out_b_data = out_b.data.read().unwrap().clone();
+        let out_b_data = out_b.data_f64().clone();
 
         // Position 0 output must be identical (only sees itself)
         for i in 0..dim {
@@ -2485,7 +2495,7 @@ mod tests {
         // Run 1
         let input_a: Vec<f64> = {
             let t = Tensor::rand(vec![seq_len * dim], -0.1, 0.1, 200);
-            let v = t.data.read().unwrap().clone();
+            let v = t.data_f64().clone();
             v
         };
         let out_a = mla.forward_inference(&input_a);
@@ -2547,7 +2557,7 @@ mod tests {
         // Prefill 2 tokens, then decode token 3 with two different values
         let prefill: Vec<f64> = {
             let t = Tensor::rand(vec![2 * dim], -0.1, 0.1, 300);
-            let v = t.data.read().unwrap().clone();
+            let v = t.data_f64().clone();
             v
         };
 
@@ -2557,7 +2567,7 @@ mod tests {
 
         let token_a: Vec<f64> = {
             let t = Tensor::rand(vec![dim], -0.1, 0.1, 400);
-            let v = t.data.read().unwrap().clone();
+            let v = t.data_f64().clone();
             v
         };
         let out_a = mla.forward_inference_cached(&token_a, &mut cache_a, 2);
@@ -2616,18 +2626,10 @@ mod tests {
         let num_heads = model.blocks[0].mla_layer.config.num_heads;
         let mut base_cache = vec![KVCache::new(num_heads); model.blocks.len()];
 
-        let prefill = Tensor::rand(vec![2 * 8], -0.1, 0.1, 500)
-            .data
-            .read()
-            .unwrap()
-            .clone();
+        let prefill = Tensor::rand(vec![2 * 8], -0.1, 0.1, 500).data_f64().clone();
         let _ = model.forward_inference_step(&prefill, &mut base_cache, 0);
 
-        let token = Tensor::rand(vec![8], -0.1, 0.1, 501)
-            .data
-            .read()
-            .unwrap()
-            .clone();
+        let token = Tensor::rand(vec![8], -0.1, 0.1, 501).data_f64().clone();
 
         let mut cache_a = base_cache.clone();
         let expected = model.forward_inference_step(&token, &mut cache_a, 2);
@@ -2655,7 +2657,7 @@ mod tests {
         let dim = 4;
         let n = 2;
         let mhc = MhcResidual::new(dim, n, 42);
-        let w = mhc.h_res.weight.data.read().unwrap();
+        let w = mhc.h_res.weight.data_f64();
         let total_dim = dim * n;
         // Verify row sums equal 1.0
         for r in 0..total_dim {
@@ -2683,9 +2685,9 @@ mod tests {
     fn test_mhc_forward_inference_matches_tensor() {
         let mhc = MhcResidual::new(4, 2, 42);
         let x = Tensor::rand(vec![2, 4], -0.1, 0.1, 200);
-        let x_data = x.data.read().unwrap().clone();
+        let x_data = x.data_f64().clone();
         let tensor_out = mhc.forward(&x);
-        let tensor_data = tensor_out.data.read().unwrap().clone();
+        let tensor_data = tensor_out.data_f64().clone();
         let inference_out = mhc.forward_inference(&x_data);
         assert_eq!(tensor_data.len(), inference_out.len());
         for (a, b) in tensor_data.iter().zip(inference_out.iter()) {
@@ -2708,8 +2710,8 @@ mod tests {
         assert_eq!(split.len(), 2);
         assert_eq!(split[0].shape, vec![2, 2]);
         assert_eq!(split[1].shape, vec![2, 2]);
-        let s0 = split[0].data.read().unwrap();
-        let s1 = split[1].data.read().unwrap();
+        let s0 = split[0].data_f64();
+        let s1 = split[1].data_f64();
         assert_eq!(s0[0], 1.0);
         assert_eq!(s0[3], 4.0);
         assert_eq!(s1[0], 5.0);
