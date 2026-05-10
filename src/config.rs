@@ -562,7 +562,7 @@ impl Default for Config {
             language: None,
             model_dim: 512,
             model_hidden_dim: 8192,
-            model_num_layers: 12,
+            model_num_layers: 24,
             model_num_heads: 32,
             model_kv_lora_rank: 1024,
             model_qk_rope_dim: 256,
