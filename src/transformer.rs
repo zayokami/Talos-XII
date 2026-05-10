@@ -47,12 +47,211 @@ impl MLAConfig {
     }
 }
 
+// --- MhcResidual: Multi-stream residual expansion (n x C) with doubly-stochastic mixing ---
+#[derive(Clone, Serialize, Deserialize)]
+pub struct MhcResidual {
+    pub h_pre: Vec<Linear>,
+    pub h_res: Linear,
+    pub h_post: Vec<Linear>,
+    pub n: usize,
+}
+
+impl MhcResidual {
+    pub fn new(dim: usize, n: usize, seed: u64) -> Self {
+        let mut h_pre = Vec::with_capacity(n);
+        let mut h_post = Vec::with_capacity(n);
+        for i in 0..n {
+            h_pre.push(Linear::new(dim, dim, false, seed.wrapping_add(i as u64)));
+            h_post.push(Linear::new(
+                dim,
+                dim,
+                false,
+                seed.wrapping_add(100 + i as u64),
+            ));
+        }
+        let h_res = Linear::new(dim * n, dim * n, false, seed.wrapping_add(200));
+        {
+            let mut w = h_res.weight.data.write().unwrap();
+            // Sinkhorn-Knopp requires strictly positive entries
+            for v in w.iter_mut() {
+                *v = v.abs();
+            }
+            crate::achf::sinkhorn_project(&mut w, dim * n, dim * n, 20, None, None);
+        }
+        Self {
+            h_pre,
+            h_res,
+            h_post,
+            n,
+        }
+    }
+
+    /// Tensor-based forward (training). x shape: [..., dim].
+    pub fn forward(&self, x: &Tensor) -> Tensor {
+        // 1. Expand to n streams
+        let streams: Vec<Tensor> = self.h_pre.iter().map(|pre| pre.forward(x)).collect();
+        // 2. Concatenate along last dim: [..., n*dim]
+        let concat = concat_last_dim(&streams);
+        // 3. Apply H_res mixing
+        let mixed = self.h_res.forward(&concat);
+        // 4. Split back to n streams
+        let mixed_streams = split_last_dim(&mixed, self.n);
+        // 5. Apply h_post to each stream and sum
+        let mut out = Tensor::zeros(x.shape.clone());
+        for (post, ms) in self.h_post.iter().zip(mixed_streams.iter()) {
+            out = out + post.forward(ms);
+        }
+        out
+    }
+
+    #[allow(clippy::needless_range_loop)]
+    /// Vec-based forward (inference). x: flat [num_positions * dim].
+    pub fn forward_inference(&self, x: &[f64]) -> Vec<f64> {
+        let dim = self.h_pre[0].in_features;
+        let num_positions = x.len() / dim;
+        let n = self.n;
+        // 1. Expand: n streams
+        let mut streams: Vec<Vec<f64>> = Vec::with_capacity(n);
+        for pre in &self.h_pre {
+            streams.push(pre.forward_inference(x));
+        }
+        // 2. Concatenate along last dim
+        let mut concat = vec![0.0; num_positions * n * dim];
+        for pos in 0..num_positions {
+            for i in 0..n {
+                let src_offset = pos * dim;
+                let dst_offset = pos * n * dim + i * dim;
+                concat[dst_offset..dst_offset + dim]
+                    .copy_from_slice(&streams[i][src_offset..src_offset + dim]);
+            }
+        }
+        // 3. Apply H_res
+        let mixed = self.h_res.forward_inference(&concat);
+        // 4. Split back to n streams
+        let mut mixed_streams: Vec<Vec<f64>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut ms = vec![0.0; num_positions * dim];
+            for pos in 0..num_positions {
+                let src_offset = pos * n * dim + i * dim;
+                let dst_offset = pos * dim;
+                ms[dst_offset..dst_offset + dim]
+                    .copy_from_slice(&mixed[src_offset..src_offset + dim]);
+            }
+            mixed_streams.push(ms);
+        }
+        // 5. Apply h_post and sum
+        let mut out = vec![0.0; x.len()];
+        for (post, ms) in self.h_post.iter().zip(mixed_streams.iter()) {
+            let post_out = post.forward_inference(ms);
+            for i in 0..out.len() {
+                out[i] += post_out[i];
+            }
+        }
+        out
+    }
+
+    pub fn parameters(&self) -> Vec<Tensor> {
+        let mut p = Vec::new();
+        for pre in &self.h_pre {
+            p.extend(pre.parameters());
+        }
+        p.extend(self.h_res.parameters());
+        for post in &self.h_post {
+            p.extend(post.parameters());
+        }
+        p
+    }
+
+    #[cfg(cuda)]
+    pub fn to_cuda(&mut self) {
+        for pre in &mut self.h_pre {
+            pre.to_cuda();
+        }
+        self.h_res.to_cuda();
+        for post in &mut self.h_post {
+            post.to_cuda();
+        }
+    }
+}
+
+/// Concatenate n tensors along the last dimension.
+/// All tensors must share the same shape except the last dim.
+fn concat_last_dim(tensors: &[Tensor]) -> Tensor {
+    assert!(!tensors.is_empty(), "concat_last_dim: empty input");
+    let first_shape = &tensors[0].shape;
+    let prefix_len: usize = first_shape[..first_shape.len() - 1].iter().product();
+    let last_dim = first_shape[first_shape.len() - 1];
+    let n = tensors.len();
+    let out_last_dim = last_dim * n;
+    let total = prefix_len * out_last_dim;
+
+    let mut out_data = vec![0.0; total];
+    for t in tensors.iter() {
+        assert_eq!(
+            &t.shape[..t.shape.len() - 1],
+            &first_shape[..first_shape.len() - 1],
+            "concat_last_dim: prefix shapes must match"
+        );
+        assert_eq!(
+            t.shape[t.shape.len() - 1],
+            last_dim,
+            "concat_last_dim: last dim must match"
+        );
+    }
+
+    for p in 0..prefix_len {
+        for (i, t) in tensors.iter().enumerate() {
+            let t_data = t.data.read().unwrap();
+            let src_start = p * last_dim;
+            let dst_start = p * out_last_dim + i * last_dim;
+            out_data[dst_start..dst_start + last_dim]
+                .copy_from_slice(&t_data[src_start..src_start + last_dim]);
+        }
+    }
+
+    let mut out_shape = first_shape.clone();
+    *out_shape.last_mut().unwrap() = out_last_dim;
+    Tensor::new(out_data, out_shape)
+}
+
+/// Split a tensor along the last dimension into n equal parts.
+fn split_last_dim(tensor: &Tensor, n: usize) -> Vec<Tensor> {
+    assert!(n > 0, "split_last_dim: n must be > 0");
+    let shape = &tensor.shape;
+    let prefix_len: usize = shape[..shape.len() - 1].iter().product();
+    let last_dim = shape[shape.len() - 1];
+    assert_eq!(
+        last_dim % n,
+        0,
+        "split_last_dim: last dim {} not divisible by {}",
+        last_dim,
+        n
+    );
+    let split_dim = last_dim / n;
+    let t_data = tensor.data.read().unwrap();
+
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut chunk_data = vec![0.0; prefix_len * split_dim];
+        for p in 0..prefix_len {
+            let src_start = p * last_dim + i * split_dim;
+            let dst_start = p * split_dim;
+            chunk_data[dst_start..dst_start + split_dim]
+                .copy_from_slice(&t_data[src_start..src_start + split_dim]);
+        }
+        let mut chunk_shape = shape.clone();
+        *chunk_shape.last_mut().unwrap() = split_dim;
+        out.push(Tensor::new(chunk_data, chunk_shape));
+    }
+    out
+}
+
 // --- LuckTransformer (Transformer Backbone with MLA) ---
 #[derive(Clone, Serialize, Deserialize)]
 pub struct TransformerBlock {
     pub norm_1: RMSNorm,
     pub mla_layer: MultiHeadLatentAttention,
-    pub achf_attn: Option<AchfLayer>,
+    pub mhc: Option<MhcResidual>,
     pub norm_2: RMSNorm,
     pub ffn_1: Linear,
     pub ffn_2: Linear,
@@ -67,6 +266,7 @@ struct TransformerStepScratch {
     norm2: Vec<f64>,
     ffn1: Vec<f64>,
     ffn2: Vec<f64>,
+    mhc_scratch: Vec<f64>,
 }
 
 thread_local! {
@@ -83,6 +283,7 @@ pub struct LuckTransformer {
 }
 
 impl LuckTransformer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         in_dim: usize,
         hidden_dim: usize,
@@ -91,15 +292,17 @@ impl LuckTransformer {
         seed: u64,
         achf: &AchfConfig,
         mla_config: &MLAConfig,
+        use_mhc: bool,
+        mhc_factor: usize,
     ) -> Self {
         let num_layers = if num_layers == 0 { 2 } else { num_layers };
         let mut blocks = Vec::with_capacity(num_layers);
         for layer_idx in 0..num_layers {
             let layer_seed = seed.wrapping_add((layer_idx as u64).wrapping_mul(200));
-            let achf_attn = if achf.enabled && achf.apply_attn {
-                Some(AchfLayer::new_square(
+            let mhc = if use_mhc && mhc_factor > 1 {
+                Some(MhcResidual::new(
                     hidden_dim,
-                    achf.clone(),
+                    mhc_factor,
                     layer_seed.wrapping_add(1000),
                 ))
             } else {
@@ -119,7 +322,7 @@ impl LuckTransformer {
             blocks.push(TransformerBlock {
                 norm_1: RMSNorm::new(hidden_dim, 1e-5, layer_seed + 5),
                 mla_layer: MultiHeadLatentAttention::new(mla_config.clone(), layer_seed + 10),
-                achf_attn,
+                mhc,
                 norm_2: RMSNorm::new(hidden_dim, 1e-5, layer_seed + 15),
                 ffn_1: Linear::new(hidden_dim, hidden_dim * 2, true, layer_seed + 20),
                 ffn_2: Linear::new(hidden_dim * 2, hidden_dim, true, layer_seed + 30),
@@ -146,6 +349,8 @@ impl LuckTransformer {
             seed,
             &config.achf,
             &mla,
+            config.use_multi_stream,
+            config.multi_stream_factor,
         )
     }
 
@@ -176,6 +381,8 @@ impl LuckTransformer {
             seed,
             achf,
             &mla_config,
+            false,
+            4,
         )
     }
 
@@ -185,8 +392,8 @@ impl LuckTransformer {
         for block in &mut self.blocks {
             block.norm_1.to_cuda();
             block.mla_layer.to_cuda();
-            if let Some(ref mut achf) = block.achf_attn {
-                achf.to_cuda();
+            if let Some(ref mut mhc) = block.mhc {
+                mhc.to_cuda();
             }
             block.norm_2.to_cuda();
             block.ffn_1.to_cuda();
@@ -208,11 +415,12 @@ impl LuckTransformer {
             // Block 1: MLA (Pre-Norm)
             let h_norm1 = block.norm_1.forward(&h);
             let attn_out = block.mla_layer.forward(&h_norm1);
-            let mut h2 = h.clone() + attn_out;
-            if let Some(achf) = &block.achf_attn {
-                let residual = achf.forward_residual(&h);
-                h2 = &h2 + &residual;
-            }
+            let h2 = if let Some(mhc) = &block.mhc {
+                // mHC multi-stream residual replaces standard residual
+                &h + &mhc.forward(&attn_out)
+            } else {
+                h.clone() + attn_out
+            };
 
             // Block 2: FFN (Pre-Norm)
             let h_norm2 = block.norm_2.forward(&h2);
@@ -252,9 +460,6 @@ impl LuckTransformer {
 
     pub fn update_achf_after_backward(&self) {
         for block in &self.blocks {
-            if let Some(achf) = &block.achf_attn {
-                achf.update_after_backward();
-            }
             if let Some(achf) = &block.achf_ffn {
                 achf.update_after_backward();
             }
@@ -263,9 +468,6 @@ impl LuckTransformer {
 
     pub fn freeze_achf_for_inference(&self) {
         for block in &self.blocks {
-            if let Some(achf) = &block.achf_attn {
-                achf.freeze_for_inference();
-            }
             if let Some(achf) = &block.achf_ffn {
                 achf.freeze_for_inference();
             }
@@ -275,9 +477,6 @@ impl LuckTransformer {
     pub fn snapshot_achf(&self) -> Option<crate::achf::AchfStateSnapshot> {
         for block in &self.blocks {
             if let Some(achf) = &block.achf_ffn {
-                return Some(achf.snapshot_state());
-            }
-            if let Some(achf) = &block.achf_attn {
                 return Some(achf.snapshot_state());
             }
         }
@@ -292,13 +491,14 @@ impl LuckTransformer {
             let h_norm1 = block.norm_1.forward_inference(&h);
             let attn_out = block.mla_layer.forward_inference(&h_norm1);
             let mut h2 = vec![0.0; h.len()];
-            for i in 0..h.len() {
-                h2[i] = h[i] + attn_out[i];
-            }
-            if let Some(achf) = &block.achf_attn {
-                let res = achf.forward_inference_forced_path(&h, forced_path);
-                for i in 0..h2.len() {
-                    h2[i] += res[i];
+            if let Some(mhc) = &block.mhc {
+                let mhc_out = mhc.forward_inference(&attn_out);
+                for i in 0..h.len() {
+                    h2[i] = h[i] + mhc_out[i];
+                }
+            } else {
+                for i in 0..h.len() {
+                    h2[i] = h[i] + attn_out[i];
                 }
             }
             let h_norm2 = block.norm_2.forward_inference(&h2);
@@ -320,14 +520,9 @@ impl LuckTransformer {
     }
 
     pub fn achf_cache_stats_iter(&self) -> impl Iterator<Item = AchfCacheStats> + '_ {
-        self.blocks.iter().flat_map(|block| {
-            [
-                block.achf_attn.as_ref().map(|achf| achf.cache_stats()),
-                block.achf_ffn.as_ref().map(|achf| achf.cache_stats()),
-            ]
-            .into_iter()
-            .flatten()
-        })
+        self.blocks
+            .iter()
+            .flat_map(|block| block.achf_ffn.as_ref().map(|achf| achf.cache_stats()))
     }
 
     pub fn achf_cache_stats_aggregate(&self) -> AchfCacheStats {
@@ -337,14 +532,6 @@ impl LuckTransformer {
     pub fn achf_orthogonal_penalty(&self) -> Option<Tensor> {
         let mut reg: Option<Tensor> = None;
         for block in &self.blocks {
-            if let Some(achf) = &block.achf_attn {
-                if let Some(val) = achf.orthogonal_penalty() {
-                    reg = Some(match reg {
-                        Some(r) => r + val,
-                        None => val,
-                    });
-                }
-            }
             if let Some(achf) = &block.achf_ffn {
                 if let Some(val) = achf.orthogonal_penalty() {
                     reg = Some(match reg {
@@ -358,7 +545,7 @@ impl LuckTransformer {
     }
 
     pub fn forward_inference(&self, x: &[f64]) -> Vec<f64> {
-        use crate::simd::{vector_add, vector_gelu, vector_grad_acc};
+        use crate::simd::{vector_add, vector_gelu};
 
         let mut h = self.embed.forward_inference(x);
 
@@ -367,10 +554,11 @@ impl LuckTransformer {
             let attn_out = block.mla_layer.forward_inference(&h_norm1);
 
             let mut h2 = vec![0.0; h.len()];
-            vector_add(&mut h2, &h, &attn_out);
-            if let Some(achf) = &block.achf_attn {
-                let achf_out = achf.forward_inference_residual(&h);
-                vector_grad_acc(&mut h2, &achf_out);
+            if let Some(mhc) = &block.mhc {
+                let mhc_out = mhc.forward_inference(&attn_out);
+                vector_add(&mut h2, &h, &mhc_out);
+            } else {
+                vector_add(&mut h2, &h, &attn_out);
             }
 
             let h_norm2 = block.norm_2.forward_inference(&h2);
@@ -431,6 +619,7 @@ impl LuckTransformer {
                 norm2,
                 ffn1,
                 ffn2,
+                mhc_scratch,
             } = &mut *scratch;
 
             self.embed.forward_inference_into(x, h);
@@ -443,14 +632,11 @@ impl LuckTransformer {
                     .mla_layer
                     .forward_inference_cached_into(norm1, kv_cache, start_pos, attn);
 
-                let achf_attn_out = block
-                    .achf_attn
-                    .as_ref()
-                    .map(|achf| achf.forward_inference_residual(h));
-
-                vector_grad_acc(h, attn);
-                if let Some(ref achf_out) = achf_attn_out {
-                    vector_grad_acc(h, achf_out);
+                if let Some(mhc) = &block.mhc {
+                    *mhc_scratch = mhc.forward_inference(attn);
+                    vector_grad_acc(h, mhc_scratch);
+                } else {
+                    vector_grad_acc(h, attn);
                 }
 
                 block.norm_2.forward_inference_into(h, norm2);
@@ -499,8 +685,8 @@ impl Module for LuckTransformer {
         for block in &self.blocks {
             p.extend(block.norm_1.parameters());
             p.extend(block.mla_layer.parameters());
-            if let Some(achf) = &block.achf_attn {
-                p.extend(achf.parameters());
+            if let Some(mhc) = &block.mhc {
+                p.extend(mhc.parameters());
             }
             p.extend(block.norm_2.parameters());
             p.extend(block.ffn_1.parameters());
@@ -2451,5 +2637,82 @@ mod tests {
         model.forward_inference_step_into(&token, &mut cache_b, 2, &mut actual);
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_mhc_preserves_dim() {
+        let mhc = MhcResidual::new(8, 4, 42);
+        let x = Tensor::rand(vec![2, 3, 8], -0.1, 0.1, 100);
+        let out = mhc.forward(&x);
+        assert_eq!(
+            out.shape, x.shape,
+            "MhcResidual output shape must match input"
+        );
+    }
+
+    #[test]
+    fn test_h_res_doubly_stochastic() {
+        let dim = 4;
+        let n = 2;
+        let mhc = MhcResidual::new(dim, n, 42);
+        let w = mhc.h_res.weight.data.read().unwrap();
+        let total_dim = dim * n;
+        // Verify row sums equal 1.0
+        for r in 0..total_dim {
+            let sum: f64 = (0..total_dim).map(|c| w[r * total_dim + c]).sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-6,
+                "H_res row {} sum = {}, expected 1.0",
+                r,
+                sum
+            );
+        }
+        // Verify column sums equal 1.0
+        for c in 0..total_dim {
+            let sum: f64 = (0..total_dim).map(|r| w[r * total_dim + c]).sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-6,
+                "H_res col {} sum = {}, expected 1.0",
+                c,
+                sum
+            );
+        }
+    }
+
+    #[test]
+    fn test_mhc_forward_inference_matches_tensor() {
+        let mhc = MhcResidual::new(4, 2, 42);
+        let x = Tensor::rand(vec![2, 4], -0.1, 0.1, 200);
+        let x_data = x.data.read().unwrap().clone();
+        let tensor_out = mhc.forward(&x);
+        let tensor_data = tensor_out.data.read().unwrap().clone();
+        let inference_out = mhc.forward_inference(&x_data);
+        assert_eq!(tensor_data.len(), inference_out.len());
+        for (a, b) in tensor_data.iter().zip(inference_out.iter()) {
+            assert!(
+                (a - b).abs() < 1e-9,
+                "Tensor and inference paths diverge: {} vs {}",
+                a,
+                b
+            );
+        }
+    }
+
+    #[test]
+    fn test_concat_split_last_dim_roundtrip() {
+        let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
+        let b = Tensor::new(vec![5.0, 6.0, 7.0, 8.0], vec![2, 2]);
+        let concat = concat_last_dim(&[a.clone(), b.clone()]);
+        assert_eq!(concat.shape, vec![2, 4]);
+        let split = split_last_dim(&concat, 2);
+        assert_eq!(split.len(), 2);
+        assert_eq!(split[0].shape, vec![2, 2]);
+        assert_eq!(split[1].shape, vec![2, 2]);
+        let s0 = split[0].data.read().unwrap();
+        let s1 = split[1].data.read().unwrap();
+        assert_eq!(s0[0], 1.0);
+        assert_eq!(s0[3], 4.0);
+        assert_eq!(s1[0], 5.0);
+        assert_eq!(s1[3], 8.0);
     }
 }

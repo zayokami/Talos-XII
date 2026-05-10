@@ -330,6 +330,7 @@ impl AchfLayer {
         layer
     }
 
+    #[allow(dead_code)]
     pub fn new_square(dim: usize, config: AchfConfig, seed: u64) -> Self {
         Self::new(dim, dim, false, config, seed)
     }
@@ -400,6 +401,7 @@ impl Module for AchfLayer {
 }
 
 impl AchfLayer {
+    #[allow(dead_code)]
     pub fn forward_residual(&self, x: &Tensor) -> Tensor {
         if !self.config.enabled {
             return Tensor::zeros(x.shape.clone());
@@ -1148,7 +1150,7 @@ fn rowcol_project(w: &mut [f64], rows: usize, cols: usize) {
     }
 }
 
-fn sinkhorn_project(
+pub(crate) fn sinkhorn_project(
     w: &mut [f64],
     rows: usize,
     cols: usize,
@@ -1580,10 +1582,7 @@ mod tests {
     fn test_sinkhorn_doubly_stochastic() {
         // Build a 4x4 positive matrix
         let mut w = vec![
-            1.0, 2.0, 3.0, 4.0,
-            5.0, 6.0, 7.0, 8.0,
-            9.0, 10.0, 11.0, 12.0,
-            13.0, 14.0, 15.0, 16.0,
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
         ];
         let (row_scales, col_scales) = sinkhorn_project(&mut w, 4, 4, 20, None, None);
         // Verify all row sums equal 1.0
@@ -1616,10 +1615,7 @@ mod tests {
     #[test]
     fn test_sinkhorn_warm_start_accelerates() {
         let w0 = vec![
-            1.0, 2.0, 3.0, 4.0,
-            5.0, 6.0, 7.0, 8.0,
-            9.0, 10.0, 11.0, 12.0,
-            13.0, 14.0, 15.0, 16.0,
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
         ];
         // First projection with few steps (no warm-start)
         let mut w1 = w0.clone();
