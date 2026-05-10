@@ -368,24 +368,25 @@ impl Module for RMSNorm {
 
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(out_data))),
-            grad: Arc::new(RwLock::new(vec![0.0; num_elements])),
+            grad: Storage::zeros(num_elements, Tensor::grad_dtype_for(x.dtype)),
             shape: shape.clone(),
             device: x.device,
             dtype: x.dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let x_in = &parents[0];
                     let w_in = &parents[1];
 
-                    let mut x_grad = x_in.grad.write().unwrap();
-                    let mut w_grad = w_in.grad.write().unwrap();
+                    let mut x_grad = x_in.grad_write_f64();
+                    let mut w_grad = w_in.grad_write_f64();
                     let w_data = w_in.data_f64();
 
                     // 1. Calculate dL/dx parallel over rows
                     x_grad
                         .par_chunks_mut(dim)
-                        .zip(grad_out.par_chunks(dim))
+                        .zip(grad_out_f64.par_chunks(dim))
                         .enumerate()
                         .for_each(|(r, (x_g_row, g_out_row))| {
                             let base = r * dim;
@@ -412,14 +413,14 @@ impl Module for RMSNorm {
                         });
 
                     // 2. Accumulate weight gradient (reduction over batch)
-                    let num_rows = grad_out.len() / dim;
+                    let num_rows = grad_out_f64.len() / dim;
 
                     // Parallelize over dimension (feature)
                     w_grad.par_iter_mut().enumerate().for_each(|(i, wg)| {
                         let mut sum = 0.0;
                         for r in 0..num_rows {
                             let base = r * dim;
-                            sum += grad_out[base + i] * x_hat_cache[base + i];
+                            sum += grad_out_f64[base + i] * x_hat_cache[base + i];
                         }
                         *wg += sum;
                     });

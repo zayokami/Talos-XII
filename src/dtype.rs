@@ -128,6 +128,137 @@ impl Storage {
             ))),
         }
     }
+
+    /// Create zero-initialized storage with the specified dtype.
+    pub fn zeros(len: usize, dtype: Dtype) -> Self {
+        match dtype {
+            Dtype::F64 => Storage::F64(Arc::new(RwLock::new(vec![0.0; len]))),
+            Dtype::F32 => Storage::F32(Arc::new(RwLock::new(vec![0.0_f32; len]))),
+            Dtype::BF16 => Storage::BF16(Arc::new(RwLock::new(vec![bf16(0); len]))),
+            Dtype::I8 => Storage::I8(Arc::new(RwLock::new(vec![0_i8; len]))),
+        }
+    }
+
+    /// Convert storage data to Vec<f32>, regardless of original dtype.
+    pub fn to_f32_vec(&self) -> Vec<f32> {
+        match self {
+            Storage::F64(v) => v.read().unwrap().iter().map(|&x| x as f32).collect(),
+            Storage::F32(v) => v.read().unwrap().iter().copied().collect(),
+            Storage::BF16(v) => v.read().unwrap().iter().map(|&x| x.to_f32()).collect(),
+            Storage::I8(v) => v.read().unwrap().iter().map(|&x| x as f32).collect(),
+        }
+    }
+
+    /// Accumulate an f32 slice into an F32 storage (panics if not F32).
+    pub fn accumulate_f32(&self, slice: &[f32]) {
+        match self {
+            Storage::F32(v) => {
+                let mut guard = v.write().unwrap();
+                assert_eq!(guard.len(), slice.len());
+                for (dst, &src) in guard.iter_mut().zip(slice.iter()) {
+                    *dst += src;
+                }
+            }
+            _ => panic!(
+                "accumulate_f32 called on non-F32 storage: {:?}",
+                self.dtype()
+            ),
+        }
+    }
+
+    /// Accumulate an f64 slice into an F64 storage (panics if not F64).
+    pub fn accumulate_f64(&self, slice: &[f64]) {
+        match self {
+            Storage::F64(v) => {
+                let mut guard = v.write().unwrap();
+                assert_eq!(guard.len(), slice.len());
+                for (dst, &src) in guard.iter_mut().zip(slice.iter()) {
+                    *dst += src;
+                }
+            }
+            _ => panic!(
+                "accumulate_f64 called on non-F64 storage: {:?}",
+                self.dtype()
+            ),
+        }
+    }
+
+    /// Accumulate an f64 slice, converting to native dtype as needed.
+    /// Supports F64 (direct) and F32 (cast). Panics for other dtypes.
+    pub fn accumulate_f64_slice(&self, slice: &[f64]) {
+        match self {
+            Storage::F64(v) => {
+                let mut guard = v.write().unwrap();
+                assert_eq!(guard.len(), slice.len());
+                for (dst, &src) in guard.iter_mut().zip(slice.iter()) {
+                    *dst += src;
+                }
+            }
+            Storage::F32(v) => {
+                let mut guard = v.write().unwrap();
+                assert_eq!(guard.len(), slice.len());
+                for (dst, &src) in guard.iter_mut().zip(slice.iter()) {
+                    *dst += src as f32;
+                }
+            }
+            _ => panic!("accumulate_f64_slice not supported for {:?}", self.dtype()),
+        }
+    }
+
+    /// Fill storage with a value (converted to native dtype).
+    pub fn fill_f64(&self, value: f64) {
+        match self {
+            Storage::F64(v) => {
+                let mut guard = v.write().unwrap();
+                guard.fill(value);
+            }
+            Storage::F32(v) => {
+                let mut guard = v.write().unwrap();
+                let v32 = value as f32;
+                guard.fill(v32);
+            }
+            Storage::BF16(v) => {
+                let mut guard = v.write().unwrap();
+                let vbf = bf16::from_f64(value);
+                guard.fill(vbf);
+            }
+            Storage::I8(v) => {
+                let mut guard = v.write().unwrap();
+                let vi8 = value as i8;
+                guard.fill(vi8);
+            }
+        }
+    }
+
+    /// Zero all elements.
+    pub fn zero(&self) {
+        match self {
+            Storage::F64(v) => v.write().unwrap().fill(0.0),
+            Storage::F32(v) => v.write().unwrap().fill(0.0_f32),
+            Storage::BF16(v) => v.write().unwrap().fill(bf16(0)),
+            Storage::I8(v) => v.write().unwrap().fill(0_i8),
+        }
+    }
+
+    /// Return true if this is F64 storage.
+    pub fn is_f64(&self) -> bool {
+        matches!(self, Storage::F64(_))
+    }
+
+    /// Return true if this is F32 storage.
+    pub fn is_f32(&self) -> bool {
+        matches!(self, Storage::F32(_))
+    }
+
+    /// Return a unique identifier for this storage (based on Arc pointer).
+    pub fn id(&self) -> usize {
+        match self {
+            Storage::F64(v) => Arc::as_ptr(v) as usize,
+            Storage::F32(v) => Arc::as_ptr(v) as usize,
+            Storage::BF16(v) => Arc::as_ptr(v) as usize,
+            Storage::I8(v) => Arc::as_ptr(v) as usize,
+        }
+    }
 }
 
 /// Trait for types that can be tensor elements.

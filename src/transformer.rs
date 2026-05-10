@@ -797,15 +797,16 @@ impl RoPE {
 
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(out_data))),
-            grad: Arc::new(RwLock::new(vec![0.0; num_elements])),
+            grad: Storage::zeros(num_elements, Tensor::grad_dtype_for(Dtype::F64)),
             shape: shape.clone(),
             device: crate::autograd::Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let input = &parents[0];
-                    let mut inp_grad = input.grad.write().unwrap();
+                    let mut inp_grad = input.grad_write_f64();
                     let shape = &input.shape;
 
                     let seq_len = shape[shape.len() - 2];
@@ -824,8 +825,8 @@ impl RoPE {
                                 let c = cos_cache[cache_idx + i];
                                 let s = sin_cache[cache_idx + i];
 
-                                let g1 = grad_out[base_idx + 2 * i];
-                                let g2 = grad_out[base_idx + 2 * i + 1];
+                                let g1 = grad_out_f64[base_idx + 2 * i];
+                                let g2 = grad_out_f64[base_idx + 2 * i + 1];
 
                                 // dL/dx1 = g1 * c + g2 * s
                                 // dL/dx2 = -g1 * s + g2 * c
@@ -1724,13 +1725,14 @@ impl MultiHeadLatentAttention {
 
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(out_data))),
-            grad: Arc::new(RwLock::new(vec![0.0; b * seq * seq])),
+            grad: Storage::zeros(b * seq * seq, Tensor::grad_dtype_for(Dtype::F64)),
             shape: vec![b, seq, seq],
             device: crate::autograd::Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let q_in = &parents[0];
                     let k_in = &parents[1];
                     // Use batch lock for data read
@@ -1738,8 +1740,8 @@ impl MultiHeadLatentAttention {
                     let q_data = guards.get(0);
                     let k_data = guards.get(1);
 
-                    let mut q_grad = q_in.grad.write().unwrap();
-                    let mut k_grad = k_in.grad.write().unwrap();
+                    let mut q_grad = q_in.grad_write_f64();
+                    let mut k_grad = k_in.grad_write_f64();
 
                     let chunk_size_grad = seq * dim;
                     let chunk_size_out = seq * seq;
@@ -1747,7 +1749,7 @@ impl MultiHeadLatentAttention {
                     q_grad
                         .par_chunks_mut(chunk_size_grad)
                         .zip(k_grad.par_chunks_mut(chunk_size_grad))
-                        .zip(grad_out.par_chunks(chunk_size_out))
+                        .zip(grad_out_f64.par_chunks(chunk_size_out))
                         .enumerate()
                         .for_each(|(batch_idx, ((q_g_chunk, k_g_chunk), g_out_chunk))| {
                             let base_data = batch_idx * seq * dim;
@@ -1828,13 +1830,14 @@ impl MultiHeadLatentAttention {
 
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(out_data))),
-            grad: Arc::new(RwLock::new(vec![0.0; b * seq * dim_v])),
+            grad: Storage::zeros(b * seq * dim_v, Tensor::grad_dtype_for(Dtype::F64)),
             shape: vec![b, seq, dim_v],
             device: crate::autograd::Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let p_in = &parents[0];
                     let v_in = &parents[1];
                     // Use batch lock for data read
@@ -1842,8 +1845,8 @@ impl MultiHeadLatentAttention {
                     let p_data = guards.get(0);
                     let v_data = guards.get(1);
 
-                    let mut p_grad = p_in.grad.write().unwrap();
-                    let mut v_grad = v_in.grad.write().unwrap();
+                    let mut p_grad = p_in.grad_write_f64();
+                    let mut v_grad = v_in.grad_write_f64();
 
                     let chunk_size_p = seq * seq;
                     let chunk_size_v = seq * dim_v;
@@ -1852,7 +1855,7 @@ impl MultiHeadLatentAttention {
                     p_grad
                         .par_chunks_mut(chunk_size_p)
                         .zip(v_grad.par_chunks_mut(chunk_size_v))
-                        .zip(grad_out.par_chunks(chunk_size_grad))
+                        .zip(grad_out_f64.par_chunks(chunk_size_grad))
                         .enumerate()
                         .for_each(|(batch_idx, ((p_g_chunk, v_g_chunk), g_out_chunk))| {
                             let base_p = batch_idx * seq * seq;
@@ -1943,17 +1946,18 @@ impl MultiHeadLatentAttention {
         let parents = vec![probs.clone(), v.clone()];
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(out_data))),
-            grad: Arc::new(RwLock::new(vec![0.0; out_len])),
+            grad: Storage::zeros(out_len, Tensor::grad_dtype_for(Dtype::F64)),
             shape: vec![b, seq, dim_v],
             device: crate::autograd::Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let p_in = &parents[0];
                     let v_in = &parents[1];
-                    let mut p_grad = p_in.grad.write().unwrap();
-                    let mut v_grad = v_in.grad.write().unwrap();
+                    let mut p_grad = p_in.grad_write_f64();
+                    let mut v_grad = v_in.grad_write_f64();
 
                     let chunk_size_p = seq_cap * seq_cap;
                     let chunk_size_v = seq_cap * dim_v_cap;
@@ -1962,7 +1966,7 @@ impl MultiHeadLatentAttention {
                     p_grad
                         .par_chunks_mut(chunk_size_p)
                         .zip(v_grad.par_chunks_mut(chunk_size_v))
-                        .zip(grad_out.par_chunks(chunk_size_grad))
+                        .zip(grad_out_f64.par_chunks(chunk_size_grad))
                         .enumerate()
                         .for_each(|(batch_idx, ((p_g_chunk, v_g_chunk), g_out_chunk))| {
                             let base_p = batch_idx * seq_cap * seq_cap;
@@ -2027,21 +2031,22 @@ impl MultiHeadLatentAttention {
         let parents = vec![probs.clone(), v.clone()];
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(out_data))),
-            grad: Arc::new(RwLock::new(vec![0.0; b * seq * dim_v])),
+            grad: Storage::zeros(b * seq * dim_v, Tensor::grad_dtype_for(Dtype::F64)),
             shape: vec![b, seq, dim_v],
             device: crate::autograd::Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let p_in = &parents[0];
                     let v_in = &parents[1];
                     let guards = TensorReadGuard::new(&[p_in, v_in]);
                     let p_data = guards.get(0);
                     let v_data = guards.get(1);
 
-                    let mut p_grad = p_in.grad.write().unwrap();
-                    let mut v_grad = v_in.grad.write().unwrap();
+                    let mut p_grad = p_in.grad_write_f64();
+                    let mut v_grad = v_in.grad_write_f64();
 
                     let chunk_size_p = seq * seq;
                     let chunk_size_v = seq * dim_v;
@@ -2050,7 +2055,7 @@ impl MultiHeadLatentAttention {
                     p_grad
                         .par_chunks_mut(chunk_size_p)
                         .zip(v_grad.par_chunks_mut(chunk_size_v))
-                        .zip(grad_out.par_chunks(chunk_size_grad))
+                        .zip(grad_out_f64.par_chunks(chunk_size_grad))
                         .enumerate()
                         .for_each(|(batch_idx, ((p_g_chunk, v_g_chunk), g_out_chunk))| {
                             let base_p = batch_idx * seq * seq;
@@ -2091,16 +2096,18 @@ impl MultiHeadLatentAttention {
         let parents = vec![t.clone()];
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(new_data))),
-            grad: Arc::new(RwLock::new(vec![0.0; data.len()])),
+            grad: Storage::zeros(data.len(), Tensor::grad_dtype_for(Dtype::F64)),
             shape: t.shape.clone(),
             device: crate::autograd::Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
-                    let mut inp_grad = parents[0].grad.write().unwrap();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = parents[0].grad_write_f64();
                     let bh = inp_grad.len() / (seq_len * seq_len);
-                    for (idx, (&g, ig)) in grad_out.iter().zip(inp_grad.iter_mut()).enumerate() {
+                    for (idx, (&g, ig)) in grad_out_f64.iter().zip(inp_grad.iter_mut()).enumerate()
+                    {
                         let local = idx % (seq_len * seq_len);
                         let i = local / seq_len;
                         let j = local % seq_len;
@@ -2122,17 +2129,18 @@ impl MultiHeadLatentAttention {
         let parents = vec![t.clone()];
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(new_data))),
-            grad: Arc::new(RwLock::new(vec![0.0; data.len()])),
+            grad: Storage::zeros(data.len(), Tensor::grad_dtype_for(Dtype::F64)),
             shape: t.shape.clone(),
             device: crate::autograd::Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
-                    let mut inp_grad = parents[0].grad.write().unwrap();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = parents[0].grad_write_f64();
                     inp_grad
                         .par_iter_mut()
-                        .zip(grad_out.par_iter())
+                        .zip(grad_out_f64.par_iter())
                         .for_each(|(ig, &g)| *ig += g * scale);
                 }),
             })),
@@ -2165,19 +2173,20 @@ impl MultiHeadLatentAttention {
 
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(new_data))),
-            grad: Arc::new(RwLock::new(vec![0.0; data.len()])),
+            grad: Storage::zeros(data.len(), Tensor::grad_dtype_for(Dtype::F64)),
             shape: t.shape.clone(),
             device: crate::autograd::Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
-                    let mut inp_grad = parents[0].grad.write().unwrap();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = parents[0].grad_write_f64();
                     let out_data = &out_data_clone;
 
                     inp_grad
                         .par_chunks_mut(seq_len)
-                        .zip(grad_out.par_chunks(seq_len))
+                        .zip(grad_out_f64.par_chunks(seq_len))
                         .zip(out_data.par_chunks(seq_len))
                         .for_each(|((ig_row, g_row), out_row)| {
                             let mut sum_gy = 0.0;
@@ -2230,25 +2239,26 @@ impl MultiHeadLatentAttention {
 
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(new_data))),
-            grad: Arc::new(RwLock::new(vec![
-                0.0;
-                total_elements * (last_dim_a + last_dim_b)
-            ])),
+            grad: Storage::zeros(
+                total_elements * (last_dim_a + last_dim_b),
+                Tensor::grad_dtype_for(Dtype::F64),
+            ),
             shape: new_shape,
             device: crate::autograd::Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
-                    let mut a_grad = parents[0].grad.write().unwrap();
-                    let mut b_grad = parents[1].grad.write().unwrap();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut a_grad = parents[0].grad_write_f64();
+                    let mut b_grad = parents[1].grad_write_f64();
 
                     let stride = last_dim_a + last_dim_b;
 
                     a_grad
                         .par_chunks_mut(last_dim_a)
                         .zip(b_grad.par_chunks_mut(last_dim_b))
-                        .zip(grad_out.par_chunks(stride))
+                        .zip(grad_out_f64.par_chunks(stride))
                         .for_each(|((ag_row, bg_row), g_row)| {
                             for k in 0..last_dim_a {
                                 ag_row[k] += g_row[k];
@@ -2336,12 +2346,12 @@ mod tests {
 
         // Check if gradients propagated to weights
         // W_DKV is the first projection
-        let w_dkv_grad = mla.w_dkv.weight.grad.read().unwrap();
+        let w_dkv_grad = mla.w_dkv.weight.grad_read_f64();
         let grad_sum: f64 = w_dkv_grad.iter().sum();
         assert!(grad_sum.abs() > 0.0, "Gradient should not be zero");
 
         // Check W_UK
-        let w_uk_grad = mla.w_uk.weight.grad.read().unwrap();
+        let w_uk_grad = mla.w_uk.weight.grad_read_f64();
         let grad_sum_uk: f64 = w_uk_grad.iter().sum();
         assert!(
             grad_sum_uk.abs() > 0.0,
@@ -2360,7 +2370,7 @@ mod tests {
         loss.backward();
 
         // Verify x.grad is not zero
-        let x_grad = x.grad.read().unwrap();
+        let x_grad = x.grad_read_f64();
         assert!(x_grad.iter().any(|&g| g.abs() > 1e-6));
     }
 
@@ -2374,10 +2384,10 @@ mod tests {
         let loss = out.sum();
         loss.backward();
 
-        let x_grad = x.grad.read().unwrap();
+        let x_grad = x.grad_read_f64();
         assert!(x_grad.iter().any(|&g| g.abs() > 1e-6));
 
-        let w_grad = norm.weight.grad.read().unwrap();
+        let w_grad = norm.weight.grad_read_f64();
         // Weight init is 1.0. Gradient should flow.
         assert!(w_grad.iter().any(|&g| g.abs() > 1e-6));
     }
@@ -2398,14 +2408,14 @@ mod tests {
         assert!(params.len() > 10, "Should have many parameters");
 
         // Check if Embed gradients exist
-        let embed_grad = t.embed.weight.grad.read().unwrap();
+        let embed_grad = t.embed.weight.grad_read_f64();
         assert!(
             embed_grad.iter().any(|&g: &f64| g.abs() > 0.0),
             "Embed grad missing"
         );
 
         // Check Norm grad
-        let norm_grad = t.blocks[0].norm_1.weight.grad.read().unwrap();
+        let norm_grad = t.blocks[0].norm_1.weight.grad_read_f64();
         assert!(
             norm_grad.iter().any(|&g| g.abs() > 0.0),
             "Norm grad missing"

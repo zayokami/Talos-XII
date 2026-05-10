@@ -422,7 +422,7 @@ impl Adam {
         // Global gradient clipping via SIMD dot_product for L2 norm
         let mut total_norm = 0.0;
         for param in &self.params {
-            let grad = param.grad.read().unwrap();
+            let grad = param.grad_read_f64();
             total_norm += crate::simd::dot_product(&grad, &grad);
         }
         total_norm = total_norm.sqrt();
@@ -443,7 +443,7 @@ impl Adam {
         let wd = self.weight_decay;
 
         for (i, param) in self.params.iter_mut().enumerate() {
-            let grad = param.grad.read().unwrap();
+            let grad = param.grad_read_f64();
             let mut data = param.data_write_f64();
             let m = &mut self.m[i];
             let v = &mut self.v[i];
@@ -535,7 +535,7 @@ impl GpuAdam {
         // Compute global gradient norm on CPU (copy grads from GPU)
         let mut total_norm = 0.0;
         for param in &self.params {
-            let grad = param.grad.read().unwrap();
+            let grad = param.grad_read_f64();
             total_norm += crate::simd::dot_product(&grad, &grad);
         }
         total_norm = total_norm.sqrt();

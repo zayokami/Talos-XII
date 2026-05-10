@@ -47,8 +47,8 @@ fn cuda_tensor_buffer_cache() -> &'static Mutex<CudaTensorBufferMap> {
 
 #[derive(Clone)]
 pub struct Tensor {
-    pub data: Storage,               // Typed storage (F64, F32, BF16, I8)
-    pub grad: Arc<RwLock<Vec<f64>>>, // Gradients always in f64 for now
+    pub data: Storage, // Typed storage (F64, F32, BF16, I8)
+    pub grad: Storage, // Typed gradients
     pub shape: Vec<usize>,
     pub device: Device,             // Device where tensor resides
     pub dtype: Dtype,               // Element data type
@@ -135,11 +135,46 @@ impl<'de> Deserialize<'de> for Tensor {
     }
 }
 
-type BackwardOp = Box<dyn Fn(&Vec<f64>, &Vec<Tensor>) + Send + Sync>;
+type BackwardOp = Box<dyn Fn(&Storage, &Vec<Tensor>) + Send + Sync>;
 
 pub struct Context {
     pub parents: Vec<Tensor>,
-    pub backward_op: BackwardOp, // receives grad_output, parents
+    pub backward_op: BackwardOp, // receives grad_output Storage, parents
+}
+
+/// Write guard that transparently handles F64 and F32 gradients.
+/// For F64 grad, writes directly. For F32 grad, accumulates into a temporary
+/// f64 buffer and flushes back to F32 storage on Drop.
+pub enum GradWriteCompat<'a> {
+    F64(std::sync::RwLockWriteGuard<'a, Vec<f64>>),
+    F32Buffer(Vec<f64>, &'a Storage),
+}
+
+impl<'a> std::ops::Deref for GradWriteCompat<'a> {
+    type Target = [f64];
+    fn deref(&self) -> &[f64] {
+        match self {
+            GradWriteCompat::F64(g) => g,
+            GradWriteCompat::F32Buffer(buf, _) => buf,
+        }
+    }
+}
+
+impl<'a> std::ops::DerefMut for GradWriteCompat<'a> {
+    fn deref_mut(&mut self) -> &mut [f64] {
+        match self {
+            GradWriteCompat::F64(g) => g,
+            GradWriteCompat::F32Buffer(buf, _) => buf,
+        }
+    }
+}
+
+impl<'a> Drop for GradWriteCompat<'a> {
+    fn drop(&mut self) {
+        if let GradWriteCompat::F32Buffer(buf, storage) = self {
+            storage.accumulate_f64_slice(buf);
+        }
+    }
 }
 
 impl Tensor {
@@ -180,7 +215,7 @@ impl Tensor {
 
         Ok(Tensor {
             data: Storage::F64(Arc::new(RwLock::new(data))),
-            grad: Arc::new(RwLock::new(vec![0.0; expected_len])),
+            grad: Storage::zeros(expected_len, Tensor::grad_dtype_for(Dtype::F64)),
             shape,
             device: Device::Cpu,
             dtype: Dtype::F64,
@@ -207,7 +242,7 @@ impl Tensor {
         );
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(data))),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
             shape,
             device: Device::Cpu,
             dtype: Dtype::F64,
@@ -226,7 +261,7 @@ impl Tensor {
         match dtype {
             Dtype::F64 => Tensor {
                 data: Storage::F64(Arc::new(RwLock::new(data))),
-                grad: Arc::new(RwLock::new(vec![0.0; len])),
+                grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
                 shape,
                 device: Device::Cpu,
                 dtype,
@@ -237,7 +272,7 @@ impl Tensor {
                 let f32_data: Vec<f32> = data.iter().map(|&v| v as f32).collect();
                 Tensor {
                     data: Storage::F32(Arc::new(RwLock::new(f32_data))),
-                    grad: Arc::new(RwLock::new(vec![0.0; len])),
+                    grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
                     shape,
                     device: Device::Cpu,
                     dtype,
@@ -251,7 +286,7 @@ impl Tensor {
                     .collect();
                 Tensor {
                     data: Storage::BF16(Arc::new(RwLock::new(bf16_data))),
-                    grad: Arc::new(RwLock::new(vec![0.0; len])),
+                    grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
                     shape,
                     device: Device::Cpu,
                     dtype,
@@ -262,7 +297,7 @@ impl Tensor {
                 let i8_data: Vec<i8> = data.iter().map(|&v| v as i8).collect();
                 Tensor {
                     data: Storage::I8(Arc::new(RwLock::new(i8_data))),
-                    grad: Arc::new(RwLock::new(vec![0.0; len])),
+                    grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
                     shape,
                     device: Device::Cpu,
                     dtype,
@@ -284,7 +319,7 @@ impl Tensor {
             Dtype::F64 => Tensor::new(vec![0.0; len], shape),
             Dtype::F32 => Tensor {
                 data: Storage::F32(Arc::new(RwLock::new(vec![0.0f32; len]))),
-                grad: Arc::new(RwLock::new(vec![0.0; len])),
+                grad: Storage::zeros(len, Tensor::grad_dtype_for(dtype)),
                 shape,
                 device: Device::Cpu,
                 dtype,
@@ -295,7 +330,7 @@ impl Tensor {
                     crate::dtype::bf16::default();
                     len
                 ]))),
-                grad: Arc::new(RwLock::new(vec![0.0; len])),
+                grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
                 shape,
                 device: Device::Cpu,
                 dtype,
@@ -303,7 +338,7 @@ impl Tensor {
             },
             Dtype::I8 => Tensor {
                 data: Storage::I8(Arc::new(RwLock::new(vec![0i8; len]))),
-                grad: Arc::new(RwLock::new(vec![0.0; len])),
+                grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
                 shape,
                 device: Device::Cpu,
                 dtype,
@@ -376,18 +411,6 @@ impl Tensor {
         self.data_write_f64()
     }
 
-    /// Read the grad lock. Panics if poisoned.
-    #[inline]
-    pub fn grad_read(&self) -> std::sync::RwLockReadGuard<'_, Vec<f64>> {
-        self.grad.read().unwrap()
-    }
-
-    /// Write the grad lock. Panics if poisoned.
-    #[inline]
-    pub fn grad_write(&self) -> std::sync::RwLockWriteGuard<'_, Vec<f64>> {
-        self.grad.write().unwrap()
-    }
-
     /// Read tensor data as Vec<f64>. For F64 storage this clones; for other
     /// dtypes it converts element-wise.
     #[inline]
@@ -405,11 +428,95 @@ impl Tensor {
         }
     }
 
-    /// Write the grad lock, returning `None` if the lock is poisoned.
-    /// Use in backward closures where skipping one gradient is preferable to a crash.
+    /// Determine grad dtype from data dtype.
+    /// F64 data -> F64 grad (backward compat).
+    /// All other dtypes -> F32 grad (native compute precision).
     #[inline]
-    pub fn grad_write_safe(&self) -> Option<std::sync::RwLockWriteGuard<'_, Vec<f64>>> {
-        self.grad.write().ok()
+    pub fn grad_dtype_for(data_dtype: Dtype) -> Dtype {
+        match data_dtype {
+            Dtype::F64 => Dtype::F64,
+            _ => Dtype::F32,
+        }
+    }
+
+    // --- Grad access helpers (typed) ---
+
+    /// Read F32 grad lock. Panics if grad is not F32.
+    #[inline]
+    pub fn grad_read_f32(&self) -> std::sync::RwLockReadGuard<'_, Vec<f32>> {
+        match &self.grad {
+            Storage::F32(v) => v.read().unwrap(),
+            _ => panic!("Expected F32 grad, got {:?}", self.grad.dtype()),
+        }
+    }
+
+    /// Write F32 grad lock. Panics if grad is not F32.
+    #[inline]
+    pub fn grad_write_f32(&self) -> std::sync::RwLockWriteGuard<'_, Vec<f32>> {
+        match &self.grad {
+            Storage::F32(v) => v.write().unwrap(),
+            _ => panic!("Expected F32 grad, got {:?}", self.grad.dtype()),
+        }
+    }
+
+    /// Read F64 grad lock. Panics if grad is not F64.
+    #[inline]
+    pub fn grad_read_f64(&self) -> std::sync::RwLockReadGuard<'_, Vec<f64>> {
+        match &self.grad {
+            Storage::F64(v) => v.read().unwrap(),
+            _ => panic!("Expected F64 grad, got {:?}", self.grad.dtype()),
+        }
+    }
+
+    /// Write F64 grad lock. Panics if grad is not F64.
+    #[inline]
+    pub fn grad_write_f64(&self) -> std::sync::RwLockWriteGuard<'_, Vec<f64>> {
+        match &self.grad {
+            Storage::F64(v) => v.write().unwrap(),
+            _ => panic!("Expected F64 grad, got {:?}", self.grad.dtype()),
+        }
+    }
+
+    /// Convert grad to Vec<f32>.
+    #[inline]
+    pub fn grad_to_f32_vec(&self) -> Vec<f32> {
+        self.grad.to_f32_vec()
+    }
+
+    /// Convert grad to Vec<f64>.
+    #[inline]
+    pub fn grad_to_f64_vec(&self) -> Vec<f64> {
+        self.grad.to_f64_vec()
+    }
+
+    /// Accumulate f32 slice into grad.
+    #[inline]
+    pub fn grad_accumulate_f32(&self, slice: &[f32]) {
+        self.grad.accumulate_f32(slice);
+    }
+
+    /// Accumulate f64 slice into grad.
+    #[inline]
+    pub fn grad_accumulate_f64(&self, slice: &[f64]) {
+        self.grad.accumulate_f64(slice);
+    }
+
+    /// Get a write-compatible gradient guard.
+    /// For F64 grad, returns direct RwLockWriteGuard.
+    /// For F32 grad, returns a temporary f64 buffer that flushes back on Drop.
+    #[inline]
+    pub fn grad_write_compat(&self) -> GradWriteCompat<'_> {
+        match &self.grad {
+            Storage::F64(v) => GradWriteCompat::F64(v.write().unwrap()),
+            Storage::F32(v) => {
+                let len = v.read().unwrap().len();
+                GradWriteCompat::F32Buffer(vec![0.0; len], &self.grad)
+            }
+            _ => panic!(
+                "grad_write_compat: unsupported grad dtype {:?}",
+                self.grad.dtype()
+            ),
+        }
     }
 
     /// Generate a tensor with uniformly distributed random values in [min, max).
@@ -436,10 +543,10 @@ impl Tensor {
     }
 
     pub fn detach(&self) -> Tensor {
-        let grad_len = self.grad.read().unwrap().len();
+        let grad_len = self.grad.len();
         Tensor {
             data: self.data.clone(),
-            grad: Arc::new(RwLock::new(vec![0.0; grad_len])),
+            grad: Storage::zeros(grad_len, Tensor::grad_dtype_for(self.dtype)),
             shape: self.shape.clone(),
             device: self.device,
             dtype: self.dtype,
@@ -462,8 +569,8 @@ impl Tensor {
             visited: &mut std::collections::HashSet<usize>,
             topo: &mut Vec<Tensor>,
         ) {
-            // Use pointer address of grad RwLock as ID
-            let id = Arc::as_ptr(&t.grad) as usize;
+            // Use pointer address of data Arc as ID
+            let id = t.grad.id();
             if !visited.contains(&id) {
                 visited.insert(id);
                 if let Some(ctx) = &t._ctx {
@@ -478,12 +585,7 @@ impl Tensor {
         build_topo(self, &mut visited, &mut topo);
 
         // Seed gradient of this tensor to 1.0
-        {
-            let mut g = self.grad.write().unwrap();
-            for v in g.iter_mut() {
-                *v = 1.0;
-            }
-        }
+        self.grad.fill_f64(1.0);
         #[cfg(cuda)]
         if self.device == Device::Cuda {
             if let Some(d_grad) = self.cuda_grad_ensure_buffer() {
@@ -499,18 +601,7 @@ impl Tensor {
             if let Some(ctx) = &t._ctx {
                 // GPU-aware backward ops read from GPU buffers directly;
                 // we no longer force materialization of all parents to CPU.
-                match t.grad.read() {
-                    Ok(grad) => {
-                        (ctx.backward_op)(&grad, &ctx.parents);
-                    }
-                    Err(_) => {
-                        log::warn!(
-                            target: "resilience",
-                            "backward: grad lock poisoned for tensor {:?}, skipping node",
-                            t.shape
-                        );
-                    }
-                }
+                (ctx.backward_op)(&t.grad, &ctx.parents);
             }
         }
     }
@@ -521,12 +612,7 @@ impl Tensor {
     }
 
     pub fn zero_grad(&self) {
-        {
-            let mut g = self.grad.write().unwrap();
-            for v in g.iter_mut() {
-                *v = 0.0;
-            }
-        }
+        self.grad.zero();
         #[cfg(cuda)]
         if self.device == Device::Cuda {
             if let Some(d_grad) = self.cuda_grad_ensure_buffer() {
@@ -703,13 +789,14 @@ impl Tensor {
 
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(out_data))),
-            grad: Arc::new(RwLock::new(vec![0.0; m * n])),
+            grad: Storage::zeros(m * n, Tensor::grad_dtype_for(Dtype::F64)),
             shape: out_shape,
             device: Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let lhs = &parents[0];
                     let rhs = &parents[1];
 
@@ -719,7 +806,7 @@ impl Tensor {
 
                     // dL/dLHS = grad_out * RHS^T
                     {
-                        let mut lhs_grad = lhs.grad.write().unwrap();
+                        let mut lhs_grad = lhs.grad_write_compat();
                         let ops = m * k * n;
                         if ops < 32768 {
                             for r in 0..m {
@@ -728,7 +815,7 @@ impl Tensor {
                                 for i in 0..k {
                                     let rhs_row_start = i * n;
                                     let grad_row =
-                                        &grad_out[grad_out_row_start..grad_out_row_start + n];
+                                        &grad_out_f64[grad_out_row_start..grad_out_row_start + n];
                                     let rhs_row = &rhs_data[rhs_row_start..rhs_row_start + n];
                                     lhs_grad[lhs_grad_row_start + i] +=
                                         dot_product(grad_row, rhs_row);
@@ -736,7 +823,7 @@ impl Tensor {
                             }
                         } else if (2..=4).contains(&m) && k >= 64 {
                             for r in 0..m {
-                                let grad_row = &grad_out[r * n..(r + 1) * n];
+                                let grad_row = &grad_out_f64[r * n..(r + 1) * n];
                                 let lhs_row = &mut lhs_grad[r * k..(r + 1) * k];
                                 lhs_row.par_iter_mut().enumerate().for_each(|(i, val)| {
                                     let rhs_row = &rhs_data[i * n..i * n + n];
@@ -744,7 +831,7 @@ impl Tensor {
                                 });
                             }
                         } else if m == 1 {
-                            let grad_row = &grad_out[..n];
+                            let grad_row = &grad_out_f64[..n];
                             for i in 0..k {
                                 let rhs_row = &rhs_data[i * n..i * n + n];
                                 lhs_grad[i] += dot_product(grad_row, rhs_row);
@@ -756,7 +843,7 @@ impl Tensor {
                                 .for_each(|(r, lhs_row)| {
                                     let grad_out_row_start = r * n;
                                     let grad_row =
-                                        &grad_out[grad_out_row_start..grad_out_row_start + n];
+                                        &grad_out_f64[grad_out_row_start..grad_out_row_start + n];
                                     for (i, lhs_val) in lhs_row.iter_mut().enumerate().take(k) {
                                         let rhs_row_start = i * n;
                                         let rhs_row = &rhs_data[rhs_row_start..rhs_row_start + n];
@@ -767,9 +854,9 @@ impl Tensor {
                     }
 
                     // dL/dRHS = LHS^T * grad_out
-                    // RHS_grad[i, :] += sum_r ( LHS[r, i] * grad_out[r, :] )
+                    // RHS_grad[i, :] += sum_r ( LHS[r, i] * grad_out_f64[r, :] )
                     {
-                        let mut rhs_grad = rhs.grad.write().unwrap();
+                        let mut rhs_grad = rhs.grad_write_compat();
                         let ops = k * n * m;
                         if ops < 32768 {
                             // Serial
@@ -785,7 +872,7 @@ impl Tensor {
                                     }
                                     let grad_out_row_start = r * n;
                                     let grad_row =
-                                        &grad_out[grad_out_row_start..grad_out_row_start + n];
+                                        &grad_out_f64[grad_out_row_start..grad_out_row_start + n];
                                     add_scaled_row(rhs_row, grad_row, scale);
                                 }
                             }
@@ -800,8 +887,8 @@ impl Tensor {
                                             continue;
                                         }
                                         let grad_out_row_start = r * n;
-                                        let grad_row =
-                                            &grad_out[grad_out_row_start..grad_out_row_start + n];
+                                        let grad_row = &grad_out_f64
+                                            [grad_out_row_start..grad_out_row_start + n];
                                         add_scaled_row(rhs_row, grad_row, scale);
                                     }
                                 });
@@ -850,32 +937,33 @@ impl Tensor {
 
         Tensor {
             data: Storage::from_f64_vec(out_data, out_dtype),
-            grad: Arc::new(RwLock::new(vec![0.0; m * n])),
+            grad: Storage::zeros(m * n, Tensor::grad_dtype_for(out_dtype)),
             shape: out_shape,
             device: Device::Cpu,
             dtype: out_dtype,
             _ctx: Some(Arc::new(Context {
                 parents: vec![self.clone(), other.clone()],
                 backward_op: Box::new(move |grad_out, _parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     // dL/dLHS = grad_out * RHS^T
-                    let mut lhs_grad = _parents[0].grad.write().unwrap();
+                    let mut lhs_grad = _parents[0].grad_write_compat();
                     for r in 0..m {
                         for i in 0..k {
                             let mut sum = 0.0;
                             for j in 0..n {
-                                sum += grad_out[r * n + j] * rhs_cache[i * n + j];
+                                sum += grad_out_f64[r * n + j] * rhs_cache[i * n + j];
                             }
                             lhs_grad[r * k + i] += sum;
                         }
                     }
 
                     // dL/dRHS = LHS^T * grad_out
-                    let mut rhs_grad = _parents[1].grad.write().unwrap();
+                    let mut rhs_grad = _parents[1].grad_write_compat();
                     for i in 0..k {
                         for j in 0..n {
                             let mut sum = 0.0;
                             for r in 0..m {
-                                sum += lhs_cache[r * k + i] * grad_out[r * n + j];
+                                sum += lhs_cache[r * k + i] * grad_out_f64[r * n + j];
                             }
                             rhs_grad[i * n + j] += sum;
                         }
@@ -917,20 +1005,21 @@ impl Tensor {
 
             Tensor {
                 data: Storage::F64(Arc::new(RwLock::new(data))),
-                grad: Arc::new(RwLock::new(vec![0.0; len])),
+                grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
                 shape: self.shape.clone(),
                 device: Device::Cpu,
                 dtype: Dtype::F64,
                 _ctx: Some(Arc::new(Context {
                     parents,
                     backward_op: Box::new(move |grad_out, parents| {
+                        let grad_out_f64 = grad_out.to_f64_vec();
                         let input = &parents[0];
                         let input_data = input.data_f64();
-                        let mut inp_grad = input.grad.write().unwrap();
+                        let mut inp_grad = input.grad_write_compat();
                         if inp_grad.len() >= PAR_THRESHOLD {
                             inp_grad
                                 .par_iter_mut()
-                                .zip(grad_out.par_iter())
+                                .zip(grad_out_f64.par_iter())
                                 .zip(input_data.par_iter())
                                 .for_each(|((ig, &go), &val)| {
                                     if val > 0.0 {
@@ -940,7 +1029,7 @@ impl Tensor {
                         } else {
                             for i in 0..inp_grad.len() {
                                 if input_data[i] > 0.0 {
-                                    inp_grad[i] += grad_out[i];
+                                    inp_grad[i] += grad_out_f64[i];
                                 }
                             }
                         }
@@ -966,17 +1055,18 @@ impl Tensor {
         let mask = Arc::new(mask);
         Tensor {
             data: Storage::from_f64_vec(data, self.dtype),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(self.dtype)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: self.dtype,
             _ctx: Some(Arc::new(Context {
                 parents: vec![self.clone()],
                 backward_op: Box::new(move |grad_out, _parents| {
-                    let mut inp_grad = _parents[0].grad.write().unwrap();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = _parents[0].grad_write_compat();
                     for i in 0..len {
                         if mask[i] {
-                            inp_grad[i] += grad_out[i];
+                            inp_grad[i] += grad_out_f64[i];
                         }
                     }
                 }),
@@ -1005,20 +1095,21 @@ impl Tensor {
 
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(data))),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let input = &parents[0];
                     let input_data = input.data_f64();
-                    let mut inp_grad = input.grad.write().unwrap();
+                    let mut inp_grad = input.grad_write_compat();
                     if inp_grad.len() >= PAR_THRESHOLD {
                         inp_grad
                             .par_iter_mut()
-                            .zip(grad_out.par_iter())
+                            .zip(grad_out_f64.par_iter())
                             .zip(input_data.par_iter())
                             .for_each(|((ig, &go), &val)| {
                                 if val > 0.0 {
@@ -1028,7 +1119,7 @@ impl Tensor {
                     } else {
                         for i in 0..inp_grad.len() {
                             if input_data[i] > 0.0 {
-                                inp_grad[i] += grad_out[i];
+                                inp_grad[i] += grad_out_f64[i];
                             }
                         }
                     }
@@ -1093,19 +1184,20 @@ impl Tensor {
         let parents = vec![self.clone()];
         let out = Tensor {
             data: Storage::F64(Arc::new(RwLock::new(vec![0.0; len]))),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
             shape: self.shape.clone(),
             device: Device::Cuda,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let input = &parents[0];
                     #[cfg(cuda)]
                     if input.device == Device::Cuda {
                         if let Some(d_input) = input.cuda_cached_buffer() {
                             if let Ok(d_grad_tmp) =
-                                crate::cuda::memory::alloc_pooled::<f64>(grad_out.len())
+                                crate::cuda::memory::alloc_pooled::<f64>(grad_out_f64.len())
                             {
                                 let d_grad_tmp = std::sync::Arc::new(d_grad_tmp);
                                 if crate::cuda::memory::copy_h2d(&d_grad_tmp, grad_out).is_ok() {
@@ -1114,7 +1206,7 @@ impl Tensor {
                                             &d_input,
                                             &d_grad_tmp,
                                             &d_in_grad,
-                                            grad_out.len(),
+                                            grad_out_f64.len(),
                                         );
                                     }
                                 }
@@ -1122,11 +1214,11 @@ impl Tensor {
                         }
                     }
                     let input_data = input.data_f64();
-                    let mut inp_grad = input.grad.write().unwrap();
+                    let mut inp_grad = input.grad_write_compat();
                     if inp_grad.len() >= PAR_THRESHOLD {
                         inp_grad
                             .par_iter_mut()
-                            .zip(grad_out.par_iter())
+                            .zip(grad_out_f64.par_iter())
                             .zip(input_data.par_iter())
                             .for_each(|((ig, &go), &val)| {
                                 if val > 0.0 {
@@ -1136,7 +1228,7 @@ impl Tensor {
                     } else {
                         for i in 0..inp_grad.len() {
                             if input_data[i] > 0.0 {
-                                inp_grad[i] += grad_out[i];
+                                inp_grad[i] += grad_out_f64[i];
                             }
                         }
                     }
@@ -1178,20 +1270,21 @@ impl Tensor {
 
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(data))),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let input = &parents[0];
                     let input_data = input.data_f64();
-                    let mut inp_grad = input.grad.write().unwrap();
+                    let mut inp_grad = input.grad_write_compat();
                     if inp_grad.len() >= PAR_THRESHOLD {
                         inp_grad
                             .par_iter_mut()
-                            .zip(grad_out.par_iter())
+                            .zip(grad_out_f64.par_iter())
                             .zip(input_data.par_iter())
                             .for_each(|((ig, &go), &x)| {
                                 let x2 = x * x;
@@ -1213,7 +1306,7 @@ impl Tensor {
                             let sech2_u = 1.0 - tanh_u * tanh_u;
                             let du_dx = sqrt_2_over_pi * (1.0 + 3.0 * c * x2);
                             let gelu_grad = 0.5 * (1.0 + tanh_u) + 0.5 * x * sech2_u * du_dx;
-                            inp_grad[i] += grad_out[i] * gelu_grad;
+                            inp_grad[i] += grad_out_f64[i] * gelu_grad;
                         }
                     }
                 }),
@@ -1236,14 +1329,15 @@ impl Tensor {
         let input_cache = Arc::new(self_f64);
         Tensor {
             data: Storage::from_f64_vec(data, self.dtype),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(self.dtype)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: self.dtype,
             _ctx: Some(Arc::new(Context {
                 parents: vec![self.clone()],
                 backward_op: Box::new(move |grad_out, _parents| {
-                    let mut inp_grad = _parents[0].grad.write().unwrap();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = _parents[0].grad_write_compat();
                     for i in 0..len {
                         let x = input_cache[i];
                         let x2 = x * x;
@@ -1253,7 +1347,7 @@ impl Tensor {
                         let sech2_u = 1.0 - tanh_u * tanh_u;
                         let du_dx = sqrt_2_over_pi * (1.0 + 3.0 * c * x2);
                         let gelu_grad = 0.5 * (1.0 + tanh_u) + 0.5 * x * sech2_u * du_dx;
-                        inp_grad[i] += grad_out[i] * gelu_grad;
+                        inp_grad[i] += grad_out_f64[i] * gelu_grad;
                     }
                 }),
             })),
@@ -1273,20 +1367,21 @@ impl Tensor {
 
         Tensor {
             data: Storage::from_f64_vec(data, self.dtype),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(self.dtype)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: self.dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, _parents| {
-                    let mut inp_grad = _parents[0].grad.write().unwrap();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = _parents[0].grad_write_compat();
                     // d(ln x)/dx = 1/x; clamp denominator to avoid inf when x -> 0
                     const LOG_GRAD_EPS: f64 = 1e-12;
                     if inp_grad.len() >= PAR_THRESHOLD {
                         inp_grad
                             .par_iter_mut()
-                            .zip(grad_out.par_iter())
+                            .zip(grad_out_f64.par_iter())
                             .zip(input_cache.par_iter())
                             .for_each(|((ig, &g), &id)| {
                                 let safe = if id.abs() < LOG_GRAD_EPS {
@@ -1303,7 +1398,7 @@ impl Tensor {
                             } else {
                                 input_cache[i]
                             };
-                            inp_grad[i] += grad_out[i] / safe;
+                            inp_grad[i] += grad_out_f64[i] / safe;
                         }
                     }
                 }),
@@ -1326,25 +1421,26 @@ impl Tensor {
 
         Tensor {
             data: Storage::from_f64_vec(data, self.dtype),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(self.dtype)),
             shape: self.shape.clone(),
             device: self.device,
             dtype: self.dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, _parents| {
-                    let mut inp_grad = _parents[0].grad.write().unwrap();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = _parents[0].grad_write_compat();
                     if inp_grad.len() >= PAR_THRESHOLD {
                         inp_grad
                             .par_iter_mut()
-                            .zip(grad_out.par_iter())
+                            .zip(grad_out_f64.par_iter())
                             .zip(exp_cache.par_iter())
                             .for_each(|((ig, &g), &cached)| {
                                 *ig += g * cached;
                             });
                     } else {
                         for i in 0..inp_grad.len() {
-                            inp_grad[i] += grad_out[i] * exp_cache[i];
+                            inp_grad[i] += grad_out_f64[i] * exp_cache[i];
                         }
                     }
                 }),
@@ -1385,25 +1481,26 @@ impl Tensor {
 
         Tensor {
             data: Storage::from_f64_vec(data, self.dtype),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(self.dtype)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: self.dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, _parents| {
-                    let mut inp_grad = _parents[0].grad.write().unwrap();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = _parents[0].grad_write_compat();
                     if inp_grad.len() >= PAR_THRESHOLD {
                         inp_grad
                             .par_iter_mut()
-                            .zip(grad_out.par_iter())
+                            .zip(grad_out_f64.par_iter())
                             .zip(sign_cache.par_iter())
                             .for_each(|((ig, &g), &s)| {
                                 *ig += g * s;
                             });
                     } else {
                         for i in 0..inp_grad.len() {
-                            inp_grad[i] += grad_out[i] * sign_cache[i];
+                            inp_grad[i] += grad_out_f64[i] * sign_cache[i];
                         }
                     }
                 }),
@@ -1433,25 +1530,26 @@ impl Tensor {
 
         Tensor {
             data: Storage::from_f64_vec(data, self.dtype),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(self.dtype)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: self.dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, _parents| {
-                    let mut inp_grad = _parents[0].grad.write().unwrap();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = _parents[0].grad_write_compat();
                     if inp_grad.len() >= PAR_THRESHOLD {
                         inp_grad
                             .par_iter_mut()
-                            .zip(grad_out.par_iter())
+                            .zip(grad_out_f64.par_iter())
                             .zip(pow_cache.par_iter())
                             .for_each(|((ig, &g), &cached)| {
                                 *ig += g * exp * cached;
                             });
                     } else {
                         for i in 0..inp_grad.len() {
-                            inp_grad[i] += grad_out[i] * exp * pow_cache[i];
+                            inp_grad[i] += grad_out_f64[i] * exp * pow_cache[i];
                         }
                     }
                 }),
@@ -1496,25 +1594,26 @@ impl Tensor {
 
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(data))),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     // d/dx softmax = softmax * (grad_out - sum(grad_out * softmax))
-                    let mut inp_grad = parents[0].grad.write().unwrap();
+                    let mut inp_grad = parents[0].grad_write_compat();
                     for row in 0..rows_cap {
                         let base = row * cols_cap;
                         let mut sum_term = 0.0;
                         for j in 0..cols_cap {
                             let idx = base + j;
-                            sum_term += grad_out[idx] * softmax_cache[idx];
+                            sum_term += grad_out_f64[idx] * softmax_cache[idx];
                         }
                         for j in 0..cols_cap {
                             let idx = base + j;
-                            inp_grad[idx] += softmax_cache[idx] * (grad_out[idx] - sum_term);
+                            inp_grad[idx] += softmax_cache[idx] * (grad_out_f64[idx] - sum_term);
                         }
                     }
                 }),
@@ -1558,24 +1657,25 @@ impl Tensor {
 
         Tensor {
             data: Storage::from_f64_vec(data, self.dtype),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(self.dtype)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: self.dtype,
             _ctx: Some(Arc::new(Context {
                 parents: vec![self.clone()],
                 backward_op: Box::new(move |grad_out, _parents| {
-                    let mut inp_grad = _parents[0].grad.write().unwrap();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = _parents[0].grad_write_compat();
                     for row in 0..rows_cap {
                         let base = row * cols_cap;
                         let mut sum_term = 0.0;
                         for j in 0..cols_cap {
                             let idx = base + j;
-                            sum_term += grad_out[idx] * softmax_cache[idx];
+                            sum_term += grad_out_f64[idx] * softmax_cache[idx];
                         }
                         for j in 0..cols_cap {
                             let idx = base + j;
-                            inp_grad[idx] += softmax_cache[idx] * (grad_out[idx] - sum_term);
+                            inp_grad[idx] += softmax_cache[idx] * (grad_out_f64[idx] - sum_term);
                         }
                     }
                 }),
@@ -1667,26 +1767,27 @@ impl Tensor {
 
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(data))),
-            grad: Arc::new(RwLock::new(vec![0.0; self_data.len()])),
+            grad: Storage::zeros(self_data.len(), Tensor::grad_dtype_for(Dtype::F64)),
             shape,
             device: Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
-                    let mut inp_grad = parents[0].grad.write().unwrap();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = parents[0].grad_write_compat();
                     if inner_cap == 1 {
                         for outer_idx in 0..outer_cap {
                             let base = outer_idx * dim_size_cap;
                             let mut sum_term = 0.0;
                             for dim_idx in 0..dim_size_cap {
                                 let idx = base + dim_idx;
-                                sum_term += grad_out[idx] * softmax_cache_for_backward[idx];
+                                sum_term += grad_out_f64[idx] * softmax_cache_for_backward[idx];
                             }
                             for dim_idx in 0..dim_size_cap {
                                 let idx = base + dim_idx;
-                                inp_grad[idx] +=
-                                    softmax_cache_for_backward[idx] * (grad_out[idx] - sum_term);
+                                inp_grad[idx] += softmax_cache_for_backward[idx]
+                                    * (grad_out_f64[idx] - sum_term);
                             }
                         }
                     } else {
@@ -1696,12 +1797,12 @@ impl Tensor {
                                 let mut sum_term = 0.0;
                                 for dim_idx in 0..dim_size_cap {
                                     let idx = base_outer + dim_idx * inner_cap + inner_idx;
-                                    sum_term += grad_out[idx] * softmax_cache_for_backward[idx];
+                                    sum_term += grad_out_f64[idx] * softmax_cache_for_backward[idx];
                                 }
                                 for dim_idx in 0..dim_size_cap {
                                     let idx = base_outer + dim_idx * inner_cap + inner_idx;
                                     inp_grad[idx] += softmax_cache_for_backward[idx]
-                                        * (grad_out[idx] - sum_term);
+                                        * (grad_out_f64[idx] - sum_term);
                                 }
                             }
                         }
@@ -1769,14 +1870,15 @@ impl Tensor {
 
         Tensor {
             data: Storage::from_f64_vec(output, self.dtype),
-            grad: Arc::new(RwLock::new(vec![0.0; input_data.len()])),
+            grad: Storage::zeros(input_data.len(), Tensor::grad_dtype_for(self.dtype)),
             shape,
             device: Device::Cpu,
             dtype: self.dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
-                    let mut inp_grad = parents[0].grad.write().unwrap();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = parents[0].grad_write_compat();
 
                     for i in 0..outer_len {
                         let base = i * last_dim;
@@ -1790,8 +1892,8 @@ impl Tensor {
                         let mut g_diff_sum = 0.0;
                         for j in 0..last_dim {
                             let diff = input_data[base + j] - m;
-                            g_sum += grad_out[base + j];
-                            g_diff_sum += grad_out[base + j] * diff;
+                            g_sum += grad_out_f64[base + j];
+                            g_diff_sum += grad_out_f64[base + j] * diff;
                         }
 
                         // dvar = sum grad_out * (x - mean) * -0.5 / std^3
@@ -1802,7 +1904,7 @@ impl Tensor {
                         // dx_j = grad_out_j / std + dvar * 2 * (x_j - m) / N + dmean / N
                         for j in 0..last_dim {
                             let diff = input_data[base + j] - m;
-                            let dx = grad_out[base + j] / std
+                            let dx = grad_out_f64[base + j] / std
                                 + dvar * 2.0 * diff / last_dim_f
                                 + dmean / last_dim_f;
                             inp_grad[base + j] += dx;
@@ -1821,16 +1923,17 @@ impl Tensor {
 
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(vec![val]))),
-            grad: Arc::new(RwLock::new(vec![0.0])),
+            grad: Storage::zeros(1, Tensor::grad_dtype_for(Dtype::F64)),
             shape: vec![1],
             device: self.device,
             dtype: self.dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
-                    let mut inp_grad = parents[0].grad.write().unwrap();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = parents[0].grad_write_compat();
                     if idx < inp_grad.len() {
-                        inp_grad[idx] += grad_out[0];
+                        inp_grad[idx] += grad_out_f64[0];
                     }
                 }),
             })),
@@ -1852,15 +1955,16 @@ impl Tensor {
 
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(vec![sum_val]))),
-            grad: Arc::new(RwLock::new(vec![0.0])),
+            grad: Storage::zeros(1, Tensor::grad_dtype_for(Dtype::F64)),
             shape: vec![1],
             device: self.device,
             dtype: self.dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
-                    let mut inp_grad = parents[0].grad.write().unwrap();
-                    let g = grad_out[0];
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = parents[0].grad_write_compat();
+                    let g = grad_out_f64[0];
                     if inp_grad.len() >= PAR_THRESHOLD {
                         inp_grad.par_iter_mut().for_each(|v| *v += g);
                     } else {
@@ -1888,15 +1992,16 @@ impl Tensor {
 
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(vec![sum_val / len as f64]))),
-            grad: Arc::new(RwLock::new(vec![0.0])),
+            grad: Storage::zeros(1, Tensor::grad_dtype_for(Dtype::F64)),
             shape: vec![1],
             device: self.device,
             dtype: self.dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
-                    let mut inp_grad = parents[0].grad.write().unwrap();
-                    let g = grad_out[0] / len as f64;
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = parents[0].grad_write_compat();
+                    let g = grad_out_f64[0] / len as f64;
                     if inp_grad.len() >= PAR_THRESHOLD {
                         inp_grad.par_iter_mut().for_each(|v| *v += g);
                     } else {
@@ -1914,15 +2019,16 @@ impl Tensor {
         let sum_val: f64 = self_f64.iter().sum();
         Tensor {
             data: Storage::from_f64_vec(vec![sum_val], self.dtype),
-            grad: Arc::new(RwLock::new(vec![0.0])),
+            grad: Storage::zeros(1, Tensor::grad_dtype_for(Dtype::F64)),
             shape: vec![1],
             device: self.device,
             dtype: self.dtype,
             _ctx: Some(Arc::new(Context {
                 parents: vec![self.clone()],
                 backward_op: Box::new(move |grad_out, _parents| {
-                    let mut inp_grad = _parents[0].grad.write().unwrap();
-                    let g = grad_out[0];
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = _parents[0].grad_write_compat();
+                    let g = grad_out_f64[0];
                     for v in inp_grad.iter_mut() {
                         *v += g;
                     }
@@ -1937,15 +2043,16 @@ impl Tensor {
         let mean_val = self_f64.iter().sum::<f64>() / len as f64;
         Tensor {
             data: Storage::from_f64_vec(vec![mean_val], self.dtype),
-            grad: Arc::new(RwLock::new(vec![0.0])),
+            grad: Storage::zeros(1, Tensor::grad_dtype_for(Dtype::F64)),
             shape: vec![1],
             device: self.device,
             dtype: self.dtype,
             _ctx: Some(Arc::new(Context {
                 parents: vec![self.clone()],
                 backward_op: Box::new(move |grad_out, _parents| {
-                    let mut inp_grad = _parents[0].grad.write().unwrap();
-                    let g = grad_out[0] / len as f64;
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = _parents[0].grad_write_compat();
+                    let g = grad_out_f64[0] / len as f64;
                     for v in inp_grad.iter_mut() {
                         *v += g;
                     }
@@ -1971,18 +2078,19 @@ impl Tensor {
         let parents = vec![self.clone()];
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(out_data))),
-            grad: Arc::new(RwLock::new(vec![0.0; rows * cols])),
+            grad: Storage::zeros(rows * cols, Tensor::grad_dtype_for(Dtype::F64)),
             shape: vec![cols, rows],
             device: Device::Cpu,
             dtype: self.dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let input = &parents[0];
-                    let mut inp_grad = input.grad.write().unwrap();
+                    let mut inp_grad = input.grad_write_compat();
                     for r in 0..rows {
                         for c in 0..cols {
-                            inp_grad[r * cols + c] += grad_out[c * rows + r];
+                            inp_grad[r * cols + c] += grad_out_f64[c * rows + r];
                         }
                     }
                 }),
@@ -2002,17 +2110,18 @@ impl Tensor {
         }
         Tensor {
             data: Storage::from_f64_vec(out_data, self.dtype),
-            grad: Arc::new(RwLock::new(vec![0.0; rows * cols])),
+            grad: Storage::zeros(rows * cols, Tensor::grad_dtype_for(self.dtype)),
             shape: vec![cols, rows],
             device: Device::Cpu,
             dtype: self.dtype,
             _ctx: Some(Arc::new(Context {
                 parents: vec![self.clone()],
                 backward_op: Box::new(move |grad_out, _parents| {
-                    let mut inp_grad = _parents[0].grad.write().unwrap();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = _parents[0].grad_write_compat();
                     for r in 0..rows {
                         for c in 0..cols {
-                            inp_grad[r * cols + c] += grad_out[c * rows + r];
+                            inp_grad[r * cols + c] += grad_out_f64[c * rows + r];
                         }
                     }
                 }),
@@ -2101,15 +2210,16 @@ impl Tensor {
 
         Tensor {
             data: Storage::from_f64_vec(new_data, self.dtype),
-            grad: Arc::new(RwLock::new(vec![0.0; total_elements])),
+            grad: Storage::zeros(total_elements, Tensor::grad_dtype_for(self.dtype)),
             shape: new_shape.clone(),
             device: self.device,
             dtype: self.dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, _parents| {
-                    let mut inp_grad = _parents[0].grad.write().unwrap();
-                    let total_elements = grad_out.len();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = _parents[0].grad_write_compat();
+                    let total_elements = grad_out_f64.len();
                     let old_shape = old_shape.clone();
                     let old_len = old_shape.len();
                     let new_len = new_shape.len();
@@ -2139,7 +2249,7 @@ impl Tensor {
                             multiplier *= new_dim;
                         }
 
-                        inp_grad[old_linear_idx] += grad_out[linear_idx];
+                        inp_grad[old_linear_idx] += grad_out_f64[linear_idx];
                     }
                 }),
             })),
@@ -2161,16 +2271,17 @@ impl Tensor {
 
         Tensor {
             data: Storage::from_f64_vec(new_data, self.dtype),
-            grad: Arc::new(RwLock::new(vec![0.0; len * batch_size])),
+            grad: Storage::zeros(len * batch_size, Tensor::grad_dtype_for(self.dtype)),
             shape: new_shape,
             device: self.device,
             dtype: self.dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, _parents| {
-                    let mut inp_grad = _parents[0].grad.write().unwrap();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = _parents[0].grad_write_compat();
                     let chunk_size = inp_grad.len();
-                    for chunk in grad_out.chunks(chunk_size) {
+                    for chunk in grad_out_f64.chunks(chunk_size) {
                         for (i, &g) in chunk.iter().enumerate() {
                             inp_grad[i] += g;
                         }
@@ -2193,25 +2304,26 @@ impl Tensor {
 
         Tensor {
             data: Storage::from_f64_vec(data, self.dtype),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(self.dtype)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: self.dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, _parents| {
-                    let mut inp_grad = _parents[0].grad.write().unwrap();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = _parents[0].grad_write_compat();
                     if inp_grad.len() >= PAR_THRESHOLD {
                         inp_grad
                             .par_iter_mut()
-                            .zip(grad_out.par_iter())
+                            .zip(grad_out_f64.par_iter())
                             .zip(input_cache.par_iter())
                             .for_each(|((ig, &g), &id)| {
                                 *ig += g * id.cos();
                             });
                     } else {
                         for i in 0..inp_grad.len() {
-                            inp_grad[i] += grad_out[i] * input_cache[i].cos();
+                            inp_grad[i] += grad_out_f64[i] * input_cache[i].cos();
                         }
                     }
                 }),
@@ -2232,25 +2344,26 @@ impl Tensor {
 
         Tensor {
             data: Storage::from_f64_vec(data, self.dtype),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(self.dtype)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: self.dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, _parents| {
-                    let mut inp_grad = _parents[0].grad.write().unwrap();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = _parents[0].grad_write_compat();
                     if inp_grad.len() >= PAR_THRESHOLD {
                         inp_grad
                             .par_iter_mut()
-                            .zip(grad_out.par_iter())
+                            .zip(grad_out_f64.par_iter())
                             .zip(input_cache.par_iter())
                             .for_each(|((ig, &g), &id)| {
                                 *ig -= g * id.sin();
                             });
                     } else {
                         for i in 0..inp_grad.len() {
-                            inp_grad[i] -= grad_out[i] * input_cache[i].sin();
+                            inp_grad[i] -= grad_out_f64[i] * input_cache[i].sin();
                         }
                     }
                 }),
@@ -2271,20 +2384,21 @@ impl Tensor {
 
         Tensor {
             data: Storage::from_f64_vec(data, self.dtype),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(self.dtype)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: self.dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, _parents| {
-                    let mut inp_grad = _parents[0].grad.write().unwrap();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = _parents[0].grad_write_compat();
                     let len = inp_grad.len();
                     // Reuse cached sqrt values: d/dx sqrt(x) = 0.5 / sqrt(x)
                     if len >= PAR_THRESHOLD {
                         inp_grad
                             .par_iter_mut()
-                            .zip(grad_out.par_iter())
+                            .zip(grad_out_f64.par_iter())
                             .zip(sqrt_cache.par_iter())
                             .for_each(|((ig, &g), &s)| {
                                 if s > 0.0 {
@@ -2294,7 +2408,7 @@ impl Tensor {
                     } else {
                         for i in 0..len {
                             if sqrt_cache[i] > 0.0 {
-                                inp_grad[i] += grad_out[i] * 0.5 / sqrt_cache[i];
+                                inp_grad[i] += grad_out_f64[i] * 0.5 / sqrt_cache[i];
                             }
                         }
                     }
@@ -2358,17 +2472,18 @@ impl Tensor {
 
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(new_data))),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
             shape: new_shape,
             device: self.device,
             dtype: self.dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let input = &parents[0];
-                    let mut inp_grad = input.grad.write().unwrap();
+                    let mut inp_grad = input.grad_write_compat();
 
-                    for (i, &grad_val) in grad_out.iter().enumerate() {
+                    for (i, &grad_val) in grad_out_f64.iter().enumerate() {
                         let mut temp = i;
                         let mut coords = [0usize; 8];
                         for d in 0..cap_rank {
@@ -2402,21 +2517,22 @@ impl Tensor {
 
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(data))),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
             shape: self.shape.clone(),
             device: self.device,
             dtype: self.dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let input = &parents[0];
                     let input_data = input.data_f64();
-                    let mut inp_grad = input.grad.write().unwrap();
+                    let mut inp_grad = input.grad_write_compat();
                     let len = inp_grad.len();
                     if len >= PAR_THRESHOLD {
                         inp_grad
                             .par_iter_mut()
-                            .zip(grad_out.par_iter())
+                            .zip(grad_out_f64.par_iter())
                             .zip(input_data.par_iter())
                             .for_each(|((ig, &g), &id)| {
                                 if id >= min && id <= max {
@@ -2426,7 +2542,7 @@ impl Tensor {
                     } else {
                         for i in 0..len {
                             if input_data[i] >= min && input_data[i] <= max {
-                                inp_grad[i] += grad_out[i];
+                                inp_grad[i] += grad_out_f64[i];
                             }
                         }
                     }
@@ -2444,23 +2560,24 @@ impl Tensor {
 
         Tensor {
             data: self.data.clone(),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
             shape: new_shape,
             device: self.device,
             dtype: self.dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
-                    let mut inp_grad = parents[0].grad.write().unwrap();
-                    let len = grad_out.len();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = parents[0].grad_write_compat();
+                    let len = grad_out_f64.len();
                     if len >= PAR_THRESHOLD {
                         inp_grad
                             .par_iter_mut()
-                            .zip(grad_out.par_iter())
+                            .zip(grad_out_f64.par_iter())
                             .for_each(|(ig, &g)| *ig += g);
                     } else {
                         for i in 0..len {
-                            inp_grad[i] += grad_out[i];
+                            inp_grad[i] += grad_out_f64[i];
                         }
                     }
                 }),
@@ -2718,7 +2835,7 @@ impl Tensor {
 
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(out_data))),
-            grad: Arc::new(RwLock::new(vec![0.0; out_len])),
+            grad: Storage::zeros(out_len, Tensor::grad_dtype_for(Dtype::F64)),
             shape: out_shape,
             device: Device::Cpu,
             dtype: Dtype::F64,
@@ -2726,6 +2843,7 @@ impl Tensor {
                 parents,
                 // Using standard Im2Col backward pass logic.
                 backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let input = &parents[0];
                     let weight = &parents[1];
                     // Use batch lock for better performance
@@ -2754,7 +2872,7 @@ impl Tensor {
 
                     // dL/dInput (Standard Col2Im)
                     {
-                        let mut input_grad = input.grad.write().unwrap();
+                        let mut input_grad = input.grad_write_compat();
                         input_grad.par_chunks_mut(h_in * w_in).enumerate().for_each(
                             |(idx, in_plane)| {
                                 let b = idx / c_in;
@@ -2784,7 +2902,7 @@ impl Tensor {
                                                         && kw < k_w as isize
                                                     {
                                                         for k in 0..c_out {
-                                                            let g = grad_out[((b * c_out + k)
+                                                            let g = grad_out_f64[((b * c_out + k)
                                                                 * h_out
                                                                 + oh)
                                                                 * w_out
@@ -2809,7 +2927,7 @@ impl Tensor {
 
                     // dL/dWeight
                     {
-                        let mut weight_grad = weight.grad.write().unwrap();
+                        let mut weight_grad = weight.grad_write_compat();
                         weight_grad.par_chunks_mut(k_h * k_w).enumerate().for_each(
                             |(idx, w_plane)| {
                                 let k = idx / c_in;
@@ -2838,7 +2956,7 @@ impl Tensor {
                                                             + h_in_idx as usize)
                                                             * w_in
                                                             + w_in_idx as usize];
-                                                        let g_val = grad_out[((b * c_out + k)
+                                                        let g_val = grad_out_f64[((b * c_out + k)
                                                             * h_out
                                                             + oh)
                                                             * w_out
@@ -2964,13 +3082,14 @@ impl Tensor {
 
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(out_data))),
-            grad: Arc::new(RwLock::new(vec![0.0; out_len])),
+            grad: Storage::zeros(out_len, Tensor::grad_dtype_for(Dtype::F64)),
             shape: out_shape,
             device: Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let input = &parents[0];
                     let weight = &parents[1];
                     // Use batch lock for better performance
@@ -2980,7 +3099,7 @@ impl Tensor {
 
                     // dL/dInput
                     {
-                        let mut input_grad = input.grad.write().unwrap();
+                        let mut input_grad = input.grad_write_compat();
                         // Parallel over Input (N, C_in)
                         input_grad.par_chunks_mut(h_in * w_in).enumerate().for_each(
                             |(idx, in_plane)| {
@@ -3018,7 +3137,7 @@ impl Tensor {
                                                         // If we iterate oh, ow, kh is determined.
 
                                                         for k in 0..c_out {
-                                                            let g = grad_out[((b * c_out + k)
+                                                            let g = grad_out_f64[((b * c_out + k)
                                                                 * h_out
                                                                 + oh)
                                                                 * w_out
@@ -3043,7 +3162,7 @@ impl Tensor {
 
                     // dL/dWeight
                     {
-                        let mut weight_grad = weight.grad.write().unwrap();
+                        let mut weight_grad = weight.grad_write_compat();
                         // dWeight = grad_out * Input_Cols^T
                         // Implemented via manual accumulation over batch
 
@@ -3078,7 +3197,7 @@ impl Tensor {
                                                             + h_in_idx as usize)
                                                             * w_in
                                                             + w_in_idx as usize];
-                                                        let g_val = grad_out[((b * c_out + k)
+                                                        let g_val = grad_out_f64[((b * c_out + k)
                                                             * h_out
                                                             + oh)
                                                             * w_out
@@ -3163,16 +3282,17 @@ impl Tensor {
 
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(out_data))),
-            grad: Arc::new(RwLock::new(vec![0.0; out_len])),
+            grad: Storage::zeros(out_len, Tensor::grad_dtype_for(Dtype::F64)),
             shape: out_shape,
             device: Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let input = &parents[0];
                     let input_data = input.data_f64();
-                    let mut input_grad = input.grad.write().unwrap();
+                    let mut input_grad = input.grad_write_compat();
 
                     // Parallelize over Input (N, C)
                     input_grad.par_chunks_mut(h_in * w_in).enumerate().for_each(
@@ -3266,10 +3386,11 @@ impl Tensor {
                                                     }
 
                                                     if (val_in - max_val).abs() < 1e-6 {
-                                                        grad_sum +=
-                                                            grad_out[((b * c + ch) * h_out + oh)
-                                                                * w_out
-                                                                + ow];
+                                                        grad_sum += grad_out_f64[((b * c + ch)
+                                                            * h_out
+                                                            + oh)
+                                                            * w_out
+                                                            + ow];
                                                     }
                                                 }
                                             }
@@ -3318,21 +3439,22 @@ impl Tensor {
         let numerator_cap = result_val;
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(vec![result_val]))),
-            grad: Arc::new(RwLock::new(vec![0.0])),
+            grad: Storage::zeros(1, Tensor::grad_dtype_for(Dtype::F64)),
             shape: vec![1],
             device: Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     // f = total / w_sum
                     // df/d(total) = 1 / w_sum
-                    let mut total_grad = parents[0].grad.write().unwrap();
-                    total_grad[0] += grad_out[0] / denom_cap;
+                    let mut total_grad = parents[0].grad_write_compat();
+                    total_grad[0] += grad_out_f64[0] / denom_cap;
                     drop(total_grad);
                     // df/d(w_sum) = -total / w_sum^2 = -f / w_sum
-                    let mut wsum_grad = parents[1].grad.write().unwrap();
-                    wsum_grad[0] += grad_out[0] * (-numerator_cap / denom_cap);
+                    let mut wsum_grad = parents[1].grad_write_compat();
+                    wsum_grad[0] += grad_out_f64[0] * (-numerator_cap / denom_cap);
                 }),
             })),
         }
@@ -3352,18 +3474,19 @@ impl Tensor {
         let out_dtype = Tensor::binary_dtype(self.dtype, rhs.dtype);
         Tensor {
             data: Storage::from_f64_vec(data, out_dtype),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(out_dtype)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: out_dtype,
             _ctx: Some(Arc::new(Context {
                 parents: vec![self.clone(), rhs.clone()],
                 backward_op: Box::new(move |grad_out, _parents| {
-                    let mut lhs_grad = _parents[0].grad.write().unwrap();
-                    let mut rhs_grad = _parents[1].grad.write().unwrap();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut lhs_grad = _parents[0].grad_write_compat();
+                    let mut rhs_grad = _parents[1].grad_write_compat();
                     for i in 0..len {
-                        lhs_grad[i] += grad_out[i];
-                        rhs_grad[i] += grad_out[i];
+                        lhs_grad[i] += grad_out_f64[i];
+                        rhs_grad[i] += grad_out_f64[i];
                     }
                 }),
             })),
@@ -3381,18 +3504,19 @@ impl Tensor {
         let out_dtype = Tensor::binary_dtype(self.dtype, rhs.dtype);
         Tensor {
             data: Storage::from_f64_vec(data, out_dtype),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(out_dtype)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: out_dtype,
             _ctx: Some(Arc::new(Context {
                 parents: vec![self.clone(), rhs.clone()],
                 backward_op: Box::new(move |grad_out, _parents| {
-                    let mut lhs_grad = _parents[0].grad.write().unwrap();
-                    let mut rhs_grad = _parents[1].grad.write().unwrap();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut lhs_grad = _parents[0].grad_write_compat();
+                    let mut rhs_grad = _parents[1].grad_write_compat();
                     for i in 0..len {
-                        lhs_grad[i] += grad_out[i];
-                        rhs_grad[i] -= grad_out[i];
+                        lhs_grad[i] += grad_out_f64[i];
+                        rhs_grad[i] -= grad_out_f64[i];
                     }
                 }),
             })),
@@ -3412,18 +3536,19 @@ impl Tensor {
         let self_cache = Arc::new(self_f64);
         Tensor {
             data: Storage::from_f64_vec(data, out_dtype),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(out_dtype)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: out_dtype,
             _ctx: Some(Arc::new(Context {
                 parents: vec![self.clone(), rhs.clone()],
                 backward_op: Box::new(move |grad_out, _parents| {
-                    let mut lhs_grad = _parents[0].grad.write().unwrap();
-                    let mut rhs_grad = _parents[1].grad.write().unwrap();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut lhs_grad = _parents[0].grad_write_compat();
+                    let mut rhs_grad = _parents[1].grad_write_compat();
                     for i in 0..len {
-                        lhs_grad[i] += grad_out[i] * rhs_cache[i];
-                        rhs_grad[i] += grad_out[i] * self_cache[i];
+                        lhs_grad[i] += grad_out_f64[i] * rhs_cache[i];
+                        rhs_grad[i] += grad_out_f64[i] * self_cache[i];
                     }
                 }),
             })),
@@ -3443,19 +3568,20 @@ impl Tensor {
         let self_cache = Arc::new(self_f64);
         Tensor {
             data: Storage::from_f64_vec(data, out_dtype),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(out_dtype)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: out_dtype,
             _ctx: Some(Arc::new(Context {
                 parents: vec![self.clone(), rhs.clone()],
                 backward_op: Box::new(move |grad_out, _parents| {
-                    let mut lhs_grad = _parents[0].grad.write().unwrap();
-                    let mut rhs_grad = _parents[1].grad.write().unwrap();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut lhs_grad = _parents[0].grad_write_compat();
+                    let mut rhs_grad = _parents[1].grad_write_compat();
                     for i in 0..len {
-                        lhs_grad[i] += grad_out[i] / rhs_cache[i];
+                        lhs_grad[i] += grad_out_f64[i] / rhs_cache[i];
                         rhs_grad[i] +=
-                            grad_out[i] * (-self_cache[i] / (rhs_cache[i] * rhs_cache[i]));
+                            grad_out_f64[i] * (-self_cache[i] / (rhs_cache[i] * rhs_cache[i]));
                     }
                 }),
             })),
@@ -3491,34 +3617,35 @@ impl Add for Tensor {
         let parents = vec![self.clone(), rhs.clone()];
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(data))),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(|grad_out, parents| {
-                    let len = grad_out.len();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let len = grad_out_f64.len();
                     {
-                        let mut lhs_grad = parents[0].grad.write().unwrap();
+                        let mut lhs_grad = parents[0].grad_write_f64();
                         if len >= PAR_THRESHOLD {
                             lhs_grad
                                 .par_iter_mut()
-                                .zip(grad_out.par_iter())
+                                .zip(grad_out_f64.par_iter())
                                 .for_each(|(lg, &g)| *lg += g);
                         } else {
-                            vector_grad_acc(&mut lhs_grad, grad_out);
+                            vector_grad_acc(&mut lhs_grad, &grad_out_f64);
                         }
                     }
                     {
-                        let mut rhs_grad = parents[1].grad.write().unwrap();
+                        let mut rhs_grad = parents[1].grad_write_f64();
                         if len >= PAR_THRESHOLD {
                             rhs_grad
                                 .par_iter_mut()
-                                .zip(grad_out.par_iter())
+                                .zip(grad_out_f64.par_iter())
                                 .for_each(|(rg, &g)| *rg += g);
                         } else {
-                            vector_grad_acc(&mut rhs_grad, grad_out);
+                            vector_grad_acc(&mut rhs_grad, &grad_out_f64);
                         }
                     }
                 }),
@@ -3553,34 +3680,35 @@ impl<'b> Add<&'b Tensor> for &Tensor {
         let parents = vec![self.clone(), rhs.clone()];
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(data))),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(|grad_out, parents| {
-                    let len = grad_out.len();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let len = grad_out_f64.len();
                     {
-                        let mut lhs_grad = parents[0].grad.write().unwrap();
+                        let mut lhs_grad = parents[0].grad_write_f64();
                         if len >= PAR_THRESHOLD {
                             lhs_grad
                                 .par_iter_mut()
-                                .zip(grad_out.par_iter())
+                                .zip(grad_out_f64.par_iter())
                                 .for_each(|(lg, &g)| *lg += g);
                         } else {
-                            vector_grad_acc(&mut lhs_grad, grad_out);
+                            vector_grad_acc(&mut lhs_grad, &grad_out_f64);
                         }
                     }
                     {
-                        let mut rhs_grad = parents[1].grad.write().unwrap();
+                        let mut rhs_grad = parents[1].grad_write_f64();
                         if len >= PAR_THRESHOLD {
                             rhs_grad
                                 .par_iter_mut()
-                                .zip(grad_out.par_iter())
+                                .zip(grad_out_f64.par_iter())
                                 .for_each(|(rg, &g)| *rg += g);
                         } else {
-                            vector_grad_acc(&mut rhs_grad, grad_out);
+                            vector_grad_acc(&mut rhs_grad, &grad_out_f64);
                         }
                     }
                 }),
@@ -3611,35 +3739,36 @@ impl Sub for Tensor {
         let parents = vec![self.clone(), rhs.clone()];
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(data))),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(|grad_out, parents| {
-                    let len = grad_out.len();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let len = grad_out_f64.len();
                     {
-                        let mut lhs_grad = parents[0].grad.write().unwrap();
+                        let mut lhs_grad = parents[0].grad_write_f64();
                         if len >= PAR_THRESHOLD {
                             lhs_grad
                                 .par_iter_mut()
-                                .zip(grad_out.par_iter())
+                                .zip(grad_out_f64.par_iter())
                                 .for_each(|(lg, &g)| *lg += g);
                         } else {
-                            vector_grad_acc(&mut lhs_grad, grad_out);
+                            vector_grad_acc(&mut lhs_grad, &grad_out_f64);
                         }
                     }
                     {
-                        let mut rhs_grad = parents[1].grad.write().unwrap();
+                        let mut rhs_grad = parents[1].grad_write_f64();
                         if len >= PAR_THRESHOLD {
                             rhs_grad
                                 .par_iter_mut()
-                                .zip(grad_out.par_iter())
+                                .zip(grad_out_f64.par_iter())
                                 .for_each(|(rg, &g)| *rg -= g);
                         } else {
                             for i in 0..len {
-                                rhs_grad[i] -= grad_out[i];
+                                rhs_grad[i] -= grad_out_f64[i];
                             }
                         }
                     }
@@ -3671,35 +3800,36 @@ impl<'b> Sub<&'b Tensor> for &Tensor {
         let parents = vec![self.clone(), rhs.clone()];
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(data))),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(|grad_out, parents| {
-                    let len = grad_out.len();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let len = grad_out_f64.len();
                     {
-                        let mut lhs_grad = parents[0].grad.write().unwrap();
+                        let mut lhs_grad = parents[0].grad_write_f64();
                         if len >= PAR_THRESHOLD {
                             lhs_grad
                                 .par_iter_mut()
-                                .zip(grad_out.par_iter())
+                                .zip(grad_out_f64.par_iter())
                                 .for_each(|(lg, &g)| *lg += g);
                         } else {
-                            vector_grad_acc(&mut lhs_grad, grad_out);
+                            vector_grad_acc(&mut lhs_grad, &grad_out_f64);
                         }
                     }
                     {
-                        let mut rhs_grad = parents[1].grad.write().unwrap();
+                        let mut rhs_grad = parents[1].grad_write_f64();
                         if len >= PAR_THRESHOLD {
                             rhs_grad
                                 .par_iter_mut()
-                                .zip(grad_out.par_iter())
+                                .zip(grad_out_f64.par_iter())
                                 .for_each(|(rg, &g)| *rg -= g);
                         } else {
                             for i in 0..len {
-                                rhs_grad[i] -= grad_out[i];
+                                rhs_grad[i] -= grad_out_f64[i];
                             }
                         }
                     }
@@ -3731,24 +3861,25 @@ impl Mul for Tensor {
         let parents = vec![self.clone(), rhs.clone()];
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(data))),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(|grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let lhs = &parents[0];
                     let rhs = &parents[1];
                     let guards = TensorReadGuard::new(&[lhs, rhs]);
                     let lhs_data = guards.get(0);
                     let rhs_data = guards.get(1);
-                    let len = grad_out.len();
-                    if Arc::ptr_eq(&lhs.grad, &rhs.grad) {
-                        let mut grad = lhs.grad.write().unwrap();
+                    let len = grad_out_f64.len();
+                    if lhs.grad.id() == rhs.grad.id() {
+                        let mut grad = lhs.grad_write_f64();
                         if len >= PAR_THRESHOLD {
                             grad.par_iter_mut()
-                                .zip(grad_out.par_iter())
+                                .zip(grad_out_f64.par_iter())
                                 .zip(lhs_data.par_iter())
                                 .zip(rhs_data.par_iter())
                                 .for_each(|(((g, &go), &l), &r)| {
@@ -3756,35 +3887,35 @@ impl Mul for Tensor {
                                 });
                         } else {
                             for i in 0..len {
-                                grad[i] += grad_out[i] * (lhs_data[i] + rhs_data[i]);
+                                grad[i] += grad_out_f64[i] * (lhs_data[i] + rhs_data[i]);
                             }
                         }
                     } else {
                         {
-                            let mut lhs_grad = lhs.grad.write().unwrap();
+                            let mut lhs_grad = lhs.grad_write_f64();
                             if len >= PAR_THRESHOLD {
                                 lhs_grad
                                     .par_iter_mut()
-                                    .zip(grad_out.par_iter())
+                                    .zip(grad_out_f64.par_iter())
                                     .zip(rhs_data.par_iter())
                                     .for_each(|((lg, &g), &r)| *lg += g * r);
                             } else {
                                 for i in 0..len {
-                                    lhs_grad[i] += grad_out[i] * rhs_data[i];
+                                    lhs_grad[i] += grad_out_f64[i] * rhs_data[i];
                                 }
                             }
                         }
                         {
-                            let mut rhs_grad = rhs.grad.write().unwrap();
+                            let mut rhs_grad = rhs.grad_write_f64();
                             if len >= PAR_THRESHOLD {
                                 rhs_grad
                                     .par_iter_mut()
-                                    .zip(grad_out.par_iter())
+                                    .zip(grad_out_f64.par_iter())
                                     .zip(lhs_data.par_iter())
                                     .for_each(|((rg, &g), &l)| *rg += g * l);
                             } else {
                                 for i in 0..len {
-                                    rhs_grad[i] += grad_out[i] * lhs_data[i];
+                                    rhs_grad[i] += grad_out_f64[i] * lhs_data[i];
                                 }
                             }
                         }
@@ -3817,35 +3948,36 @@ impl<'b> Mul<&'b Tensor> for &Tensor {
         let parents = vec![self.clone(), rhs.clone()];
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(data))),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(|grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let lhs = &parents[0];
                     let rhs = &parents[1];
                     let guards = TensorReadGuard::new(&[lhs, rhs]);
                     let lhs_data = guards.get(0);
                     let rhs_data = guards.get(1);
-                    let len = grad_out.len();
-                    if Arc::ptr_eq(&lhs.grad, &rhs.grad) {
-                        let mut grad = lhs.grad.write().unwrap();
+                    let len = grad_out_f64.len();
+                    if lhs.grad.id() == rhs.grad.id() {
+                        let mut grad = lhs.grad_write_f64();
                         for i in 0..len {
-                            grad[i] += grad_out[i] * (lhs_data[i] + rhs_data[i]);
+                            grad[i] += grad_out_f64[i] * (lhs_data[i] + rhs_data[i]);
                         }
                     } else {
                         {
-                            let mut lhs_grad = lhs.grad.write().unwrap();
+                            let mut lhs_grad = lhs.grad_write_f64();
                             for i in 0..len {
-                                lhs_grad[i] += grad_out[i] * rhs_data[i];
+                                lhs_grad[i] += grad_out_f64[i] * rhs_data[i];
                             }
                         }
                         {
-                            let mut rhs_grad = rhs.grad.write().unwrap();
+                            let mut rhs_grad = rhs.grad_write_f64();
                             for i in 0..len {
-                                rhs_grad[i] += grad_out[i] * lhs_data[i];
+                                rhs_grad[i] += grad_out_f64[i] * lhs_data[i];
                             }
                         }
                     }
@@ -3882,25 +4014,26 @@ impl Div for Tensor {
         let parents = vec![self.clone(), rhs.clone()];
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(data))),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(|grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let lhs = &parents[0];
                     let rhs = &parents[1];
                     let guards = TensorReadGuard::new(&[lhs, rhs]);
                     let lhs_data = guards.get(0);
                     let rhs_data = guards.get(1);
-                    let len = grad_out.len();
+                    let len = grad_out_f64.len();
                     const DIV_EPS: f64 = 1e-12;
-                    if Arc::ptr_eq(&lhs.grad, &rhs.grad) {
-                        let mut grad = lhs.grad.write().unwrap();
+                    if lhs.grad.id() == rhs.grad.id() {
+                        let mut grad = lhs.grad_write_f64();
                         if len >= PAR_THRESHOLD {
                             grad.par_iter_mut()
-                                .zip(grad_out.par_iter())
+                                .zip(grad_out_f64.par_iter())
                                 .zip(lhs_data.par_iter())
                                 .zip(rhs_data.par_iter())
                                 .for_each(|(((g, &go), &l), &r)| {
@@ -3919,17 +4052,17 @@ impl Div for Tensor {
                                 } else {
                                     r
                                 };
-                                grad[i] += grad_out[i] / safe_r
-                                    - grad_out[i] * lhs_data[i] / (safe_r * safe_r);
+                                grad[i] += grad_out_f64[i] / safe_r
+                                    - grad_out_f64[i] * lhs_data[i] / (safe_r * safe_r);
                             }
                         }
                     } else {
                         {
-                            let mut lhs_grad = lhs.grad.write().unwrap();
+                            let mut lhs_grad = lhs.grad_write_f64();
                             if len >= PAR_THRESHOLD {
                                 lhs_grad
                                     .par_iter_mut()
-                                    .zip(grad_out.par_iter())
+                                    .zip(grad_out_f64.par_iter())
                                     .zip(rhs_data.par_iter())
                                     .for_each(|((lg, &g), &r)| {
                                         let safe_r = if r.abs() < DIV_EPS {
@@ -3947,16 +4080,16 @@ impl Div for Tensor {
                                     } else {
                                         r
                                     };
-                                    lhs_grad[i] += grad_out[i] / safe_r;
+                                    lhs_grad[i] += grad_out_f64[i] / safe_r;
                                 }
                             }
                         }
                         {
-                            let mut rhs_grad = rhs.grad.write().unwrap();
+                            let mut rhs_grad = rhs.grad_write_f64();
                             if len >= PAR_THRESHOLD {
                                 rhs_grad
                                     .par_iter_mut()
-                                    .zip(grad_out.par_iter())
+                                    .zip(grad_out_f64.par_iter())
                                     .zip(lhs_data.par_iter())
                                     .zip(rhs_data.par_iter())
                                     .for_each(|(((rg, &g), &l), &r)| {
@@ -3975,7 +4108,8 @@ impl Div for Tensor {
                                     } else {
                                         r
                                     };
-                                    rhs_grad[i] -= grad_out[i] * lhs_data[i] / (safe_r * safe_r);
+                                    rhs_grad[i] -=
+                                        grad_out_f64[i] * lhs_data[i] / (safe_r * safe_r);
                                 }
                             }
                         }
@@ -4005,22 +4139,23 @@ impl<'b> Div<&'b Tensor> for &Tensor {
         let parents = vec![self.clone(), rhs.clone()];
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(data))),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(|grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let lhs = &parents[0];
                     let rhs = &parents[1];
                     let guards = TensorReadGuard::new(&[lhs, rhs]);
                     let lhs_data = guards.get(0);
                     let rhs_data = guards.get(1);
-                    let len = grad_out.len();
+                    let len = grad_out_f64.len();
                     const DIV_EPS: f64 = 1e-12;
-                    if Arc::ptr_eq(&lhs.grad, &rhs.grad) {
-                        let mut grad = lhs.grad.write().unwrap();
+                    if lhs.grad.id() == rhs.grad.id() {
+                        let mut grad = lhs.grad_write_f64();
                         for i in 0..len {
                             let r = rhs_data[i];
                             let safe_r = if r.abs() < DIV_EPS {
@@ -4028,12 +4163,12 @@ impl<'b> Div<&'b Tensor> for &Tensor {
                             } else {
                                 r
                             };
-                            grad[i] += grad_out[i] / safe_r
-                                - grad_out[i] * lhs_data[i] / (safe_r * safe_r);
+                            grad[i] += grad_out_f64[i] / safe_r
+                                - grad_out_f64[i] * lhs_data[i] / (safe_r * safe_r);
                         }
                     } else {
                         {
-                            let mut lhs_grad = lhs.grad.write().unwrap();
+                            let mut lhs_grad = lhs.grad_write_f64();
                             for i in 0..len {
                                 let r = rhs_data[i];
                                 let safe_r = if r.abs() < DIV_EPS {
@@ -4041,11 +4176,11 @@ impl<'b> Div<&'b Tensor> for &Tensor {
                                 } else {
                                     r
                                 };
-                                lhs_grad[i] += grad_out[i] / safe_r;
+                                lhs_grad[i] += grad_out_f64[i] / safe_r;
                             }
                         }
                         {
-                            let mut rhs_grad = rhs.grad.write().unwrap();
+                            let mut rhs_grad = rhs.grad_write_f64();
                             for i in 0..len {
                                 let r = rhs_data[i];
                                 let safe_r = if r.abs() < DIV_EPS {
@@ -4053,7 +4188,7 @@ impl<'b> Div<&'b Tensor> for &Tensor {
                                 } else {
                                     r
                                 };
-                                rhs_grad[i] -= grad_out[i] * lhs_data[i] / (safe_r * safe_r);
+                                rhs_grad[i] -= grad_out_f64[i] * lhs_data[i] / (safe_r * safe_r);
                             }
                         }
                     }
@@ -4076,23 +4211,24 @@ impl Neg for Tensor {
         let parents = vec![self.clone()];
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(data))),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(|grad_out, parents| {
-                    let mut inp_grad = parents[0].grad.write().unwrap();
-                    let len = grad_out.len();
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = parents[0].grad_write_f64();
+                    let len = grad_out_f64.len();
                     if len >= PAR_THRESHOLD {
                         inp_grad
                             .par_iter_mut()
-                            .zip(grad_out.par_iter())
+                            .zip(grad_out_f64.par_iter())
                             .for_each(|(ig, &g)| *ig -= g);
                     } else {
                         for i in 0..len {
-                            inp_grad[i] -= grad_out[i];
+                            inp_grad[i] -= grad_out_f64[i];
                         }
                     }
                 }),
@@ -4165,7 +4301,7 @@ impl Tensor {
     > {
         use crate::cuda::memory::{alloc, copy_h2d};
 
-        let host = self.grad.read().unwrap();
+        let host = self.grad_read_f64();
         let len = host.len();
         if let Some(buffer) = self.cuda_grad_cached_buffer() {
             if buffer.len() == len {
@@ -4204,7 +4340,7 @@ impl Tensor {
     ) -> Option<Arc<crate::cuda::memory::DevicePtr<f64>>> {
         use crate::cuda::memory::{alloc, copy_h2d};
 
-        let len = self.grad.read().unwrap().len();
+        let len = self.grad_read_f64().len();
         if len == 0 {
             return Some(Arc::new(crate::cuda::memory::DevicePtr::zero_sized()));
         }
@@ -4377,13 +4513,14 @@ impl Tensor {
         let parents = vec![self.clone(), other.clone()];
         let out = Tensor {
             data: Storage::F64(Arc::new(RwLock::new(vec![0.0; m * n]))),
-            grad: Arc::new(RwLock::new(vec![0.0; m * n])),
+            grad: Storage::zeros(m * n, Tensor::grad_dtype_for(Dtype::F64)),
             shape: out_shape,
             device: Device::Cuda,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let lhs = &parents[0];
                     let rhs = &parents[1];
 
@@ -4395,13 +4532,13 @@ impl Tensor {
                             (lhs.cuda_cached_buffer(), rhs.cuda_cached_buffer())
                         {
                             if let Ok(d_grad_tmp) =
-                                crate::cuda::memory::alloc_pooled::<f64>(grad_out.len())
+                                crate::cuda::memory::alloc_pooled::<f64>(grad_out_f64.len())
                             {
                                 let d_grad_tmp = std::sync::Arc::new(d_grad_tmp);
                                 if crate::cuda::memory::copy_h2d(&d_grad_tmp, grad_out).is_ok() {
                                     use crate::cuda::blas::gemm_thread_local;
 
-                                    // dL/dLHS = grad_out[m,n] * rhs^T[n,k]  --> m x k
+                                    // dL/dLHS = grad_out_f64[m,n] * rhs^T[n,k]  --> m x k
                                     let lhs_ok =
                                         if let Some(d_lhs_grad) = lhs.cuda_grad_ensure_buffer() {
                                             gemm_thread_local(
@@ -4424,7 +4561,7 @@ impl Tensor {
                                             false
                                         };
 
-                                    // dL/dRHS = lhs^T[k,m] * grad_out[m,n]  --> k x n
+                                    // dL/dRHS = lhs^T[k,m] * grad_out_f64[m,n]  --> k x n
                                     let rhs_ok =
                                         if let Some(d_rhs_grad) = rhs.cuda_grad_ensure_buffer() {
                                             gemm_thread_local(
@@ -4466,11 +4603,11 @@ impl Tensor {
                     let rhs_data = guards.get(1);
 
                     {
-                        let mut lhs_grad = lhs.grad.write().unwrap();
+                        let mut lhs_grad = lhs.grad_write_compat();
                         for r in 0..m {
                             for i in 0..k {
                                 lhs_grad[r * k + i] += dot_product(
-                                    &grad_out[r * n..r * n + n],
+                                    &grad_out_f64[r * n..r * n + n],
                                     &rhs_data[i * n..i * n + n],
                                 );
                             }
@@ -4478,12 +4615,12 @@ impl Tensor {
                     }
 
                     {
-                        let mut rhs_grad = rhs.grad.write().unwrap();
+                        let mut rhs_grad = rhs.grad_write_compat();
                         for i in 0..k {
                             for j in 0..n {
                                 for r in 0..m {
                                     rhs_grad[i * n + j] +=
-                                        lhs_data[r * k + i] * grad_out[r * n + j];
+                                        lhs_data[r * k + i] * grad_out_f64[r * n + j];
                                 }
                             }
                         }
@@ -4524,13 +4661,14 @@ impl Tensor {
         let parents = vec![self.clone(), other.clone()];
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(out_data))),
-            grad: Arc::new(RwLock::new(vec![0.0; m * n])),
+            grad: Storage::zeros(m * n, Tensor::grad_dtype_for(Dtype::F64)),
             shape: out_shape,
             device: Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let lhs = &parents[0];
                     let rhs = &parents[1];
                     let guards = TensorReadGuard::new(&[lhs, rhs]);
@@ -4539,11 +4677,11 @@ impl Tensor {
 
                     {
                         // dL/dLHS
-                        let mut lhs_grad = lhs.grad.write().unwrap();
+                        let mut lhs_grad = lhs.grad_write_compat();
                         for r in 0..m {
                             for i in 0..k {
                                 lhs_grad[r * k + i] += dot_product(
-                                    &grad_out[r * n..r * n + n],
+                                    &grad_out_f64[r * n..r * n + n],
                                     &rhs_data[i * n..i * n + n],
                                 );
                             }
@@ -4552,12 +4690,12 @@ impl Tensor {
 
                     {
                         // dL/dRHS
-                        let mut rhs_grad = rhs.grad.write().unwrap();
+                        let mut rhs_grad = rhs.grad_write_compat();
                         for i in 0..k {
                             for j in 0..n {
                                 for r in 0..m {
                                     rhs_grad[i * n + j] +=
-                                        lhs_data[r * k + i] * grad_out[r * n + j];
+                                        lhs_data[r * k + i] * grad_out_f64[r * n + j];
                                 }
                             }
                         }
@@ -4623,19 +4761,20 @@ impl Tensor {
         let parents = vec![self.clone()];
         let out = Tensor {
             data: Storage::F64(Arc::new(RwLock::new(vec![0.0; len]))),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
             shape: self.shape.clone(),
             device: Device::Cuda,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let input = &parents[0];
                     #[cfg(cuda)]
                     if input.device == Device::Cuda {
                         if let Some(d_input) = input.cuda_cached_buffer() {
                             if let Ok(d_grad_tmp) =
-                                crate::cuda::memory::alloc_pooled::<f64>(grad_out.len())
+                                crate::cuda::memory::alloc_pooled::<f64>(grad_out_f64.len())
                             {
                                 let d_grad_tmp = std::sync::Arc::new(d_grad_tmp);
                                 if crate::cuda::memory::copy_h2d(&d_grad_tmp, grad_out).is_ok() {
@@ -4644,7 +4783,7 @@ impl Tensor {
                                             &d_input,
                                             &d_grad_tmp,
                                             &d_in_grad,
-                                            grad_out.len(),
+                                            grad_out_f64.len(),
                                         );
                                     }
                                 }
@@ -4652,7 +4791,7 @@ impl Tensor {
                         }
                     }
                     let input_data = input.data_f64();
-                    let mut inp_grad = input.grad.write().unwrap();
+                    let mut inp_grad = input.grad_write_compat();
                     let sqrt_2_over_pi = (2.0 / std::f64::consts::PI).sqrt();
                     let c = 0.044715;
                     for i in 0..inp_grad.len() {
@@ -4664,7 +4803,7 @@ impl Tensor {
                         let sech2_u = 1.0 - tanh_u * tanh_u;
                         let du_dx = sqrt_2_over_pi * (1.0 + 3.0 * c * x2);
                         let gelu_grad = 0.5 * (1.0 + tanh_u) + 0.5 * x * sech2_u * du_dx;
-                        inp_grad[i] += grad_out[i] * gelu_grad;
+                        inp_grad[i] += grad_out_f64[i] * gelu_grad;
                     }
                 }),
             })),
@@ -4692,16 +4831,17 @@ impl Tensor {
 
         Tensor {
             data: Storage::F64(Arc::new(RwLock::new(data))),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let input = &parents[0];
                     let input_data = input.data_f64();
-                    let mut inp_grad = input.grad.write().unwrap();
+                    let mut inp_grad = input.grad_write_compat();
                     for i in 0..inp_grad.len() {
                         let x = input_data[i];
                         let x2 = x * x;
@@ -4711,7 +4851,7 @@ impl Tensor {
                         let sech2_u = 1.0 - tanh_u * tanh_u;
                         let du_dx = sqrt_2_over_pi * (1.0 + 3.0 * c * x2);
                         let gelu_grad = 0.5 * (1.0 + tanh_u) + 0.5 * x * sech2_u * du_dx;
-                        inp_grad[i] += grad_out[i] * gelu_grad;
+                        inp_grad[i] += grad_out_f64[i] * gelu_grad;
                     }
                 }),
             })),
@@ -4794,13 +4934,14 @@ impl Tensor {
         let cols_cap = cols;
         let out = Tensor {
             data: Storage::F64(Arc::new(RwLock::new(vec![0.0; len]))),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
             shape: self.shape.clone(),
             device: Device::Cuda,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     // Backward needs softmax output for: grad_in = softmax * (grad_out - sum(grad_out * softmax))
                     // The softmax output lives on GPU (self's cached buffer).
                     // We materialize it here so the backward computation can proceed on CPU.
@@ -4816,17 +4957,17 @@ impl Tensor {
                         return;
                     };
 
-                    let mut inp_grad = parents[0].grad.write().unwrap();
+                    let mut inp_grad = parents[0].grad_write_compat();
                     for row in 0..rows_cap {
                         let base = row * cols_cap;
                         let mut sum_term = 0.0;
                         for j in 0..cols_cap {
                             let idx = base + j;
-                            sum_term += grad_out[idx] * out_data[idx];
+                            sum_term += grad_out_f64[idx] * out_data[idx];
                         }
                         for j in 0..cols_cap {
                             let idx = base + j;
-                            inp_grad[idx] += out_data[idx] * (grad_out[idx] - sum_term);
+                            inp_grad[idx] += out_data[idx] * (grad_out_f64[idx] - sum_term);
                         }
                     }
                 }),
@@ -4928,13 +5069,14 @@ impl Tensor {
         let cols_cap = cols;
         let out = Tensor {
             data: Storage::F64(Arc::new(RwLock::new(vec![0.0; len]))),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
             shape: self.shape.clone(),
             device: Device::Cuda,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     // Causal softmax backward: grad_in = out * (grad_out - sum(grad_out * out))
                     // Masked positions (j > i) have out = 0, so grad_in = 0 for them.
                     let out_data: Vec<f64> = if let Some(buf) = parents[0].cuda_cached_buffer() {
@@ -4948,20 +5090,20 @@ impl Tensor {
                         return;
                     };
 
-                    let mut inp_grad = parents[0].grad.write().unwrap();
+                    let mut inp_grad = parents[0].grad_write_compat();
                     for row in 0..rows_cap {
                         let base = row * cols_cap;
                         let mut sum_term = 0.0;
                         for j in 0..cols_cap {
                             let idx = base + j;
-                            sum_term += grad_out[idx] * out_data[idx];
+                            sum_term += grad_out_f64[idx] * out_data[idx];
                         }
                         for j in 0..cols_cap {
                             let idx = base + j;
                             // Causal mask: j > row positions were -inf in forward,
                             // their output is 0, so gradient contribution is also 0.
                             // The formula handles this naturally since out_data[idx] = 0.
-                            inp_grad[idx] += out_data[idx] * (grad_out[idx] - sum_term);
+                            inp_grad[idx] += out_data[idx] * (grad_out_f64[idx] - sum_term);
                         }
                     }
                 }),
@@ -5067,7 +5209,7 @@ impl Tensor {
 
         let out = Tensor {
             data: Storage::F64(Arc::new(RwLock::new(vec![0.0; len]))),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
             shape: self.shape.clone(),
             device: Device::Cuda,
             dtype: Dtype::F64,
@@ -5087,7 +5229,7 @@ impl Tensor {
                     } else {
                         return;
                     };
-                    let mut inp_grad = parents[0].grad.write().unwrap();
+                    let mut inp_grad = parents[0].grad_write_f64();
                     let half_dim = dim_cap / 2;
                     for b in 0..total_batches_cap {
                         for t in 0..seq_len_cap {
@@ -5183,32 +5325,33 @@ impl Tensor {
 
         let out = Tensor {
             data: Storage::F64(Arc::new(RwLock::new(data))),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
             shape,
             device: Device::Cuda,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let mut sum_terms = vec![0.0; num_slices_cap];
                     for (slice_idx, sum_term) in sum_terms.iter_mut().enumerate() {
                         let base = slice_idx * dim_size_cap;
                         let mut slice_sum = 0.0;
                         for j in 0..dim_size_cap {
                             let idx = base + j;
-                            slice_sum += grad_out[idx] * softmax_cache_for_backward[idx];
+                            slice_sum += grad_out_f64[idx] * softmax_cache_for_backward[idx];
                         }
                         *sum_term = slice_sum;
                     }
 
-                    let mut inp_grad = parents[0].grad.write().unwrap();
+                    let mut inp_grad = parents[0].grad_write_compat();
                     #[allow(clippy::needless_range_loop)]
                     for slice_idx in 0..num_slices_cap {
                         let base = slice_idx * dim_size_cap;
                         for j in 0..dim_size_cap {
                             let idx = base + j;
                             inp_grad[idx] += softmax_cache_for_backward[idx]
-                                * (grad_out[idx] - sum_terms[slice_idx]);
+                                * (grad_out_f64[idx] - sum_terms[slice_idx]);
                         }
                     }
                 }),
@@ -5272,13 +5415,14 @@ impl Tensor {
         let parents = vec![self.clone(), rhs.clone()];
         let out = Tensor {
             data: Storage::F64(Arc::new(RwLock::new(vec![0.0; len]))),
-            grad: Arc::new(RwLock::new(vec![0.0; len])),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
             shape: self.shape.clone(),
             device: Device::Cuda,
             dtype: Dtype::F64,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let a = &parents[0];
                     let b = &parents[1];
                     #[cfg(cuda)]
@@ -5287,7 +5431,7 @@ impl Tensor {
                             (a.cuda_cached_buffer(), b.cuda_cached_buffer())
                         {
                             if let Ok(d_grad_tmp) =
-                                crate::cuda::memory::alloc_pooled::<f64>(grad_out.len())
+                                crate::cuda::memory::alloc_pooled::<f64>(grad_out_f64.len())
                             {
                                 let d_grad_tmp = std::sync::Arc::new(d_grad_tmp);
                                 if crate::cuda::memory::copy_h2d(&d_grad_tmp, grad_out).is_ok() {
@@ -5300,7 +5444,7 @@ impl Tensor {
                                                     &d_b,
                                                     &d_a_grad,
                                                     &d_b_grad,
-                                                    grad_out.len(),
+                                                    grad_out_f64.len(),
                                                 );
                                             }
                                         }
@@ -5310,11 +5454,11 @@ impl Tensor {
                         }
                     }
                     // CPU backward fallback
-                    let mut a_grad = a.grad.write().unwrap();
-                    let mut b_grad = b.grad.write().unwrap();
-                    for i in 0..grad_out.len() {
-                        a_grad[i] += grad_out[i];
-                        b_grad[i] += grad_out[i];
+                    let mut a_grad = a.grad_write_compat();
+                    let mut b_grad = b.grad_write_compat();
+                    for i in 0..grad_out_f64.len() {
+                        a_grad[i] += grad_out_f64[i];
+                        b_grad[i] += grad_out_f64[i];
                     }
                 }),
             })),
@@ -5666,8 +5810,8 @@ mod tests {
 
         // Backward
         c.sum().backward();
-        let a_grad = a.grad.read().unwrap();
-        let _b_grad = b.grad.read().unwrap();
+        let a_grad = a.grad_read_f64();
+        let _b_grad = b.grad_read_f64();
         // dL/da = ones * b^T
         assert!((a_grad[0] - 11.0).abs() < 1e-4);
         assert!((a_grad[1] - 15.0).abs() < 1e-4);
@@ -5792,8 +5936,8 @@ mod tests {
         let c = (&a * &b).sum();
         c.backward();
 
-        let a_grad = a.grad.read().unwrap();
-        let b_grad = b.grad.read().unwrap();
+        let a_grad = a.grad_read_f64();
+        let b_grad = b.grad_read_f64();
         // d(ab)/da = b
         assert!((a_grad[0] - 4.0).abs() < 1e-4);
         assert!((a_grad[1] - 5.0).abs() < 1e-4);

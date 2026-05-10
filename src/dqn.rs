@@ -485,7 +485,7 @@ impl Adam {
         // Global gradient clipping (max_norm = 1.0)
         let mut total_norm = 0.0;
         for param in &self.params {
-            let grad = param.grad.read().unwrap();
+            let grad = param.grad_read_f64();
             for &g in grad.iter() {
                 total_norm += g * g;
             }
@@ -501,7 +501,7 @@ impl Adam {
         let bias_correction2 = 1.0 - self.beta2.powi(self.t as i32);
 
         for (i, param) in self.params.iter_mut().enumerate() {
-            let grad = param.grad.read().unwrap();
+            let grad = param.grad_read_f64();
             let mut data = param.data_write_f64();
 
             for j in 0..data.len() {
@@ -573,7 +573,7 @@ impl GpuAdam {
         crate::cuda::record_optimizer_attempt();
         let mut total_norm = 0.0;
         for param in &self.params {
-            let grad = param.grad.read().unwrap();
+            let grad = param.grad_read_f64();
             for &g in grad.iter() {
                 total_norm += g * g;
             }

@@ -547,9 +547,9 @@ impl AchfLayer {
         let mut count = 0usize;
         // Include dense weight gradient
         {
-            let grad = self.weight.weight.grad.read().unwrap();
+            let grad = self.weight.weight.grad_to_f32_vec();
             for &v in grad.iter() {
-                sum_sq += v * v;
+                sum_sq += (v * v) as f64;
             }
             count += grad.len();
         }

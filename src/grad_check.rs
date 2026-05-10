@@ -24,7 +24,7 @@ where
     // Compute analytical gradient via backward
     let loss = loss_fn(tensor);
     loss.backward();
-    let analytical_grad = tensor.grad.read().unwrap().clone();
+    let analytical_grad = tensor.grad_read_f64().clone();
 
     // Compute numerical gradients via finite differences
     let mut max_diff: f64 = 0.0;
@@ -34,7 +34,7 @@ where
         data_plus[i] += epsilon;
         let t_plus = Tensor {
             data: Storage::F64(Arc::new(RwLock::new(data_plus))),
-            grad: Arc::new(RwLock::new(vec![0.0; n])),
+            grad: Storage::zeros(n, Tensor::grad_dtype_for(Dtype::F64)),
             shape: shape.clone(),
             device: crate::autograd::Device::Cpu,
             dtype: Dtype::F64,
@@ -48,7 +48,7 @@ where
         data_minus[i] -= epsilon;
         let t_minus = Tensor {
             data: Storage::F64(Arc::new(RwLock::new(data_minus))),
-            grad: Arc::new(RwLock::new(vec![0.0; n])),
+            grad: Storage::zeros(n, Tensor::grad_dtype_for(Dtype::F64)),
             shape: shape.clone(),
             device: crate::autograd::Device::Cpu,
             dtype: Dtype::F64,
@@ -118,8 +118,8 @@ mod tests {
 
         loss.backward();
 
-        let a_grad = a.grad.read().unwrap();
-        let x_grad = x.grad.read().unwrap();
+        let a_grad = a.grad_read_f64();
+        let x_grad = x.grad_read_f64();
 
         // Expected x_grad: [6, 8]
         assert!((x_grad[0] - 6.0).abs() < 1e-6);
@@ -151,8 +151,8 @@ mod tests {
 
         loss.backward();
 
-        let x_grad = x.grad.read().unwrap();
-        let y_grad = y.grad.read().unwrap();
+        let x_grad = x.grad_read_f64();
+        let y_grad = y.grad_read_f64();
 
         assert!((x_grad[0] - 1.0).abs() < 1e-6);
         assert!((x_grad[1] - 1.0).abs() < 1e-6);
