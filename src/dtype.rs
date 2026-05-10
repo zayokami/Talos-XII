@@ -102,6 +102,32 @@ impl Storage {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Convert storage data to Vec<f64>, regardless of original dtype.
+    pub fn to_f64_vec(&self) -> Vec<f64> {
+        match self {
+            Storage::F64(v) => v.read().unwrap().clone(),
+            Storage::F32(v) => v.read().unwrap().iter().map(|&x| x as f64).collect(),
+            Storage::BF16(v) => v.read().unwrap().iter().map(|&x| x.to_f64()).collect(),
+            Storage::I8(v) => v.read().unwrap().iter().map(|&x| x as f64).collect(),
+        }
+    }
+
+    /// Create storage from Vec<f64> with the specified dtype.
+    pub fn from_f64_vec(data: Vec<f64>, dtype: Dtype) -> Self {
+        match dtype {
+            Dtype::F64 => Storage::F64(Arc::new(RwLock::new(data))),
+            Dtype::F32 => Storage::F32(Arc::new(RwLock::new(
+                data.into_iter().map(|v| v as f32).collect(),
+            ))),
+            Dtype::BF16 => Storage::BF16(Arc::new(RwLock::new(
+                data.into_iter().map(bf16::from_f64).collect(),
+            ))),
+            Dtype::I8 => Storage::I8(Arc::new(RwLock::new(
+                data.into_iter().map(|v| v as i8).collect(),
+            ))),
+        }
+    }
 }
 
 /// Trait for types that can be tensor elements.
