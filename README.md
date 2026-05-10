@@ -311,7 +311,7 @@ Yes. Deleting `neural.cache`, `dqn.cache.bin`, `ppo.cache.bin` triggers retraini
 
 ## References
 
-- *DeepSeek mHC: Manifold-Constrained Hyper-Connections* — theoretical foundation for the optimizer design
+- *DeepSeek mHC: Manifold-Constrained Hyper-Connections* — early prototype reference (ACHF has since diverged to its own design)
 - *Proximal Policy Optimization Algorithms* (OpenAI) — PPO algorithm
 - *Embarrassingly Simple Self-Distillation Improves Code Generation* — self-distillation for EMA teacher updates and Best-K Sampling
 
@@ -617,7 +617,7 @@ cargo test
 
 ## 引用论文
 
-- *DeepSeek mHC: Manifold-Constrained Hyper-Connections* — 流形约束超连接，本项目优化器设计的核心理论
+- *DeepSeek mHC: Manifold-Constrained Hyper-Connections* — 早期原型参考来源之一（ACHF已发展为独立设计）
 - *Proximal Policy Optimization Algorithms* (OpenAI) — PPO 算法
 - *Embarrassingly Simple Self-Distillation Improves Code Generation* — 自蒸馏技术，用于 EMA teacher 更新和 Best-K Sampling
 

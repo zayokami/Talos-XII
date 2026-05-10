@@ -1,6 +1,6 @@
 use crate::achf::{aggregate_cache_stats_iter, AchfCacheStats, AchfLayer};
 use crate::autograd::{Context, Tensor, TensorReadGuard};
-use crate::config::AchfConfig;
+use crate::config::{AchfConfig, Config};
 use crate::nn::{Linear, Module, RMSNorm};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -30,6 +30,19 @@ impl MLAConfig {
             qk_rope_dim: 32,
             v_head_dim: 64,
             max_seq_len: 2048,
+        }
+    }
+
+    pub fn from_config(config: &Config) -> Self {
+        let num_heads = config.model_num_heads.max(1);
+        Self {
+            dim: config.model_hidden_dim,
+            num_heads,
+            q_lora_rank: 0,
+            kv_lora_rank: config.model_kv_lora_rank,
+            qk_rope_dim: config.model_qk_rope_dim,
+            v_head_dim: config.model_hidden_dim / num_heads,
+            max_seq_len: 256,
         }
     }
 }
@@ -77,17 +90,8 @@ impl LuckTransformer {
         num_layers: usize,
         seed: u64,
         achf: &AchfConfig,
+        mla_config: &MLAConfig,
     ) -> Self {
-        let mla_config = MLAConfig {
-            dim: hidden_dim,
-            num_heads: 8,
-            q_lora_rank: 0,
-            kv_lora_rank: 128,
-            qk_rope_dim: 64,
-            v_head_dim: hidden_dim / 8,
-            max_seq_len: 256,
-        };
-
         let num_layers = if num_layers == 0 { 2 } else { num_layers };
         let mut blocks = Vec::with_capacity(num_layers);
         for layer_idx in 0..num_layers {
@@ -129,6 +133,50 @@ impl LuckTransformer {
             norm_final: RMSNorm::new(hidden_dim, 1e-5, seed + 35),
             out_proj: Linear::new(hidden_dim, hidden_dim, true, seed + 40),
         }
+    }
+
+    /// Convenience constructor that builds MLAConfig from a global Config.
+    pub fn new_with_config(config: &Config, seed: u64) -> Self {
+        let mla = MLAConfig::from_config(config);
+        Self::new(
+            config.model_dim,
+            config.model_hidden_dim,
+            true,
+            config.model_num_layers,
+            seed,
+            &config.achf,
+            &mla,
+        )
+    }
+
+    /// Backward-compatible wrapper that uses hard-coded defaults for MLAConfig.
+    #[allow(dead_code)]
+    pub fn new_compat(
+        in_dim: usize,
+        hidden_dim: usize,
+        bias: bool,
+        num_layers: usize,
+        seed: u64,
+        achf: &AchfConfig,
+    ) -> Self {
+        let mla_config = MLAConfig {
+            dim: hidden_dim,
+            num_heads: 8,
+            q_lora_rank: 0,
+            kv_lora_rank: 128,
+            qk_rope_dim: 64,
+            v_head_dim: hidden_dim / 8,
+            max_seq_len: 256,
+        };
+        Self::new(
+            in_dim,
+            hidden_dim,
+            bias,
+            num_layers,
+            seed,
+            achf,
+            &mla_config,
+        )
     }
 
     #[cfg(cuda)]
@@ -236,7 +284,7 @@ impl LuckTransformer {
         None
     }
 
-    /// Run inference forcing a specific ACHF path (0=Cached, 1=LowRank, 2=Dense).
+    /// Run inference forcing a specific ACHF path (0=Cached, 1=Sparse, 2=Dense).
     pub fn forward_inference_forced_path(&self, x: &[f64], forced_path: u8) -> Vec<f64> {
         use crate::simd::vector_gelu;
         let mut h = self.embed.forward_inference(x);
@@ -2142,7 +2190,7 @@ mod tests {
     fn test_luck_transformer_integration() {
         // Use small dims for test
         let achf = crate::config::AchfConfig::default();
-        let t = LuckTransformer::new(8, 8, true, 2, 42, &achf);
+        let t = LuckTransformer::new_compat(8, 8, true, 2, 42, &achf);
         let x = Tensor::rand(vec![1, 5, 8], -0.1, 0.1, 123);
 
         let out = t.forward(&x, &[]);
@@ -2378,7 +2426,7 @@ mod tests {
     #[test]
     fn test_luck_transformer_step_into_matches_allocating_path() {
         let achf = crate::config::AchfConfig::default();
-        let model = LuckTransformer::new(8, 8, true, 2, 42, &achf);
+        let model = LuckTransformer::new_compat(8, 8, true, 2, 42, &achf);
         let num_heads = model.blocks[0].mla_layer.config.num_heads;
         let mut base_cache = vec![KVCache::new(num_heads); model.blocks.len()];
 

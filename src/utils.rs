@@ -105,17 +105,17 @@ pub fn format_achf_stats(stats: &AchfCacheStats) -> String {
         0.0
     };
     format!(
-        "[ACHF] Calls: {} | Hit: {:.2}% | Miss: {} | Skip: {} | LowRank: {} | Dense: {} | CachedEMA(ns): {:.1}/{:.1} | LowRankEMA(ns): {:.1}/{:.1} | DecisionEMA(ns): {:.1}/{:.1} | Bias: {:.3} | Samples: {}/{}",
+        "[ACHF] Calls: {} | Hit: {:.2}% | Miss: {} | Skip: {} | Sparse: {} | Dense: {} | CachedEMA(ns): {:.1}/{:.1} | SparseEMA(ns): {:.1}/{:.1} | DecisionEMA(ns): {:.1}/{:.1} | Bias: {:.3} | Samples: {}/{}",
         stats.calls,
         hit_rate * 100.0,
         stats.cache_misses,
         stats.cache_skips,
-        stats.low_rank_paths,
+        stats.sparse_paths,
         stats.dense_paths,
         stats.ema_cached_ns,
         stats.ema_cached_long_ns,
-        stats.ema_low_rank_ns,
-        stats.ema_low_rank_long_ns,
+        stats.ema_sparse_ns,
+        stats.ema_sparse_long_ns,
         stats.decision_ema_ns,
         stats.decision_ema_long_ns,
         stats.adaptive_bias,

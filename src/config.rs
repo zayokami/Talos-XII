@@ -254,6 +254,11 @@ fn sanitize_achf_config(achf: &mut AchfConfig) {
         "cache_adapt_blend",
         defaults.cache_adapt_blend,
     );
+    sanitize_non_negative(
+        &mut achf.prune_threshold,
+        "prune_threshold",
+        defaults.prune_threshold,
+    );
 }
 /// Determines which policy drives the luck factor during simulation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,6 +362,7 @@ pub struct AchfConfig {
     pub cache_log_interval_steps: usize,
     pub cache_log_per_layer: bool,
     pub rank: usize,
+    pub prune_threshold: f64,
     pub apply_attn: bool,
     pub apply_ffn: bool,
     pub apply_dqn: bool,
@@ -398,7 +404,8 @@ impl Default for AchfConfig {
             cache_latency_sample_every: 1,
             cache_log_interval_steps: 0,
             cache_log_per_layer: false,
-            rank: 32,
+            rank: 256,
+            prune_threshold: 0.01,
             apply_attn: true,
             apply_ffn: true,
             apply_dqn: false,
@@ -487,6 +494,14 @@ pub struct Config {
     pub train_interval_ms: usize,
     pub max_train_steps_per_tick: usize,
     pub language: Option<String>,
+    pub model_dim: usize,
+    pub model_hidden_dim: usize,
+    pub model_num_layers: usize,
+    pub model_num_heads: usize,
+    pub model_kv_lora_rank: usize,
+    pub model_qk_rope_dim: usize,
+    pub use_multi_stream: bool,
+    pub multi_stream_factor: usize,
     pub achf: AchfConfig,
 }
 
@@ -545,6 +560,14 @@ impl Default for Config {
             train_interval_ms: 50,
             max_train_steps_per_tick: 1,
             language: None,
+            model_dim: 512,
+            model_hidden_dim: 8192,
+            model_num_layers: 12,
+            model_num_heads: 32,
+            model_kv_lora_rank: 1024,
+            model_qk_rope_dim: 256,
+            use_multi_stream: true,
+            multi_stream_factor: 4,
             achf: AchfConfig::default(),
         }
     }
@@ -773,6 +796,30 @@ impl Config {
             if let Some(v) = map.get("language") {
                 config.language = v.as_str().map(|s| s.to_string());
             }
+            if let Some(v) = map.get("model_dim") {
+                config.model_dim = v.as_f64().unwrap_or(512.0).round() as usize;
+            }
+            if let Some(v) = map.get("model_hidden_dim") {
+                config.model_hidden_dim = v.as_f64().unwrap_or(8192.0).round() as usize;
+            }
+            if let Some(v) = map.get("model_num_layers") {
+                config.model_num_layers = v.as_f64().unwrap_or(12.0).round() as usize;
+            }
+            if let Some(v) = map.get("model_num_heads") {
+                config.model_num_heads = v.as_f64().unwrap_or(32.0).round() as usize;
+            }
+            if let Some(v) = map.get("model_kv_lora_rank") {
+                config.model_kv_lora_rank = v.as_f64().unwrap_or(1024.0).round() as usize;
+            }
+            if let Some(v) = map.get("model_qk_rope_dim") {
+                config.model_qk_rope_dim = v.as_f64().unwrap_or(256.0).round() as usize;
+            }
+            if let Some(v) = map.get("use_multi_stream") {
+                config.use_multi_stream = v.as_bool().unwrap_or(true);
+            }
+            if let Some(v) = map.get("multi_stream_factor") {
+                config.multi_stream_factor = v.as_f64().unwrap_or(4.0).round() as usize;
+            }
             if let Some(v) = map.get("use_calibrated") {
                 config.use_calibrated = v.as_bool().unwrap_or(true);
             }
@@ -880,8 +927,11 @@ impl Config {
                     config.achf.cache_log_per_layer = v.as_bool().unwrap_or(false);
                 }
                 if let Some(v) = achf_map.get("rank") {
-                    let r = v.as_f64().unwrap_or(32.0).round() as usize;
-                    config.achf.rank = if r == 0 { 32 } else { r };
+                    let r = v.as_f64().unwrap_or(256.0).round() as usize;
+                    config.achf.rank = if r == 0 { 256 } else { r };
+                }
+                if let Some(v) = achf_map.get("prune_threshold") {
+                    config.achf.prune_threshold = v.as_f64().unwrap_or(0.01);
                 }
                 if let Some(v) = achf_map.get("apply_attn") {
                     config.achf.apply_attn = v.as_bool().unwrap_or(false);
@@ -905,6 +955,37 @@ impl Config {
             "root config",
         );
         sanitize_achf_config(&mut config.achf);
+
+        // Sanitize model dimension settings
+        if config.model_dim == 0 {
+            eprintln!("[Config Warning] model_dim is 0, fallback to 512");
+            config.model_dim = 512;
+        }
+        if config.model_hidden_dim == 0 {
+            eprintln!("[Config Warning] model_hidden_dim is 0, fallback to 8192");
+            config.model_hidden_dim = 8192;
+        }
+        if config.model_num_layers == 0 {
+            eprintln!("[Config Warning] model_num_layers is 0, fallback to 12");
+            config.model_num_layers = 12;
+        }
+        if config.model_num_heads == 0 {
+            eprintln!("[Config Warning] model_num_heads is 0, fallback to 32");
+            config.model_num_heads = 32;
+        }
+        if config.model_dim % config.model_num_heads != 0 {
+            eprintln!(
+                "[Config Warning] model_dim ({}) not divisible by model_num_heads ({}), adjusting model_dim",
+                config.model_dim, config.model_num_heads
+            );
+            config.model_dim = (config.model_dim / config.model_num_heads) * config.model_num_heads;
+            if config.model_dim == 0 {
+                config.model_dim = config.model_num_heads;
+            }
+        }
+        if config.multi_stream_factor == 0 {
+            config.multi_stream_factor = 4;
+        }
 
         if !config.pools.is_empty() {
             if let Some(active) = config.active_pool.clone() {

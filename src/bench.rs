@@ -25,9 +25,9 @@ pub struct StepSnapshot {
     pub loss: f64,
     pub reward: f64,
     pub cache_hit_rate: f64,
-    pub low_rank_ratio: f64,
+    pub sparse_ratio: f64,
     pub ema_cached_ns: f64,
-    pub ema_low_rank_ns: f64,
+    pub ema_sparse_ns: f64,
     pub adaptive_bias: f64,
 }
 
@@ -223,13 +223,13 @@ fn ext(fmt: &ChartFormat) -> &'static str {
 
 // ── Main entry point ────────────────────────────────────────────────────
 
-pub fn run_paper_benchmarks(base_config: &Config, seed: u64, bench_cfg: &BenchConfig) {
+pub fn run_achf_benchmarks(base_config: &Config, seed: u64, bench_cfg: &BenchConfig) {
     let dir = &bench_cfg.output_dir;
     let nt = bench_cfg.num_trials;
     fs::create_dir_all(dir).expect("Failed to create output directory");
 
     println!("\n========================================");
-    println!("  ACHF Paper Benchmark Suite");
+    println!("  ACHF Benchmark Suite");
     println!("  Trials per experiment: {}", nt);
     println!("========================================\n");
 
@@ -363,7 +363,7 @@ fn run_mode_comparison(base_config: &Config, seed: u64, nt: usize) -> Vec<Aggreg
 }
 
 fn run_path_comparison(base_config: &Config, seed: u64) -> Vec<(String, Vec<f64>)> {
-    println!("[Bench] Running Path Comparison (Cached/LowRank/Dense)...");
+    println!("[Bench] Running Path Comparison (Cached/Sparse/Dense)...");
     let mut rng = Rng::from_seed(seed);
     let mut cfg = base_config.clone();
     cfg.achf.enabled = true;
@@ -381,8 +381,8 @@ fn run_path_comparison(base_config: &Config, seed: u64) -> Vec<(String, Vec<f64>
 
     let mut all_latencies: Vec<(String, Vec<f64>)> = Vec::new();
 
-    // 0 = Cached, 1 = LowRank, 2 = Dense
-    for (path_name, path_id) in [("Cached", 0u8), ("LowRank", 1), ("Dense", 2)] {
+    // 0 = Cached, 1 = Sparse, 2 = Dense
+    for (path_name, path_id) in [("Cached", 0u8), ("Sparse", 1), ("Dense", 2)] {
         let mut latencies = Vec::with_capacity(iterations);
         for _ in 0..iterations {
             let start = Instant::now();
@@ -700,7 +700,7 @@ fn chart_gate_curve(result: &BenchRunResult, dir: &str, ext: &str) {
     let lr_ratio: Vec<(f64, f64)> = result
         .snapshots
         .iter()
-        .map(|s| (s.step as f64, s.low_rank_ratio))
+        .map(|s| (s.step as f64, s.sparse_ratio))
         .collect();
     let abias: Vec<(f64, f64)> = result
         .snapshots
@@ -713,7 +713,7 @@ fn chart_gate_curve(result: &BenchRunResult, dir: &str, ext: &str) {
         ("g_min", &gmin),
         ("Grad EMA", &grad),
         ("Cache Hit Rate", &hit),
-        ("LowRank Ratio", &lr_ratio),
+        ("Sparse Ratio", &lr_ratio),
         ("Adaptive Bias", &abias),
     ];
     let path = format!("{}/gate_curve.{}", dir, ext);
@@ -888,7 +888,7 @@ fn write_summary_txt(all: &[(&str, Vec<AggregatedResult>)], dir: &str) {
                     "    ACHF: calls={} hit={:.1}% lr={} dense={} bias={:.3}",
                     stats.calls,
                     hit_pct,
-                    stats.low_rank_paths,
+                    stats.sparse_paths,
                     stats.dense_paths,
                     stats.adaptive_bias
                 ));

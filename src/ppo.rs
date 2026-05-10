@@ -1,5 +1,5 @@
 use crate::autograd::Tensor;
-use crate::config::Config;
+use crate::config::{AchfConfig, Config};
 use crate::env_net::EnvNet;
 use crate::neural::DIM;
 use crate::nn::{Linear, Module};
@@ -139,8 +139,27 @@ pub struct ActorCritic {
 }
 
 impl ActorCritic {
-    pub fn new(seed: u64, achf: &crate::config::AchfConfig) -> Self {
-        let backbone = LuckTransformer::new(DIM, 2048, true, 4, seed, achf);
+    pub fn new_with_config(config: &Config, seed: u64) -> Self {
+        let backbone = LuckTransformer::new_with_config(config, seed);
+        let actor_head = Linear::new(
+            config.model_hidden_dim,
+            ACTION_SPACE,
+            true,
+            seed.wrapping_add(100),
+        );
+        let critic_head = Linear::new(config.model_hidden_dim, 1, true, seed.wrapping_add(200));
+
+        ActorCritic {
+            backbone,
+            actor_head,
+            critic_head,
+        }
+    }
+
+    /// Backward-compatible constructor using hard-coded defaults.
+    #[allow(dead_code)]
+    pub fn new(seed: u64, achf: &AchfConfig) -> Self {
+        let backbone = LuckTransformer::new_compat(DIM, 2048, true, 4, seed, achf);
         let actor_head = Linear::new(2048, ACTION_SPACE, true, seed.wrapping_add(100));
         let critic_head = Linear::new(2048, 1, true, seed.wrapping_add(200));
 
@@ -659,13 +678,8 @@ pub struct Ppo {
 }
 
 impl Ppo {
-    pub fn new(
-        seed: u64,
-        k_epochs: usize,
-        batch_size: usize,
-        achf: &crate::config::AchfConfig,
-    ) -> Self {
-        let policy = ActorCritic::new(seed, achf);
+    pub fn new(seed: u64, k_epochs: usize, batch_size: usize, config: &Config) -> Self {
+        let policy = ActorCritic::new_with_config(config, seed);
         Self::from_policy(policy, k_epochs, batch_size)
     }
 
@@ -1339,7 +1353,7 @@ pub fn train_ppo(rng: &mut Rng, env_net: &EnvNet, config: &Config) -> ActorCriti
         1
     };
     let worker = GoodJobWorker::new_with_config(config).expect("Failed to build PPO worker pool");
-    let mut ppo = Ppo::new(rng.next_u64(), k_epochs, batch_size, &config.achf);
+    let mut ppo = Ppo::new(rng.next_u64(), k_epochs, batch_size, config);
     ppo.init_distillation(config);
     let mut steps_done = 0;
 
@@ -1539,7 +1553,7 @@ pub fn train_ppo_with_metrics(
         1
     };
     let worker = GoodJobWorker::new_with_config(config).expect("Failed to build PPO worker pool");
-    let mut ppo = Ppo::new(rng.next_u64(), k_epochs, batch_size, &config.achf);
+    let mut ppo = Ppo::new(rng.next_u64(), k_epochs, batch_size, config);
     ppo.init_distillation(config);
     let mut steps_done = 0;
 
@@ -1660,9 +1674,9 @@ pub fn train_ppo_with_metrics(
                     loss: update_loss,
                     reward: avg_r,
                     cache_hit_rate: achf_snap.map_or(0.0, |s| s.cache_hit_rate),
-                    low_rank_ratio: achf_snap.map_or(0.0, |s| s.low_rank_ratio),
+                    sparse_ratio: achf_snap.map_or(0.0, |s| s.low_rank_ratio),
                     ema_cached_ns: achf_snap.map_or(0.0, |s| s.ema_cached_ns),
-                    ema_low_rank_ns: achf_snap.map_or(0.0, |s| s.ema_low_rank_ns),
+                    ema_sparse_ns: achf_snap.map_or(0.0, |s| s.ema_sparse_ns),
                     adaptive_bias: achf_snap.map_or(1.0, |s| s.adaptive_bias),
                 };
                 let _ = tx.send(snapshot);
@@ -1685,13 +1699,12 @@ pub struct OnlinePpoTrainer {
 
 impl OnlinePpoTrainer {
     #[allow(dead_code)]
-    pub fn new(
-        seed: u64,
-        k_epochs: usize,
-        batch_size: usize,
-        achf: &crate::config::AchfConfig,
-    ) -> Self {
-        Self::from_policy(ActorCritic::new(seed, achf), k_epochs, batch_size)
+    pub fn new(seed: u64, k_epochs: usize, batch_size: usize, config: &Config) -> Self {
+        Self::from_policy(
+            ActorCritic::new_with_config(config, seed),
+            k_epochs,
+            batch_size,
+        )
     }
 
     pub fn from_policy(policy: ActorCritic, k_epochs: usize, batch_size: usize) -> Self {

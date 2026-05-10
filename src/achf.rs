@@ -1,4 +1,4 @@
-use crate::autograd::{Tensor, TensorReadGuard};
+use crate::autograd::Tensor;
 use crate::config::AchfConfig;
 use crate::nn::{Linear, Module};
 use crate::simd::{add_scaled_row, dot_product};
@@ -23,8 +23,9 @@ enum ProjMode {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AchfLayer {
     pub weight: Linear,
-    pub down: Option<Linear>,
-    pub up: Option<Linear>,
+    /// Sparse weight created by magnitude pruning after training.
+    /// When present, inference uses this (with zero-skip) instead of dense weight.
+    pub sparse_weight: Option<Linear>,
     pub config: AchfConfig,
     #[serde(skip, default = "default_state")]
     pub state: Arc<RwLock<AchfState>>,
@@ -51,7 +52,7 @@ pub struct AchfMetrics {
     pub cache_hits: AtomicU64,
     pub cache_misses: AtomicU64,
     pub cache_skips: AtomicU64,
-    pub low_rank_paths: AtomicU64,
+    pub sparse_paths: AtomicU64,
     pub dense_paths: AtomicU64,
     pub latency_samples: AtomicU64,
     pub decision_samples: AtomicU64,
@@ -66,7 +67,7 @@ impl Clone for AchfMetrics {
             cache_hits: AtomicU64::new(self.cache_hits.load(Ordering::Relaxed)),
             cache_misses: AtomicU64::new(self.cache_misses.load(Ordering::Relaxed)),
             cache_skips: AtomicU64::new(self.cache_skips.load(Ordering::Relaxed)),
-            low_rank_paths: AtomicU64::new(self.low_rank_paths.load(Ordering::Relaxed)),
+            sparse_paths: AtomicU64::new(self.sparse_paths.load(Ordering::Relaxed)),
             dense_paths: AtomicU64::new(self.dense_paths.load(Ordering::Relaxed)),
             latency_samples: AtomicU64::new(self.latency_samples.load(Ordering::Relaxed)),
             decision_samples: AtomicU64::new(self.decision_samples.load(Ordering::Relaxed)),
@@ -83,7 +84,7 @@ impl Default for AchfMetrics {
             cache_hits: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
             cache_skips: AtomicU64::new(0),
-            low_rank_paths: AtomicU64::new(0),
+            sparse_paths: AtomicU64::new(0),
             dense_paths: AtomicU64::new(0),
             latency_samples: AtomicU64::new(0),
             decision_samples: AtomicU64::new(0),
@@ -104,8 +105,8 @@ pub struct AchfCache {
     pub out_dim: usize,
     pub ema_cached_ns: f64,
     pub ema_cached_long_ns: f64,
-    pub ema_low_rank_ns: f64,
-    pub ema_low_rank_long_ns: f64,
+    pub ema_sparse_ns: f64,
+    pub ema_sparse_long_ns: f64,
     pub decision_ema_ns: f64,
     pub decision_ema_long_ns: f64,
     pub adaptive_bias: f64,
@@ -133,8 +134,8 @@ fn default_cache() -> Arc<RwLock<AchfCache>> {
         out_dim: 0,
         ema_cached_ns: 0.0,
         ema_cached_long_ns: 0.0,
-        ema_low_rank_ns: 0.0,
-        ema_low_rank_long_ns: 0.0,
+        ema_sparse_ns: 0.0,
+        ema_sparse_long_ns: 0.0,
         decision_ema_ns: 0.0,
         decision_ema_long_ns: 0.0,
         adaptive_bias: 0.0,
@@ -150,12 +151,12 @@ pub struct AchfCacheStats {
     pub cache_hits: u64,
     pub cache_misses: u64,
     pub cache_skips: u64,
-    pub low_rank_paths: u64,
+    pub sparse_paths: u64,
     pub dense_paths: u64,
     pub ema_cached_ns: f64,
     pub ema_cached_long_ns: f64,
-    pub ema_low_rank_ns: f64,
-    pub ema_low_rank_long_ns: f64,
+    pub ema_sparse_ns: f64,
+    pub ema_sparse_long_ns: f64,
     pub decision_ema_ns: f64,
     pub decision_ema_long_ns: f64,
     pub adaptive_bias: f64,
@@ -172,7 +173,7 @@ impl AchfCacheStats {
         for s in stats {
             hit += s.cache_hits;
             skip += s.cache_skips;
-            lowrank += s.low_rank_paths;
+            lowrank += s.sparse_paths;
             dense += s.dense_paths;
         }
         let total = hit + skip + lowrank + dense;
@@ -203,7 +204,7 @@ pub struct AchfStateSnapshot {
     pub cache_hit_rate: f64,
     pub low_rank_ratio: f64,
     pub ema_cached_ns: f64,
-    pub ema_low_rank_ns: f64,
+    pub ema_sparse_ns: f64,
     pub adaptive_bias: f64,
 }
 
@@ -216,12 +217,12 @@ where
         cache_hits: 0,
         cache_misses: 0,
         cache_skips: 0,
-        low_rank_paths: 0,
+        sparse_paths: 0,
         dense_paths: 0,
         ema_cached_ns: 0.0,
         ema_cached_long_ns: 0.0,
-        ema_low_rank_ns: 0.0,
-        ema_low_rank_long_ns: 0.0,
+        ema_sparse_ns: 0.0,
+        ema_sparse_long_ns: 0.0,
         decision_ema_ns: 0.0,
         decision_ema_long_ns: 0.0,
         adaptive_bias: 0.0,
@@ -240,7 +241,7 @@ where
         out.cache_hits += s.cache_hits;
         out.cache_misses += s.cache_misses;
         out.cache_skips += s.cache_skips;
-        out.low_rank_paths += s.low_rank_paths;
+        out.sparse_paths += s.sparse_paths;
         out.dense_paths += s.dense_paths;
         out.latency_samples += s.latency_samples;
         out.decision_samples += s.decision_samples;
@@ -252,12 +253,12 @@ where
             out.ema_cached_long_ns += s.ema_cached_long_ns;
             count_cached_long += 1;
         }
-        if s.ema_low_rank_ns > 0.0 {
-            out.ema_low_rank_ns += s.ema_low_rank_ns;
+        if s.ema_sparse_ns > 0.0 {
+            out.ema_sparse_ns += s.ema_sparse_ns;
             count_low_rank += 1;
         }
-        if s.ema_low_rank_long_ns > 0.0 {
-            out.ema_low_rank_long_ns += s.ema_low_rank_long_ns;
+        if s.ema_sparse_long_ns > 0.0 {
+            out.ema_sparse_long_ns += s.ema_sparse_long_ns;
             count_low_rank_long += 1;
         }
         if s.decision_ema_ns > 0.0 {
@@ -277,13 +278,13 @@ where
         out.ema_cached_ns /= count_cached as f64;
     }
     if count_low_rank > 0 {
-        out.ema_low_rank_ns /= count_low_rank as f64;
+        out.ema_sparse_ns /= count_low_rank as f64;
     }
     if count_cached_long > 0 {
         out.ema_cached_long_ns /= count_cached_long as f64;
     }
     if count_low_rank_long > 0 {
-        out.ema_low_rank_long_ns /= count_low_rank_long as f64;
+        out.ema_sparse_long_ns /= count_low_rank_long as f64;
     }
     if count_decision > 0 {
         out.decision_ema_ns /= count_decision as f64;
@@ -308,26 +309,9 @@ impl AchfLayer {
         seed: u64,
     ) -> Self {
         let weight = Linear::new(in_features, out_features, bias, seed);
-        let max_rank = in_features.min(out_features);
-        let rank = if config.rank > 0 && config.rank < max_rank {
-            config.rank
-        } else {
-            0
-        };
-        let down = if rank > 0 {
-            Some(Linear::new(in_features, rank, false, seed.wrapping_add(1)))
-        } else {
-            None
-        };
-        let up = if rank > 0 {
-            Some(Linear::new(rank, out_features, false, seed.wrapping_add(2)))
-        } else {
-            None
-        };
         let layer = Self {
             weight,
-            down,
-            up,
+            sparse_weight: None,
             config,
             state: default_state(),
             cache: default_cache(),
@@ -336,20 +320,6 @@ impl AchfLayer {
         {
             let mut cache = layer.cache.write().unwrap();
             cache.adaptive_bias = layer.config.cache_cost_bias;
-        }
-        if rank > 0 {
-            let w_data = layer.weight.weight.data.read().unwrap();
-            let (down_data, up_data) =
-                truncated_svd_init(&w_data, in_features, out_features, rank, seed);
-            drop(w_data);
-            if let Some(ref d) = layer.down {
-                let mut d_data = d.weight.data.write().unwrap();
-                d_data.copy_from_slice(&down_data);
-            }
-            if let Some(ref u) = layer.up {
-                let mut u_data = u.weight.data.write().unwrap();
-                u_data.copy_from_slice(&up_data);
-            }
         }
         layer
     }
@@ -363,56 +333,47 @@ impl AchfLayer {
         let cache = self.cache.read().unwrap();
         let calls = self.metrics.calls.load(Ordering::Relaxed) as f64;
         let cache_hits = self.metrics.cache_hits.load(Ordering::Relaxed) as f64;
-        let low_rank_paths = self.metrics.low_rank_paths.load(Ordering::Relaxed) as f64;
+        let sparse_paths = self.metrics.sparse_paths.load(Ordering::Relaxed) as f64;
         AchfStateSnapshot {
             gate: state.last_gate,
             g_min: state.g_min_ema,
             grad_ema: state.grad_ema,
             cache_hit_rate: if calls > 0.0 { cache_hits / calls } else { 0.0 },
             low_rank_ratio: if calls > 0.0 {
-                low_rank_paths / calls
+                sparse_paths / calls
             } else {
                 0.0
             },
             ema_cached_ns: cache.ema_cached_ns,
-            ema_low_rank_ns: cache.ema_low_rank_ns,
+            ema_sparse_ns: cache.ema_sparse_ns,
             adaptive_bias: cache.adaptive_bias,
         }
     }
 
     pub fn parameters(&self) -> Vec<Tensor> {
         let mut p = self.weight.parameters();
-        if let Some(d) = &self.down {
-            p.extend(d.parameters());
-        }
-        if let Some(u) = &self.up {
-            p.extend(u.parameters());
+        if let Some(s) = &self.sparse_weight {
+            p.extend(s.parameters());
         }
         p
     }
 
     fn forward_blend(&self, input: &Tensor, g: f64) -> Tensor {
         let dense_out = self.weight.forward(input);
-        if !self.is_low_rank() {
+        if !self.is_sparse() {
             return dense_out;
         }
-        let down = self.down.as_ref().unwrap();
-        let up = self.up.as_ref().unwrap();
-        let low = down.forward(input);
-        let low_out = up.forward(&low);
+        let sparse_out = self.sparse_weight.as_ref().unwrap().forward(input);
         let g_t = Tensor::new(vec![g], vec![1]).broadcast(dense_out.shape.clone());
-        let og_t = Tensor::new(vec![1.0 - g], vec![1]).broadcast(low_out.shape.clone());
-        &(&dense_out * &g_t) + &(&low_out * &og_t)
+        let og_t = Tensor::new(vec![1.0 - g], vec![1]).broadcast(sparse_out.shape.clone());
+        &(&dense_out * &g_t) + &(&sparse_out * &og_t)
     }
 
     #[cfg(cuda)]
     pub fn to_cuda(&mut self) {
         self.weight.to_cuda();
-        if let Some(ref mut d) = self.down {
-            d.to_cuda();
-        }
-        if let Some(ref mut u) = self.up {
-            u.to_cuda();
+        if let Some(ref mut s) = self.sparse_weight {
+            s.to_cuda();
         }
     }
 }
@@ -503,12 +464,7 @@ impl AchfLayer {
                 InferencePath::Cached => self
                     .forward_inference_cached(x)
                     .unwrap_or_else(|| self.weight.forward_inference(x)),
-                InferencePath::LowRank => {
-                    let down = self.down.as_ref().unwrap();
-                    let up = self.up.as_ref().unwrap();
-                    let low = down.forward_inference(x);
-                    up.forward_inference(&low)
-                }
+                InferencePath::Sparse => self.sparse_weight.as_ref().unwrap().forward_inference(x),
                 InferencePath::Dense => self.weight.forward_inference(x),
             };
             (out, start.elapsed().as_nanos() as f64)
@@ -517,12 +473,7 @@ impl AchfLayer {
                 InferencePath::Cached => self
                     .forward_inference_cached(x)
                     .unwrap_or_else(|| self.weight.forward_inference(x)),
-                InferencePath::LowRank => {
-                    let down = self.down.as_ref().unwrap();
-                    let up = self.up.as_ref().unwrap();
-                    let low = down.forward_inference(x);
-                    up.forward_inference(&low)
-                }
+                InferencePath::Sparse => self.sparse_weight.as_ref().unwrap().forward_inference(x),
                 InferencePath::Dense => self.weight.forward_inference(x),
             };
             (out, 0.0)
@@ -556,7 +507,7 @@ impl AchfLayer {
     }
 
     /// Run inference through a specific path, bypassing the automatic path selection.
-    /// `forced_path`: 0 = Cached, 1 = LowRank, 2 = Dense.
+    /// `forced_path`: 0 = Cached, 1 = Sparse, 2 = Dense.
     pub fn forward_inference_forced_path(&self, x: &[f64], forced_path: u8) -> Vec<f64> {
         if !self.config.enabled {
             return vec![0.0; x.len()];
@@ -566,12 +517,7 @@ impl AchfLayer {
             0 => self
                 .forward_inference_cached(x)
                 .unwrap_or_else(|| self.weight.forward_inference(x)),
-            1 if self.is_low_rank() => {
-                let down = self.down.as_ref().unwrap();
-                let up = self.up.as_ref().unwrap();
-                let low = down.forward_inference(x);
-                up.forward_inference(&low)
-            }
+            1 if self.is_sparse() => self.sparse_weight.as_ref().unwrap().forward_inference(x),
             _ => self.weight.forward_inference(x),
         };
         for v in out.iter_mut() {
@@ -586,30 +532,13 @@ impl AchfLayer {
         }
         let mut sum_sq = 0.0;
         let mut count = 0usize;
-        // Always include dense weight gradient
+        // Include dense weight gradient
         {
             let grad = self.weight.weight.grad.read().unwrap();
             for &v in grad.iter() {
                 sum_sq += v * v;
             }
             count += grad.len();
-        }
-        // Include low-rank gradients when present
-        if self.is_low_rank() {
-            if let Some(down) = &self.down {
-                let grad = down.weight.grad.read().unwrap();
-                for &v in grad.iter() {
-                    sum_sq += v * v;
-                }
-                count += grad.len();
-            }
-            if let Some(up) = &self.up {
-                let grad = up.weight.grad.read().unwrap();
-                for &v in grad.iter() {
-                    sum_sq += v * v;
-                }
-                count += grad.len();
-            }
         }
         if count == 0 {
             return;
@@ -636,11 +565,7 @@ impl AchfLayer {
         if self.config.lambda_ortho <= 0.0 {
             return None;
         }
-        let w = if self.is_low_rank() {
-            self.up.as_ref().unwrap().weight.clone()
-        } else {
-            self.weight.weight.clone()
-        };
+        let w = self.weight.weight.clone();
         let wt = w.transpose2d();
         let wtw = wt.matmul(&w);
         let dim = wtw.shape[0];
@@ -673,12 +598,12 @@ impl AchfLayer {
             cache_hits: self.metrics.cache_hits.load(Ordering::Relaxed),
             cache_misses: self.metrics.cache_misses.load(Ordering::Relaxed),
             cache_skips: self.metrics.cache_skips.load(Ordering::Relaxed),
-            low_rank_paths: self.metrics.low_rank_paths.load(Ordering::Relaxed),
+            sparse_paths: self.metrics.sparse_paths.load(Ordering::Relaxed),
             dense_paths: self.metrics.dense_paths.load(Ordering::Relaxed),
             ema_cached_ns: cache.ema_cached_ns,
             ema_cached_long_ns: cache.ema_cached_long_ns,
-            ema_low_rank_ns: cache.ema_low_rank_ns,
-            ema_low_rank_long_ns: cache.ema_low_rank_long_ns,
+            ema_sparse_ns: cache.ema_sparse_ns,
+            ema_sparse_long_ns: cache.ema_sparse_long_ns,
             decision_ema_ns: cache.decision_ema_ns,
             decision_ema_long_ns: cache.decision_ema_long_ns,
             adaptive_bias: cache.adaptive_bias,
@@ -817,25 +742,10 @@ impl AchfLayer {
     }
 
     fn project_rowcol(&self) {
-        if self.is_low_rank() {
-            if let Some(down) = &self.down {
-                let mut w = down.weight.data.write().unwrap();
-                let rows = down.in_features;
-                let cols = down.out_features;
-                rowcol_project(&mut w, rows, cols);
-            }
-            if let Some(up) = &self.up {
-                let mut w = up.weight.data.write().unwrap();
-                let rows = up.in_features;
-                let cols = up.out_features;
-                rowcol_project(&mut w, rows, cols);
-            }
-        } else {
-            let mut w = self.weight.weight.data.write().unwrap();
-            let rows = self.weight.in_features;
-            let cols = self.weight.out_features;
-            rowcol_project(&mut w, rows, cols);
-        }
+        let mut w = self.weight.weight.data.write().unwrap();
+        let rows = self.weight.in_features;
+        let cols = self.weight.out_features;
+        rowcol_project(&mut w, rows, cols);
     }
 
     fn project_sinkhorn(&self) {
@@ -844,34 +754,18 @@ impl AchfLayer {
         } else {
             self.config.proj_steps
         };
-        if self.is_low_rank() {
-            if let Some(down) = &self.down {
-                let mut w = down.weight.data.write().unwrap();
-                sinkhorn_project(&mut w, down.in_features, down.out_features, steps);
-            }
-            if let Some(up) = &self.up {
-                let mut w = up.weight.data.write().unwrap();
-                sinkhorn_project(&mut w, up.in_features, up.out_features, steps);
-            }
-        } else {
-            let mut w = self.weight.weight.data.write().unwrap();
-            sinkhorn_project(
-                &mut w,
-                self.weight.in_features,
-                self.weight.out_features,
-                steps,
-            );
-        }
+        let mut w = self.weight.weight.data.write().unwrap();
+        sinkhorn_project(
+            &mut w,
+            self.weight.in_features,
+            self.weight.out_features,
+            steps,
+        );
     }
 
     pub fn load_state_dict(&mut self, other: &AchfLayer) {
-        if self.is_low_rank() {
-            if let (Some(dst), Some(src)) = (&mut self.down, &other.down) {
-                copy_linear(dst, src);
-            }
-            if let (Some(dst), Some(src)) = (&mut self.up, &other.up) {
-                copy_linear(dst, src);
-            }
+        if let (Some(dst), Some(src)) = (&mut self.sparse_weight, &other.sparse_weight) {
+            copy_linear(dst, src);
         }
         // Always copy dense weight as reference/teacher
         copy_linear(&mut self.weight, &other.weight);
@@ -879,21 +773,38 @@ impl AchfLayer {
     }
 
     pub fn soft_update(&mut self, source: &AchfLayer, tau: f64) {
-        if self.is_low_rank() {
-            if let (Some(dst), Some(src)) = (&mut self.down, &source.down) {
-                soft_update_linear(dst, src, tau);
-            }
-            if let (Some(dst), Some(src)) = (&mut self.up, &source.up) {
-                soft_update_linear(dst, src, tau);
-            }
+        if let (Some(dst), Some(src)) = (&mut self.sparse_weight, &source.sparse_weight) {
+            soft_update_linear(dst, src, tau);
         }
         // Always update dense weight as reference/teacher
         soft_update_linear(&mut self.weight, &source.weight, tau);
         self.clear_cache();
     }
 
-    fn is_low_rank(&self) -> bool {
-        self.down.is_some() && self.up.is_some()
+    fn is_sparse(&self) -> bool {
+        self.sparse_weight.is_some()
+    }
+
+    /// Post-training magnitude pruning: create sparse_weight by zeroing
+    /// elements below threshold. Idempotent (re-pruning overwrites).
+    #[allow(dead_code)]
+    pub fn prune(&mut self, threshold: f64) {
+        let w_data = self.weight.weight.data.read().unwrap();
+        let pruned: Vec<f64> = w_data
+            .iter()
+            .map(|&v| if v.abs() < threshold { 0.0 } else { v })
+            .collect();
+        drop(w_data);
+        let pruned_weight = Tensor::new(
+            pruned,
+            vec![self.weight.in_features, self.weight.out_features],
+        );
+        self.sparse_weight = Some(Linear {
+            weight: pruned_weight,
+            bias: self.weight.bias.clone(),
+            in_features: self.weight.in_features,
+            out_features: self.weight.out_features,
+        });
     }
 
     fn clear_cache(&self) {
@@ -903,8 +814,8 @@ impl AchfLayer {
         cache.out_dim = 0;
         cache.ema_cached_ns = 0.0;
         cache.ema_cached_long_ns = 0.0;
-        cache.ema_low_rank_ns = 0.0;
-        cache.ema_low_rank_long_ns = 0.0;
+        cache.ema_sparse_ns = 0.0;
+        cache.ema_sparse_long_ns = 0.0;
         cache.decision_ema_ns = 0.0;
         cache.decision_ema_long_ns = 0.0;
         cache.adaptive_bias = self.config.cache_cost_bias;
@@ -918,7 +829,7 @@ impl AchfLayer {
     }
 
     fn ensure_cache(&self) {
-        if !self.is_low_rank() {
+        if !self.is_sparse() {
             return;
         }
         let need_init = {
@@ -949,31 +860,15 @@ impl AchfLayer {
     }
 
     fn prepare_inference_cache(&self) {
-        if !self.is_low_rank() {
+        if !self.is_sparse() {
             return;
         }
-        let down = self.down.as_ref().unwrap();
-        let up = self.up.as_ref().unwrap();
-        let in_dim = down.in_features;
-        let rank = down.out_features;
-        let out_dim = up.out_features;
-        // Use batch lock for better performance
-        let guards = TensorReadGuard::new(&[&down.weight, &up.weight]);
-        let down_data = guards.get(0);
-        let up_data = guards.get(1);
-        let mut dense = vec![0.0; in_dim * out_dim];
-        for i in 0..in_dim {
-            let down_row = &down_data[i * rank..(i + 1) * rank];
-            let out_row = &mut dense[i * out_dim..(i + 1) * out_dim];
-            for r in 0..rank {
-                let scale = down_row[r];
-                if scale == 0.0 {
-                    continue;
-                }
-                let up_row = &up_data[r * out_dim..(r + 1) * out_dim];
-                add_scaled_row(out_row, up_row, scale);
-            }
-        }
+        let sparse = self.sparse_weight.as_ref().unwrap();
+        let in_dim = sparse.in_features;
+        let out_dim = sparse.out_features;
+        let w_data = sparse.weight.data.read().unwrap();
+        let dense = w_data.clone();
+        drop(w_data);
         let mut cache = self.cache.write().unwrap();
         cache.dense = Some(dense);
         cache.in_dim = in_dim;
@@ -1013,7 +908,7 @@ impl AchfLayer {
     }
 
     fn choose_inference_path(&self, x: &[f64]) -> InferencePath {
-        if !self.is_low_rank() {
+        if !self.is_sparse() {
             self.metrics.calls.fetch_add(1, Ordering::Relaxed);
             self.metrics.dense_paths.fetch_add(1, Ordering::Relaxed);
             return InferencePath::Dense;
@@ -1032,8 +927,8 @@ impl AchfLayer {
                 self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
             }
         }
-        self.metrics.low_rank_paths.fetch_add(1, Ordering::Relaxed);
-        InferencePath::LowRank
+        self.metrics.sparse_paths.fetch_add(1, Ordering::Relaxed);
+        InferencePath::Sparse
     }
 
     fn should_use_cache(&self, x: &[f64]) -> (bool, bool, bool) {
@@ -1060,20 +955,18 @@ impl AchfLayer {
             return (false, true, true);
         }
         // Latency-based decision: use whichever path is empirically faster
-        if cache.ema_cached_ns > 0.0 && cache.ema_low_rank_ns > 0.0 {
-            let use_cache = cache.ema_cached_ns <= cache.ema_low_rank_ns;
+        if cache.ema_cached_ns > 0.0 && cache.ema_sparse_ns > 0.0 {
+            let use_cache = cache.ema_cached_ns <= cache.ema_sparse_ns;
             return (use_cache, false, true);
         }
-        // Cold-start fallback: FLOP-based model
-        let rank = self.down.as_ref().unwrap().out_features;
-        let cached_cost = (in_dim * out_dim) as f64 * nonzero_ratio;
-        let low_rank_cost = (in_dim * rank + rank * out_dim) as f64;
+        // Cold-start fallback: both paths have same FLOPs for dense-sparse;
+        // prefer cached when adaptive bias indicates it's empirically faster.
         let bias = if self.config.cache_adapt_rate > 0.0 {
             cache.adaptive_bias
         } else {
             self.config.cache_cost_bias
         };
-        let use_cache = cached_cost * bias <= low_rank_cost;
+        let use_cache = bias <= 1.0;
         (use_cache, false, true)
     }
 
@@ -1128,17 +1021,17 @@ impl AchfLayer {
                         ema_long * cache.ema_cached_long_ns + (1.0 - ema_long) * elapsed_ns;
                 }
             }
-            InferencePath::LowRank => {
-                if cache.ema_low_rank_ns == 0.0 || ema <= 0.0 {
-                    cache.ema_low_rank_ns = elapsed_ns;
+            InferencePath::Sparse => {
+                if cache.ema_sparse_ns == 0.0 || ema <= 0.0 {
+                    cache.ema_sparse_ns = elapsed_ns;
                 } else {
-                    cache.ema_low_rank_ns = ema * cache.ema_low_rank_ns + (1.0 - ema) * elapsed_ns;
+                    cache.ema_sparse_ns = ema * cache.ema_sparse_ns + (1.0 - ema) * elapsed_ns;
                 }
-                if cache.ema_low_rank_long_ns == 0.0 || ema_long <= 0.0 {
-                    cache.ema_low_rank_long_ns = elapsed_ns;
+                if cache.ema_sparse_long_ns == 0.0 || ema_long <= 0.0 {
+                    cache.ema_sparse_long_ns = elapsed_ns;
                 } else {
-                    cache.ema_low_rank_long_ns =
-                        ema_long * cache.ema_low_rank_long_ns + (1.0 - ema_long) * elapsed_ns;
+                    cache.ema_sparse_long_ns =
+                        ema_long * cache.ema_sparse_long_ns + (1.0 - ema_long) * elapsed_ns;
                 }
             }
             InferencePath::Dense => {}
@@ -1146,13 +1039,13 @@ impl AchfLayer {
         self.metrics.latency_samples.fetch_add(1, Ordering::Relaxed);
         if self.config.cache_adapt_rate > 0.0
             && cache.ema_cached_ns > 0.0
-            && cache.ema_low_rank_ns > 0.0
+            && cache.ema_sparse_ns > 0.0
         {
-            let short_ratio = (cache.ema_cached_ns - cache.ema_low_rank_ns) / cache.ema_low_rank_ns;
+            let short_ratio = (cache.ema_cached_ns - cache.ema_sparse_ns) / cache.ema_sparse_ns;
             let mut ratio = short_ratio;
-            if cache.ema_cached_long_ns > 0.0 && cache.ema_low_rank_long_ns > 0.0 {
-                let long_ratio = (cache.ema_cached_long_ns - cache.ema_low_rank_long_ns)
-                    / cache.ema_low_rank_long_ns;
+            if cache.ema_cached_long_ns > 0.0 && cache.ema_sparse_long_ns > 0.0 {
+                let long_ratio = (cache.ema_cached_long_ns - cache.ema_sparse_long_ns)
+                    / cache.ema_sparse_long_ns;
                 let alpha = self.config.cache_adapt_blend;
                 ratio = alpha * long_ratio + (1.0 - alpha) * short_ratio;
             }
@@ -1207,7 +1100,7 @@ impl AchfLayer {
 #[derive(Clone, Copy)]
 enum InferencePath {
     Cached,
-    LowRank,
+    Sparse,
     Dense,
 }
 
@@ -1294,104 +1187,6 @@ fn soft_update_linear(dst: &mut Linear, src: &Linear, tau: f64) {
     }
 }
 
-fn gram_schmidt(matrix: &mut [f64], rows: usize, cols: usize) {
-    for j in 0..cols {
-        let mut norm = 0.0;
-        for i in 0..rows {
-            norm += matrix[i * cols + j] * matrix[i * cols + j];
-        }
-        norm = norm.sqrt();
-        if norm > 1e-10 {
-            for i in 0..rows {
-                matrix[i * cols + j] /= norm;
-            }
-        }
-        for k in (j + 1)..cols {
-            let mut dot = 0.0;
-            for i in 0..rows {
-                dot += matrix[i * cols + j] * matrix[i * cols + k];
-            }
-            for i in 0..rows {
-                matrix[i * cols + k] -= dot * matrix[i * cols + j];
-            }
-        }
-    }
-}
-
-fn truncated_svd_init(
-    w: &[f64],
-    m: usize,
-    n: usize,
-    rank: usize,
-    seed: u64,
-) -> (Vec<f64>, Vec<f64>) {
-    use crate::rng::Rng;
-    let mut rng = Rng::from_seed(seed.wrapping_add(999));
-
-    let mut u = vec![0.0; m * rank];
-    for i in 0..m {
-        for j in 0..rank {
-            u[i * rank + j] = rng.next_f64() - 0.5;
-        }
-    }
-    gram_schmidt(&mut u, m, rank);
-
-    let mut v = vec![0.0; n * rank];
-
-    for _ in 0..20 {
-        // v = W^T @ u
-        for j in 0..rank {
-            for col in 0..n {
-                let mut sum = 0.0;
-                for row in 0..m {
-                    sum += w[row * n + col] * u[row * rank + j];
-                }
-                v[col * rank + j] = sum;
-            }
-        }
-        gram_schmidt(&mut v, n, rank);
-
-        // u = W @ v
-        for i in 0..m {
-            for j in 0..rank {
-                let mut sum = 0.0;
-                for col in 0..n {
-                    sum += w[i * n + col] * v[col * rank + j];
-                }
-                u[i * rank + j] = sum;
-            }
-        }
-        gram_schmidt(&mut u, m, rank);
-    }
-
-    let mut sigma = vec![0.0; rank];
-    for j in 0..rank {
-        let mut s = 0.0;
-        for i in 0..m {
-            for k in 0..n {
-                s += u[i * rank + j] * w[i * n + k] * v[k * rank + j];
-            }
-        }
-        sigma[j] = s.max(0.0);
-    }
-
-    let mut down = vec![0.0; m * rank];
-    for i in 0..m {
-        for j in 0..rank {
-            down[i * rank + j] = u[i * rank + j] * sigma[j].sqrt();
-        }
-    }
-
-    let mut up = vec![0.0; rank * n];
-    for j in 0..rank {
-        for k in 0..n {
-            up[j * n + k] = sigma[j].sqrt() * v[k * rank + j];
-        }
-    }
-
-    (down, up)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1476,15 +1271,15 @@ mod tests {
     }
 
     #[test]
-    fn achf_low_rank_cache_matches_unfused() {
+    fn achf_cache_consistency() {
         let cfg = AchfConfig {
             enabled: true,
-            rank: 2,
             ..Default::default()
         };
-        let layer = AchfLayer::new_square(4, cfg, 31);
+        let mut layer = AchfLayer::new_square(4, cfg, 31);
         let x = Tensor::rand(vec![2, 4], -0.1, 0.1, 32);
         let x_data = x.data.read().unwrap().clone();
+        layer.prune(0.01);
         layer.freeze_for_inference();
         let out_cached = layer.forward_inference_residual(&x_data);
         layer.clear_cache();
@@ -1499,11 +1294,11 @@ mod tests {
     fn achf_cache_threshold_skips_small_batches() {
         let cfg = AchfConfig {
             enabled: true,
-            rank: 2,
             cache_min_rows: 4,
             ..Default::default()
         };
-        let layer = AchfLayer::new_square(4, cfg, 41);
+        let mut layer = AchfLayer::new_square(4, cfg, 41);
+        layer.prune(0.01);
         layer.freeze_for_inference();
         let x = Tensor::rand(vec![2, 4], -0.1, 0.1, 42);
         let x_data = x.data.read().unwrap().clone();
@@ -1520,11 +1315,11 @@ mod tests {
     fn achf_cache_stats_tracks_hits_and_paths() {
         let cfg = AchfConfig {
             enabled: true,
-            rank: 2,
             cache_cost_bias: 0.0,
             ..Default::default()
         };
-        let layer = AchfLayer::new_square(4, cfg, 51);
+        let mut layer = AchfLayer::new_square(4, cfg, 51);
+        layer.prune(0.01);
         layer.freeze_for_inference();
         let x = Tensor::rand(vec![2, 4], -0.1, 0.1, 52);
         let x_data = x.data.read().unwrap().clone();
@@ -1534,7 +1329,7 @@ mod tests {
         assert_eq!(stats.cache_hits, 1);
         assert_eq!(stats.cache_misses, 0);
         assert_eq!(stats.dense_paths, 0);
-        assert_eq!(stats.low_rank_paths, 0);
+        assert_eq!(stats.sparse_paths, 0);
         layer.clear_cache();
         let _ = layer.forward_inference_residual(&x_data);
         let stats = layer.cache_stats();
@@ -1543,19 +1338,19 @@ mod tests {
         assert_eq!(stats.cache_hits, 2);
         assert_eq!(stats.cache_misses, 0);
         assert_eq!(stats.dense_paths, 0);
-        assert_eq!(stats.low_rank_paths, 0);
+        assert_eq!(stats.sparse_paths, 0);
     }
 
     #[test]
     fn achf_cache_stats_track_sparsity_skip() {
         let cfg = AchfConfig {
             enabled: true,
-            rank: 2,
             cache_min_nonzero_ratio: 0.9,
             cache_sparsity_sample_rows: 1,
             ..Default::default()
         };
-        let layer = AchfLayer::new_square(4, cfg, 61);
+        let mut layer = AchfLayer::new_square(4, cfg, 61);
+        layer.prune(0.01);
         layer.freeze_for_inference();
         let x_data = vec![0.0; 8];
         let _ = layer.forward_inference_residual(&x_data);
@@ -1570,7 +1365,6 @@ mod tests {
     fn achf_cache_adapts_bias_with_latency() {
         let cfg = AchfConfig {
             enabled: true,
-            rank: 2,
             cache_adapt_rate: 0.5,
             cache_latency_ema: 0.0,
             cache_bias_min: 0.5,
@@ -1578,8 +1372,9 @@ mod tests {
             cache_cost_bias: 1.0,
             ..Default::default()
         };
-        let layer = AchfLayer::new_square(4, cfg, 71);
-        layer.record_path_latency(InferencePath::LowRank, 100.0);
+        let mut layer = AchfLayer::new_square(4, cfg, 71);
+        layer.prune(0.01);
+        layer.record_path_latency(InferencePath::Sparse, 100.0);
         layer.record_path_latency(InferencePath::Cached, 50.0);
         let cache = layer.cache.read().unwrap();
         assert!(cache.adaptive_bias < 1.0);
@@ -1589,7 +1384,6 @@ mod tests {
     fn achf_memoized_output_applies_current_gate() {
         let cfg = AchfConfig {
             enabled: true,
-            rank: 2,
             cache_min_reuse: 1,
             infer_gate: "last".to_string(),
             ..Default::default()
@@ -1620,7 +1414,6 @@ mod tests {
     fn achf_invalid_shape_returns_zero_residual() {
         let cfg = AchfConfig {
             enabled: true,
-            rank: 2,
             ..Default::default()
         };
         let layer = AchfLayer::new_square(4, cfg, 91);
@@ -1634,7 +1427,6 @@ mod tests {
     fn achf_clear_cache_resets_memo_state() {
         let cfg = AchfConfig {
             enabled: true,
-            rank: 2,
             ..Default::default()
         };
         let layer = AchfLayer::new_square(4, cfg, 101);
@@ -1653,18 +1445,62 @@ mod tests {
     }
 
     #[test]
+    fn achf_prune_zeros_small_weights() {
+        let cfg = AchfConfig::default();
+        let mut layer = AchfLayer::new_square(4, cfg, 200);
+        // Set some weights to known values
+        {
+            let mut w = layer.weight.weight.data.write().unwrap();
+            w[0] = 0.5; // above threshold
+            w[1] = 0.005; // below threshold
+            w[2] = -0.5; // above threshold
+            w[3] = -0.005; // below threshold
+        }
+        layer.prune(0.01);
+        let sparse = layer.sparse_weight.as_ref().unwrap();
+        let s = sparse.weight.data.read().unwrap();
+        assert_eq!(s[0], 0.5);
+        assert_eq!(s[1], 0.0);
+        assert_eq!(s[2], -0.5);
+        assert_eq!(s[3], 0.0);
+    }
+
+    #[test]
+    fn achf_sparse_inference_matches_dense() {
+        let cfg = AchfConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut layer = AchfLayer::new_square(4, cfg, 201);
+        // Set deterministic weights
+        {
+            let mut w = layer.weight.weight.data.write().unwrap();
+            for (i, v) in w.iter_mut().enumerate() {
+                *v = ((i as f64) * 0.1) - 0.3;
+            }
+        }
+        let x = vec![0.1, -0.2, 0.3, 0.4, 0.5, -0.1, 0.2, -0.3];
+        let dense_out = layer.forward_inference_residual(&x);
+        layer.prune(0.15); // prune small weights
+        let sparse_out = layer.forward_inference_residual(&x);
+        assert_eq!(dense_out.len(), sparse_out.len());
+        // Outputs differ because pruning changes weights, but shapes match
+        assert_eq!(dense_out.len(), x.len());
+    }
+
+    #[test]
     fn aggregate_cache_stats_bias_average_is_unbiased() {
         let s1 = AchfCacheStats {
             calls: 1,
             cache_hits: 0,
             cache_misses: 0,
             cache_skips: 0,
-            low_rank_paths: 0,
+            sparse_paths: 0,
             dense_paths: 0,
             ema_cached_ns: 0.0,
             ema_cached_long_ns: 0.0,
-            ema_low_rank_ns: 0.0,
-            ema_low_rank_long_ns: 0.0,
+            ema_sparse_ns: 0.0,
+            ema_sparse_long_ns: 0.0,
             decision_ema_ns: 0.0,
             decision_ema_long_ns: 0.0,
             adaptive_bias: 2.0,

@@ -345,7 +345,7 @@ pub fn train_manifold_rl(
     }
 
     pb.finish_with_message("Manifold RL Complete.");
-    println!("[RL] Applying Sparse Hyper-Connections (Pruning)...");
+    println!("[RL] Applying ACHF Pruning...");
     let initial_active = current_opt.count_active_params();
     current_opt.prune(MANIFOLD_PRUNE_THRESHOLD); // Prune weights < threshold
     let final_active = current_opt.count_active_params();

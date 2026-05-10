@@ -67,6 +67,36 @@ impl Module for DuelingQNetwork {
 }
 
 impl DuelingQNetwork {
+    pub fn new_with_config(config: &Config, seed: u64) -> Self {
+        let hidden = config.model_hidden_dim;
+        let l1 = Linear::new(DIM, hidden, true, seed);
+        let l2 = Linear::new(hidden, hidden, true, seed.wrapping_add(1));
+        let l3 = Linear::new(hidden, hidden, true, seed.wrapping_add(2));
+        let val_head = Linear::new(hidden, 1, true, seed.wrapping_add(3));
+        let adv_head = Linear::new(hidden, ACTION_SPACE, true, seed.wrapping_add(4));
+        let achf_layer = if config.achf.enabled && config.achf.apply_dqn {
+            Some(AchfLayer::new(
+                hidden,
+                hidden,
+                true,
+                config.achf.clone(),
+                seed.wrapping_add(500),
+            ))
+        } else {
+            None
+        };
+
+        DuelingQNetwork {
+            l1,
+            l2,
+            l3,
+            val_head,
+            adv_head,
+            achf: achf_layer,
+        }
+    }
+
+    /// Backward-compatible constructor using hard-coded defaults.
     pub fn new(seed: u64, achf: &AchfConfig) -> Self {
         let l1 = Linear::new(DIM, 2048, true, seed);
         let l2 = Linear::new(2048, 2048, true, seed.wrapping_add(1));
@@ -864,8 +894,8 @@ fn train_dqn_impl(
 ) -> DuelingQNetwork {
     println!("\n[DQN] Initializing Double Dueling DQN Training...");
 
-    let policy_net = DuelingQNetwork::new(rng.next_u64(), &config.achf);
-    let mut target_net = DuelingQNetwork::new(rng.next_u64(), &config.achf);
+    let policy_net = DuelingQNetwork::new_with_config(config, rng.next_u64());
+    let mut target_net = DuelingQNetwork::new_with_config(config, rng.next_u64());
     target_net.load_state_dict(&policy_net); // Sync weights
 
     #[cfg(cuda)]
@@ -1253,9 +1283,9 @@ fn train_dqn_impl(
                     loss: last_train_loss,
                     reward: avg_r,
                     cache_hit_rate: achf_snap.map_or(0.0, |s| s.cache_hit_rate),
-                    low_rank_ratio: achf_snap.map_or(0.0, |s| s.low_rank_ratio),
+                    sparse_ratio: achf_snap.map_or(0.0, |s| s.low_rank_ratio),
                     ema_cached_ns: achf_snap.map_or(0.0, |s| s.ema_cached_ns),
-                    ema_low_rank_ns: achf_snap.map_or(0.0, |s| s.ema_low_rank_ns),
+                    ema_sparse_ns: achf_snap.map_or(0.0, |s| s.ema_sparse_ns),
                     adaptive_bias: achf_snap.map_or(1.0, |s| s.adaptive_bias),
                 };
                 let _ = tx.send(snapshot);

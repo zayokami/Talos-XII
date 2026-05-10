@@ -112,8 +112,8 @@ enum Commands {
 
 #[derive(Subcommand, Clone)]
 enum BenchAction {
-    /// Run full ACHF paper benchmark suite
-    Paper {
+    /// Run full ACHF benchmark suite
+    Achf {
         /// Run only specific experiments (comma-separated: ablation,mode,path,gate,scale,apply,convergence)
         #[arg(long)]
         only: Option<String>,
@@ -600,7 +600,7 @@ fn initialize_system(
 
     // DQN
     let dqn_policy = if config.online_train && config.online_train_dqn {
-        DuelingQNetwork::new(rng.next_u64(), &config.achf)
+        DuelingQNetwork::new_with_config(&config, rng.next_u64())
     } else if !args.force {
         if let Some(cached) = load_model::<DuelingQNetwork>("dqn.cache", "DQN") {
             cached.freeze_achf_for_inference();
@@ -871,7 +871,7 @@ fn main() {
             );
         }
         Commands::Benchmark { action } => match action {
-            Some(BenchAction::Paper {
+            Some(BenchAction::Achf {
                 only,
                 output_dir,
                 format,
@@ -888,7 +888,7 @@ fn main() {
                     num_trials: trials.max(1),
                 };
                 let seed = args.seed.unwrap_or(42);
-                bench::run_paper_benchmarks(&config, seed, &bench_cfg);
+                bench::run_achf_benchmarks(&config, seed, &bench_cfg);
             }
             None => {
                 benchmark_simulation(
@@ -1513,7 +1513,7 @@ fn run_interactive(args: RunInteractiveArgs) {
                         num_trials: trials,
                     };
                     let seed = rng.next_u64();
-                    bench::run_paper_benchmarks(&config, seed, &bench_cfg);
+                    bench::run_achf_benchmarks(&config, seed, &bench_cfg);
                 }
                 "list" | "l" => {
                     println!("{}", I18n::get(lang, "bench_list_header"));
@@ -1541,7 +1541,7 @@ fn run_interactive(args: RunInteractiveArgs) {
                         num_trials: 3,
                     };
                     let seed = rng.next_u64();
-                    bench::run_paper_benchmarks(&config, seed, &bench_cfg);
+                    bench::run_achf_benchmarks(&config, seed, &bench_cfg);
                 }
             }
             continue;
@@ -2075,7 +2075,14 @@ mod tests {
     use sim::{simulate_core, simulate_fast, simulate_one, SimControl, SimModelContext};
 
     fn build_context() -> (Config, EnvNet, NeuralLuckOptimizer) {
-        let config = Config::load("data/config.json");
+        let mut config = Config::load("data/config.json");
+        // Force small model dims in tests to avoid OOM with large defaults
+        config.model_dim = 32;
+        config.model_hidden_dim = 2048;
+        config.model_num_layers = 4;
+        config.model_num_heads = 8;
+        config.model_kv_lora_rank = 128;
+        config.model_qk_rope_dim = 64;
         let mut rng = Rng::from_seed(1234);
         let env_net = EnvNet::new(&mut rng);
         let neural_opt = NeuralLuckOptimizer::new(5678);
@@ -2243,6 +2250,9 @@ mod tests {
     fn dqn_training_produces_valid_q_values() {
         let (mut config, env_net, neural_opt) = build_context();
         config.fast_init = true;
+        // Use tiny hidden dim so the test finishes quickly and doesn't OOM
+        config.model_hidden_dim = 64;
+        config.model_num_layers = 2;
         let mut rng = Rng::from_seed(7777);
         let dqn = train_dqn(&neural_opt, &mut rng, &env_net, &config);
         let state = AutoTensor::new(vec![0.5; DIM], vec![DIM]);
