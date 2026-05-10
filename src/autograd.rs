@@ -5919,7 +5919,7 @@ mod tests {
         assert_eq!(e.dtype, Dtype::F32);
         let e_f64 = e.data_as_f64_vec();
         assert!((e_f64[0] - 1.0).abs() < 1e-4);
-        assert!((e_f64[1] - 2.718).abs() < 1e-3);
+        assert!((e_f64[1] - std::f64::consts::E).abs() < 1e-3);
 
         let l = Tensor::with_dtype(vec![1.0, 2.0, 3.0], vec![3], Dtype::F32).log();
         assert_eq!(l.dtype, Dtype::F32);
