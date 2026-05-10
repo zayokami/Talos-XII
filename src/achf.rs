@@ -300,20 +300,27 @@ where
 }
 
 impl AchfLayer {
-    pub fn new(dim: usize, config: AchfConfig, seed: u64) -> Self {
-        let weight = Linear::new(dim, dim, false, seed);
-        let rank = if config.rank > 0 && config.rank < dim {
+    pub fn new(
+        in_features: usize,
+        out_features: usize,
+        bias: bool,
+        config: AchfConfig,
+        seed: u64,
+    ) -> Self {
+        let weight = Linear::new(in_features, out_features, bias, seed);
+        let max_rank = in_features.min(out_features);
+        let rank = if config.rank > 0 && config.rank < max_rank {
             config.rank
         } else {
             0
         };
         let down = if rank > 0 {
-            Some(Linear::new(dim, rank, false, seed.wrapping_add(1)))
+            Some(Linear::new(in_features, rank, false, seed.wrapping_add(1)))
         } else {
             None
         };
         let up = if rank > 0 {
-            Some(Linear::new(rank, dim, false, seed.wrapping_add(2)))
+            Some(Linear::new(rank, out_features, false, seed.wrapping_add(2)))
         } else {
             None
         };
@@ -330,7 +337,25 @@ impl AchfLayer {
             let mut cache = layer.cache.write().unwrap();
             cache.adaptive_bias = layer.config.cache_cost_bias;
         }
+        if rank > 0 {
+            let w_data = layer.weight.weight.data.read().unwrap();
+            let (down_data, up_data) =
+                truncated_svd_init(&w_data, in_features, out_features, rank, seed);
+            drop(w_data);
+            if let Some(ref d) = layer.down {
+                let mut d_data = d.weight.data.write().unwrap();
+                d_data.copy_from_slice(&down_data);
+            }
+            if let Some(ref u) = layer.up {
+                let mut u_data = u.weight.data.write().unwrap();
+                u_data.copy_from_slice(&up_data);
+            }
+        }
         layer
+    }
+
+    pub fn new_square(dim: usize, config: AchfConfig, seed: u64) -> Self {
+        Self::new(dim, dim, false, config, seed)
     }
 
     pub fn snapshot_state(&self) -> AchfStateSnapshot {
@@ -356,18 +381,28 @@ impl AchfLayer {
     }
 
     pub fn parameters(&self) -> Vec<Tensor> {
-        if self.is_low_rank() {
-            let mut p = Vec::new();
-            if let Some(down) = &self.down {
-                p.extend(down.parameters());
-            }
-            if let Some(up) = &self.up {
-                p.extend(up.parameters());
-            }
-            p
-        } else {
-            self.weight.parameters()
+        let mut p = self.weight.parameters();
+        if let Some(d) = &self.down {
+            p.extend(d.parameters());
         }
+        if let Some(u) = &self.up {
+            p.extend(u.parameters());
+        }
+        p
+    }
+
+    fn forward_blend(&self, input: &Tensor, g: f64) -> Tensor {
+        let dense_out = self.weight.forward(input);
+        if !self.is_low_rank() {
+            return dense_out;
+        }
+        let down = self.down.as_ref().unwrap();
+        let up = self.up.as_ref().unwrap();
+        let low = down.forward(input);
+        let low_out = up.forward(&low);
+        let g_t = Tensor::new(vec![g], vec![1]).broadcast(dense_out.shape.clone());
+        let og_t = Tensor::new(vec![1.0 - g], vec![1]).broadcast(low_out.shape.clone());
+        &(&dense_out * &g_t) + &(&low_out * &og_t)
     }
 
     #[cfg(cuda)]
@@ -380,23 +415,34 @@ impl AchfLayer {
             u.to_cuda();
         }
     }
+}
 
+impl Module for AchfLayer {
+    fn forward(&self, input: &Tensor) -> Tensor {
+        if !self.config.enabled {
+            return self.weight.forward(input);
+        }
+        self.maybe_project();
+        let g = self.compute_gate();
+        self.forward_blend(input, g)
+    }
+
+    fn parameters(&self) -> Vec<Tensor> {
+        AchfLayer::parameters(self)
+    }
+}
+
+impl AchfLayer {
     pub fn forward_residual(&self, x: &Tensor) -> Tensor {
         if !self.config.enabled {
             return Tensor::zeros(x.shape.clone());
         }
         self.maybe_project();
         let g = self.compute_gate();
-        let g_tensor = Tensor::new(vec![g], vec![1]).broadcast(x.shape.clone());
-        let hc = if self.is_low_rank() {
-            let down = self.down.as_ref().unwrap();
-            let up = self.up.as_ref().unwrap();
-            let low = down.forward(x);
-            up.forward(&low)
-        } else {
-            self.weight.forward(x)
-        };
-        hc * g_tensor
+        if g <= 0.001 {
+            return Tensor::zeros(x.shape.clone());
+        }
+        self.forward_blend(x, g)
     }
 
     pub fn forward_inference_residual(&self, x: &[f64]) -> Vec<f64> {
@@ -540,6 +586,15 @@ impl AchfLayer {
         }
         let mut sum_sq = 0.0;
         let mut count = 0usize;
+        // Always include dense weight gradient
+        {
+            let grad = self.weight.weight.grad.read().unwrap();
+            for &v in grad.iter() {
+                sum_sq += v * v;
+            }
+            count += grad.len();
+        }
+        // Include low-rank gradients when present
         if self.is_low_rank() {
             if let Some(down) = &self.down {
                 let grad = down.weight.grad.read().unwrap();
@@ -555,12 +610,6 @@ impl AchfLayer {
                 }
                 count += grad.len();
             }
-        } else {
-            let grad = self.weight.weight.grad.read().unwrap();
-            for &v in grad.iter() {
-                sum_sq += v * v;
-            }
-            count += grad.len();
         }
         if count == 0 {
             return;
@@ -667,11 +716,34 @@ impl AchfLayer {
     fn compute_gate(&self) -> f64 {
         let mut state = self.state.write().unwrap();
         state.gate_step += 1;
-        if self.config.gate_warmup_steps > 0 && state.gate_step <= self.config.gate_warmup_steps {
+        let warmup = self.config.gate_warmup_steps;
+        let transition = self.config.gate_transition_steps;
+        let total = warmup.saturating_add(transition);
+
+        if warmup > 0 && state.gate_step <= warmup {
             state.last_gate = 1.0;
             state.g_min_ema = self.config.g_min;
             return 1.0;
         }
+
+        let target = self.compute_target_gate(&state);
+
+        if transition > 0 && state.gate_step <= total {
+            let t = (state.gate_step - warmup) as f64 / transition as f64;
+            let g = 1.0 * (1.0 - t) + target * t;
+            state.last_gate = g;
+            state.g_min_ema = self.config.g_min_momentum * state.g_min_ema
+                + (1.0 - self.config.g_min_momentum) * self.config.g_min;
+            return g;
+        }
+
+        state.last_gate = target;
+        state.g_min_ema = self.config.g_min_momentum * state.g_min_ema
+            + (1.0 - self.config.g_min_momentum) * self.config.g_min;
+        target
+    }
+
+    fn compute_target_gate(&self, state: &AchfState) -> f64 {
         let mut k = match self.gate_mode() {
             GateMode::GradEma => state.grad_ema,
             GateMode::FimTrace => state.fim_ema.sqrt(),
@@ -699,9 +771,6 @@ impl AchfLayer {
         if g > 1.0 {
             g = 1.0;
         }
-        state.last_gate = g;
-        state.g_min_ema = self.config.g_min_momentum * state.g_min_ema
-            + (1.0 - self.config.g_min_momentum) * g_min;
         g
     }
 
@@ -803,9 +872,9 @@ impl AchfLayer {
             if let (Some(dst), Some(src)) = (&mut self.up, &other.up) {
                 copy_linear(dst, src);
             }
-        } else {
-            copy_linear(&mut self.weight, &other.weight);
         }
+        // Always copy dense weight as reference/teacher
+        copy_linear(&mut self.weight, &other.weight);
         self.clear_cache();
     }
 
@@ -817,9 +886,9 @@ impl AchfLayer {
             if let (Some(dst), Some(src)) = (&mut self.up, &source.up) {
                 soft_update_linear(dst, src, tau);
             }
-        } else {
-            soft_update_linear(&mut self.weight, &source.weight, tau);
         }
+        // Always update dense weight as reference/teacher
+        soft_update_linear(&mut self.weight, &source.weight, tau);
         self.clear_cache();
     }
 
@@ -990,16 +1059,21 @@ impl AchfLayer {
         {
             return (false, true, true);
         }
+        // Latency-based decision: use whichever path is empirically faster
+        if cache.ema_cached_ns > 0.0 && cache.ema_low_rank_ns > 0.0 {
+            let use_cache = cache.ema_cached_ns <= cache.ema_low_rank_ns;
+            return (use_cache, false, true);
+        }
+        // Cold-start fallback: FLOP-based model
         let rank = self.down.as_ref().unwrap().out_features;
-        // 真实 CPU 上 dense GEMM 已高度 vectorized，稀疏输入不降低 matmul 成本
-        let dense_cost = (in_dim * out_dim) as f64;
+        let cached_cost = (in_dim * out_dim) as f64 * nonzero_ratio;
         let low_rank_cost = (in_dim * rank + rank * out_dim) as f64;
         let bias = if self.config.cache_adapt_rate > 0.0 {
             cache.adaptive_bias
         } else {
             self.config.cache_cost_bias
         };
-        let use_cache = dense_cost * bias <= low_rank_cost;
+        let use_cache = cached_cost * bias <= low_rank_cost;
         (use_cache, false, true)
     }
 
@@ -1220,6 +1294,104 @@ fn soft_update_linear(dst: &mut Linear, src: &Linear, tau: f64) {
     }
 }
 
+fn gram_schmidt(matrix: &mut [f64], rows: usize, cols: usize) {
+    for j in 0..cols {
+        let mut norm = 0.0;
+        for i in 0..rows {
+            norm += matrix[i * cols + j] * matrix[i * cols + j];
+        }
+        norm = norm.sqrt();
+        if norm > 1e-10 {
+            for i in 0..rows {
+                matrix[i * cols + j] /= norm;
+            }
+        }
+        for k in (j + 1)..cols {
+            let mut dot = 0.0;
+            for i in 0..rows {
+                dot += matrix[i * cols + j] * matrix[i * cols + k];
+            }
+            for i in 0..rows {
+                matrix[i * cols + k] -= dot * matrix[i * cols + j];
+            }
+        }
+    }
+}
+
+fn truncated_svd_init(
+    w: &[f64],
+    m: usize,
+    n: usize,
+    rank: usize,
+    seed: u64,
+) -> (Vec<f64>, Vec<f64>) {
+    use crate::rng::Rng;
+    let mut rng = Rng::from_seed(seed.wrapping_add(999));
+
+    let mut u = vec![0.0; m * rank];
+    for i in 0..m {
+        for j in 0..rank {
+            u[i * rank + j] = rng.next_f64() - 0.5;
+        }
+    }
+    gram_schmidt(&mut u, m, rank);
+
+    let mut v = vec![0.0; n * rank];
+
+    for _ in 0..20 {
+        // v = W^T @ u
+        for j in 0..rank {
+            for col in 0..n {
+                let mut sum = 0.0;
+                for row in 0..m {
+                    sum += w[row * n + col] * u[row * rank + j];
+                }
+                v[col * rank + j] = sum;
+            }
+        }
+        gram_schmidt(&mut v, n, rank);
+
+        // u = W @ v
+        for i in 0..m {
+            for j in 0..rank {
+                let mut sum = 0.0;
+                for col in 0..n {
+                    sum += w[i * n + col] * v[col * rank + j];
+                }
+                u[i * rank + j] = sum;
+            }
+        }
+        gram_schmidt(&mut u, m, rank);
+    }
+
+    let mut sigma = vec![0.0; rank];
+    for j in 0..rank {
+        let mut s = 0.0;
+        for i in 0..m {
+            for k in 0..n {
+                s += u[i * rank + j] * w[i * n + k] * v[k * rank + j];
+            }
+        }
+        sigma[j] = s.max(0.0);
+    }
+
+    let mut down = vec![0.0; m * rank];
+    for i in 0..m {
+        for j in 0..rank {
+            down[i * rank + j] = u[i * rank + j] * sigma[j].sqrt();
+        }
+    }
+
+    let mut up = vec![0.0; rank * n];
+    for j in 0..rank {
+        for k in 0..n {
+            up[j * n + k] = sigma[j].sqrt() * v[k * rank + j];
+        }
+    }
+
+    (down, up)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1232,7 +1404,7 @@ mod tests {
             proj_mode: "rowcol".to_string(),
             ..Default::default()
         };
-        let layer = AchfLayer::new(4, cfg, 42);
+        let layer = AchfLayer::new_square(4, cfg, 42);
         let x = Tensor::rand(vec![2, 4], -0.1, 0.1, 123);
         let out = layer.forward_residual(&x);
         let loss = out.mean();
@@ -1250,7 +1422,7 @@ mod tests {
             proj_mode: "rowcol".to_string(),
             ..Default::default()
         };
-        let layer = AchfLayer::new(4, cfg, 7);
+        let layer = AchfLayer::new_square(4, cfg, 7);
         let x = Tensor::rand(vec![1, 4], -0.1, 0.1, 9);
         let _ = layer.forward_residual(&x);
         let w = layer.weight.weight.data.read().unwrap();
@@ -1273,7 +1445,7 @@ mod tests {
             proj_mode: "rowcol".to_string(),
             ..Default::default()
         };
-        let layer = AchfLayer::new(4, cfg, 11);
+        let layer = AchfLayer::new_square(4, cfg, 11);
         let x = Tensor::rand(vec![1, 4], -0.1, 0.1, 12);
         let _ = layer.forward_residual(&x);
         layer.freeze_for_inference();
@@ -1295,7 +1467,7 @@ mod tests {
             gate_beta: 0.0,
             ..Default::default()
         };
-        let layer = AchfLayer::new(4, cfg, 21);
+        let layer = AchfLayer::new_square(4, cfg, 21);
         let x = Tensor::rand(vec![1, 4], -0.1, 0.1, 22);
         let _ = layer.forward_residual(&x);
         let g = layer.last_gate();
@@ -1310,7 +1482,7 @@ mod tests {
             rank: 2,
             ..Default::default()
         };
-        let layer = AchfLayer::new(4, cfg, 31);
+        let layer = AchfLayer::new_square(4, cfg, 31);
         let x = Tensor::rand(vec![2, 4], -0.1, 0.1, 32);
         let x_data = x.data.read().unwrap().clone();
         layer.freeze_for_inference();
@@ -1331,7 +1503,7 @@ mod tests {
             cache_min_rows: 4,
             ..Default::default()
         };
-        let layer = AchfLayer::new(4, cfg, 41);
+        let layer = AchfLayer::new_square(4, cfg, 41);
         layer.freeze_for_inference();
         let x = Tensor::rand(vec![2, 4], -0.1, 0.1, 42);
         let x_data = x.data.read().unwrap().clone();
@@ -1352,7 +1524,7 @@ mod tests {
             cache_cost_bias: 0.0,
             ..Default::default()
         };
-        let layer = AchfLayer::new(4, cfg, 51);
+        let layer = AchfLayer::new_square(4, cfg, 51);
         layer.freeze_for_inference();
         let x = Tensor::rand(vec![2, 4], -0.1, 0.1, 52);
         let x_data = x.data.read().unwrap().clone();
@@ -1383,7 +1555,7 @@ mod tests {
             cache_sparsity_sample_rows: 1,
             ..Default::default()
         };
-        let layer = AchfLayer::new(4, cfg, 61);
+        let layer = AchfLayer::new_square(4, cfg, 61);
         layer.freeze_for_inference();
         let x_data = vec![0.0; 8];
         let _ = layer.forward_inference_residual(&x_data);
@@ -1406,7 +1578,7 @@ mod tests {
             cache_cost_bias: 1.0,
             ..Default::default()
         };
-        let layer = AchfLayer::new(4, cfg, 71);
+        let layer = AchfLayer::new_square(4, cfg, 71);
         layer.record_path_latency(InferencePath::LowRank, 100.0);
         layer.record_path_latency(InferencePath::Cached, 50.0);
         let cache = layer.cache.read().unwrap();
@@ -1422,7 +1594,7 @@ mod tests {
             infer_gate: "last".to_string(),
             ..Default::default()
         };
-        let layer = AchfLayer::new(4, cfg, 81);
+        let layer = AchfLayer::new_square(4, cfg, 81);
         let x_data = vec![0.1, -0.2, 0.3, 0.4, -0.5, 0.6, -0.7, 0.8];
         let hash = AchfLayer::input_hash(&x_data);
         layer.metrics.memo_hash.store(hash, Ordering::Relaxed);
@@ -1451,7 +1623,7 @@ mod tests {
             rank: 2,
             ..Default::default()
         };
-        let layer = AchfLayer::new(4, cfg, 91);
+        let layer = AchfLayer::new_square(4, cfg, 91);
         let x_data = vec![0.1, 0.2, 0.3];
         let out = layer.forward_inference_residual(&x_data);
         assert_eq!(out.len(), x_data.len());
@@ -1465,7 +1637,7 @@ mod tests {
             rank: 2,
             ..Default::default()
         };
-        let layer = AchfLayer::new(4, cfg, 101);
+        let layer = AchfLayer::new_square(4, cfg, 101);
         layer.metrics.memo_hash.store(123, Ordering::Relaxed);
         layer.metrics.memo_count.store(9, Ordering::Relaxed);
         layer.clear_cache();

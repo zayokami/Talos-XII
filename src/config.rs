@@ -336,6 +336,7 @@ pub struct AchfConfig {
     pub gate_alpha: f64,
     pub g_min: f64,
     pub gate_warmup_steps: usize,
+    pub gate_transition_steps: usize,
     pub gate_k_clip: f64,
     pub g_target_min: f64,
     pub g_target_max: f64,
@@ -376,7 +377,8 @@ impl Default for AchfConfig {
             gate_beta: 0.7,
             gate_alpha: 0.0,
             g_min: 0.2,
-            gate_warmup_steps: 0,
+            gate_warmup_steps: 100,
+            gate_transition_steps: 50,
             gate_k_clip: 0.0,
             g_target_min: 0.3,
             g_target_max: 0.8,
@@ -400,7 +402,7 @@ impl Default for AchfConfig {
             apply_attn: true,
             apply_ffn: true,
             apply_dqn: false,
-            infer_gate: "g_min".to_string(),
+            infer_gate: "last".to_string(),
         }
     }
 }

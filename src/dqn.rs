@@ -74,7 +74,13 @@ impl DuelingQNetwork {
         let val_head = Linear::new(2048, 1, true, seed.wrapping_add(3));
         let adv_head = Linear::new(2048, ACTION_SPACE, true, seed.wrapping_add(4));
         let achf_layer = if achf.enabled && achf.apply_dqn {
-            Some(AchfLayer::new(2048, achf.clone(), seed.wrapping_add(500)))
+            Some(AchfLayer::new(
+                2048,
+                2048,
+                true,
+                achf.clone(),
+                seed.wrapping_add(500),
+            ))
         } else {
             None
         };
@@ -93,11 +99,11 @@ impl DuelingQNetwork {
         // state: (Batch, 8) or (8)
         let x = self.l1.forward(state).relu();
         let x = self.l2.forward(&x).relu();
-        let mut x = self.l3.forward(&x).relu();
-        if let Some(achf) = &self.achf {
-            let residual = achf.forward_residual(&x);
-            x = &x + &residual;
-        }
+        let x = if let Some(achf) = &self.achf {
+            achf.forward(&x).relu()
+        } else {
+            self.l3.forward(&x).relu()
+        };
 
         let val = self.val_head.forward(&x); // (Batch, 1) or (1)
         let adv = self.adv_head.forward(&x); // (Batch, 5) or (5)
@@ -261,6 +267,7 @@ impl DuelingQNetwork {
         struct Scratch {
             h1: Vec<f64>,
             h2: Vec<f64>,
+            h3: Vec<f64>,
             val: Vec<f64>,
             adv: Vec<f64>,
         }
@@ -307,6 +314,7 @@ impl DuelingQNetwork {
             static SCRATCH: RefCell<Scratch> = const { RefCell::new(Scratch {
                 h1: Vec::new(),
                 h2: Vec::new(),
+                h3: Vec::new(),
                 val: Vec::new(),
                 adv: Vec::new(),
             }) };
@@ -340,7 +348,13 @@ impl DuelingQNetwork {
         // Cache miss: compute forward pass
         SCRATCH.with(|scratch| {
             let mut s = scratch.borrow_mut();
-            let Scratch { h1, h2, val, adv } = &mut *s;
+            let Scratch {
+                h1,
+                h2,
+                h3,
+                val,
+                adv,
+            } = &mut *s;
 
             self.l1.forward_inference_into(state, h1);
             for v in h1.iter_mut() {
@@ -357,14 +371,20 @@ impl DuelingQNetwork {
             }
 
             if let Some(achf) = &self.achf {
-                let residual = achf.forward_inference_residual(h2);
-                for (dst, &r) in h2.iter_mut().zip(residual.iter()) {
-                    *dst += r;
+                let out = achf.forward_inference_residual(h2);
+                h3.copy_from_slice(&out);
+            } else {
+                h3.resize(h2.len(), 0.0);
+                self.l3.forward_inference_into(h2, h3);
+            }
+            for v in h3.iter_mut() {
+                if *v < 0.0 {
+                    *v = 0.0;
                 }
             }
 
-            self.val_head.forward_inference_into(h2, val);
-            self.adv_head.forward_inference_into(h2, adv);
+            self.val_head.forward_inference_into(h3, val);
+            self.adv_head.forward_inference_into(h3, adv);
             if adv.len() != ACTION_SPACE {
                 return (0, ACTIONS[0]);
             }

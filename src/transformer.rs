@@ -93,7 +93,7 @@ impl LuckTransformer {
         for layer_idx in 0..num_layers {
             let layer_seed = seed.wrapping_add((layer_idx as u64).wrapping_mul(200));
             let achf_attn = if achf.enabled && achf.apply_attn {
-                Some(AchfLayer::new(
+                Some(AchfLayer::new_square(
                     hidden_dim,
                     achf.clone(),
                     layer_seed.wrapping_add(1000),
@@ -103,7 +103,9 @@ impl LuckTransformer {
             };
             let achf_ffn = if achf.enabled && achf.apply_ffn {
                 Some(AchfLayer::new(
+                    hidden_dim * 2,
                     hidden_dim,
+                    true,
                     achf.clone(),
                     layer_seed.wrapping_add(1100),
                 ))
@@ -167,12 +169,12 @@ impl LuckTransformer {
             // Block 2: FFN (Pre-Norm)
             let h_norm2 = block.norm_2.forward(&h2);
             let f1 = block.ffn_1.forward(&h_norm2).gelu();
-            let f2 = block.ffn_2.forward(&f1);
-            let mut h3 = h2.clone() + f2;
-            if let Some(achf) = &block.achf_ffn {
-                let residual = achf.forward_residual(&h2);
-                h3 = &h3 + &residual;
-            }
+            let f2 = if let Some(achf) = &block.achf_ffn {
+                achf.forward(&f1)
+            } else {
+                block.ffn_2.forward(&f1)
+            };
+            let h3 = h2.clone() + f2;
             h = h3;
         }
 
@@ -255,16 +257,14 @@ impl LuckTransformer {
             let f1 = block.ffn_1.forward_inference(&h_norm2);
             let mut f1_gelu = vec![0.0; f1.len()];
             vector_gelu(&mut f1_gelu, &f1);
-            let f2 = block.ffn_2.forward_inference(&f1_gelu);
+            let f2 = if let Some(achf) = &block.achf_ffn {
+                achf.forward_inference_forced_path(&f1_gelu, forced_path)
+            } else {
+                block.ffn_2.forward_inference(&f1_gelu)
+            };
             let mut h3 = vec![0.0; h2.len()];
             for i in 0..h2.len() {
                 h3[i] = h2[i] + f2[i];
-            }
-            if let Some(achf) = &block.achf_ffn {
-                let res = achf.forward_inference_forced_path(&h2, forced_path);
-                for i in 0..h3.len() {
-                    h3[i] += res[i];
-                }
             }
             h = h3;
         }
@@ -331,14 +331,14 @@ impl LuckTransformer {
             let mut f1_gelu = vec![0.0; f1.len()];
             vector_gelu(&mut f1_gelu, &f1);
 
-            let f2 = block.ffn_2.forward_inference(&f1_gelu);
+            let f2 = if let Some(achf) = &block.achf_ffn {
+                achf.forward_inference_residual(&f1_gelu)
+            } else {
+                block.ffn_2.forward_inference(&f1_gelu)
+            };
 
             let mut h3 = vec![0.0; h2.len()];
             vector_add(&mut h3, &h2, &f2);
-            if let Some(achf) = &block.achf_ffn {
-                let achf_out = achf.forward_inference_residual(&h2);
-                vector_grad_acc(&mut h3, &achf_out);
-            }
             h = h3;
         }
 
@@ -409,16 +409,13 @@ impl LuckTransformer {
                 block.ffn_1.forward_inference_into(norm2, ffn1);
                 ffn2.resize(ffn1.len(), 0.0);
                 vector_gelu(ffn2, ffn1);
-                block.ffn_2.forward_inference_into(ffn2, attn);
 
-                let achf_ffn_out = block
-                    .achf_ffn
-                    .as_ref()
-                    .map(|achf| achf.forward_inference_residual(h));
-
-                vector_grad_acc(h, attn);
-                if let Some(ref achf_out) = achf_ffn_out {
-                    vector_grad_acc(h, achf_out);
+                if let Some(achf) = &block.achf_ffn {
+                    let achf_out = achf.forward_inference_residual(ffn2);
+                    vector_grad_acc(h, &achf_out);
+                } else {
+                    block.ffn_2.forward_inference_into(ffn2, attn);
+                    vector_grad_acc(h, attn);
                 }
             }
 
