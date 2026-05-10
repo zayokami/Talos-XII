@@ -41,6 +41,7 @@ const ONES_5_1_DATA: [f64; 5] = [1.0; 5];
 pub struct DuelingQNetwork {
     l1: Linear,
     l2: Linear,
+    l3: Linear,
     val_head: Linear,
     adv_head: Linear,
     achf: Option<AchfLayer>,
@@ -55,6 +56,7 @@ impl Module for DuelingQNetwork {
         let mut p = Vec::new();
         p.extend(self.l1.parameters());
         p.extend(self.l2.parameters());
+        p.extend(self.l3.parameters());
         p.extend(self.val_head.parameters());
         p.extend(self.adv_head.parameters());
         if let Some(achf) = &self.achf {
@@ -66,12 +68,13 @@ impl Module for DuelingQNetwork {
 
 impl DuelingQNetwork {
     pub fn new(seed: u64, achf: &AchfConfig) -> Self {
-        let l1 = Linear::new(DIM, 1024, true, seed);
-        let l2 = Linear::new(1024, 1024, true, seed.wrapping_add(1));
-        let val_head = Linear::new(1024, 1, true, seed.wrapping_add(2));
-        let adv_head = Linear::new(1024, ACTION_SPACE, true, seed.wrapping_add(3));
+        let l1 = Linear::new(DIM, 2048, true, seed);
+        let l2 = Linear::new(2048, 2048, true, seed.wrapping_add(1));
+        let l3 = Linear::new(2048, 2048, true, seed.wrapping_add(2));
+        let val_head = Linear::new(2048, 1, true, seed.wrapping_add(3));
+        let adv_head = Linear::new(2048, ACTION_SPACE, true, seed.wrapping_add(4));
         let achf_layer = if achf.enabled && achf.apply_dqn {
-            Some(AchfLayer::new(1024, achf.clone(), seed.wrapping_add(500)))
+            Some(AchfLayer::new(2048, achf.clone(), seed.wrapping_add(500)))
         } else {
             None
         };
@@ -79,6 +82,7 @@ impl DuelingQNetwork {
         DuelingQNetwork {
             l1,
             l2,
+            l3,
             val_head,
             adv_head,
             achf: achf_layer,
@@ -88,7 +92,8 @@ impl DuelingQNetwork {
     pub fn forward_impl(&self, state: &Tensor) -> Tensor {
         // state: (Batch, 8) or (8)
         let x = self.l1.forward(state).relu();
-        let mut x = self.l2.forward(&x).relu();
+        let x = self.l2.forward(&x).relu();
+        let mut x = self.l3.forward(&x).relu();
         if let Some(achf) = &self.achf {
             let residual = achf.forward_residual(&x);
             x = &x + &residual;
@@ -141,6 +146,7 @@ impl DuelingQNetwork {
     pub fn to_cuda(&mut self) {
         self.l1.to_cuda();
         self.l2.to_cuda();
+        self.l3.to_cuda();
         self.val_head.to_cuda();
         self.adv_head.to_cuda();
         if let Some(ref mut achf) = self.achf {
@@ -198,6 +204,7 @@ impl DuelingQNetwork {
 
         copy_linear(&mut self.l1, &other.l1);
         copy_linear(&mut self.l2, &other.l2);
+        copy_linear(&mut self.l3, &other.l3);
         copy_linear(&mut self.val_head, &other.val_head);
         copy_linear(&mut self.adv_head, &other.adv_head);
         if let (Some(dst), Some(src)) = (&mut self.achf, &other.achf) {
@@ -223,6 +230,7 @@ impl DuelingQNetwork {
 
         update_linear(&mut self.l1, &source.l1);
         update_linear(&mut self.l2, &source.l2);
+        update_linear(&mut self.l3, &source.l3);
         update_linear(&mut self.val_head, &source.val_head);
         update_linear(&mut self.adv_head, &source.adv_head);
         if let (Some(dst), Some(src)) = (&mut self.achf, &source.achf) {

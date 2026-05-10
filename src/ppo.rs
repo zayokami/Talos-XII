@@ -140,9 +140,9 @@ pub struct ActorCritic {
 
 impl ActorCritic {
     pub fn new(seed: u64, achf: &crate::config::AchfConfig) -> Self {
-        let backbone = LuckTransformer::new(DIM, 1024, true, 2, seed, achf);
-        let actor_head = Linear::new(1024, ACTION_SPACE, true, seed.wrapping_add(100));
-        let critic_head = Linear::new(1024, 1, true, seed.wrapping_add(200));
+        let backbone = LuckTransformer::new(DIM, 2048, true, 4, seed, achf);
+        let actor_head = Linear::new(2048, ACTION_SPACE, true, seed.wrapping_add(100));
+        let critic_head = Linear::new(2048, 1, true, seed.wrapping_add(200));
 
         ActorCritic {
             backbone,
