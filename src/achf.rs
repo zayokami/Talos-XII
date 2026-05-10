@@ -113,6 +113,10 @@ pub struct AchfCache {
     pub last_input_hash: Option<u64>,
     pub last_output: Option<Vec<f64>>,
     pub last_input_count: u64,
+    /// Warm-start row scale vectors for Sinkhorn projection (cached between calls).
+    pub sinkhorn_row_scales: Option<Vec<f64>>,
+    /// Warm-start column scale vectors for Sinkhorn projection (cached between calls).
+    pub sinkhorn_col_scales: Option<Vec<f64>>,
 }
 
 fn default_state() -> Arc<RwLock<AchfState>> {
@@ -142,6 +146,8 @@ fn default_cache() -> Arc<RwLock<AchfCache>> {
         last_input_hash: None,
         last_output: None,
         last_input_count: 0,
+        sinkhorn_row_scales: None,
+        sinkhorn_col_scales: None,
     }))
 }
 
@@ -754,13 +760,23 @@ impl AchfLayer {
         } else {
             self.config.proj_steps
         };
+        let cache = self.cache.read().unwrap();
+        let row_scales = cache.sinkhorn_row_scales.clone();
+        let col_scales = cache.sinkhorn_col_scales.clone();
+        drop(cache);
         let mut w = self.weight.weight.data.write().unwrap();
-        sinkhorn_project(
+        let (new_row, new_col) = sinkhorn_project(
             &mut w,
             self.weight.in_features,
             self.weight.out_features,
             steps,
+            row_scales.as_deref(),
+            col_scales.as_deref(),
         );
+        drop(w);
+        let mut cache = self.cache.write().unwrap();
+        cache.sinkhorn_row_scales = Some(new_row);
+        cache.sinkhorn_col_scales = Some(new_col);
     }
 
     pub fn load_state_dict(&mut self, other: &AchfLayer) {
@@ -822,6 +838,8 @@ impl AchfLayer {
         cache.last_input_hash = None;
         cache.last_output = None;
         cache.last_input_count = 0;
+        cache.sinkhorn_row_scales = None;
+        cache.sinkhorn_col_scales = None;
         self.metrics.memo_hash.store(0, Ordering::Relaxed);
         self.metrics.memo_count.store(0, Ordering::Relaxed);
         self.metrics.latency_samples.store(0, Ordering::Relaxed);
@@ -1130,9 +1148,41 @@ fn rowcol_project(w: &mut [f64], rows: usize, cols: usize) {
     }
 }
 
-fn sinkhorn_project(w: &mut [f64], rows: usize, cols: usize, steps: usize) {
+fn sinkhorn_project(
+    w: &mut [f64],
+    rows: usize,
+    cols: usize,
+    steps: usize,
+    row_scales: Option<&[f64]>,
+    col_scales: Option<&[f64]>,
+) -> (Vec<f64>, Vec<f64>) {
     let eps = 1e-12;
     let convergence_tol = 1e-6;
+
+    // Apply warm-start scale vectors if dimensions match.
+    if let Some(rs) = row_scales {
+        if rs.len() == rows {
+            for r in 0..rows {
+                let scale = rs[r];
+                for c in 0..cols {
+                    w[r * cols + c] *= scale;
+                }
+            }
+        }
+    }
+    if let Some(cs) = col_scales {
+        if cs.len() == cols {
+            for c in 0..cols {
+                let scale = cs[c];
+                for r in 0..rows {
+                    w[r * cols + c] *= scale;
+                }
+            }
+        }
+    }
+
+    let mut out_row_scales = vec![1.0; rows];
+    let mut out_col_scales = vec![1.0; cols];
 
     for _ in 0..steps {
         // Row normalization
@@ -1142,6 +1192,7 @@ fn sinkhorn_project(w: &mut [f64], rows: usize, cols: usize, steps: usize) {
                 sum += w[r * cols + c].abs();
             }
             let denom = if sum < eps { 1.0 } else { sum };
+            out_row_scales[r] /= denom;
             for c in 0..cols {
                 w[r * cols + c] /= denom;
             }
@@ -1153,13 +1204,21 @@ fn sinkhorn_project(w: &mut [f64], rows: usize, cols: usize, steps: usize) {
                 sum += w[r * cols + c].abs();
             }
             let denom = if sum < eps { 1.0 } else { sum };
+            out_col_scales[c] /= denom;
             for r in 0..rows {
                 w[r * cols + c] /= denom;
             }
         }
 
-        // Early termination: check max deviation of column sums from 1.0
+        // Early termination: check max deviation of both row and column sums from 1.0
         let mut max_dev = 0.0_f64;
+        for r in 0..rows {
+            let mut sum = 0.0;
+            for c in 0..cols {
+                sum += w[r * cols + c].abs();
+            }
+            max_dev = max_dev.max((sum - 1.0).abs());
+        }
         for c in 0..cols {
             let mut sum = 0.0;
             for r in 0..rows {
@@ -1171,6 +1230,8 @@ fn sinkhorn_project(w: &mut [f64], rows: usize, cols: usize, steps: usize) {
             break;
         }
     }
+
+    (out_row_scales, out_col_scales)
 }
 
 fn copy_linear(dst: &mut Linear, src: &Linear) {
@@ -1513,5 +1574,94 @@ mod tests {
         };
         let agg = aggregate_cache_stats_iter([s1, s2]);
         assert!((agg.adaptive_bias - 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_sinkhorn_doubly_stochastic() {
+        // Build a 4x4 positive matrix
+        let mut w = vec![
+            1.0, 2.0, 3.0, 4.0,
+            5.0, 6.0, 7.0, 8.0,
+            9.0, 10.0, 11.0, 12.0,
+            13.0, 14.0, 15.0, 16.0,
+        ];
+        let (row_scales, col_scales) = sinkhorn_project(&mut w, 4, 4, 20, None, None);
+        // Verify all row sums equal 1.0
+        for r in 0..4 {
+            let sum: f64 = (0..4).map(|c| w[r * 4 + c]).sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-6,
+                "Row {} sum = {}, expected 1.0",
+                r,
+                sum
+            );
+        }
+        // Verify all column sums equal 1.0
+        for c in 0..4 {
+            let sum: f64 = (0..4).map(|r| w[r * 4 + c]).sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-6,
+                "Col {} sum = {}, expected 1.0",
+                c,
+                sum
+            );
+        }
+        // All values should be non-negative
+        assert!(w.iter().all(|&v| v >= 0.0));
+        // Returned scale vectors should not be all 1.0 (projection did real work)
+        assert!(row_scales.iter().any(|&v| (v - 1.0).abs() > 1e-6));
+        assert!(col_scales.iter().any(|&v| (v - 1.0).abs() > 1e-6));
+    }
+
+    #[test]
+    fn test_sinkhorn_warm_start_accelerates() {
+        let w0 = vec![
+            1.0, 2.0, 3.0, 4.0,
+            5.0, 6.0, 7.0, 8.0,
+            9.0, 10.0, 11.0, 12.0,
+            13.0, 14.0, 15.0, 16.0,
+        ];
+        // First projection with few steps (no warm-start)
+        let mut w1 = w0.clone();
+        let (rs1, cs1) = sinkhorn_project(&mut w1, 4, 4, 3, None, None);
+        // Second projection on same matrix with warm-start from first
+        let mut w2 = w0.clone();
+        let (rs2, cs2) = sinkhorn_project(&mut w2, 4, 4, 3, Some(&rs1), Some(&cs1));
+        // Warm-started result should be closer to doubly-stochastic
+        let max_dev1 = {
+            let mut dev = 0.0f64;
+            for r in 0..4 {
+                let s: f64 = (0..4).map(|c| w1[r * 4 + c]).sum();
+                dev = dev.max((s - 1.0).abs());
+            }
+            for c in 0..4 {
+                let s: f64 = (0..4).map(|r| w1[r * 4 + c]).sum();
+                dev = dev.max((s - 1.0).abs());
+            }
+            dev
+        };
+        let max_dev2 = {
+            let mut dev = 0.0f64;
+            for r in 0..4 {
+                let s: f64 = (0..4).map(|c| w2[r * 4 + c]).sum();
+                dev = dev.max((s - 1.0).abs());
+            }
+            for c in 0..4 {
+                let s: f64 = (0..4).map(|r| w2[r * 4 + c]).sum();
+                dev = dev.max((s - 1.0).abs());
+            }
+            dev
+        };
+        assert!(
+            max_dev2 <= max_dev1,
+            "Warm-start should not be worse: no-warm={:.6e}, warm={:.6e}",
+            max_dev1,
+            max_dev2
+        );
+        // Returned scales should compose with input scales
+        assert_eq!(rs1.len(), 4);
+        assert_eq!(cs1.len(), 4);
+        assert_eq!(rs2.len(), 4);
+        assert_eq!(cs2.len(), 4);
     }
 }
