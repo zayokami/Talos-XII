@@ -38,7 +38,7 @@ use config::{ComputeDevice, Config, LuckMode};
 use dqn::{train_dqn, DuelingQNetwork, Experience, OnlineDqnTrainer};
 use env_net::EnvNet;
 use i18n::{I18n, Language};
-use log::info;
+use log::{info, warn};
 use neural::{NeuralLuckOptimizer, DIM};
 use ppo::{train_ppo, ActorCritic, OnlinePpoTrainer};
 use rng::Rng;
@@ -522,6 +522,12 @@ fn initialize_system(
 ) {
     let mut config = Config::load(&args.config);
     apply_compute_device_policy(&mut config);
+    if config.model_hidden_dim >= 8192 {
+        warn!(
+            "Large model detected ({} dim x {} layers). Training will take significantly longer and may require substantial memory.",
+            config.model_hidden_dim, config.model_num_layers
+        );
+    }
     let mut rng = if let Some(seed) = args.seed {
         Rng::from_seed(seed)
     } else {

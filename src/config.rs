@@ -1238,6 +1238,14 @@ fn warn_unknown_fields(map: &serde_json::Map<String, JsonValue>) {
         "six_stars_en",
         "five_stars_en",
         "four_stars_en",
+        "model_dim",
+        "model_hidden_dim",
+        "model_num_layers",
+        "model_num_heads",
+        "model_kv_lora_rank",
+        "model_qk_rope_dim",
+        "use_multi_stream",
+        "multi_stream_factor",
     ]
     .into_iter()
     .collect();
