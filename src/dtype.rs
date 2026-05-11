@@ -129,6 +129,22 @@ impl Storage {
         }
     }
 
+    /// Create storage from Vec<f32> with the specified dtype.
+    pub fn from_f32_vec(data: Vec<f32>, dtype: Dtype) -> Self {
+        match dtype {
+            Dtype::F64 => Storage::F64(Arc::new(RwLock::new(
+                data.into_iter().map(|v| v as f64).collect(),
+            ))),
+            Dtype::F32 => Storage::F32(Arc::new(RwLock::new(data))),
+            Dtype::BF16 => Storage::BF16(Arc::new(RwLock::new(
+                data.into_iter().map(bf16::from_f32).collect(),
+            ))),
+            Dtype::I8 => Storage::I8(Arc::new(RwLock::new(
+                data.into_iter().map(|v| v as i8).collect(),
+            ))),
+        }
+    }
+
     /// Create zero-initialized storage with the specified dtype.
     pub fn zeros(len: usize, dtype: Dtype) -> Self {
         match dtype {

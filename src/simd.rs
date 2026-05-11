@@ -190,6 +190,36 @@ fn dot_product_scalar(a: &[f64], b: &[f64]) -> f64 {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  Public API: dot_product_f32  —  sum(a[i] * b[i]) for f32
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[allow(dead_code)]
+#[inline(always)]
+pub fn dot_product_f32(a: &[f32], b: &[f32]) -> f32 {
+    let len = a.len();
+    assert_eq!(len, b.len(), "Dimension mismatch in dot_product_f32");
+    let mut sum = 0.0f32;
+    for i in 0..len {
+        sum += a[i] * b[i];
+    }
+    sum
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Public API: vector_grad_acc_f32  —  dst[i] += src[i]   (f32)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[allow(dead_code)]
+#[inline(always)]
+pub fn vector_grad_acc_f32(dst: &mut [f32], src: &[f32]) {
+    let len = dst.len();
+    debug_assert!(len <= src.len());
+    for i in 0..len {
+        dst[i] += src[i];
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  Public API: vector_fma  —  dst[i] += a[i] * b[i]
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -518,6 +548,7 @@ fn softmax_exp_sum_scalar(row: &mut [f64]) -> f64 {
 //  Absolute error < 2 ULP over [-709, 709]. Suitable for softmax.
 // ═══════════════════════════════════════════════════════════════════════════
 
+#[allow(dead_code)]
 #[inline(always)]
 pub fn fast_exp_bulk(dst: &mut [f64], src: &[f64]) {
     let len = dst.len();
@@ -538,6 +569,17 @@ pub fn fast_exp_bulk(dst: &mut [f64], src: &[f64]) {
         }
     }
 
+    for i in 0..len {
+        dst[i] = src[i].exp();
+    }
+}
+
+/// Scalar f32 variant of fast_exp_bulk.
+/// Phase 5 will add AVX2/AVX-512 vectorized variants.
+#[inline(always)]
+pub fn fast_exp_bulk_f32(dst: &mut [f32], src: &[f32]) {
+    let len = dst.len();
+    debug_assert!(len <= src.len());
     for i in 0..len {
         dst[i] = src[i].exp();
     }
@@ -1191,6 +1233,7 @@ unsafe fn fast_exp_avx2(x: __m256d) -> __m256d {
     _mm256_mul_pd(p, pow2n)
 }
 
+#[allow(dead_code)]
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 unsafe fn fast_exp_bulk_avx512(dst: &mut [f64], src: &[f64]) {
@@ -1208,6 +1251,7 @@ unsafe fn fast_exp_bulk_avx512(dst: &mut [f64], src: &[f64]) {
     }
 }
 
+#[allow(dead_code)]
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn fast_exp_bulk_avx2(dst: &mut [f64], src: &[f64]) {
