@@ -269,9 +269,10 @@ impl Module for RMSNorm {
                             let eps = self.eps;
                             let out = Tensor {
                                 data: Storage::F64(Arc::new(RwLock::new(vec![0.0; num_elements]))),
-                                grad: Arc::new(RwLock::new(vec![0.0; num_elements])),
+                                grad: Storage::zeros(num_elements, Dtype::F64),
                                 shape: shape.clone(),
                                 device: crate::autograd::Device::Cuda,
+                                dtype: Dtype::F64,
                                 _ctx: Some(Arc::new(Context {
                                     parents,
                                     backward_op: Box::new(move |grad_out, parents| {
@@ -280,15 +281,16 @@ impl Module for RMSNorm {
 
                                         #[cfg(cuda)]
                                         if x_in.device == crate::autograd::Device::Cuda {
+                                            let grad_out_f64 = grad_out.to_f64_vec();
                                             if let Ok(d_grad_tmp) =
                                                 crate::cuda::memory::alloc_pooled::<f64>(
-                                                    grad_out.len(),
+                                                    grad_out_f64.len(),
                                                 )
                                             {
                                                 let d_grad_tmp = std::sync::Arc::new(d_grad_tmp);
                                                 if crate::cuda::memory::copy_h2d(
                                                     &d_grad_tmp,
-                                                    grad_out,
+                                                    &grad_out_f64,
                                                 )
                                                 .is_ok()
                                                 {
