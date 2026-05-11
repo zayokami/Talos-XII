@@ -379,8 +379,8 @@ impl RunningMeanStd {
 
 struct Adam {
     params: Vec<Tensor>,
-    m: Vec<Vec<f64>>,
-    v: Vec<Vec<f64>>,
+    m: Vec<Vec<f32>>,
+    v: Vec<Vec<f32>>,
     t: usize,
     lr: f64,
     beta1: f64,
@@ -391,14 +391,8 @@ struct Adam {
 
 impl Adam {
     fn new(params: Vec<Tensor>, lr: f64) -> Self {
-        let m = params
-            .iter()
-            .map(|p| vec![0.0; p.data_f64().len()])
-            .collect();
-        let v = params
-            .iter()
-            .map(|p| vec![0.0; p.data_f64().len()])
-            .collect();
+        let m = params.iter().map(|p| vec![0.0f32; p.data.len()]).collect();
+        let v = params.iter().map(|p| vec![0.0f32; p.data.len()]).collect();
         Adam {
             params,
             m,
@@ -419,56 +413,84 @@ impl Adam {
     fn step(&mut self) {
         self.t += 1;
 
-        // Global gradient clipping via SIMD dot_product for L2 norm
-        let mut total_norm = 0.0;
+        // Global gradient clipping via SIMD dot_product for L2 norm (f32)
+        let mut total_norm_sq = 0.0f32;
         for param in &self.params {
-            let grad = param.grad_read_f64();
-            total_norm += crate::simd::dot_product(&grad, &grad);
+            let grad = param.grad_to_f32_vec();
+            total_norm_sq += crate::simd::dot_product_f32(&grad, &grad);
         }
-        total_norm = total_norm.sqrt();
+        let total_norm = (total_norm_sq as f64).sqrt();
         let clip_coef = if total_norm > 1.0 {
             1.0 / total_norm
         } else {
             1.0
         };
+        let clip = clip_coef as f32;
 
-        let bias_correction1 = 1.0 - self.beta1.powi(self.t as i32);
-        let bias_correction2 = 1.0 - self.beta2.powi(self.t as i32);
-        let b1 = self.beta1;
-        let one_minus_b1 = 1.0 - b1;
-        let b2 = self.beta2;
-        let one_minus_b2 = 1.0 - b2;
-        let lr = self.lr;
-        let eps = self.eps;
-        let wd = self.weight_decay;
+        let bc1 = (1.0 - self.beta1.powi(self.t as i32)) as f32;
+        let bc2 = (1.0 - self.beta2.powi(self.t as i32)) as f32;
+        let b1 = self.beta1 as f32;
+        let b2 = self.beta2 as f32;
+        let lr = self.lr as f32;
+        let eps = self.eps as f32;
+        let wd = self.weight_decay as f32;
 
         for (i, param) in self.params.iter_mut().enumerate() {
-            let grad = param.grad_read_f64();
-            let mut data = param.data_write_f64();
-            let m = &mut self.m[i];
-            let v = &mut self.v[i];
-            let len = data.len();
-            let mut j = 0;
-            // Process 4 elements at a time for better ILP
-            while j + 4 <= len {
-                for k in j..j + 4 {
-                    let g = grad[k] * clip_coef;
-                    m[k] = b1 * m[k] + one_minus_b1 * g;
-                    v[k] = b2 * v[k] + one_minus_b2 * g * g;
-                    let m_hat = m[k] / bias_correction1;
-                    let v_hat = v[k] / bias_correction2;
-                    data[k] -= lr * (m_hat / (v_hat.sqrt() + eps) + wd * data[k]);
+            let grad = param.grad_to_f32_vec();
+            if param.dtype == crate::dtype::Dtype::F64 {
+                let mut data = param.data_write_f64();
+                let m = &mut self.m[i];
+                let v = &mut self.v[i];
+                let len = data.len();
+                let mut j = 0;
+                while j + 4 <= len {
+                    for k in j..j + 4 {
+                        let g = grad[k] * clip;
+                        m[k] = b1 * m[k] + (1.0 - b1) * g;
+                        v[k] = b2 * v[k] + (1.0 - b2) * g * g;
+                        let m_hat = m[k] / bc1;
+                        let v_hat = v[k] / bc2;
+                        data[k] -=
+                            lr as f64 * (m_hat / (v_hat.sqrt() + eps) + wd * data[k] as f32) as f64;
+                    }
+                    j += 4;
                 }
-                j += 4;
-            }
-            while j < len {
-                let g = grad[j] * clip_coef;
-                m[j] = b1 * m[j] + one_minus_b1 * g;
-                v[j] = b2 * v[j] + one_minus_b2 * g * g;
-                let m_hat = m[j] / bias_correction1;
-                let v_hat = v[j] / bias_correction2;
-                data[j] -= lr * (m_hat / (v_hat.sqrt() + eps) + wd * data[j]);
-                j += 1;
+                while j < len {
+                    let g = grad[j] * clip;
+                    m[j] = b1 * m[j] + (1.0 - b1) * g;
+                    v[j] = b2 * v[j] + (1.0 - b2) * g * g;
+                    let m_hat = m[j] / bc1;
+                    let v_hat = v[j] / bc2;
+                    data[j] -=
+                        lr as f64 * (m_hat / (v_hat.sqrt() + eps) + wd * data[j] as f32) as f64;
+                    j += 1;
+                }
+            } else {
+                let mut data = param.data_write_f32();
+                let m = &mut self.m[i];
+                let v = &mut self.v[i];
+                let len = data.len();
+                let mut j = 0;
+                while j + 4 <= len {
+                    for k in j..j + 4 {
+                        let g = grad[k] * clip;
+                        m[k] = b1 * m[k] + (1.0 - b1) * g;
+                        v[k] = b2 * v[k] + (1.0 - b2) * g * g;
+                        let m_hat = m[k] / bc1;
+                        let v_hat = v[k] / bc2;
+                        data[k] -= lr * (m_hat / (v_hat.sqrt() + eps) + wd * data[k]);
+                    }
+                    j += 4;
+                }
+                while j < len {
+                    let g = grad[j] * clip;
+                    m[j] = b1 * m[j] + (1.0 - b1) * g;
+                    v[j] = b2 * v[j] + (1.0 - b2) * g * g;
+                    let m_hat = m[j] / bc1;
+                    let v_hat = v[j] / bc2;
+                    data[j] -= lr * (m_hat / (v_hat.sqrt() + eps) + wd * data[j]);
+                    j += 1;
+                }
             }
         }
     }
@@ -499,7 +521,7 @@ impl GpuAdam {
         let mut m = Vec::with_capacity(params.len());
         let mut v = Vec::with_capacity(params.len());
         for p in &params {
-            let len = p.data_f64().len();
+            let len = p.data.len();
             if p.device != crate::autograd::Device::Cuda {
                 return None;
             }
@@ -535,7 +557,7 @@ impl GpuAdam {
         // Compute global gradient norm on CPU (copy grads from GPU)
         let mut total_norm = 0.0;
         for param in &self.params {
-            let grad = param.grad_read_f64();
+            let grad = param.grad_to_f64_vec();
             total_norm += crate::simd::dot_product(&grad, &grad);
         }
         total_norm = total_norm.sqrt();
@@ -550,7 +572,7 @@ impl GpuAdam {
 
         let mut all_ok = true;
         for (i, param) in self.params.iter().enumerate() {
-            let len = param.data_f64().len();
+            let len = param.data.len();
             if len == 0 {
                 continue;
             }
@@ -1869,19 +1891,19 @@ mod tests {
         let policy = ActorCritic::new(42, &crate::config::AchfConfig::default());
 
         // Case 1: 1D input [DIM] (e.g. [8])
-        let state_1d = Tensor::new(vec![0.5; DIM], vec![DIM]);
+        let state_1d = Tensor::new_f32(vec![0.5; DIM], vec![DIM]);
         let pity = vec![0];
         let _ = policy.forward_actor(&state_1d, &pity);
         let _ = policy.forward_critic(&state_1d, &pity);
 
         // Case 2: 2D input [Seq, DIM] (e.g. [5, 8])
         let seq_len = 5;
-        let state_2d = Tensor::new(vec![0.5; seq_len * DIM], vec![seq_len, DIM]);
+        let state_2d = Tensor::new_f32(vec![0.5; seq_len * DIM], vec![seq_len, DIM]);
         let _ = policy.forward_actor(&state_2d, &pity);
         let _ = policy.forward_critic(&state_2d, &pity);
 
         // Case 3: 3D input [1, Seq, DIM]
-        let state_3d = Tensor::new(vec![0.5; seq_len * DIM], vec![1, seq_len, DIM]);
+        let state_3d = Tensor::new_f32(vec![0.5; seq_len * DIM], vec![1, seq_len, DIM]);
         let _ = policy.forward_actor(&state_3d, &pity);
         let _ = policy.forward_critic(&state_3d, &pity);
     }

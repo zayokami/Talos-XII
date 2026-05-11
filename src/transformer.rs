@@ -202,7 +202,7 @@ fn concat_last_dim(tensors: &[Tensor]) -> Tensor {
 
     for p in 0..prefix_len {
         for (i, t) in tensors.iter().enumerate() {
-            let t_data = t.data_f64();
+            let t_data = t.data_as_f64_vec();
             let src_start = p * last_dim;
             let dst_start = p * out_last_dim + i * last_dim;
             out_data[dst_start..dst_start + last_dim]
@@ -212,7 +212,12 @@ fn concat_last_dim(tensors: &[Tensor]) -> Tensor {
 
     let mut out_shape = first_shape.clone();
     *out_shape.last_mut().unwrap() = out_last_dim;
-    Tensor::new(out_data, out_shape)
+    let out_dtype = if tensors.iter().all(|t| t.dtype == tensors[0].dtype) {
+        tensors[0].dtype
+    } else {
+        crate::dtype::Dtype::F64
+    };
+    Tensor::with_dtype(out_data, out_shape, out_dtype)
 }
 
 /// Split a tensor along the last dimension into n equal parts.
@@ -229,7 +234,7 @@ fn split_last_dim(tensor: &Tensor, n: usize) -> Vec<Tensor> {
         n
     );
     let split_dim = last_dim / n;
-    let t_data = tensor.data_f64();
+    let t_data = tensor.data_as_f64_vec();
 
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
@@ -242,7 +247,7 @@ fn split_last_dim(tensor: &Tensor, n: usize) -> Vec<Tensor> {
         }
         let mut chunk_shape = shape.clone();
         *chunk_shape.last_mut().unwrap() = split_dim;
-        out.push(Tensor::new(chunk_data, chunk_shape));
+        out.push(Tensor::with_dtype(chunk_data, chunk_shape, tensor.dtype));
     }
     out
 }
@@ -2280,36 +2285,36 @@ mod tests {
 
     #[test]
     fn test_tensor_reshape() {
-        let t = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
+        let t = Tensor::new_f32(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
         let t_reshaped = t.reshape(vec![4]);
         assert_eq!(t_reshaped.shape, vec![4]);
 
         // Zero-copy reshape: data is shared via Arc
         {
-            let data_reshaped = t_reshaped.data_f64();
+            let data_reshaped = t_reshaped.data_as_f64_vec();
             assert_eq!(data_reshaped[0], 1.0);
             assert_eq!(data_reshaped[3], 4.0);
         }
 
         // Verify data is shared (zero-copy): mutating original is visible through reshaped
         {
-            let mut data = t.data_write_f64();
+            let mut data = t.data_write_f32();
             data[0] = 10.0;
         }
         {
-            let data_reshaped_after = t_reshaped.data_f64();
+            let data_reshaped_after = t_reshaped.data_as_f64_vec();
             assert_eq!(data_reshaped_after[0], 10.0); // Shared �?reflects mutation
         }
     }
 
     #[test]
     fn test_tensor_transpose() {
-        let t = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
+        let t = Tensor::new_f32(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
         // [[1, 2, 3], [4, 5, 6]]
         let t_t = t.transpose(0, 1);
         // [[1, 4], [2, 5], [3, 6]]
         assert_eq!(t_t.shape, vec![3, 2]);
-        let data = t_t.data_f64();
+        let data = t_t.data_as_f64_vec();
         assert_eq!(data[0], 1.0);
         assert_eq!(data[1], 4.0);
         assert_eq!(data[2], 2.0);
@@ -2410,7 +2415,7 @@ mod tests {
         // Check if Embed gradients exist
         let embed_grad = t.embed.weight.grad_read_f64();
         assert!(
-            embed_grad.iter().any(|&g: &f64| g.abs() > 0.0),
+            embed_grad.iter().any(|&g| g.abs() > 0.0),
             "Embed grad missing"
         );
 
@@ -2440,19 +2445,22 @@ mod tests {
         let dim = 16;
 
         // Run 1: input_a = [t0, t1, t2, t3]
-        let input_a = Tensor::rand(vec![1, seq_len, dim], -0.1, 0.1, 100);
+        let input_a = Tensor::new_f32(
+            Tensor::rand(vec![1, seq_len, dim], -0.1, 0.1, 100).data_as_f64_vec(),
+            vec![1, seq_len, dim],
+        );
         let out_a = mla.forward(&input_a);
-        let out_a_data = out_a.data_f64().clone();
+        let out_a_data = out_a.data_as_f64_vec().clone();
 
         // Run 2: same t0, but t2 and t3 are different
-        let mut input_b_raw = input_a.data_f64().clone();
+        let mut input_b_raw = input_a.data_as_f64_vec().clone();
         // Overwrite positions 2 and 3 (indices 2*dim .. 4*dim) with different values
         for val in input_b_raw.iter_mut().take(4 * dim).skip(2 * dim) {
             *val = 99.0 - *val;
         }
-        let input_b = Tensor::new(input_b_raw, vec![1, seq_len, dim]);
+        let input_b = Tensor::new_f32(input_b_raw, vec![1, seq_len, dim]);
         let out_b = mla.forward(&input_b);
-        let out_b_data = out_b.data_f64().clone();
+        let out_b_data = out_b.data_as_f64_vec().clone();
 
         // Position 0 output must be identical (only sees itself)
         for i in 0..dim {
@@ -2505,7 +2513,7 @@ mod tests {
         // Run 1
         let input_a: Vec<f64> = {
             let t = Tensor::rand(vec![seq_len * dim], -0.1, 0.1, 200);
-            let v = t.data_f64().clone();
+            let v = t.data_as_f64_vec().clone();
             v
         };
         let out_a = mla.forward_inference(&input_a);
@@ -2567,7 +2575,7 @@ mod tests {
         // Prefill 2 tokens, then decode token 3 with two different values
         let prefill: Vec<f64> = {
             let t = Tensor::rand(vec![2 * dim], -0.1, 0.1, 300);
-            let v = t.data_f64().clone();
+            let v = t.data_as_f64_vec().clone();
             v
         };
 
@@ -2577,7 +2585,7 @@ mod tests {
 
         let token_a: Vec<f64> = {
             let t = Tensor::rand(vec![dim], -0.1, 0.1, 400);
-            let v = t.data_f64().clone();
+            let v = t.data_as_f64_vec().clone();
             v
         };
         let out_a = mla.forward_inference_cached(&token_a, &mut cache_a, 2);
@@ -2636,10 +2644,14 @@ mod tests {
         let num_heads = model.blocks[0].mla_layer.config.num_heads;
         let mut base_cache = vec![KVCache::new(num_heads); model.blocks.len()];
 
-        let prefill = Tensor::rand(vec![2 * 8], -0.1, 0.1, 500).data_f64().clone();
+        let prefill = Tensor::rand(vec![2 * 8], -0.1, 0.1, 500)
+            .data_as_f64_vec()
+            .clone();
         let _ = model.forward_inference_step(&prefill, &mut base_cache, 0);
 
-        let token = Tensor::rand(vec![8], -0.1, 0.1, 501).data_f64().clone();
+        let token = Tensor::rand(vec![8], -0.1, 0.1, 501)
+            .data_as_f64_vec()
+            .clone();
 
         let mut cache_a = base_cache.clone();
         let expected = model.forward_inference_step(&token, &mut cache_a, 2);
@@ -2667,7 +2679,7 @@ mod tests {
         let dim = 4;
         let n = 2;
         let mhc = MhcResidual::new(dim, n, 42);
-        let w = mhc.h_res.weight.data_f64();
+        let w = mhc.h_res.weight.data_as_f64_vec();
         let total_dim = dim * n;
         // Verify row sums equal 1.0
         for r in 0..total_dim {
@@ -2695,9 +2707,9 @@ mod tests {
     fn test_mhc_forward_inference_matches_tensor() {
         let mhc = MhcResidual::new(4, 2, 42);
         let x = Tensor::rand(vec![2, 4], -0.1, 0.1, 200);
-        let x_data = x.data_f64().clone();
+        let x_data = x.data_as_f64_vec().clone();
         let tensor_out = mhc.forward(&x);
-        let tensor_data = tensor_out.data_f64().clone();
+        let tensor_data = tensor_out.data_as_f64_vec().clone();
         let inference_out = mhc.forward_inference(&x_data);
         assert_eq!(tensor_data.len(), inference_out.len());
         for (a, b) in tensor_data.iter().zip(inference_out.iter()) {
@@ -2712,16 +2724,16 @@ mod tests {
 
     #[test]
     fn test_concat_split_last_dim_roundtrip() {
-        let a = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
-        let b = Tensor::new(vec![5.0, 6.0, 7.0, 8.0], vec![2, 2]);
+        let a = Tensor::new_f32(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
+        let b = Tensor::new_f32(vec![5.0, 6.0, 7.0, 8.0], vec![2, 2]);
         let concat = concat_last_dim(&[a.clone(), b.clone()]);
         assert_eq!(concat.shape, vec![2, 4]);
         let split = split_last_dim(&concat, 2);
         assert_eq!(split.len(), 2);
         assert_eq!(split[0].shape, vec![2, 2]);
         assert_eq!(split[1].shape, vec![2, 2]);
-        let s0 = split[0].data_f64();
-        let s1 = split[1].data_f64();
+        let s0 = split[0].data_as_f64_vec();
+        let s1 = split[1].data_as_f64_vec();
         assert_eq!(s0[0], 1.0);
         assert_eq!(s0[3], 4.0);
         assert_eq!(s1[0], 5.0);

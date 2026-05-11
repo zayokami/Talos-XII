@@ -17,14 +17,14 @@ pub fn numerical_grad_check<F>(
 where
     F: Fn(&Tensor) -> Tensor,
 {
-    let original_data = tensor.data_f64().clone();
+    let original_data = tensor.data_as_f64_vec();
     let shape = tensor.shape.clone();
     let n = original_data.len();
 
     // Compute analytical gradient via backward
     let loss = loss_fn(tensor);
     loss.backward();
-    let analytical_grad = tensor.grad_read_f64().clone();
+    let analytical_grad = tensor.grad_to_f64_vec();
 
     // Compute numerical gradients via finite differences
     let mut max_diff: f64 = 0.0;
@@ -75,12 +75,12 @@ mod tests {
     #[test]
     fn test_autograd_memory_leak_fix() {
         // Create a chain
-        let a = Tensor::new(vec![2.0], vec![1]);
+        let a = Tensor::new_f32(vec![2.0], vec![1]);
         let mut b = a.clone();
 
         // Loop to create a deep graph
         for _ in 0..100 {
-            b = b * Tensor::new(vec![1.1], vec![1]);
+            b = b * Tensor::new_f32(vec![1.1], vec![1]);
         }
 
         // b holds the graph.
@@ -110,16 +110,16 @@ mod tests {
         let a_data = vec![2.0, 3.0, 4.0, 5.0];
         let x_data = vec![1.0, 2.0];
 
-        let a = Tensor::new(a_data.clone(), vec![2, 2]);
-        let x = Tensor::new(x_data.clone(), vec![2, 1]); // Column vector
+        let a = Tensor::new_f32(a_data.clone(), vec![2, 2]);
+        let x = Tensor::new_f32(x_data.clone(), vec![2, 1]); // Column vector
 
         let y = a.matmul(&x);
         let loss = y.sum();
 
         loss.backward();
 
-        let a_grad = a.grad_read_f64();
-        let x_grad = x.grad_read_f64();
+        let a_grad = a.grad_read_f32();
+        let x_grad = x.grad_read_f32();
 
         // Expected x_grad: [6, 8]
         assert!((x_grad[0] - 6.0).abs() < 1e-6);
@@ -142,8 +142,8 @@ mod tests {
         // dL/dx = [1, 1]
         // dL/dy = sum([1, 1]) = 2
 
-        let x = Tensor::new(vec![1.0, 2.0], vec![2]);
-        let y = Tensor::new(vec![10.0], vec![1]);
+        let x = Tensor::new_f32(vec![1.0, 2.0], vec![2]);
+        let y = Tensor::new_f32(vec![10.0], vec![1]);
 
         let y_b = y.broadcast(vec![2]);
         let z = x.clone() + y_b;
@@ -151,8 +151,8 @@ mod tests {
 
         loss.backward();
 
-        let x_grad = x.grad_read_f64();
-        let y_grad = y.grad_read_f64();
+        let x_grad = x.grad_read_f32();
+        let y_grad = y.grad_read_f32();
 
         assert!((x_grad[0] - 1.0).abs() < 1e-6);
         assert!((x_grad[1] - 1.0).abs() < 1e-6);
@@ -166,7 +166,7 @@ mod tests {
         // f'(x) = 2x*sin(x) + x^2*cos(x)
         // Check at x = 2.0
 
-        let x = Tensor::new(vec![2.0], vec![1]);
+        let x = Tensor::new_f32(vec![2.0], vec![1]);
         let loss_fn = |t: &Tensor| t.clone() * t.clone() * t.sin();
         let (_, all_passed) = super::numerical_grad_check(&x, loss_fn, 1e-6, 1e-4);
         assert!(all_passed);

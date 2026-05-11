@@ -226,7 +226,7 @@ impl Tensor {
     pub fn save_binary(&self, path: &str) -> std::io::Result<()> {
         use std::io::Write;
         let mut file = File::create(path)?;
-        let data = self.data_f64();
+        let data = self.data_as_f64_vec();
         let bytes =
             unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
         file.write_all(bytes)?;
@@ -248,6 +248,11 @@ impl Tensor {
             dtype: Dtype::F64,
             _ctx: None,
         }
+    }
+
+    /// Create an F32 tensor from f64 data (auto-converts to f32).
+    pub fn new_f32(data: Vec<f64>, shape: Vec<usize>) -> Self {
+        Self::with_dtype(data, shape, Dtype::F32)
     }
 
     /// Create a tensor with explicit dtype.
@@ -377,6 +382,15 @@ impl Tensor {
         match &self.data {
             Storage::F64(v) => v.write().unwrap(),
             _ => panic!("Expected F64 storage, got {:?}", self.dtype),
+        }
+    }
+
+    /// Write F32 data lock. Panics if not F32 or poisoned.
+    #[inline]
+    pub fn data_write_f32(&self) -> std::sync::RwLockWriteGuard<'_, Vec<f32>> {
+        match &self.data {
+            Storage::F32(v) => v.write().unwrap(),
+            _ => panic!("Expected F32 storage, got {:?}", self.dtype),
         }
     }
 
@@ -1838,7 +1852,7 @@ impl Tensor {
             return self.log_softmax_cuda_last_dim();
         }
 
-        let self_data = self.data_f64();
+        let self_data = self.data_as_f64_vec();
         let shape = self.shape.clone();
         let dim_size = shape[dim];
         let inner: usize = shape[dim + 1..].iter().product();
@@ -3750,11 +3764,25 @@ impl Tensor {
                 parents: vec![self.clone(), rhs.clone()],
                 backward_op: Box::new(move |grad_out, _parents| {
                     let grad_out_f32 = grad_out.to_f32_vec();
-                    let mut lhs_grad = _parents[0].grad_write_f32();
-                    let mut rhs_grad = _parents[1].grad_write_f32();
-                    for i in 0..len {
-                        lhs_grad[i] += grad_out_f32[i];
-                        rhs_grad[i] += grad_out_f32[i];
+                    let same_grad = if let (Storage::F32(a), Storage::F32(b)) =
+                        (&_parents[0].grad, &_parents[1].grad)
+                    {
+                        std::sync::Arc::ptr_eq(a, b)
+                    } else {
+                        false
+                    };
+                    if same_grad {
+                        let mut grad = _parents[0].grad_write_f32();
+                        for i in 0..len {
+                            grad[i] += grad_out_f32[i] * 2.0;
+                        }
+                    } else {
+                        let mut lhs_grad = _parents[0].grad_write_f32();
+                        let mut rhs_grad = _parents[1].grad_write_f32();
+                        for i in 0..len {
+                            lhs_grad[i] += grad_out_f32[i];
+                            rhs_grad[i] += grad_out_f32[i];
+                        }
                     }
                 }),
             })),
@@ -3780,11 +3808,22 @@ impl Tensor {
                 parents: vec![self.clone(), rhs.clone()],
                 backward_op: Box::new(move |grad_out, _parents| {
                     let grad_out_f32 = grad_out.to_f32_vec();
-                    let mut lhs_grad = _parents[0].grad_write_f32();
-                    let mut rhs_grad = _parents[1].grad_write_f32();
-                    for i in 0..len {
-                        lhs_grad[i] += grad_out_f32[i];
-                        rhs_grad[i] -= grad_out_f32[i];
+                    let same_grad = if let (Storage::F32(a), Storage::F32(b)) =
+                        (&_parents[0].grad, &_parents[1].grad)
+                    {
+                        std::sync::Arc::ptr_eq(a, b)
+                    } else {
+                        false
+                    };
+                    if same_grad {
+                        // d/dx (x - x) = 0, no-op
+                    } else {
+                        let mut lhs_grad = _parents[0].grad_write_f32();
+                        let mut rhs_grad = _parents[1].grad_write_f32();
+                        for i in 0..len {
+                            lhs_grad[i] += grad_out_f32[i];
+                            rhs_grad[i] -= grad_out_f32[i];
+                        }
                     }
                 }),
             })),
@@ -3812,11 +3851,25 @@ impl Tensor {
                 parents: vec![self.clone(), rhs.clone()],
                 backward_op: Box::new(move |grad_out, _parents| {
                     let grad_out_f32 = grad_out.to_f32_vec();
-                    let mut lhs_grad = _parents[0].grad_write_f32();
-                    let mut rhs_grad = _parents[1].grad_write_f32();
-                    for i in 0..len {
-                        lhs_grad[i] += grad_out_f32[i] * rhs_cache[i];
-                        rhs_grad[i] += grad_out_f32[i] * self_cache[i];
+                    let same_grad = if let (Storage::F32(a), Storage::F32(b)) =
+                        (&_parents[0].grad, &_parents[1].grad)
+                    {
+                        std::sync::Arc::ptr_eq(a, b)
+                    } else {
+                        false
+                    };
+                    if same_grad {
+                        let mut grad = _parents[0].grad_write_f32();
+                        for i in 0..len {
+                            grad[i] += grad_out_f32[i] * 2.0 * rhs_cache[i];
+                        }
+                    } else {
+                        let mut lhs_grad = _parents[0].grad_write_f32();
+                        let mut rhs_grad = _parents[1].grad_write_f32();
+                        for i in 0..len {
+                            lhs_grad[i] += grad_out_f32[i] * rhs_cache[i];
+                            rhs_grad[i] += grad_out_f32[i] * self_cache[i];
+                        }
                     }
                 }),
             })),
@@ -3844,12 +3897,23 @@ impl Tensor {
                 parents: vec![self.clone(), rhs.clone()],
                 backward_op: Box::new(move |grad_out, _parents| {
                     let grad_out_f32 = grad_out.to_f32_vec();
-                    let mut lhs_grad = _parents[0].grad_write_f32();
-                    let mut rhs_grad = _parents[1].grad_write_f32();
-                    for i in 0..len {
-                        lhs_grad[i] += grad_out_f32[i] / rhs_cache[i];
-                        rhs_grad[i] +=
-                            grad_out_f32[i] * (-self_cache[i] / (rhs_cache[i] * rhs_cache[i]));
+                    let same_grad = if let (Storage::F32(a), Storage::F32(b)) =
+                        (&_parents[0].grad, &_parents[1].grad)
+                    {
+                        std::sync::Arc::ptr_eq(a, b)
+                    } else {
+                        false
+                    };
+                    if same_grad {
+                        // d/dx (x/x) = 0, no-op
+                    } else {
+                        let mut lhs_grad = _parents[0].grad_write_f32();
+                        let mut rhs_grad = _parents[1].grad_write_f32();
+                        for i in 0..len {
+                            lhs_grad[i] += grad_out_f32[i] / rhs_cache[i];
+                            rhs_grad[i] +=
+                                grad_out_f32[i] * (-self_cache[i] / (rhs_cache[i] * rhs_cache[i]));
+                        }
                     }
                 }),
             })),
@@ -4569,7 +4633,7 @@ impl Tensor {
     > {
         use crate::cuda::memory::{alloc, copy_h2d};
 
-        let host = self.grad_read_f64();
+        let host = self.grad_to_f64_vec();
         let len = host.len();
         if let Some(buffer) = self.cuda_grad_cached_buffer() {
             if buffer.len() == len {
@@ -4595,7 +4659,6 @@ impl Tensor {
         if let Err(err) = copy_h2d(&device, &host) {
             return Err(("copy", err));
         }
-        drop(host);
 
         let device = Arc::new(device);
         self.cuda_grad_set_cached_buffer(device.clone());
@@ -4608,7 +4671,7 @@ impl Tensor {
     ) -> Option<Arc<crate::cuda::memory::DevicePtr<f64>>> {
         use crate::cuda::memory::{alloc, copy_h2d};
 
-        let len = self.grad_read_f64().len();
+        let len = self.grad.len();
         if len == 0 {
             return Some(Arc::new(crate::cuda::memory::DevicePtr::zero_sized()));
         }
@@ -5796,10 +5859,10 @@ mod tests {
 
     #[test]
     fn test_broadcast_scalar() {
-        let t = Tensor::new(vec![5.0], vec![1]);
+        let t = Tensor::new_f32(vec![5.0], vec![1]);
         let b = t.broadcast(vec![2, 2]);
         assert_eq!(b.shape, vec![2, 2]);
-        let data = b.data_f64();
+        let data = b.data_as_f64_vec();
         assert_eq!(*data, vec![5.0, 5.0, 5.0, 5.0]);
     }
 
@@ -5816,54 +5879,54 @@ mod tests {
     #[test]
     fn test_from_mmap_roundtrip_small_tensor() {
         let path = temp_file_path("autograd_mmap_roundtrip");
-        let tensor = Tensor::new(vec![1.25, -2.5], vec![2]);
+        let tensor = Tensor::new_f32(vec![1.25, -2.5], vec![2]);
         tensor.save_binary(&path).unwrap();
 
         let loaded = Tensor::from_mmap(&path, vec![2]).unwrap();
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(loaded.shape, vec![2]);
-        let data = loaded.data_f64();
+        let data = loaded.data_as_f64_vec();
         assert_eq!(*data, vec![1.25, -2.5]);
     }
 
     #[test]
     fn test_log_softmax_dim_zero_normalization() {
-        let t = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
+        let t = Tensor::new_f32(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
         let out = t.log_softmax_dim(0);
-        let d = out.data_f64();
+        let d = out.data_as_f64_vec();
 
         for col in 0..3 {
             let p0 = d[col].exp();
             let p1 = d[3 + col].exp();
             let sum = p0 + p1;
-            assert!((sum - 1.0).abs() < 1e-10, "column {} sum={}", col, sum);
+            assert!((sum - 1.0).abs() < 1e-5, "column {} sum={}", col, sum);
         }
     }
 
     #[test]
     fn test_log_softmax_dim_one_normalization() {
-        let t = Tensor::new(vec![1.0, -1.0, 2.0, 0.0, 3.0, 4.0], vec![2, 3]);
+        let t = Tensor::new_f32(vec![1.0, -1.0, 2.0, 0.0, 3.0, 4.0], vec![2, 3]);
         let out = t.log_softmax_dim(1);
-        let d = out.data_f64();
+        let d = out.data_as_f64_vec();
 
         for row in 0..2 {
             let base = row * 3;
             let sum = d[base..base + 3].iter().map(|v| v.exp()).sum::<f64>();
-            assert!((sum - 1.0).abs() < 1e-10, "row {} sum={}", row, sum);
+            assert!((sum - 1.0).abs() < 1e-5, "row {} sum={}", row, sum);
         }
     }
 
     #[test]
     fn test_softmax_last_dim_row_normalization_cpu() {
-        let t = Tensor::new(vec![1.0, -1.0, 2.0, 0.0, 3.0, 4.0], vec![2, 3]);
+        let t = Tensor::new_f32(vec![1.0, -1.0, 2.0, 0.0, 3.0, 4.0], vec![2, 3]);
         let out = t.softmax();
-        let d = out.data_f64();
+        let d = out.data_as_f64_vec();
 
         for row in 0..2 {
             let base = row * 3;
             let sum = d[base..base + 3].iter().sum::<f64>();
-            assert!((sum - 1.0).abs() < 1e-10, "row {} sum={}", row, sum);
+            assert!((sum - 1.0).abs() < 1e-5, "row {} sum={}", row, sum);
         }
     }
 
@@ -5874,18 +5937,18 @@ mod tests {
             return;
         }
 
-        let t = Tensor::new(vec![1.0, 2.0, 3.0, -1.0, 0.5, 4.0], vec![2, 3]);
+        let t = Tensor::new_f32(vec![1.0, 2.0, 3.0, -1.0, 0.5, 4.0], vec![2, 3]);
         let t_cuda = match t.to_cuda() {
             Ok(tensor) => tensor,
             Err(_) => return,
         };
         let out = t_cuda.softmax();
-        let d = out.data_f64();
+        let d = out.data_as_f64_vec();
 
         for row in 0..2 {
             let base = row * 3;
             let sum = d[base..base + 3].iter().sum::<f64>();
-            assert!((sum - 1.0).abs() < 1e-10, "row {} sum={}", row, sum);
+            assert!((sum - 1.0).abs() < 1e-5, "row {} sum={}", row, sum);
         }
     }
 
@@ -5896,7 +5959,7 @@ mod tests {
             return;
         }
 
-        let t = Tensor::new(vec![1.0, 2.0, 3.0, -1.0, 0.5, 4.0], vec![2, 3]);
+        let t = Tensor::new_f32(vec![1.0, 2.0, 3.0, -1.0, 0.5, 4.0], vec![2, 3]);
         let t_cuda = match t.to_cuda() {
             Ok(tensor) => tensor,
             Err(_) => return,
@@ -5904,12 +5967,12 @@ mod tests {
         let cpu = t.log_softmax_dim(1);
         let cuda = t_cuda.log_softmax_dim(1);
 
-        let cpu_d = cpu.data_f64();
-        let cuda_d = cuda.data_f64();
+        let cpu_d = cpu.data_as_f64_vec();
+        let cuda_d = cuda.data_as_f64_vec();
         assert_eq!(cpu_d.len(), cuda_d.len());
         for i in 0..cpu_d.len() {
             assert!(
-                (cpu_d[i] - cuda_d[i]).abs() < 1e-9,
+                (cpu_d[i] - cuda_d[i]).abs() < 1e-5,
                 "idx {} cpu={} cuda={}",
                 i,
                 cpu_d[i],
@@ -5925,20 +5988,20 @@ mod tests {
             return;
         }
 
-        let t = Tensor::new(vec![-3.0, 2.0], vec![2]);
+        let t = Tensor::new_f32(vec![-3.0, 2.0], vec![2]);
         let t_cuda = match t.to_cuda() {
             Ok(tensor) => tensor,
             Err(_) => return,
         };
 
         {
-            let mut data = t_cuda.data_write_f64();
+            let mut data = t_cuda.data_write_f32();
             data[0] = 5.0;
             data[1] = -4.0;
         }
 
         let out = t_cuda.relu();
-        let d = out.data_f64();
+        let d = out.data_as_f64_vec();
         assert_eq!(d.as_slice(), &[5.0, 0.0]);
     }
 
@@ -5955,7 +6018,7 @@ mod tests {
             values.push((i as f64 * 0.125) - 4.0);
         }
 
-        let t = Tensor::new(values, vec![2, cols]);
+        let t = Tensor::new_f32(values, vec![2, cols]);
         let t_cuda = match t.to_cuda() {
             Ok(tensor) => tensor,
             Err(_) => return,
@@ -5963,12 +6026,12 @@ mod tests {
 
         let cpu = t.softmax();
         let cuda = t_cuda.softmax();
-        let cpu_d = cpu.data_f64();
-        let cuda_d = cuda.data_f64();
+        let cpu_d = cpu.data_as_f64_vec();
+        let cuda_d = cuda.data_as_f64_vec();
         assert_eq!(cpu_d.len(), cuda_d.len());
         for i in 0..cpu_d.len() {
             assert!(
-                (cpu_d[i] - cuda_d[i]).abs() < 1e-10,
+                (cpu_d[i] - cuda_d[i]).abs() < 1e-5,
                 "idx {} cpu={} cuda={}",
                 i,
                 cpu_d[i],
@@ -5984,7 +6047,7 @@ mod tests {
             return;
         }
 
-        let t = Tensor::new(vec![1.0, 2.0], vec![2]);
+        let t = Tensor::new_f32(vec![1.0, 2.0], vec![2]);
         let t_cuda = match t.to_cuda() {
             Ok(tensor) => tensor,
             Err(_) => return,
@@ -6030,7 +6093,7 @@ mod tests {
 
         let out = input.conv2d(&weight, 1, 0);
         assert_eq!(out.shape, vec![1, 1, 2, 2]);
-        let data = out.data_f64();
+        let data = out.data_as_f64_vec();
         assert_eq!(*data, vec![12.0, 16.0, 24.0, 28.0]);
     }
 
@@ -6052,7 +6115,7 @@ mod tests {
 
         let out = input.max_pool2d(2, 2, 0);
         assert_eq!(out.shape, vec![1, 1, 2, 2]);
-        let d = out.data_f64();
+        let d = out.data_as_f64_vec();
         assert_eq!(*d, vec![5.0, 7.0, 13.0, 15.0]);
     }
 

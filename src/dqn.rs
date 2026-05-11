@@ -447,8 +447,8 @@ impl DuelingQNetwork {
 
 struct Adam {
     params: Vec<Tensor>,
-    m: Vec<Vec<f64>>,
-    v: Vec<Vec<f64>>,
+    m: Vec<Vec<f32>>,
+    v: Vec<Vec<f32>>,
     t: usize,
     lr: f64,
     beta1: f64,
@@ -459,14 +459,8 @@ struct Adam {
 
 impl Adam {
     fn new(params: Vec<Tensor>, lr: f64) -> Self {
-        let m = params
-            .iter()
-            .map(|p| vec![0.0; p.data_f64().len()])
-            .collect();
-        let v = params
-            .iter()
-            .map(|p| vec![0.0; p.data_f64().len()])
-            .collect();
+        let m = params.iter().map(|p| vec![0.0f32; p.data.len()]).collect();
+        let v = params.iter().map(|p| vec![0.0f32; p.data.len()]).collect();
         Adam {
             params,
             m,
@@ -482,37 +476,53 @@ impl Adam {
 
     fn step(&mut self) {
         self.t += 1;
-        // Global gradient clipping (max_norm = 1.0)
-        let mut total_norm = 0.0;
+        // Global gradient clipping (max_norm = 1.0) using f32 grad
+        let mut total_norm_sq = 0.0f32;
         for param in &self.params {
-            let grad = param.grad_read_f64();
+            let grad = param.grad_to_f32_vec();
             for &g in grad.iter() {
-                total_norm += g * g;
+                total_norm_sq += g * g;
             }
         }
-        total_norm = total_norm.sqrt();
+        let total_norm = (total_norm_sq as f64).sqrt();
         let clip_coef = if total_norm > 1.0 {
             1.0 / total_norm
         } else {
             1.0
         };
+        let clip = clip_coef as f32;
 
-        let bias_correction1 = 1.0 - self.beta1.powi(self.t as i32);
-        let bias_correction2 = 1.0 - self.beta2.powi(self.t as i32);
+        let bc1 = (1.0 - self.beta1.powi(self.t as i32)) as f32;
+        let bc2 = (1.0 - self.beta2.powi(self.t as i32)) as f32;
+        let lr = self.lr as f32;
+        let eps = self.eps as f32;
+        let wd = self.weight_decay as f32;
+        let b1 = self.beta1 as f32;
+        let b2 = self.beta2 as f32;
 
         for (i, param) in self.params.iter_mut().enumerate() {
-            let grad = param.grad_read_f64();
-            let mut data = param.data_write_f64();
-
-            for j in 0..data.len() {
-                let g = grad[j] * clip_coef;
-                self.m[i][j] = self.beta1 * self.m[i][j] + (1.0 - self.beta1) * g;
-                self.v[i][j] = self.beta2 * self.v[i][j] + (1.0 - self.beta2) * g * g;
-                let m_hat = self.m[i][j] / bias_correction1;
-                let v_hat = self.v[i][j] / bias_correction2;
-                // AdamW: decoupled weight decay applied directly to parameters
-                data[j] -=
-                    self.lr * (m_hat / (v_hat.sqrt() + self.eps) + self.weight_decay * data[j]);
+            let grad = param.grad_to_f32_vec();
+            if param.dtype == crate::dtype::Dtype::F64 {
+                let mut data = param.data_write_f64();
+                for j in 0..data.len() {
+                    let g = grad[j] * clip;
+                    self.m[i][j] = b1 * self.m[i][j] + (1.0 - b1) * g;
+                    self.v[i][j] = b2 * self.v[i][j] + (1.0 - b2) * g * g;
+                    let m_hat = self.m[i][j] / bc1;
+                    let v_hat = self.v[i][j] / bc2;
+                    let update = lr * (m_hat / (v_hat.sqrt() + eps) + wd * data[j] as f32);
+                    data[j] -= update as f64;
+                }
+            } else {
+                let mut data = param.data_write_f32();
+                for j in 0..data.len() {
+                    let g = grad[j] * clip;
+                    self.m[i][j] = b1 * self.m[i][j] + (1.0 - b1) * g;
+                    self.v[i][j] = b2 * self.v[i][j] + (1.0 - b2) * g * g;
+                    let m_hat = self.m[i][j] / bc1;
+                    let v_hat = self.v[i][j] / bc2;
+                    data[j] -= lr * (m_hat / (v_hat.sqrt() + eps) + wd * data[j]);
+                }
             }
         }
     }
@@ -543,7 +553,7 @@ impl GpuAdam {
         let mut m = Vec::with_capacity(params.len());
         let mut v = Vec::with_capacity(params.len());
         for p in &params {
-            let len = p.data_f64().len();
+            let len = p.data.len();
             if p.device != crate::autograd::Device::Cuda {
                 return None;
             }
@@ -573,7 +583,7 @@ impl GpuAdam {
         crate::cuda::record_optimizer_attempt();
         let mut total_norm = 0.0;
         for param in &self.params {
-            let grad = param.grad_read_f64();
+            let grad = param.grad_to_f64_vec();
             for &g in grad.iter() {
                 total_norm += g * g;
             }
@@ -590,7 +600,7 @@ impl GpuAdam {
 
         let mut all_ok = true;
         for (i, param) in self.params.iter().enumerate() {
-            let len = param.data_f64().len();
+            let len = param.data.len();
             if len == 0 {
                 continue;
             }
