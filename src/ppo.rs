@@ -156,12 +156,13 @@ impl ActorCritic {
         }
     }
 
-    /// Backward-compatible constructor using hard-coded defaults.
+    /// Test-friendly constructor with configurable size.
+    /// Defaults (2048, 4) match production; tests should pass smaller values.
     #[allow(dead_code)]
-    pub fn new(seed: u64, achf: &AchfConfig) -> Self {
-        let backbone = LuckTransformer::new_compat(DIM, 2048, true, 4, seed, achf);
-        let actor_head = Linear::new(2048, ACTION_SPACE, true, seed.wrapping_add(100));
-        let critic_head = Linear::new(2048, 1, true, seed.wrapping_add(200));
+    pub fn new(seed: u64, achf: &AchfConfig, hidden_dim: usize, num_layers: usize) -> Self {
+        let backbone = LuckTransformer::new_compat(DIM, hidden_dim, true, num_layers, seed, achf);
+        let actor_head = Linear::new(hidden_dim, ACTION_SPACE, true, seed.wrapping_add(100));
+        let critic_head = Linear::new(hidden_dim, 1, true, seed.wrapping_add(200));
 
         ActorCritic {
             backbone,
@@ -1888,7 +1889,7 @@ mod tests {
 
     #[test]
     fn test_actor_critic_shapes() {
-        let policy = ActorCritic::new(42, &crate::config::AchfConfig::default());
+        let policy = ActorCritic::new(42, &crate::config::AchfConfig::default(), 64, 2);
 
         // Case 1: 1D input [DIM] (e.g. [8])
         let state_1d = Tensor::new_f32(vec![0.5; DIM], vec![DIM]);
@@ -1910,7 +1911,7 @@ mod tests {
 
     #[test]
     fn online_trainer_from_policy_preserves_initial_weights() {
-        let policy = ActorCritic::new(42, &crate::config::AchfConfig::default());
+        let policy = ActorCritic::new(42, &crate::config::AchfConfig::default(), 64, 2);
         let expected = policy.parameters()[0].data_f64().clone();
 
         let trainer = OnlinePpoTrainer::from_policy(policy, 2, 128);
@@ -1922,11 +1923,16 @@ mod tests {
     #[test]
     fn ema_update_blends_teacher_student_with_decay_0_5() {
         // Use same seed for both so they start with identical weights
-        let policy = ActorCritic::new(42, &crate::config::AchfConfig::default());
+        let policy = ActorCritic::new(42, &crate::config::AchfConfig::default(), 64, 2);
         let mut ppo = Ppo::from_policy(policy, 2, 128);
 
         // Create EMA as separate instance with same seed (not clone, to avoid Arc sharing)
-        ppo.ema_policy = Some(ActorCritic::new(42, &crate::config::AchfConfig::default()));
+        ppo.ema_policy = Some(ActorCritic::new(
+            42,
+            &crate::config::AchfConfig::default(),
+            64,
+            2,
+        ));
         ppo.distill_ema_decay = 0.5;
 
         // Capture original teacher values (initial = policy values since same seed)
@@ -1959,11 +1965,16 @@ mod tests {
 
     #[test]
     fn ema_update_applies_to_all_parameter_tensors() {
-        let policy = ActorCritic::new(42, &crate::config::AchfConfig::default());
+        let policy = ActorCritic::new(42, &crate::config::AchfConfig::default(), 64, 2);
         let mut ppo = Ppo::from_policy(policy, 2, 128);
 
         // Create separate EMA with same seed (not clone)
-        ppo.ema_policy = Some(ActorCritic::new(42, &crate::config::AchfConfig::default()));
+        ppo.ema_policy = Some(ActorCritic::new(
+            42,
+            &crate::config::AchfConfig::default(),
+            64,
+            2,
+        ));
         ppo.distill_ema_decay = 0.5;
 
         let num_params = ppo.policy.parameters().len();
@@ -2012,11 +2023,16 @@ mod tests {
 
     #[test]
     fn ema_approaches_student_after_multiple_updates() {
-        let policy = ActorCritic::new(42, &crate::config::AchfConfig::default());
+        let policy = ActorCritic::new(42, &crate::config::AchfConfig::default(), 64, 2);
         let mut ppo = Ppo::from_policy(policy, 2, 128);
 
         // Create separate EMA with same seed
-        ppo.ema_policy = Some(ActorCritic::new(42, &crate::config::AchfConfig::default()));
+        ppo.ema_policy = Some(ActorCritic::new(
+            42,
+            &crate::config::AchfConfig::default(),
+            64,
+            2,
+        ));
         ppo.distill_ema_decay = 0.5;
 
         // Set all student params to 10.0
@@ -2133,7 +2149,7 @@ mod tests {
 
     #[test]
     fn ppo_from_policy_clamps_zero_batch_size() {
-        let policy = ActorCritic::new(7, &crate::config::AchfConfig::default());
+        let policy = ActorCritic::new(7, &crate::config::AchfConfig::default(), 64, 2);
         let ppo = Ppo::from_policy(policy, 1, 0);
         assert_eq!(ppo.batch_size, 1);
     }

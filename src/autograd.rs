@@ -581,28 +581,27 @@ impl Tensor {
     }
 
     pub fn backward(&self) {
-        // Topological sort
+        // Topological sort — iterative DFS post-order to avoid stack overflow
+        // on deep computation graphs (e.g. multi-layer transformers).
         let mut visited = std::collections::HashSet::new();
         let mut topo = Vec::new();
-        fn build_topo(
-            t: &Tensor,
-            visited: &mut std::collections::HashSet<usize>,
-            topo: &mut Vec<Tensor>,
-        ) {
-            // Use pointer address of data Arc as ID
-            let id = t.grad.id();
-            if !visited.contains(&id) {
-                visited.insert(id);
-                if let Some(ctx) = &t._ctx {
-                    for parent in &ctx.parents {
-                        build_topo(parent, visited, topo);
+        let mut stack = vec![(self, false)];
+        while let Some((t, post)) = stack.pop() {
+            if post {
+                topo.push(t.clone());
+            } else {
+                let id = t.grad.id();
+                if visited.insert(id) {
+                    // Push self back as "post" so it is emitted after all parents.
+                    stack.push((t, true));
+                    if let Some(ctx) = &t._ctx {
+                        for parent in &ctx.parents {
+                            stack.push((parent, false));
+                        }
                     }
                 }
-                topo.push(t.clone());
             }
         }
-
-        build_topo(self, &mut visited, &mut topo);
 
         // Seed gradient of this tensor to 1.0
         self.grad.fill_f64(1.0);

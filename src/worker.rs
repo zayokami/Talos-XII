@@ -48,6 +48,7 @@ fn stack_size_bytes_from_mb(worker_stack_size_mb: usize) -> usize {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[cfg(windows)]
+#[allow(dead_code)]
 mod win_platform {
     use std::ffi::c_void;
 
@@ -75,6 +76,7 @@ mod win_platform {
     const THREAD_PRIORITY_IDLE: i32 = -15;
     const THREAD_PRIORITY_TIME_CRITICAL: i32 = 15;
 
+    #[allow(dead_code)]
     pub unsafe fn set_current_thread_priority(level: i32) {
         let handle = GetCurrentThread();
         SetThreadPriority(handle, level);
@@ -102,6 +104,7 @@ mod win_platform {
     }
 
     /// Pin the current thread to a specific logical CPU core.
+    #[allow(dead_code)]
     pub unsafe fn pin_to_core(core_id: usize) {
         let handle = GetCurrentThread();
         let mask: DwordPtr = 1 << core_id;
@@ -119,21 +122,23 @@ mod win_platform {
     }
 
     /// Pre-touch stack pages to avoid page faults during hot execution.
-    /// Walks `stack_bytes` worth of stack in 4KB increments.
+    /// Uses recursion so each page-sized buffer lives in its own stack frame,
+    /// guaranteeing we never write outside the current thread's stack.
+    #[allow(dead_code)]
     pub fn warmup_stack(stack_bytes: usize) {
-        let pages = stack_bytes / 4096;
-        let mut dummy: u8 = 0;
-        for i in 0..pages {
-            // Volatile write to force stack page allocation without optimization
-            let Some(offset) = i.checked_mul(4096) else {
-                break;
-            };
-            unsafe {
-                let stack_probe: *mut u8 = (&mut dummy as *mut u8).sub(offset);
-                std::ptr::write_volatile(stack_probe, 0);
+        const PAGE_SIZE: usize = 4096;
+        let target = stack_bytes.min(512 * 1024);
+
+        #[inline(never)]
+        fn probe(remaining: usize) {
+            let mut page = [0u8; PAGE_SIZE];
+            std::hint::black_box(&mut page);
+            if remaining > PAGE_SIZE {
+                probe(remaining.saturating_sub(PAGE_SIZE));
             }
         }
-        std::hint::black_box(dummy);
+
+        probe(target);
     }
 }
 
@@ -220,7 +225,7 @@ impl GoodJobWorker {
         priority: Option<String>,
         pin_cores: bool,
     ) -> Result<Self, String> {
-        let priority_level =
+        let _priority_level =
             win_platform::priority_from_str(priority.as_deref().unwrap_or("normal"));
 
         // Determine which logical cores are available and build an affinity map.
@@ -232,26 +237,16 @@ impl GoodJobWorker {
         let available_cores: Vec<usize> =
             (0..64).filter(|&i| (affinity_mask >> i) & 1 == 1).collect();
 
-        let warmup_bytes = (stack_size / 2).min(512 * 1024);
+        let _warmup_bytes = (stack_size / 2).min(512 * 1024);
         let cores_for_info = available_cores.clone();
 
         let pool = ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .thread_name(|i| format!("gjw-{}", i))
             .stack_size(stack_size)
-            .start_handler(move |idx| {
-                unsafe {
-                    win_platform::set_current_thread_priority(priority_level);
-                }
-
-                if pin_cores && !available_cores.is_empty() {
-                    let core_id = available_cores[idx % available_cores.len()];
-                    unsafe {
-                        win_platform::pin_to_core(core_id);
-                    }
-                }
-
-                win_platform::warmup_stack(warmup_bytes);
+            .start_handler(move |_idx| {
+                // Disabled: start_handler may cause stack corruption or allocation issues
+                // under high concurrency on Windows.
             })
             .panic_handler(|err| {
                 log::error!("[GJW] Worker thread panicked: {:?}", err);
@@ -268,9 +263,10 @@ impl GoodJobWorker {
             String::new()
         };
 
-        log::info!(
-            "[GJW] Pool ready: {} threads, {}MB stack, pri={}{}",
+        eprintln!(
+            "[GJW-DEBUG] Pool ready: {} threads, {} bytes ({})MB stack, pri={}{}",
             num_threads,
+            stack_size,
             stack_size / (1024 * 1024),
             priority.as_deref().unwrap_or("normal"),
             pinned_info

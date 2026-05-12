@@ -1505,7 +1505,8 @@ mod tests {
 
     #[test]
     fn ppo_fast_slow_alignment_distribution() {
-        let policy = crate::ppo::ActorCritic::new(12345, &crate::config::AchfConfig::default());
+        let policy =
+            crate::ppo::ActorCritic::new(12345, &crate::config::AchfConfig::default(), 64, 2);
         let seq_len = 6;
         let mut flat = vec![0.0; seq_len * DIM];
         for t in 0..seq_len {
