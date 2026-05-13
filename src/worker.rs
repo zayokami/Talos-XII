@@ -144,14 +144,17 @@ mod win_platform {
 
 #[cfg(not(windows))]
 mod win_platform {
+    #[allow(dead_code)]
     pub unsafe fn set_current_thread_priority(_level: i32) {}
     pub fn priority_from_str(_s: &str) -> i32 {
         0
     }
+    #[allow(dead_code)]
     pub unsafe fn pin_to_core(_core_id: usize) {}
     pub fn get_process_affinity() -> u64 {
         u64::MAX
     }
+    #[allow(dead_code)]
     pub fn warmup_stack(_stack_bytes: usize) {}
 }
 
