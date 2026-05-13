@@ -1,7 +1,7 @@
 use crate::autograd::Tensor;
 use crate::config::AchfConfig;
 use crate::nn::{Linear, Module};
-use crate::simd::{add_scaled_row, dot_product};
+use crate::simd::dot_product;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -104,7 +104,7 @@ fn default_metrics() -> Arc<AchfMetrics> {
 
 #[derive(Clone)]
 pub struct AchfCache {
-    pub dense: Option<Vec<f64>>,
+    pub dense: Option<Vec<f32>>,
     pub in_dim: usize,
     pub out_dim: usize,
     pub ema_cached_ns: f64,
@@ -115,7 +115,7 @@ pub struct AchfCache {
     pub decision_ema_long_ns: f64,
     pub adaptive_bias: f64,
     pub last_input_hash: Option<u64>,
-    pub last_output: Option<Vec<f64>>,
+    pub last_output: Option<Vec<f32>>,
     pub last_input_count: u64,
     /// Warm-start row scale vectors for Sinkhorn projection (cached between calls).
     pub sinkhorn_row_scales: Option<Vec<f64>>,
@@ -419,17 +419,17 @@ impl AchfLayer {
         self.forward_blend(x, g)
     }
 
-    pub fn forward_inference_residual(&self, x: &[f64]) -> Vec<f64> {
+    pub fn forward_inference_residual(&self, x: &[f32]) -> Vec<f32> {
         if !self.config.enabled {
-            return vec![0.0; x.len()];
+            return vec![0.0f32; x.len()];
         }
         if self.weight.in_features == 0 || !x.len().is_multiple_of(self.weight.in_features) {
             self.metrics.calls.fetch_add(1, Ordering::Relaxed);
             self.metrics.cache_skips.fetch_add(1, Ordering::Relaxed);
-            return vec![0.0; x.len()];
+            return vec![0.0f32; x.len()];
         }
         self.maybe_project();
-        let g = self.infer_gate_value();
+        let g = self.infer_gate_value() as f32;
 
         if self.config.cache_min_reuse > 0 {
             let hash = Self::input_hash(x);
@@ -476,18 +476,26 @@ impl AchfLayer {
             let out = match path {
                 InferencePath::Cached => self
                     .forward_inference_cached(x)
-                    .unwrap_or_else(|| self.weight.forward_inference(x)),
-                InferencePath::Sparse => self.sparse_weight.as_ref().unwrap().forward_inference(x),
-                InferencePath::Dense => self.weight.forward_inference(x),
+                    .unwrap_or_else(|| self.weight.forward_inference_f32(x)),
+                InferencePath::Sparse => self
+                    .sparse_weight
+                    .as_ref()
+                    .unwrap()
+                    .forward_inference_f32(x),
+                InferencePath::Dense => self.weight.forward_inference_f32(x),
             };
             (out, start.elapsed().as_nanos() as f64)
         } else {
             let out = match path {
                 InferencePath::Cached => self
                     .forward_inference_cached(x)
-                    .unwrap_or_else(|| self.weight.forward_inference(x)),
-                InferencePath::Sparse => self.sparse_weight.as_ref().unwrap().forward_inference(x),
-                InferencePath::Dense => self.weight.forward_inference(x),
+                    .unwrap_or_else(|| self.weight.forward_inference_f32(x)),
+                InferencePath::Sparse => self
+                    .sparse_weight
+                    .as_ref()
+                    .unwrap()
+                    .forward_inference_f32(x),
+                InferencePath::Dense => self.weight.forward_inference_f32(x),
             };
             (out, 0.0)
         };
@@ -521,17 +529,21 @@ impl AchfLayer {
 
     /// Run inference through a specific path, bypassing the automatic path selection.
     /// `forced_path`: 0 = Cached, 1 = Sparse, 2 = Dense.
-    pub fn forward_inference_forced_path(&self, x: &[f64], forced_path: u8) -> Vec<f64> {
+    pub fn forward_inference_forced_path(&self, x: &[f32], forced_path: u8) -> Vec<f32> {
         if !self.config.enabled {
-            return vec![0.0; x.len()];
+            return vec![0.0f32; x.len()];
         }
-        let g = self.infer_gate_value();
+        let g = self.infer_gate_value() as f32;
         let mut out = match forced_path {
             0 => self
                 .forward_inference_cached(x)
-                .unwrap_or_else(|| self.weight.forward_inference(x)),
-            1 if self.is_sparse() => self.sparse_weight.as_ref().unwrap().forward_inference(x),
-            _ => self.weight.forward_inference(x),
+                .unwrap_or_else(|| self.weight.forward_inference_f32(x)),
+            1 if self.is_sparse() => self
+                .sparse_weight
+                .as_ref()
+                .unwrap()
+                .forward_inference_f32(x),
+            _ => self.weight.forward_inference_f32(x),
         };
         for v in out.iter_mut() {
             *v *= g;
@@ -871,7 +883,7 @@ impl AchfLayer {
         }
     }
 
-    fn input_hash(x: &[f64]) -> u64 {
+    fn input_hash(x: &[f32]) -> u64 {
         let mut h: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
         for &b in (x.len() as u64).to_le_bytes().iter() {
             h ^= b as u64;
@@ -897,7 +909,7 @@ impl AchfLayer {
         let in_dim = sparse.in_features;
         let out_dim = sparse.out_features;
         let w_data = sparse.weight.data_f64();
-        let dense = w_data.clone();
+        let dense: Vec<f32> = w_data.iter().map(|&v| v as f32).collect();
         drop(w_data);
         let mut cache = self.cache.write().unwrap();
         cache.dense = Some(dense);
@@ -905,7 +917,7 @@ impl AchfLayer {
         cache.out_dim = out_dim;
     }
 
-    fn forward_inference_cached(&self, x: &[f64]) -> Option<Vec<f64>> {
+    fn forward_inference_cached(&self, x: &[f32]) -> Option<Vec<f32>> {
         let cache = self.cache.read().unwrap();
         let dense = cache.dense.as_ref()?;
         let in_dim = cache.in_dim;
@@ -920,7 +932,7 @@ impl AchfLayer {
         if self.config.cache_min_rows > 0 && num_rows < self.config.cache_min_rows {
             return None;
         }
-        let mut out = vec![0.0; num_rows * out_dim];
+        let mut out = vec![0.0f32; num_rows * out_dim];
         for r in 0..num_rows {
             let row_offset_in = r * in_dim;
             let row_offset_out = r * out_dim;
@@ -931,13 +943,15 @@ impl AchfLayer {
                 }
                 let w_row = &dense[i * out_dim..(i + 1) * out_dim];
                 let out_row = &mut out[row_offset_out..row_offset_out + out_dim];
-                add_scaled_row(out_row, w_row, scale);
+                for j in 0..out_dim {
+                    out_row[j] += scale * w_row[j];
+                }
             }
         }
         Some(out)
     }
 
-    fn choose_inference_path(&self, x: &[f64]) -> InferencePath {
+    fn choose_inference_path(&self, x: &[f32]) -> InferencePath {
         if !self.is_sparse() {
             self.metrics.calls.fetch_add(1, Ordering::Relaxed);
             self.metrics.dense_paths.fetch_add(1, Ordering::Relaxed);
@@ -961,7 +975,7 @@ impl AchfLayer {
         InferencePath::Sparse
     }
 
-    fn should_use_cache(&self, x: &[f64]) -> (bool, bool, bool) {
+    fn should_use_cache(&self, x: &[f32]) -> (bool, bool, bool) {
         let cache = self.cache.read().unwrap();
         if cache.dense.is_none() {
             return (false, false, false);
@@ -1000,7 +1014,7 @@ impl AchfLayer {
         (use_cache, false, true)
     }
 
-    fn estimate_nonzero_ratio(&self, x: &[f64], in_dim: usize, num_rows: usize) -> f64 {
+    fn estimate_nonzero_ratio(&self, x: &[f32], in_dim: usize, num_rows: usize) -> f64 {
         if x.is_empty() || in_dim == 0 || num_rows == 0 {
             return 1.0;
         }
@@ -1318,7 +1332,7 @@ mod tests {
         let _ = layer.forward_residual(&x);
         layer.freeze_for_inference();
         let w_before = layer.weight.weight.data_f64().clone();
-        let x_data = x.data_f64().clone();
+        let x_data = x.data_to_f32_vec();
         let _ = layer.forward_inference_residual(&x_data);
         let w_after = layer.weight.weight.data_f64().clone();
         assert_eq!(w_before, w_after);
@@ -1351,7 +1365,7 @@ mod tests {
         };
         let mut layer = AchfLayer::new_square(4, cfg, 31);
         let x = Tensor::rand(vec![2, 4], -0.1, 0.1, 32);
-        let x_data = x.data_f64().clone();
+        let x_data = x.data_to_f32_vec();
         layer.prune(0.01);
         layer.freeze_for_inference();
         let out_cached = layer.forward_inference_residual(&x_data);
@@ -1359,7 +1373,7 @@ mod tests {
         let out_unfused = layer.forward_inference_residual(&x_data);
         assert_eq!(out_cached.len(), out_unfused.len());
         for (a, b) in out_cached.iter().zip(out_unfused.iter()) {
-            assert!((a - b).abs() < 1e-9);
+            assert!((a - b).abs() < 1e-5);
         }
     }
 
@@ -1374,13 +1388,13 @@ mod tests {
         layer.prune(0.01);
         layer.freeze_for_inference();
         let x = Tensor::rand(vec![2, 4], -0.1, 0.1, 42);
-        let x_data = x.data_f64().clone();
+        let x_data = x.data_to_f32_vec();
         let out_cached = layer.forward_inference_residual(&x_data);
         layer.clear_cache();
         let out_unfused = layer.forward_inference_residual(&x_data);
         assert_eq!(out_cached.len(), out_unfused.len());
         for (a, b) in out_cached.iter().zip(out_unfused.iter()) {
-            assert!((a - b).abs() < 1e-9);
+            assert!((a - b).abs() < 1e-5);
         }
     }
 
@@ -1395,7 +1409,7 @@ mod tests {
         layer.prune(0.01);
         layer.freeze_for_inference();
         let x = Tensor::rand(vec![2, 4], -0.1, 0.1, 52);
-        let x_data = x.data_f64().clone();
+        let x_data = x.data_to_f32_vec();
         let _ = layer.forward_inference_residual(&x_data);
         let stats = layer.cache_stats();
         assert_eq!(stats.calls, 1);

@@ -512,7 +512,11 @@ impl LuckTransformer {
             let mut f1_gelu = vec![0.0; f1.len()];
             vector_gelu(&mut f1_gelu, &f1);
             let f2 = if let Some(achf) = &block.achf_ffn {
-                achf.forward_inference_forced_path(&f1_gelu, forced_path)
+                let f1_f32: Vec<f32> = f1_gelu.iter().map(|&v| v as f32).collect();
+                achf.forward_inference_forced_path(&f1_f32, forced_path)
+                    .into_iter()
+                    .map(|v| v as f64)
+                    .collect()
             } else {
                 block.ffn_2.forward_inference(&f1_gelu)
             };
@@ -574,7 +578,11 @@ impl LuckTransformer {
             vector_gelu(&mut f1_gelu, &f1);
 
             let f2 = if let Some(achf) = &block.achf_ffn {
-                achf.forward_inference_residual(&f1_gelu)
+                let f1_f32: Vec<f32> = f1_gelu.iter().map(|&v| v as f32).collect();
+                achf.forward_inference_residual(&f1_f32)
+                    .into_iter()
+                    .map(|v| v as f64)
+                    .collect()
             } else {
                 block.ffn_2.forward_inference(&f1_gelu)
             };
@@ -651,8 +659,11 @@ impl LuckTransformer {
                 vector_gelu(ffn2, ffn1);
 
                 if let Some(achf) = &block.achf_ffn {
-                    let achf_out = achf.forward_inference_residual(ffn2);
-                    vector_grad_acc(h, &achf_out);
+                    let ffn2_f32: Vec<f32> = ffn2.iter().map(|&v| v as f32).collect();
+                    let achf_out = achf.forward_inference_residual(&ffn2_f32);
+                    for (i, &v) in achf_out.iter().enumerate() {
+                        h[i] += v as f64;
+                    }
                 } else {
                     block.ffn_2.forward_inference_into(ffn2, attn);
                     vector_grad_acc(h, attn);

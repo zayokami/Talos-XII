@@ -119,6 +119,53 @@ impl Linear {
             }
         }
     }
+
+    /// F32 inference path: reads F64 weights but computes in F32 without
+    /// allocating a temporary F32 weight copy. Useful for ACHF fast-path.
+    pub fn forward_inference_f32(&self, input: &[f32]) -> Vec<f32> {
+        let mut out = Vec::new();
+        self.forward_inference_into_f32(input, &mut out);
+        out
+    }
+
+    pub fn forward_inference_into_f32(&self, input: &[f32], out: &mut Vec<f32>) {
+        let in_dim = self.in_features;
+        let out_dim = self.out_features;
+        debug_assert!(
+            in_dim > 0 && input.len().is_multiple_of(in_dim),
+            "forward_inference_f32: input length {} is not divisible by in_features {}",
+            input.len(),
+            in_dim
+        );
+        let num_rows = input.len() / in_dim;
+        out.resize(num_rows * out_dim, 0.0f32);
+        let w_data = self.weight.data_f64();
+        let b_data = self.bias.as_ref().map(|b| b.data_f64());
+
+        for r in 0..num_rows {
+            let row_offset_in = r * in_dim;
+            let row_offset_out = r * out_dim;
+            let out_row = &mut out[row_offset_out..row_offset_out + out_dim];
+            if let Some(b) = &b_data {
+                for j in 0..out_dim {
+                    out_row[j] = b[j] as f32;
+                }
+            } else {
+                out_row.fill(0.0f32);
+            }
+
+            for i in 0..in_dim {
+                let scale = input[row_offset_in + i];
+                if scale == 0.0 {
+                    continue;
+                }
+                let w_row = &w_data[i * out_dim..(i + 1) * out_dim];
+                for j in 0..out_dim {
+                    out_row[j] += scale * w_row[j] as f32;
+                }
+            }
+        }
+    }
 }
 
 impl Module for Linear {

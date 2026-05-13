@@ -401,8 +401,12 @@ impl DuelingQNetwork {
             }
 
             if let Some(achf) = &self.achf {
-                let out = achf.forward_inference_residual(h2);
-                h3.copy_from_slice(&out);
+                let h2_f32: Vec<f32> = h2.iter().map(|&v| v as f32).collect();
+                let out = achf.forward_inference_residual(&h2_f32);
+                h3.resize(out.len(), 0.0);
+                for (i, &v) in out.iter().enumerate() {
+                    h3[i] = v as f64;
+                }
             } else {
                 h3.resize(h2.len(), 0.0);
                 self.l3.forward_inference_into(h2, h3);
