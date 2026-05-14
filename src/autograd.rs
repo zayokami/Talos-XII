@@ -234,20 +234,7 @@ impl Tensor {
     }
 
     pub fn new(data: Vec<f64>, shape: Vec<usize>) -> Self {
-        let len = data.len();
-        assert_eq!(
-            len,
-            shape.iter().product::<usize>(),
-            "Data length must match shape"
-        );
-        Tensor {
-            data: Storage::F64(Arc::new(RwLock::new(data))),
-            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
-            shape,
-            device: Device::Cpu,
-            dtype: Dtype::F64,
-            _ctx: None,
-        }
+        Self::with_dtype(data, shape, Dtype::F64)
     }
 
     /// Create an F32 tensor from f64 data (auto-converts to f32).
@@ -354,12 +341,7 @@ impl Tensor {
 
     /// Fill tensor with a scalar value in-place.
     pub fn fill_(&mut self, value: f64) -> &mut Self {
-        {
-            let mut data = self.data_write_f64();
-            for d in data.iter_mut() {
-                *d = value;
-            }
-        }
+        self.data.fill_f64(value);
         self
     }
 
@@ -373,6 +355,15 @@ impl Tensor {
         match &self.data {
             Storage::F64(v) => v.read().unwrap(),
             _ => panic!("Expected F64 storage, got {:?}", self.dtype),
+        }
+    }
+
+    /// Read F32 data lock. Panics if not F32 or poisoned.
+    #[inline]
+    pub fn data_f32(&self) -> std::sync::RwLockReadGuard<'_, Vec<f32>> {
+        match &self.data {
+            Storage::F32(v) => v.read().unwrap(),
+            _ => panic!("Expected F32 storage, got {:?}", self.dtype),
         }
     }
 
@@ -575,9 +566,9 @@ impl Tensor {
     }
 
     // Create a new leaf tensor with same data (copy)
-    pub fn item(&self) -> f64 {
+    pub fn item(&self) -> f32 {
         assert_eq!(self.shape.iter().product::<usize>(), 1);
-        self.data_f64()[0]
+        self.data_to_f32_vec()[0]
     }
 
     pub fn backward(&self) {

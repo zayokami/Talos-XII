@@ -4,10 +4,10 @@ use std::sync::{Arc, RwLock};
 /// Data type enumeration for tensor elements.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub enum Dtype {
-    /// 64-bit float (current default)
-    #[default]
+    /// 64-bit float (backward compatibility)
     F64,
-    /// 32-bit float
+    /// 32-bit float (default)
+    #[default]
     F32,
     /// Brain float 16
     BF16,
