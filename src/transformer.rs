@@ -2540,8 +2540,7 @@ mod tests {
         // Run 1
         let input_a: Vec<f32> = {
             let t = Tensor::rand(vec![seq_len * dim], -0.1, 0.1, 200);
-            let v = t.data_to_f32_vec().clone();
-            v
+            t.data_to_f32_vec().clone()
         };
         let out_a = mla.forward_inference(&input_a);
 
@@ -2602,8 +2601,7 @@ mod tests {
         // Prefill 2 tokens, then decode token 3 with two different values
         let prefill: Vec<f32> = {
             let t = Tensor::rand(vec![2 * dim], -0.1, 0.1, 300);
-            let v = t.data_to_f32_vec().clone();
-            v
+            t.data_to_f32_vec().clone()
         };
 
         // Cache A: prefill then decode token_a
@@ -2612,8 +2610,7 @@ mod tests {
 
         let token_a: Vec<f32> = {
             let t = Tensor::rand(vec![dim], -0.1, 0.1, 400);
-            let v = t.data_to_f32_vec().clone();
-            v
+            t.data_to_f32_vec().clone()
         };
         let out_a = mla.forward_inference_cached(&token_a, &mut cache_a, 2);
 
