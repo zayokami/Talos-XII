@@ -536,7 +536,7 @@
   "worker_priority": "above_normal",
   "worker_stack_size_mb": 2,
   "f2p_sim_count": 50000,
-  "model_dim": 512,
+  "model_dim": 2048,
   "model_hidden_dim": 8192,
   "model_num_layers": 24,
   "model_num_heads": 32,

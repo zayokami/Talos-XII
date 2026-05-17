@@ -1,12 +1,12 @@
 use crate::achf::{aggregate_cache_stats_iter, AchfCacheStats, AchfLayer};
-use crate::autograd::{Context, Tensor, TensorReadGuard};
+use crate::autograd::{Context, Tensor};
 use crate::config::{AchfConfig, Config};
-use crate::dtype::{Dtype, Storage};
+use crate::dtype::Storage;
 use crate::nn::{Linear, Module, RMSNorm};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 // --- Configuration ---
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -72,7 +72,7 @@ impl MhcResidual {
         }
         let h_res = Linear::new(dim * n, dim * n, false, seed.wrapping_add(200));
         {
-            let mut w = h_res.weight.data_write_f64();
+            let mut w = h_res.weight.data_write_f32();
             // Sinkhorn-Knopp requires strictly positive entries
             for v in w.iter_mut() {
                 *v = v.abs();
@@ -107,17 +107,17 @@ impl MhcResidual {
 
     #[allow(clippy::needless_range_loop)]
     /// Vec-based forward (inference). x: flat [num_positions * dim].
-    pub fn forward_inference(&self, x: &[f64]) -> Vec<f64> {
+    pub fn forward_inference(&self, x: &[f32]) -> Vec<f32> {
         let dim = self.h_pre[0].in_features;
         let num_positions = x.len() / dim;
         let n = self.n;
         // 1. Expand: n streams
-        let mut streams: Vec<Vec<f64>> = Vec::with_capacity(n);
+        let mut streams: Vec<Vec<f32>> = Vec::with_capacity(n);
         for pre in &self.h_pre {
             streams.push(pre.forward_inference(x));
         }
         // 2. Concatenate along last dim
-        let mut concat = vec![0.0; num_positions * n * dim];
+        let mut concat = vec![0.0f32; num_positions * n * dim];
         for pos in 0..num_positions {
             for i in 0..n {
                 let src_offset = pos * dim;
@@ -129,9 +129,9 @@ impl MhcResidual {
         // 3. Apply H_res
         let mixed = self.h_res.forward_inference(&concat);
         // 4. Split back to n streams
-        let mut mixed_streams: Vec<Vec<f64>> = Vec::with_capacity(n);
+        let mut mixed_streams: Vec<Vec<f32>> = Vec::with_capacity(n);
         for i in 0..n {
-            let mut ms = vec![0.0; num_positions * dim];
+            let mut ms = vec![0.0f32; num_positions * dim];
             for pos in 0..num_positions {
                 let src_offset = pos * n * dim + i * dim;
                 let dst_offset = pos * dim;
@@ -141,7 +141,7 @@ impl MhcResidual {
             mixed_streams.push(ms);
         }
         // 5. Apply h_post and sum
-        let mut out = vec![0.0; x.len()];
+        let mut out = vec![0.0f32; x.len()];
         for (post, ms) in self.h_post.iter().zip(mixed_streams.iter()) {
             let post_out = post.forward_inference(ms);
             for i in 0..out.len() {
@@ -266,13 +266,13 @@ pub struct TransformerBlock {
 
 #[derive(Default)]
 struct TransformerStepScratch {
-    h: Vec<f64>,
-    norm1: Vec<f64>,
-    attn: Vec<f64>,
-    norm2: Vec<f64>,
-    ffn1: Vec<f64>,
-    ffn2: Vec<f64>,
-    mhc_scratch: Vec<f64>,
+    h: Vec<f32>,
+    norm1: Vec<f32>,
+    attn: Vec<f32>,
+    norm2: Vec<f32>,
+    ffn1: Vec<f32>,
+    ffn2: Vec<f32>,
+    mhc_scratch: Vec<f32>,
 }
 
 thread_local! {
@@ -453,7 +453,7 @@ impl LuckTransformer {
         let seq_len = shape[1];
         let dim = shape[2];
 
-        let x_data = x.data_f64();
+        let x_data = x.data_as_f64_vec();
         let mut out_data = Vec::with_capacity(batch_size * dim);
 
         for b in 0..batch_size {
@@ -461,7 +461,7 @@ impl LuckTransformer {
             out_data.extend_from_slice(&x_data[start..start + dim]);
         }
 
-        Tensor::new(out_data, vec![batch_size, dim])
+        Tensor::new_f32(out_data, vec![batch_size, dim])
     }
 
     pub fn update_achf_after_backward(&self) {
@@ -490,13 +490,13 @@ impl LuckTransformer {
     }
 
     /// Run inference forcing a specific ACHF path (0=Cached, 1=Sparse, 2=Dense).
-    pub fn forward_inference_forced_path(&self, x: &[f64], forced_path: u8) -> Vec<f64> {
-        use crate::simd::vector_gelu;
+    pub fn forward_inference_forced_path(&self, x: &[f32], forced_path: u8) -> Vec<f32> {
+        use crate::simd::vector_gelu_f32;
         let mut h = self.embed.forward_inference(x);
         for block in &self.blocks {
             let h_norm1 = block.norm_1.forward_inference(&h);
             let attn_out = block.mla_layer.forward_inference(&h_norm1);
-            let mut h2 = vec![0.0; h.len()];
+            let mut h2 = vec![0.0f32; h.len()];
             if let Some(mhc) = &block.mhc {
                 let mhc_out = mhc.forward_inference(&attn_out);
                 for i in 0..h.len() {
@@ -509,18 +509,14 @@ impl LuckTransformer {
             }
             let h_norm2 = block.norm_2.forward_inference(&h2);
             let f1 = block.ffn_1.forward_inference(&h_norm2);
-            let mut f1_gelu = vec![0.0; f1.len()];
-            vector_gelu(&mut f1_gelu, &f1);
+            let mut f1_gelu = vec![0.0f32; f1.len()];
+            vector_gelu_f32(&mut f1_gelu, &f1);
             let f2 = if let Some(achf) = &block.achf_ffn {
-                let f1_f32: Vec<f32> = f1_gelu.iter().map(|&v| v as f32).collect();
-                achf.forward_inference_forced_path(&f1_f32, forced_path)
-                    .into_iter()
-                    .map(|v| v as f64)
-                    .collect()
+                achf.forward_inference_forced_path(&f1_gelu, forced_path)
             } else {
                 block.ffn_2.forward_inference(&f1_gelu)
             };
-            let mut h3 = vec![0.0; h2.len()];
+            let mut h3 = vec![0.0f32; h2.len()];
             for i in 0..h2.len() {
                 h3[i] = h2[i] + f2[i];
             }
@@ -554,8 +550,8 @@ impl LuckTransformer {
         reg
     }
 
-    pub fn forward_inference(&self, x: &[f64]) -> Vec<f64> {
-        use crate::simd::{vector_add, vector_gelu};
+    pub fn forward_inference(&self, x: &[f32]) -> Vec<f32> {
+        use crate::simd::{vector_add_f32, vector_gelu_f32};
 
         let mut h = self.embed.forward_inference(x);
 
@@ -563,32 +559,28 @@ impl LuckTransformer {
             let h_norm1 = block.norm_1.forward_inference(&h);
             let attn_out = block.mla_layer.forward_inference(&h_norm1);
 
-            let mut h2 = vec![0.0; h.len()];
+            let mut h2 = vec![0.0f32; h.len()];
             if let Some(mhc) = &block.mhc {
                 let mhc_out = mhc.forward_inference(&attn_out);
-                vector_add(&mut h2, &h, &mhc_out);
+                vector_add_f32(&mut h2, &h, &mhc_out);
             } else {
-                vector_add(&mut h2, &h, &attn_out);
+                vector_add_f32(&mut h2, &h, &attn_out);
             }
 
             let h_norm2 = block.norm_2.forward_inference(&h2);
             let f1 = block.ffn_1.forward_inference(&h_norm2);
 
-            let mut f1_gelu = vec![0.0; f1.len()];
-            vector_gelu(&mut f1_gelu, &f1);
+            let mut f1_gelu = vec![0.0f32; f1.len()];
+            vector_gelu_f32(&mut f1_gelu, &f1);
 
             let f2 = if let Some(achf) = &block.achf_ffn {
-                let f1_f32: Vec<f32> = f1_gelu.iter().map(|&v| v as f32).collect();
-                achf.forward_inference_residual(&f1_f32)
-                    .into_iter()
-                    .map(|v| v as f64)
-                    .collect()
+                achf.forward_inference_residual(&f1_gelu)
             } else {
                 block.ffn_2.forward_inference(&f1_gelu)
             };
 
-            let mut h3 = vec![0.0; h2.len()];
-            vector_add(&mut h3, &h2, &f2);
+            let mut h3 = vec![0.0f32; h2.len()];
+            vector_add_f32(&mut h3, &h2, &f2);
             h = h3;
         }
 
@@ -596,7 +588,7 @@ impl LuckTransformer {
         self.out_proj.forward_inference(&h_final)
     }
 
-    pub fn last_token_inference(&self, x: &[f64]) -> Vec<f64> {
+    pub fn last_token_inference(&self, x: &[f32]) -> Vec<f32> {
         let dim = self.out_proj.out_features;
         let seq_len = x.len() / dim;
         let start = (seq_len.saturating_sub(1)) * dim;
@@ -606,10 +598,10 @@ impl LuckTransformer {
     #[allow(dead_code)]
     pub fn forward_inference_step(
         &self,
-        x: &[f64],
+        x: &[f32],
         kv_caches: &mut [KVCache],
         start_pos: usize,
-    ) -> Vec<f64> {
+    ) -> Vec<f32> {
         let mut out = Vec::new();
         self.forward_inference_step_into(x, kv_caches, start_pos, &mut out);
         out
@@ -617,12 +609,12 @@ impl LuckTransformer {
 
     pub fn forward_inference_step_into(
         &self,
-        x: &[f64],
+        x: &[f32],
         kv_caches: &mut [KVCache],
         start_pos: usize,
-        out: &mut Vec<f64>,
+        out: &mut Vec<f32>,
     ) {
-        use crate::simd::{vector_gelu, vector_grad_acc};
+        use crate::simd::{vector_gelu_f32, vector_grad_acc_f32};
 
         TRANSFORMER_STEP_SCRATCH.with(|scratch_cell| {
             let mut scratch = scratch_cell.borrow_mut();
@@ -648,25 +640,24 @@ impl LuckTransformer {
 
                 if let Some(mhc) = &block.mhc {
                     *mhc_scratch = mhc.forward_inference(attn);
-                    vector_grad_acc(h, mhc_scratch);
+                    vector_grad_acc_f32(h, mhc_scratch);
                 } else {
-                    vector_grad_acc(h, attn);
+                    vector_grad_acc_f32(h, attn);
                 }
 
                 block.norm_2.forward_inference_into(h, norm2);
                 block.ffn_1.forward_inference_into(norm2, ffn1);
                 ffn2.resize(ffn1.len(), 0.0);
-                vector_gelu(ffn2, ffn1);
+                vector_gelu_f32(ffn2, ffn1);
 
                 if let Some(achf) = &block.achf_ffn {
-                    let ffn2_f32: Vec<f32> = ffn2.iter().map(|&v| v as f32).collect();
-                    let achf_out = achf.forward_inference_residual(&ffn2_f32);
+                    let achf_out = achf.forward_inference_residual(ffn2);
                     for (i, &v) in achf_out.iter().enumerate() {
-                        h[i] += v as f64;
+                        h[i] += v;
                     }
                 } else {
                     block.ffn_2.forward_inference_into(ffn2, attn);
-                    vector_grad_acc(h, attn);
+                    vector_grad_acc_f32(h, attn);
                 }
             }
 
@@ -721,22 +712,22 @@ impl Module for LuckTransformer {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RoPE {
     pub dim: usize,
-    pub base: f64,
-    pub cos_cache: Arc<Vec<f64>>,
-    pub sin_cache: Arc<Vec<f64>>,
+    pub base: f32,
+    pub cos_cache: Arc<Vec<f32>>,
+    pub sin_cache: Arc<Vec<f32>>,
 }
 
 impl RoPE {
     pub fn new(dim: usize, max_len: usize) -> Self {
-        let base: f64 = 10000.0;
+        let base: f32 = 10000.0;
         let half = dim / 2;
         let mut cos_cache = Vec::with_capacity(max_len * half);
         let mut sin_cache = Vec::with_capacity(max_len * half);
 
         for pos in 0..max_len {
             for i in 0..half {
-                let theta = 1.0 / base.powf((2 * i) as f64 / dim as f64);
-                let angle = pos as f64 * theta;
+                let theta = 1.0 / base.powf((2 * i) as f32 / dim as f32);
+                let angle = pos as f32 * theta;
                 cos_cache.push(angle.cos());
                 sin_cache.push(angle.sin());
             }
@@ -759,24 +750,19 @@ impl RoPE {
         let dim = shape[shape.len() - 1];
         assert_eq!(dim, self.dim);
         let seq_len = shape[shape.len() - 2]; // Assumes ..., Seq, Dim
-        let num_elements = x.data_f64().len();
+        let num_elements: usize = x.shape.iter().product();
         let total_batches = num_elements / (seq_len * dim);
 
         // GPU path: if tensor is on CUDA, use the optimized kernel
         #[cfg(cuda)]
         if x.device == crate::autograd::Device::Cuda {
-            return x.rope_cuda(
-                &self.cos_cache,
-                &self.sin_cache,
-                seq_len,
-                dim,
-                total_batches,
-                start_pos,
-            );
+            let cos_f64: Vec<f64> = self.cos_cache.iter().map(|&v| v as f64).collect();
+            let sin_f64: Vec<f64> = self.sin_cache.iter().map(|&v| v as f64).collect();
+            return x.rope_cuda(&cos_f64, &sin_f64, seq_len, dim, total_batches, start_pos);
         }
 
-        // CPU path
-        let x_data = x.data_f64();
+        // CPU path: preserve input dtype
+        let x_data = x.data_as_f64_vec();
         let mut out_data = x_data.clone(); // Copy
 
         // Apply rotation
@@ -793,8 +779,8 @@ impl RoPE {
                 let base_idx = b * (seq_len * dim) + t * dim;
 
                 for i in 0..self.dim / 2 {
-                    let c = self.cos_cache[cache_idx + i];
-                    let s = self.sin_cache[cache_idx + i];
+                    let c = self.cos_cache[cache_idx + i] as f64;
+                    let s = self.sin_cache[cache_idx + i] as f64;
 
                     let r1 = x_data[base_idx + 2 * i];
                     let r2 = x_data[base_idx + 2 * i + 1];
@@ -810,19 +796,20 @@ impl RoPE {
         let sin_cache = Arc::clone(&self.sin_cache);
         let dim = self.dim;
         let start_pos_cap = start_pos;
+        let out_dtype = x.dtype;
 
         Tensor {
-            data: Storage::F64(Arc::new(RwLock::new(out_data))),
-            grad: Storage::zeros(num_elements, Tensor::grad_dtype_for(Dtype::F64)),
+            data: Storage::from_f64_vec(out_data, out_dtype),
+            grad: Storage::zeros(num_elements, Tensor::grad_dtype_for(out_dtype)),
             shape: shape.clone(),
             device: crate::autograd::Device::Cpu,
-            dtype: Dtype::F64,
+            dtype: out_dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
                     let grad_out_f64 = grad_out.to_f64_vec();
                     let input = &parents[0];
-                    let mut inp_grad = input.grad_write_f64();
+                    let mut inp_grad = input.grad_write_compat();
                     let shape = &input.shape;
 
                     let seq_len = shape[shape.len() - 2];
@@ -838,8 +825,8 @@ impl RoPE {
                             let base_idx = b * (seq_len * dim) + t * dim;
 
                             for i in 0..dim / 2 {
-                                let c = cos_cache[cache_idx + i];
-                                let s = sin_cache[cache_idx + i];
+                                let c = cos_cache[cache_idx + i] as f64;
+                                let s = sin_cache[cache_idx + i] as f64;
 
                                 let g1 = grad_out_f64[base_idx + 2 * i];
                                 let g2 = grad_out_f64[base_idx + 2 * i + 1];
@@ -858,7 +845,7 @@ impl RoPE {
     }
 
     #[allow(dead_code)]
-    pub fn forward_inference(&self, x: &[f64], seq_len: usize, start_pos: usize) -> Vec<f64> {
+    pub fn forward_inference(&self, x: &[f32], seq_len: usize, start_pos: usize) -> Vec<f32> {
         let dim = self.dim;
         let num_elements = x.len();
         let mut out = x.to_vec();
@@ -921,17 +908,17 @@ pub struct MultiHeadLatentAttention {
 #[derive(Clone, Debug, Default)]
 pub struct KVCache {
     // k_cache: [num_heads][seq_len * total_head_dim]
-    pub k_cache: Vec<Vec<f64>>,
+    pub k_cache: Vec<Vec<f32>>,
     // v_cache: [num_heads][seq_len * head_dim]
-    pub v_cache: Vec<Vec<f64>>,
-    scratch_scores: Vec<f64>,
-    scratch_att_out: Vec<f64>,
-    scratch_c_kv: Vec<f64>,
-    scratch_k_c: Vec<f64>,
-    scratch_v_c: Vec<f64>,
-    scratch_k_r: Vec<f64>,
-    scratch_q_r: Vec<f64>,
-    scratch_q_c: Vec<f64>,
+    pub v_cache: Vec<Vec<f32>>,
+    scratch_scores: Vec<f32>,
+    scratch_att_out: Vec<f32>,
+    scratch_c_kv: Vec<f32>,
+    scratch_k_c: Vec<f32>,
+    scratch_v_c: Vec<f32>,
+    scratch_k_r: Vec<f32>,
+    scratch_q_r: Vec<f32>,
+    scratch_q_c: Vec<f32>,
 }
 
 impl KVCache {
@@ -1146,8 +1133,8 @@ impl MultiHeadLatentAttention {
         self.w_o.forward(&final_out)
     }
 
-    pub fn forward_inference(&self, x: &[f64]) -> Vec<f64> {
-        use crate::simd::{add_scaled_row, dot_product};
+    pub fn forward_inference(&self, x: &[f32]) -> Vec<f32> {
+        use crate::simd::{add_scaled_row_f32, dot_product_f32};
         use rayon::prelude::*;
 
         let dim = self.config.dim;
@@ -1198,8 +1185,8 @@ impl MultiHeadLatentAttention {
         }
 
         let total_head_dim = head_dim + rope_dim;
-        let mut q = vec![0.0; seq_len * num_heads * total_head_dim];
-        let mut k = vec![0.0; seq_len * num_heads * total_head_dim];
+        let mut q = vec![0.0f32; seq_len * num_heads * total_head_dim];
+        let mut k = vec![0.0f32; seq_len * num_heads * total_head_dim];
 
         for t in 0..seq_len {
             for h in 0..num_heads {
@@ -1221,8 +1208,8 @@ impl MultiHeadLatentAttention {
         }
 
         let head_stride = seq_len * seq_len;
-        let mut att_scores = vec![0.0; num_heads * head_stride];
-        let scale = 1.0 / (total_head_dim as f64).sqrt();
+        let mut att_scores = vec![0.0f32; num_heads * head_stride];
+        let scale = 1.0 / (total_head_dim as f32).sqrt();
 
         att_scores
             .par_chunks_mut(head_stride)
@@ -1235,25 +1222,25 @@ impl MultiHeadLatentAttention {
                     for j in 0..seq_len {
                         let base_k = j * (num_heads * total_head_dim) + h * total_head_dim;
                         let k_slice = &k[base_k..base_k + total_head_dim];
-                        head_scores[i * seq_len + j] = dot_product(q_slice, k_slice) * scale;
+                        head_scores[i * seq_len + j] = dot_product_f32(q_slice, k_slice) * scale;
                     }
 
                     for j in (i + 1)..seq_len {
-                        head_scores[i * seq_len + j] = f64::NEG_INFINITY;
+                        head_scores[i * seq_len + j] = f32::NEG_INFINITY;
                     }
 
                     let row = &mut head_scores[i * seq_len..(i + 1) * seq_len];
-                    let sum = crate::simd::softmax_exp_sum(row);
-                    crate::simd::vector_scale(row, 1.0 / sum);
+                    let sum = crate::simd::softmax_exp_sum_f32(row);
+                    crate::simd::vector_scale_f32(row, 1.0 / sum);
                 }
             });
 
-        let mut att_out = vec![0.0; seq_len * num_heads * head_dim];
+        let mut att_out = vec![0.0f32; seq_len * num_heads * head_dim];
 
-        let per_head_out: Vec<Vec<f64>> = (0..num_heads)
+        let per_head_out: Vec<Vec<f32>> = (0..num_heads)
             .into_par_iter()
             .map(|h| {
-                let mut head_out = vec![0.0; seq_len * head_dim];
+                let mut head_out = vec![0.0f32; seq_len * head_dim];
                 for i in 0..seq_len {
                     let out_slice = &mut head_out[i * head_dim..(i + 1) * head_dim];
                     for j in 0..seq_len {
@@ -1263,7 +1250,7 @@ impl MultiHeadLatentAttention {
                         }
                         let base_v = j * (num_heads * head_dim) + h * head_dim;
                         let v_slice = &v_c[base_v..base_v + head_dim];
-                        add_scaled_row(out_slice, v_slice, score);
+                        add_scaled_row_f32(out_slice, v_slice, score);
                     }
                 }
                 head_out
@@ -1285,10 +1272,10 @@ impl MultiHeadLatentAttention {
     #[allow(dead_code)]
     pub fn forward_inference_cached(
         &self,
-        x: &[f64],
+        x: &[f32],
         kv_cache: &mut KVCache,
         start_pos: usize,
-    ) -> Vec<f64> {
+    ) -> Vec<f32> {
         let mut out = Vec::new();
         self.forward_inference_cached_into(x, kv_cache, start_pos, &mut out);
         out
@@ -1296,12 +1283,12 @@ impl MultiHeadLatentAttention {
 
     pub fn forward_inference_cached_into(
         &self,
-        x: &[f64],
+        x: &[f32],
         kv_cache: &mut KVCache,
         start_pos: usize,
-        out: &mut Vec<f64>,
+        out: &mut Vec<f32>,
     ) {
-        use crate::simd::{add_scaled_row, dot_product};
+        use crate::simd::{add_scaled_row_f32, dot_product_f32};
 
         let dim = self.config.dim;
         let num_heads = self.config.num_heads;
@@ -1360,8 +1347,8 @@ impl MultiHeadLatentAttention {
 
         // 3. Assemble Q and K for current tokens
         let total_head_dim = head_dim + rope_dim;
-        let mut q = vec![0.0; seq_len * num_heads * total_head_dim];
-        let mut k = vec![0.0; seq_len * num_heads * total_head_dim];
+        let mut q = vec![0.0f32; seq_len * num_heads * total_head_dim];
+        let mut k = vec![0.0f32; seq_len * num_heads * total_head_dim];
 
         if seq_len > 0 {
             let target_k = self.config.max_seq_len * total_head_dim;
@@ -1425,15 +1412,15 @@ impl MultiHeadLatentAttention {
 
         let cached_len = kv_cache.k_cache[0].len() / total_head_dim;
         let head_stride = seq_len * cached_len;
-        let mut att_scores = vec![0.0; num_heads * head_stride];
-        let scale = 1.0 / (total_head_dim as f64).sqrt();
+        let mut att_scores = vec![0.0f32; num_heads * head_stride];
+        let scale = 1.0 / (total_head_dim as f32).sqrt();
 
         let use_par = true;
 
         if use_par {
             use rayon::prelude::*;
 
-            let k_caches: Vec<&[f64]> = kv_cache.k_cache.iter().map(|v| v.as_slice()).collect();
+            let k_caches: Vec<&[f32]> = kv_cache.k_cache.iter().map(|v| v.as_slice()).collect();
 
             att_scores
                 .par_chunks_mut(head_stride)
@@ -1446,43 +1433,43 @@ impl MultiHeadLatentAttention {
 
                         for j in 0..cached_len {
                             let k_vec = &k_cache_head[j * total_head_dim..(j + 1) * total_head_dim];
-                            head_scores[i * cached_len + j] = dot_product(q_vec, k_vec) * scale;
+                            head_scores[i * cached_len + j] = dot_product_f32(q_vec, k_vec) * scale;
                         }
 
                         let abs_pos = start_pos + i;
                         for j in (abs_pos + 1)..cached_len {
-                            head_scores[i * cached_len + j] = f64::NEG_INFINITY;
+                            head_scores[i * cached_len + j] = f32::NEG_INFINITY;
                         }
 
                         let row = &mut head_scores[i * cached_len..(i + 1) * cached_len];
-                        let sum = crate::simd::softmax_exp_sum(row);
-                        crate::simd::vector_scale(row, 1.0 / sum);
+                        let sum = crate::simd::softmax_exp_sum_f32(row);
+                        crate::simd::vector_scale_f32(row, 1.0 / sum);
                     }
                 });
 
-            let v_caches: Vec<&[f64]> = kv_cache.v_cache.iter().map(|v| v.as_slice()).collect();
+            let v_caches: Vec<&[f32]> = kv_cache.v_cache.iter().map(|v| v.as_slice()).collect();
 
-            let per_head_out: Vec<Vec<f64>> = (0..num_heads)
+            let per_head_out: Vec<Vec<f32>> = (0..num_heads)
                 .into_par_iter()
                 .map(|h| {
                     let v_cache_head = v_caches[h];
-                    let mut head_out = vec![0.0; seq_len * head_dim];
+                    let mut head_out = vec![0.0f32; seq_len * head_dim];
                     for i in 0..seq_len {
                         let out_slice = &mut head_out[i * head_dim..(i + 1) * head_dim];
                         for j in 0..cached_len {
                             let score = att_scores[h * head_stride + i * cached_len + j];
-                            if score.abs() < 1e-9 {
+                            if score.abs() < 1e-9f32 {
                                 continue;
                             }
                             let v_vec = &v_cache_head[j * head_dim..(j + 1) * head_dim];
-                            add_scaled_row(out_slice, v_vec, score);
+                            add_scaled_row_f32(out_slice, v_vec, score);
                         }
                     }
                     head_out
                 })
                 .collect();
 
-            let mut att_out = vec![0.0; seq_len * num_heads * head_dim];
+            let mut att_out = vec![0.0f32; seq_len * num_heads * head_dim];
             for (h, head_buf) in per_head_out.iter().enumerate() {
                 for i in 0..seq_len {
                     let dst = i * (num_heads * head_dim) + h * head_dim;
@@ -1501,23 +1488,23 @@ impl MultiHeadLatentAttention {
                     for j in 0..cached_len {
                         let k_vec = &k_cache_head[j * total_head_dim..(j + 1) * total_head_dim];
                         att_scores[h * head_stride + i * cached_len + j] =
-                            dot_product(q_vec, k_vec) * scale;
+                            dot_product_f32(q_vec, k_vec) * scale;
                     }
 
                     let abs_pos = start_pos + i;
                     for j in (abs_pos + 1)..cached_len {
-                        att_scores[h * head_stride + i * cached_len + j] = f64::NEG_INFINITY;
+                        att_scores[h * head_stride + i * cached_len + j] = f32::NEG_INFINITY;
                     }
 
                     let start = h * head_stride + i * cached_len;
                     let end = start + cached_len;
                     let slice = &mut att_scores[start..end];
-                    let sum = crate::simd::softmax_exp_sum(slice);
-                    crate::simd::vector_scale(slice, 1.0 / sum);
+                    let sum = crate::simd::softmax_exp_sum_f32(slice);
+                    crate::simd::vector_scale_f32(slice, 1.0 / sum);
                 }
             }
 
-            let mut att_out = vec![0.0; seq_len * num_heads * head_dim];
+            let mut att_out = vec![0.0f32; seq_len * num_heads * head_dim];
             for h in 0..num_heads {
                 let v_cache_head = &kv_cache.v_cache[h];
                 for i in 0..seq_len {
@@ -1526,11 +1513,11 @@ impl MultiHeadLatentAttention {
 
                     for j in 0..cached_len {
                         let score = att_scores[h * head_stride + i * cached_len + j];
-                        if score.abs() < 1e-9 {
+                        if score.abs() < 1e-9f32 {
                             continue;
                         }
                         let v_vec = &v_cache_head[j * head_dim..(j + 1) * head_dim];
-                        add_scaled_row(out_slice, v_vec, score);
+                        add_scaled_row_f32(out_slice, v_vec, score);
                     }
                 }
             }
@@ -1540,12 +1527,14 @@ impl MultiHeadLatentAttention {
 
     fn forward_inference_cached_single_token_into(
         &self,
-        x: &[f64],
+        x: &[f32],
         kv_cache: &mut KVCache,
         start_pos: usize,
-        out: &mut Vec<f64>,
+        out: &mut Vec<f32>,
     ) {
-        use crate::simd::{add_scaled_row, dot_product, softmax_exp_sum, vector_scale};
+        use crate::simd::{
+            add_scaled_row_f32, dot_product_f32, softmax_exp_sum_f32, vector_scale_f32,
+        };
 
         let dim = self.config.dim;
         let num_heads = self.config.num_heads;
@@ -1625,7 +1614,7 @@ impl MultiHeadLatentAttention {
         kv_cache.scratch_att_out.resize(num_heads * head_dim, 0.0);
         kv_cache.scratch_att_out.fill(0.0);
 
-        let scale = 1.0 / (total_head_dim as f64).sqrt();
+        let scale = 1.0 / (total_head_dim as f32).sqrt();
         let (k_caches, v_caches, scratch_scores, scratch_att_out) = (
             &kv_cache.k_cache,
             &kv_cache.v_cache,
@@ -1642,24 +1631,25 @@ impl MultiHeadLatentAttention {
                 let base = j * total_head_dim;
                 let k_content = &k_cache_head[base..base + head_dim];
                 let k_rope = &k_cache_head[base + head_dim..base + total_head_dim];
-                *score = (dot_product(q_content, k_content) + dot_product(q_rope, k_rope)) * scale;
+                *score = (dot_product_f32(q_content, k_content) + dot_product_f32(q_rope, k_rope))
+                    * scale;
             }
 
             for score in scratch_scores.iter_mut().skip(start_pos + 1) {
-                *score = f64::NEG_INFINITY;
+                *score = f32::NEG_INFINITY;
             }
 
-            let sum = softmax_exp_sum(scratch_scores);
-            vector_scale(scratch_scores, 1.0 / sum);
+            let sum = softmax_exp_sum_f32(scratch_scores);
+            vector_scale_f32(scratch_scores, 1.0 / sum);
 
             let out_slice = &mut scratch_att_out[h * head_dim..(h + 1) * head_dim];
             let v_cache_head = &v_caches[h];
             for (j, &score) in scratch_scores.iter().enumerate().take(cached_len) {
-                if score.abs() < 1e-9 {
+                if score.abs() < 1e-9f32 {
                     continue;
                 }
                 let v_vec = &v_cache_head[j * head_dim..(j + 1) * head_dim];
-                add_scaled_row(out_slice, v_vec, score);
+                add_scaled_row_f32(out_slice, v_vec, score);
             }
         }
 
@@ -1712,10 +1702,8 @@ impl MultiHeadLatentAttention {
         // out: [B, Seq, Seq]
         // out[b, i, j] = sum_d (q[b, i, d] * k[b, j, d])
 
-        // Use batch lock for better performance
-        let guards = TensorReadGuard::new(&[q, k]);
-        let q_data = guards.get(0);
-        let k_data = guards.get(1);
+        let q_data = q.data_as_f64_vec();
+        let k_data = k.data_as_f64_vec();
 
         let out_data: Vec<f64> = (0..b)
             .into_par_iter()
@@ -1738,26 +1726,25 @@ impl MultiHeadLatentAttention {
 
         // Backward pass implementation
         let parents = vec![q.clone(), k.clone()];
+        let out_dtype = Tensor::binary_dtype(q.dtype, k.dtype);
 
         Tensor {
-            data: Storage::F64(Arc::new(RwLock::new(out_data))),
-            grad: Storage::zeros(b * seq * seq, Tensor::grad_dtype_for(Dtype::F64)),
+            data: Storage::from_f64_vec(out_data, out_dtype),
+            grad: Storage::zeros(b * seq * seq, Tensor::grad_dtype_for(out_dtype)),
             shape: vec![b, seq, seq],
             device: crate::autograd::Device::Cpu,
-            dtype: Dtype::F64,
+            dtype: out_dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
                     let grad_out_f64 = grad_out.to_f64_vec();
                     let q_in = &parents[0];
                     let k_in = &parents[1];
-                    // Use batch lock for data read
-                    let guards = TensorReadGuard::new(&[q_in, k_in]);
-                    let q_data = guards.get(0);
-                    let k_data = guards.get(1);
+                    let q_data = q_in.data_as_f64_vec();
+                    let k_data = k_in.data_as_f64_vec();
 
-                    let mut q_grad = q_in.grad_write_f64();
-                    let mut k_grad = k_in.grad_write_f64();
+                    let mut q_grad = q_in.grad_write_compat();
+                    let mut k_grad = k_in.grad_write_compat();
 
                     let chunk_size_grad = seq * dim;
                     let chunk_size_out = seq * seq;
@@ -1810,10 +1797,8 @@ impl MultiHeadLatentAttention {
             return self.batched_matmul_probs_v_cuda(probs, v, b, seq, dim_v);
         }
 
-        // Use batch lock for better performance
-        let guards = TensorReadGuard::new(&[probs, v]);
-        let p_data = guards.get(0);
-        let v_data = guards.get(1);
+        let p_data = probs.data_as_f64_vec();
+        let v_data = v.data_as_f64_vec();
 
         let out_data: Vec<f64> = (0..b)
             .into_par_iter()
@@ -1843,26 +1828,25 @@ impl MultiHeadLatentAttention {
 
         // Backward pass implementation
         let parents = vec![probs.clone(), v.clone()];
+        let out_dtype = Tensor::binary_dtype(probs.dtype, v.dtype);
 
         Tensor {
-            data: Storage::F64(Arc::new(RwLock::new(out_data))),
-            grad: Storage::zeros(b * seq * dim_v, Tensor::grad_dtype_for(Dtype::F64)),
+            data: Storage::from_f64_vec(out_data, out_dtype),
+            grad: Storage::zeros(b * seq * dim_v, Tensor::grad_dtype_for(out_dtype)),
             shape: vec![b, seq, dim_v],
             device: crate::autograd::Device::Cpu,
-            dtype: Dtype::F64,
+            dtype: out_dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
                     let grad_out_f64 = grad_out.to_f64_vec();
                     let p_in = &parents[0];
                     let v_in = &parents[1];
-                    // Use batch lock for data read
-                    let guards = TensorReadGuard::new(&[p_in, v_in]);
-                    let p_data = guards.get(0);
-                    let v_data = guards.get(1);
+                    let p_data = p_in.data_as_f64_vec();
+                    let v_data = v_in.data_as_f64_vec();
 
-                    let mut p_grad = p_in.grad_write_f64();
-                    let mut v_grad = v_in.grad_write_f64();
+                    let mut p_grad = p_in.grad_write_compat();
+                    let mut v_grad = v_in.grad_write_compat();
 
                     let chunk_size_p = seq * seq;
                     let chunk_size_v = seq * dim_v;
@@ -1911,8 +1895,8 @@ impl MultiHeadLatentAttention {
         use crate::cuda::kernels::attention_weighted_sum;
         use crate::cuda::memory::{alloc, copy_d2h};
 
-        let _p_len = probs.data_f64().len();
-        let _v_len = v.data_f64().len();
+        let _p_len = probs.num_elements();
+        let _v_len = v.num_elements();
         let out_len = b * seq * dim_v;
 
         // Upload to GPU
@@ -1953,27 +1937,28 @@ impl MultiHeadLatentAttention {
         }
 
         // Store probs and v data for backward
-        let p_data = probs.data_f64().clone();
-        let v_data = v.data_f64().clone();
+        let p_data = probs.data_as_f64_vec();
+        let v_data = v.data_as_f64_vec();
         let _b_cap = b;
         let seq_cap = seq;
         let dim_v_cap = dim_v;
 
         let parents = vec![probs.clone(), v.clone()];
+        let out_dtype = Tensor::binary_dtype(probs.dtype, v.dtype);
         Tensor {
-            data: Storage::F64(Arc::new(RwLock::new(out_data))),
-            grad: Storage::zeros(out_len, Tensor::grad_dtype_for(Dtype::F64)),
+            data: Storage::from_f64_vec(out_data, out_dtype),
+            grad: Storage::zeros(out_len, Tensor::grad_dtype_for(out_dtype)),
             shape: vec![b, seq, dim_v],
             device: crate::autograd::Device::Cpu,
-            dtype: Dtype::F64,
+            dtype: out_dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
                     let grad_out_f64 = grad_out.to_f64_vec();
                     let p_in = &parents[0];
                     let v_in = &parents[1];
-                    let mut p_grad = p_in.grad_write_f64();
-                    let mut v_grad = v_in.grad_write_f64();
+                    let mut p_grad = p_in.grad_write_compat();
+                    let mut v_grad = v_in.grad_write_compat();
 
                     let chunk_size_p = seq_cap * seq_cap;
                     let chunk_size_v = seq_cap * dim_v_cap;
@@ -2018,9 +2003,8 @@ impl MultiHeadLatentAttention {
         dim_v: usize,
     ) -> Tensor {
         use crate::simd::add_scaled_row;
-        let guards = TensorReadGuard::new(&[probs, v]);
-        let p_data = guards.get(0);
-        let v_data = guards.get(1);
+        let p_data = probs.data_as_f64_vec();
+        let v_data = v.data_as_f64_vec();
 
         let out_data: Vec<f64> = (0..b)
             .into_par_iter()
@@ -2045,24 +2029,24 @@ impl MultiHeadLatentAttention {
             .collect();
 
         let parents = vec![probs.clone(), v.clone()];
+        let out_dtype = Tensor::binary_dtype(probs.dtype, v.dtype);
         Tensor {
-            data: Storage::F64(Arc::new(RwLock::new(out_data))),
-            grad: Storage::zeros(b * seq * dim_v, Tensor::grad_dtype_for(Dtype::F64)),
+            data: Storage::from_f64_vec(out_data, out_dtype),
+            grad: Storage::zeros(b * seq * dim_v, Tensor::grad_dtype_for(out_dtype)),
             shape: vec![b, seq, dim_v],
             device: crate::autograd::Device::Cpu,
-            dtype: Dtype::F64,
+            dtype: out_dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
                     let grad_out_f64 = grad_out.to_f64_vec();
                     let p_in = &parents[0];
                     let v_in = &parents[1];
-                    let guards = TensorReadGuard::new(&[p_in, v_in]);
-                    let p_data = guards.get(0);
-                    let v_data = guards.get(1);
+                    let p_data = p_in.data_as_f64_vec();
+                    let v_data = v_in.data_as_f64_vec();
 
-                    let mut p_grad = p_in.grad_write_f64();
-                    let mut v_grad = v_in.grad_write_f64();
+                    let mut p_grad = p_in.grad_write_compat();
+                    let mut v_grad = v_in.grad_write_compat();
 
                     let chunk_size_p = seq * seq;
                     let chunk_size_v = seq * dim_v;
@@ -2097,7 +2081,7 @@ impl MultiHeadLatentAttention {
     // Apply causal mask: set positions where j > i to -inf (upper triangle excluding diagonal).
     // Input shape: [BH, Seq, Seq]. Backward zeroes out masked gradient positions.
     fn apply_causal_mask(&self, t: &Tensor, seq_len: usize) -> Tensor {
-        let data = t.data_f64();
+        let data = t.data_as_f64_vec();
         let bh = data.len() / (seq_len * seq_len);
         let mut new_data = data.clone();
 
@@ -2110,17 +2094,18 @@ impl MultiHeadLatentAttention {
         }
 
         let parents = vec![t.clone()];
+        let out_dtype = t.dtype;
         Tensor {
-            data: Storage::F64(Arc::new(RwLock::new(new_data))),
-            grad: Storage::zeros(data.len(), Tensor::grad_dtype_for(Dtype::F64)),
+            data: Storage::from_f64_vec(new_data, out_dtype),
+            grad: Storage::zeros(data.len(), Tensor::grad_dtype_for(out_dtype)),
             shape: t.shape.clone(),
             device: crate::autograd::Device::Cpu,
-            dtype: Dtype::F64,
+            dtype: out_dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
                     let grad_out_f64 = grad_out.to_f64_vec();
-                    let mut inp_grad = parents[0].grad_write_f64();
+                    let mut inp_grad = parents[0].grad_write_compat();
                     let bh = inp_grad.len() / (seq_len * seq_len);
                     for (idx, (&g, ig)) in grad_out_f64.iter().zip(inp_grad.iter_mut()).enumerate()
                     {
@@ -2139,21 +2124,22 @@ impl MultiHeadLatentAttention {
     }
 
     fn scale_tensor(&self, t: &Tensor, scale: f64) -> Tensor {
-        let data = t.data_f64();
+        let data = t.data_as_f64_vec();
         let new_data: Vec<f64> = data.par_iter().map(|&x| x * scale).collect();
 
         let parents = vec![t.clone()];
+        let out_dtype = t.dtype;
         Tensor {
-            data: Storage::F64(Arc::new(RwLock::new(new_data))),
-            grad: Storage::zeros(data.len(), Tensor::grad_dtype_for(Dtype::F64)),
+            data: Storage::from_f64_vec(new_data, out_dtype),
+            grad: Storage::zeros(data.len(), Tensor::grad_dtype_for(out_dtype)),
             shape: t.shape.clone(),
             device: crate::autograd::Device::Cpu,
-            dtype: Dtype::F64,
+            dtype: out_dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
                     let grad_out_f64 = grad_out.to_f64_vec();
-                    let mut inp_grad = parents[0].grad_write_f64();
+                    let mut inp_grad = parents[0].grad_write_compat();
                     inp_grad
                         .par_iter_mut()
                         .zip(grad_out_f64.par_iter())
@@ -2172,7 +2158,7 @@ impl MultiHeadLatentAttention {
             return t.softmax_causal_cuda();
         }
 
-        let data = t.data_f64();
+        let data = t.data_as_f64_vec();
 
         let new_data: Vec<f64> = data
             .par_chunks(seq_len)
@@ -2186,18 +2172,19 @@ impl MultiHeadLatentAttention {
 
         let parents = vec![t.clone()];
         let out_data_clone = new_data.clone();
+        let out_dtype = t.dtype;
 
         Tensor {
-            data: Storage::F64(Arc::new(RwLock::new(new_data))),
-            grad: Storage::zeros(data.len(), Tensor::grad_dtype_for(Dtype::F64)),
+            data: Storage::from_f64_vec(new_data, out_dtype),
+            grad: Storage::zeros(data.len(), Tensor::grad_dtype_for(out_dtype)),
             shape: t.shape.clone(),
             device: crate::autograd::Device::Cpu,
-            dtype: Dtype::F64,
+            dtype: out_dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
                     let grad_out_f64 = grad_out.to_f64_vec();
-                    let mut inp_grad = parents[0].grad_write_f64();
+                    let mut inp_grad = parents[0].grad_write_compat();
                     let out_data = &out_data_clone;
 
                     inp_grad
@@ -2229,10 +2216,8 @@ impl MultiHeadLatentAttention {
         let last_dim_b = shape_b[shape_b.len() - 1];
         let batch_dims = &shape_a[..shape_a.len() - 1];
 
-        // Use batch lock for better performance
-        let guards = TensorReadGuard::new(&[a, b]);
-        let a_data = guards.get(0);
-        let b_data = guards.get(1);
+        let a_data = a.data_as_f64_vec();
+        let b_data = b.data_as_f64_vec();
 
         let total_elements = batch_dims.iter().product::<usize>();
         let mut new_data = vec![0.0; total_elements * (last_dim_a + last_dim_b)];
@@ -2252,22 +2237,23 @@ impl MultiHeadLatentAttention {
         new_shape.push(last_dim_a + last_dim_b);
 
         let parents = vec![a.clone(), b.clone()];
+        let out_dtype = Tensor::binary_dtype(a.dtype, b.dtype);
 
         Tensor {
-            data: Storage::F64(Arc::new(RwLock::new(new_data))),
+            data: Storage::from_f64_vec(new_data, out_dtype),
             grad: Storage::zeros(
                 total_elements * (last_dim_a + last_dim_b),
-                Tensor::grad_dtype_for(Dtype::F64),
+                Tensor::grad_dtype_for(out_dtype),
             ),
             shape: new_shape,
             device: crate::autograd::Device::Cpu,
-            dtype: Dtype::F64,
+            dtype: out_dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
                     let grad_out_f64 = grad_out.to_f64_vec();
-                    let mut a_grad = parents[0].grad_write_f64();
-                    let mut b_grad = parents[1].grad_write_f64();
+                    let mut a_grad = parents[0].grad_write_compat();
+                    let mut b_grad = parents[1].grad_write_compat();
 
                     let stride = last_dim_a + last_dim_b;
 
@@ -2362,13 +2348,13 @@ mod tests {
 
         // Check if gradients propagated to weights
         // W_DKV is the first projection
-        let w_dkv_grad = mla.w_dkv.weight.grad_read_f64();
-        let grad_sum: f64 = w_dkv_grad.iter().sum();
+        let w_dkv_grad = mla.w_dkv.weight.grad_read_f32();
+        let grad_sum: f32 = w_dkv_grad.iter().sum();
         assert!(grad_sum.abs() > 0.0, "Gradient should not be zero");
 
         // Check W_UK
-        let w_uk_grad = mla.w_uk.weight.grad_read_f64();
-        let grad_sum_uk: f64 = w_uk_grad.iter().sum();
+        let w_uk_grad = mla.w_uk.weight.grad_read_f32();
+        let grad_sum_uk: f32 = w_uk_grad.iter().sum();
         assert!(
             grad_sum_uk.abs() > 0.0,
             "Gradient for W_UK should not be zero"
@@ -2394,16 +2380,16 @@ mod tests {
     fn test_rmsnorm_backward() {
         let dim = 4;
         let norm = RMSNorm::new(dim, 1e-5, 123);
-        let x = Tensor::rand(vec![2, 4], 0.1, 1.0, 123); // Positive inputs to avoid 0 div just in case
+        let x = Tensor::rand_f32(vec![2, 4], 0.1f32, 1.0f32, 123); // Positive inputs to avoid 0 div just in case
 
         let out = norm.forward(&x);
         let loss = out.sum();
         loss.backward();
 
-        let x_grad = x.grad_read_f64();
+        let x_grad = x.grad_read_f32();
         assert!(x_grad.iter().any(|&g| g.abs() > 1e-6));
 
-        let w_grad = norm.weight.grad_read_f64();
+        let w_grad = norm.weight.grad_read_f32();
         // Weight init is 1.0. Gradient should flow.
         assert!(w_grad.iter().any(|&g| g.abs() > 1e-6));
     }
@@ -2424,14 +2410,14 @@ mod tests {
         assert!(params.len() > 10, "Should have many parameters");
 
         // Check if Embed gradients exist
-        let embed_grad = t.embed.weight.grad_read_f64();
+        let embed_grad = t.embed.weight.grad_read_f32();
         assert!(
             embed_grad.iter().any(|&g| g.abs() > 0.0),
             "Embed grad missing"
         );
 
         // Check Norm grad
-        let norm_grad = t.blocks[0].norm_1.weight.grad_read_f64();
+        let norm_grad = t.blocks[0].norm_1.weight.grad_read_f32();
         assert!(
             norm_grad.iter().any(|&g| g.abs() > 0.0),
             "Norm grad missing"
@@ -2522,9 +2508,9 @@ mod tests {
         let dim = 16;
 
         // Run 1
-        let input_a: Vec<f64> = {
+        let input_a: Vec<f32> = {
             let t = Tensor::rand(vec![seq_len * dim], -0.1, 0.1, 200);
-            let v = t.data_as_f64_vec().clone();
+            let v = t.data_to_f32_vec().clone();
             v
         };
         let out_a = mla.forward_inference(&input_a);
@@ -2559,7 +2545,7 @@ mod tests {
         }
 
         // Position 2: should differ
-        let diff: f64 = (2 * dim..3 * dim)
+        let diff: f32 = (2 * dim..3 * dim)
             .map(|i| (out_a[i] - out_b[i]).abs())
             .sum();
         assert!(
@@ -2584,9 +2570,9 @@ mod tests {
         let dim = 16;
 
         // Prefill 2 tokens, then decode token 3 with two different values
-        let prefill: Vec<f64> = {
+        let prefill: Vec<f32> = {
             let t = Tensor::rand(vec![2 * dim], -0.1, 0.1, 300);
-            let v = t.data_as_f64_vec().clone();
+            let v = t.data_to_f32_vec().clone();
             v
         };
 
@@ -2594,9 +2580,9 @@ mod tests {
         let mut cache_a = KVCache::new(config.num_heads);
         let _ = mla.forward_inference_cached(&prefill, &mut cache_a, 0);
 
-        let token_a: Vec<f64> = {
+        let token_a: Vec<f32> = {
             let t = Tensor::rand(vec![dim], -0.1, 0.1, 400);
-            let v = t.data_as_f64_vec().clone();
+            let v = t.data_to_f32_vec().clone();
             v
         };
         let out_a = mla.forward_inference_cached(&token_a, &mut cache_a, 2);
@@ -2605,11 +2591,11 @@ mod tests {
         let mut cache_b = KVCache::new(config.num_heads);
         let _ = mla.forward_inference_cached(&prefill, &mut cache_b, 0);
 
-        let token_b: Vec<f64> = token_a.iter().map(|&x| 99.0 - x).collect();
+        let token_b: Vec<f32> = token_a.iter().map(|&x| 99.0 - x).collect();
         let out_b = mla.forward_inference_cached(&token_b, &mut cache_b, 2);
 
         // Outputs SHOULD differ (different input at position 2)
-        let diff: f64 = out_a
+        let diff: f32 = out_a
             .iter()
             .zip(out_b.iter())
             .map(|(&a, &b)| (a - b).abs())
@@ -2627,7 +2613,7 @@ mod tests {
 
         for (i, (&c, &d)) in prefill_out_c.iter().zip(prefill_out_d.iter()).enumerate() {
             assert!(
-                (c - d).abs() < 1e-12,
+                (c - d).abs() < 1e-12f32,
                 "Prefill should be deterministic at index {}",
                 i
             );
@@ -2639,7 +2625,7 @@ mod tests {
         let last_start = full_out.len() - dim;
         for (i, (&cached, &full)) in out_a.iter().zip(full_out[last_start..].iter()).enumerate() {
             assert!(
-                (cached - full).abs() < 1e-10,
+                (cached - full).abs() < 1e-4,
                 "Cached decode mismatch at dim {}: {} vs {}",
                 i,
                 cached,
@@ -2656,19 +2642,19 @@ mod tests {
         let mut base_cache = vec![KVCache::new(num_heads); model.blocks.len()];
 
         let prefill = Tensor::rand(vec![2 * 8], -0.1, 0.1, 500)
-            .data_as_f64_vec()
+            .data_to_f32_vec()
             .clone();
         let _ = model.forward_inference_step(&prefill, &mut base_cache, 0);
 
         let token = Tensor::rand(vec![8], -0.1, 0.1, 501)
-            .data_as_f64_vec()
+            .data_to_f32_vec()
             .clone();
 
         let mut cache_a = base_cache.clone();
         let expected = model.forward_inference_step(&token, &mut cache_a, 2);
 
         let mut cache_b = base_cache;
-        let mut actual = vec![123.0; 3];
+        let mut actual = vec![123.0f32; 3];
         model.forward_inference_step_into(&token, &mut cache_b, 2, &mut actual);
 
         assert_eq!(actual, expected);
@@ -2721,11 +2707,12 @@ mod tests {
         let x_data = x.data_as_f64_vec().clone();
         let tensor_out = mhc.forward(&x);
         let tensor_data = tensor_out.data_as_f64_vec().clone();
-        let inference_out = mhc.forward_inference(&x_data);
+        let x_f32: Vec<f32> = x_data.iter().map(|&v| v as f32).collect();
+        let inference_out = mhc.forward_inference(&x_f32);
         assert_eq!(tensor_data.len(), inference_out.len());
         for (a, b) in tensor_data.iter().zip(inference_out.iter()) {
             assert!(
-                (a - b).abs() < 1e-9,
+                (a - *b as f64).abs() < 1e-4,
                 "Tensor and inference paths diverge: {} vs {}",
                 a,
                 b

@@ -226,9 +226,28 @@ impl DuelingQNetwork {
     // Copy weights
     pub fn load_state_dict(&mut self, other: &Self) {
         fn copy_tensor(dst: &mut Tensor, src: &Tensor) {
-            let src_data = src.data_f64().clone();
-            let mut dst_data = dst.data_write_f64();
-            *dst_data = src_data;
+            match (dst.dtype, src.dtype) {
+                (crate::dtype::Dtype::F32, crate::dtype::Dtype::F32) => {
+                    let src_data = src.data_f32().clone();
+                    let mut dst_data = dst.data_write_f32();
+                    *dst_data = src_data;
+                }
+                (crate::dtype::Dtype::F64, crate::dtype::Dtype::F64) => {
+                    let src_data = src.data_f64().clone();
+                    let mut dst_data = dst.data_write_f64();
+                    *dst_data = src_data;
+                }
+                _ => {
+                    let src_data = src.data_as_f64_vec();
+                    if dst.dtype == crate::dtype::Dtype::F32 {
+                        let mut dst_data = dst.data_write_f32();
+                        *dst_data = src_data.iter().map(|&v| v as f32).collect();
+                    } else {
+                        let mut dst_data = dst.data_write_f64();
+                        *dst_data = src_data;
+                    }
+                }
+            }
         }
 
         let copy_linear = |dst: &mut Linear, src: &Linear| {
@@ -250,10 +269,38 @@ impl DuelingQNetwork {
 
     pub fn soft_update(&mut self, source: &Self, tau: f64) {
         fn interpolate(target: &mut Tensor, source: &Tensor, tau: f64) {
-            let mut t_data = target.data_write_f64();
-            let s_data = source.data_f64();
-            for (t, s) in t_data.iter_mut().zip(s_data.iter()) {
-                *t = *t * (1.0 - tau) + *s * tau;
+            let tau_f32 = tau as f32;
+            match (target.dtype, source.dtype) {
+                (crate::dtype::Dtype::F32, crate::dtype::Dtype::F32) => {
+                    let mut t_data = target.data_write_f32();
+                    let s_data = source.data_f32();
+                    for (t, s) in t_data.iter_mut().zip(s_data.iter()) {
+                        *t = *t * (1.0 - tau_f32) + *s * tau_f32;
+                    }
+                }
+                (crate::dtype::Dtype::F64, crate::dtype::Dtype::F64) => {
+                    let mut t_data = target.data_write_f64();
+                    let s_data = source.data_f64();
+                    for (t, s) in t_data.iter_mut().zip(s_data.iter()) {
+                        *t = *t * (1.0 - tau) + *s * tau;
+                    }
+                }
+                _ => {
+                    let t_data = target.data_as_f64_vec();
+                    let s_data = source.data_as_f64_vec();
+                    let new_data: Vec<f64> = t_data
+                        .iter()
+                        .zip(s_data.iter())
+                        .map(|(t, s)| t * (1.0 - tau) + s * tau)
+                        .collect();
+                    if target.dtype == crate::dtype::Dtype::F32 {
+                        let mut dst = target.data_write_f32();
+                        *dst = new_data.iter().map(|&v| v as f32).collect();
+                    } else {
+                        let mut dst = target.data_write_f64();
+                        *dst = new_data;
+                    }
+                }
             }
         }
 
@@ -274,18 +321,18 @@ impl DuelingQNetwork {
         }
     }
 
-    pub fn predict_action(&self, state: &Tensor) -> (usize, f64) {
+    pub fn predict_action(&self, state: &Tensor) -> (usize, f32) {
         let q_values = self.forward(state);
-        let mut max_val = f64::NEG_INFINITY;
+        let mut max_val = f32::NEG_INFINITY;
         let mut max_idx = 0;
-        let q_data = q_values.data_f64();
+        let q_data = q_values.data_to_f32_vec();
         for (i, &val) in q_data.iter().enumerate() {
             if val > max_val {
                 max_val = val;
                 max_idx = i;
             }
         }
-        (max_idx, ACTIONS[max_idx])
+        (max_idx, ACTIONS[max_idx] as f32)
     }
 
     /// Zero-allocation inference: compute Q-values from a raw feature slice
@@ -293,23 +340,23 @@ impl DuelingQNetwork {
     ///
     /// This function uses thread-local scratch buffers to avoid allocations in hot paths.
     /// Uses RepCache to avoid recomputing Q-values for previously seen states.
-    pub fn predict_action_fast(&self, state: &[f64]) -> (usize, f64) {
+    pub fn predict_action_fast(&self, state: &[f32]) -> (usize, f32) {
         struct Scratch {
-            h1: Vec<f64>,
-            h2: Vec<f64>,
-            h3: Vec<f64>,
-            val: Vec<f64>,
-            adv: Vec<f64>,
+            h1: Vec<f32>,
+            h2: Vec<f32>,
+            h3: Vec<f32>,
+            val: Vec<f32>,
+            adv: Vec<f32>,
         }
 
         // RepCache: bounded hash map for state -> Q-values
         struct RepCache {
-            entries: std::collections::HashMap<u64, [f64; ACTION_SPACE]>,
+            entries: std::collections::HashMap<u64, [f32; ACTION_SPACE]>,
         }
 
         impl RepCache {
             // FNV-1a hash, same as ACHF input_hash
-            fn state_hash(x: &[f64]) -> u64 {
+            fn state_hash(x: &[f32]) -> u64 {
                 let mut h: u64 = 0xcbf29ce484222325;
                 let step = (x.len() / 64).clamp(1, 8);
                 for i in (0..x.len()).step_by(step) {
@@ -323,14 +370,14 @@ impl DuelingQNetwork {
                 h
             }
 
-            fn get(&self, hash: u64) -> Option<&[f64; ACTION_SPACE]> {
+            fn get(&self, hash: u64) -> Option<&[f32; ACTION_SPACE]> {
                 self.entries.get(&hash).map(|q| unsafe {
                     // Safe: ACTION_SPACE is constant and we're just reinterpreting
-                    &*(q.as_slice() as *const [f64] as *const [_; ACTION_SPACE])
+                    &*(q.as_slice() as *const [f32] as *const [_; ACTION_SPACE])
                 })
             }
 
-            fn insert(&mut self, hash: u64, q_values: [f64; ACTION_SPACE]) {
+            fn insert(&mut self, hash: u64, q_values: [f32; ACTION_SPACE]) {
                 if self.entries.len() >= 1024 {
                     if let Some(key) = self.entries.keys().next().copied() {
                         self.entries.remove(&key);
@@ -364,14 +411,14 @@ impl DuelingQNetwork {
                 let binding = cache.borrow();
                 let q_ref = binding.get(state_hash).unwrap();
                 let mut max_idx = 0;
-                let mut max_val = f64::NEG_INFINITY;
+                let mut max_val = f32::NEG_INFINITY;
                 for (i, &q) in q_ref.iter().enumerate() {
                     if q > max_val {
                         max_val = q;
                         max_idx = i;
                     }
                 }
-                (max_idx, ACTIONS[max_idx])
+                (max_idx, ACTIONS[max_idx] as f32)
             });
         }
 
@@ -401,12 +448,9 @@ impl DuelingQNetwork {
             }
 
             if let Some(achf) = &self.achf {
-                let h2_f32: Vec<f32> = h2.iter().map(|&v| v as f32).collect();
-                let out = achf.forward_inference_residual(&h2_f32);
+                let out = achf.forward_inference_residual(h2);
                 h3.resize(out.len(), 0.0);
-                for (i, &v) in out.iter().enumerate() {
-                    h3[i] = v as f64;
-                }
+                h3.copy_from_slice(&out);
             } else {
                 h3.resize(h2.len(), 0.0);
                 self.l3.forward_inference_into(h2, h3);
@@ -420,14 +464,14 @@ impl DuelingQNetwork {
             self.val_head.forward_inference_into(h3, val);
             self.adv_head.forward_inference_into(h3, adv);
             if adv.len() != ACTION_SPACE {
-                return (0, ACTIONS[0]);
+                return (0, ACTIONS[0] as f32);
             }
 
-            let mean_adv: f64 = adv.iter().sum::<f64>() / ACTION_SPACE as f64;
-            let mut max_val = f64::NEG_INFINITY;
+            let mean_adv: f32 = adv.iter().sum::<f32>() / ACTION_SPACE as f32;
+            let mut max_val = f32::NEG_INFINITY;
             let mut max_idx = 0;
             let base = val.first().copied().unwrap_or(0.0);
-            let mut q_values = [0.0f64; ACTION_SPACE];
+            let mut q_values = [0.0f32; ACTION_SPACE];
             for (i, &a) in adv.iter().enumerate() {
                 let q = base + a - mean_adv;
                 q_values[i] = q;
@@ -442,7 +486,7 @@ impl DuelingQNetwork {
                 cache.borrow_mut().insert(state_hash, q_values);
             });
 
-            (max_idx, ACTIONS[max_idx])
+            (max_idx, ACTIONS[max_idx] as f32)
         })
     }
 }
@@ -988,7 +1032,7 @@ fn train_dqn_impl(
             let q_values = policy_net.forward(&current_state_tensor);
             let mut max_val = f64::NEG_INFINITY;
             let mut max_idx = 0;
-            let q_data = q_values.data_f64();
+            let q_data = q_values.data_as_f64_vec();
             for (i, &val) in q_data.iter().enumerate() {
                 if val > max_val {
                     max_val = val;
@@ -1203,7 +1247,7 @@ fn train_dqn_impl(
                 loss = loss + reg;
             }
 
-            last_train_loss = loss.data_f64()[0];
+            last_train_loss = loss.data_as_f64_vec()[0];
             let forward_time = start_forward.elapsed();
 
             let start_backward = std::time::Instant::now();
@@ -1217,8 +1261,8 @@ fn train_dqn_impl(
 
             // Write back per-sample TD errors for priority update
             {
-                let q_data = q_actions.data_f64();
-                let t_data = target_tensor.data_f64();
+                let q_data = q_actions.data_as_f64_vec();
+                let t_data = target_tensor.data_as_f64_vec();
                 scratch.td_errors.clear();
                 scratch.td_errors.extend(
                     q_data
@@ -1523,8 +1567,8 @@ impl OnlineDqnTrainer {
 
         // Write back per-sample TD errors for priority update
         {
-            let q_data = q_actions.data_f64();
-            let t_data = target_tensor.data_f64();
+            let q_data = q_actions.data_as_f64_vec();
+            let t_data = target_tensor.data_as_f64_vec();
             let td_errors: Vec<f64> = q_data
                 .iter()
                 .zip(t_data.iter())

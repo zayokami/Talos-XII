@@ -2313,7 +2313,7 @@ mod tests {
     #[test]
     fn benchmark_dqn_predict_action_fast() {
         let dqn = DuelingQNetwork::new(42, &crate::config::AchfConfig::default());
-        let features = [0.5_f64; DIM];
+        let features = [0.5_f32; DIM];
         let iterations = 10_000;
 
         // Warmup
@@ -2329,7 +2329,7 @@ mod tests {
 
         let start2 = std::time::Instant::now();
         for _ in 0..iterations {
-            let tensor_x = AutoTensor::new(features.to_vec(), vec![DIM]);
+            let tensor_x = AutoTensor::new(features.iter().map(|&v| v as f64).collect(), vec![DIM]);
             let _ = dqn.predict_action(&tensor_x);
         }
         let tensor_elapsed = start2.elapsed();

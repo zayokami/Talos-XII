@@ -29,9 +29,9 @@ const EARLY_UP_BONUS_THRESHOLD_2: usize = 50;
 
 #[derive(Default)]
 struct CachedStepScratch {
-    last: Vec<f64>,
-    logits: Vec<f64>,
-    value: Vec<f64>,
+    last: Vec<f32>,
+    logits: Vec<f32>,
+    value: Vec<f32>,
 }
 
 thread_local! {
@@ -64,14 +64,14 @@ thread_local! {
 // Returns (action_index, log_prob_of_action).
 // If top_k > 0, only the top_k logits are kept (others set to -inf).
 #[inline]
-fn softmax_sample(logits: &[f64], top_k: usize) -> (usize, f64) {
+fn softmax_sample(logits: &[f32], top_k: usize) -> (usize, f32) {
     if logits.len() != ACTION_SPACE {
-        let fallback_prob = 1.0 / ACTION_SPACE as f64;
+        let fallback_prob = 1.0 / ACTION_SPACE as f32;
         return (0, fallback_prob.ln());
     }
 
     // Find max for numerical stability
-    let mut max_l = f64::NEG_INFINITY;
+    let mut max_l = f32::NEG_INFINITY;
     for &v in logits {
         if v > max_l {
             max_l = v;
@@ -79,7 +79,7 @@ fn softmax_sample(logits: &[f64], top_k: usize) -> (usize, f64) {
     }
 
     // Top-k truncation: set non-top-k logits to -inf
-    let mut probs = [0.0; ACTION_SPACE];
+    let mut probs = [0.0f32; ACTION_SPACE];
     if top_k > 0 && top_k < ACTION_SPACE {
         // Find top_k values
         let mut sorted_logits = logits.to_vec();
@@ -87,10 +87,10 @@ fn softmax_sample(logits: &[f64], top_k: usize) -> (usize, f64) {
         let threshold = sorted_logits[top_k.saturating_sub(1)];
 
         // Compute softmax with top-k masking
-        let mut sum_exp = 0.0;
+        let mut sum_exp = 0.0f32;
         for (i, prob) in probs.iter_mut().enumerate() {
             if logits[i] < threshold {
-                *prob = 0.0; // masked out
+                *prob = 0.0f32; // masked out
             } else {
                 *prob = (logits[i] - max_l).exp();
                 sum_exp += *prob;
@@ -101,12 +101,12 @@ fn softmax_sample(logits: &[f64], top_k: usize) -> (usize, f64) {
                 *prob /= sum_exp;
             }
         } else {
-            let uniform = 1.0 / ACTION_SPACE as f64;
+            let uniform = 1.0 / ACTION_SPACE as f32;
             probs.fill(uniform);
         }
     } else {
         // Full softmax (top_k disabled or >= ACTION_SPACE)
-        let mut sum_exp = 0.0;
+        let mut sum_exp = 0.0f32;
         for (i, prob) in probs.iter_mut().enumerate() {
             *prob = (logits[i] - max_l).exp();
             sum_exp += *prob;
@@ -117,7 +117,7 @@ fn softmax_sample(logits: &[f64], top_k: usize) -> (usize, f64) {
     }
 
     // Categorical sampling
-    let mut r = rand::random::<f64>();
+    let mut r = rand::random::<f32>();
     let mut idx = ACTION_SPACE - 1;
     for (i, &p) in probs.iter().enumerate() {
         if r < p {
@@ -126,7 +126,7 @@ fn softmax_sample(logits: &[f64], top_k: usize) -> (usize, f64) {
         }
         r -= p;
     }
-    let log_prob = probs[idx].max(f64::MIN_POSITIVE).ln();
+    let log_prob = probs[idx].max(f32::MIN_POSITIVE).ln();
     (idx, log_prob)
 }
 
@@ -249,14 +249,15 @@ impl ActorCritic {
     // Returns (action_idx, log_prob, value)
     pub fn step(&self, state: &Tensor, pity: &[usize], top_k: usize) -> (usize, f64, f64) {
         let (logits, value) = self.forward_actor_critic(state, pity);
-        let logits_data = logits.data_f64();
-        let (action_idx, log_prob) = softmax_sample(&logits_data, top_k);
-        let val = value.data_f64()[0];
-        (action_idx, log_prob, val)
+        let logits_data = logits.data_as_f64_vec();
+        let logits_f32: Vec<f32> = logits_data.iter().map(|&v| v as f32).collect();
+        let (action_idx, log_prob) = softmax_sample(&logits_f32, top_k);
+        let val = value.data_as_f64_vec()[0];
+        (action_idx, log_prob as f64, val)
     }
 
     // Fast inference without Autograd graph
-    pub fn step_inference(&self, state: &[f64], top_k: usize) -> usize {
+    pub fn step_inference(&self, state: &[f32], top_k: usize) -> usize {
         let seq = self.backbone.forward_inference(state);
         let last = self.backbone.last_token_inference(&seq);
         let logits = self.actor_head.forward_inference(&last);
@@ -265,11 +266,11 @@ impl ActorCritic {
 
     pub fn step_inference_cached_with_value(
         &self,
-        state: &[f64],
+        state: &[f32],
         kv_cache: &mut [KVCache],
         start_pos: usize,
         top_k: usize,
-    ) -> (usize, f64, f64) {
+    ) -> (usize, f32, f32) {
         CACHED_STEP_SCRATCH.with(|scratch_cell| {
             let mut scratch = scratch_cell.borrow_mut();
             let CachedStepScratch {
@@ -288,7 +289,7 @@ impl ActorCritic {
 
     pub fn step_inference_cached(
         &self,
-        state: &[f64],
+        state: &[f32],
         kv_cache: &mut [KVCache],
         start_pos: usize,
         top_k: usize,
@@ -323,7 +324,7 @@ impl ActorCritic {
         self.backbone.snapshot_achf()
     }
 
-    pub fn forward_inference_forced_path(&self, x: &[f64], forced_path: u8) -> Vec<f64> {
+    pub fn forward_inference_forced_path(&self, x: &[f32], forced_path: u8) -> Vec<f32> {
         self.backbone.forward_inference_forced_path(x, forced_path)
     }
 
@@ -780,10 +781,20 @@ impl Ppo {
         let ema_params = ema.parameters();
 
         for (ema_p, stud_p) in ema_params.iter().zip(student_params.iter()) {
-            let mut ema_data = ema_p.data_write_f64();
-            let stud_data = stud_p.data_f64();
-            for (e, s) in ema_data.iter_mut().zip(stud_data.iter()) {
-                *e = decay * (*e) + inv * (*s);
+            if ema_p.dtype == crate::dtype::Dtype::F64 {
+                let mut ema_data = ema_p.data_write_f64();
+                let stud_data = stud_p.data_f64();
+                for (e, s) in ema_data.iter_mut().zip(stud_data.iter()) {
+                    *e = decay * (*e) + inv * (*s);
+                }
+            } else {
+                let mut ema_data = ema_p.data_write_f32();
+                let stud_data = stud_p.data_f32();
+                let decay_f32 = decay as f32;
+                let inv_f32 = inv as f32;
+                for (e, s) in ema_data.iter_mut().zip(stud_data.iter()) {
+                    *e = decay_f32 * (*e) + inv_f32 * (*s);
+                }
             }
         }
     }
@@ -923,7 +934,7 @@ impl Ppo {
                 let max_seq_len = chunk.iter().map(|&i| states[i].shape[0]).max().unwrap_or(1);
                 let mut batch_data = Vec::with_capacity(batch_len * max_seq_len * DIM);
                 for &i in chunk {
-                    let state_data = states[i].data_f64();
+                    let state_data = states[i].data_as_f64_vec();
                     let seq_len = states[i].shape[0];
                     batch_data.extend_from_slice(&state_data);
                     if seq_len < max_seq_len {
@@ -987,7 +998,7 @@ impl Ppo {
                     let value = batch_values.index_select(chunk_idx);
                     let entropy = batch_entropy.index_select(chunk_idx);
 
-                    let log_prob_val = log_prob.data_f64()[0];
+                    let log_prob_val = log_prob.data_as_f64_vec()[0];
                     let log_ratio_val = log_prob_val - old_log_prob;
                     let ratio_val = log_ratio_val.exp();
                     approx_kl += (ratio_val - 1.0) - log_ratio_val;
@@ -1011,8 +1022,8 @@ impl Ppo {
                     let ratio_clipped = ratio.clip(1.0 - CLIP_EPSILON, 1.0 + CLIP_EPSILON);
                     let surr2 = ratio_clipped * adv_tensor;
 
-                    let s1_val = surr1.data_f64()[0];
-                    let s2_val = surr2.data_f64()[0];
+                    let s1_val = surr1.data_as_f64_vec()[0];
+                    let s2_val = surr2.data_as_f64_vec()[0];
                     let policy_loss = if s1_val < s2_val { surr1 } else { surr2 };
 
                     let ret_tensor = TRAINING_SCRATCH.with(|s| {
@@ -1060,7 +1071,7 @@ impl Ppo {
                 if let Some(reg) = self.policy.achf_orthogonal_penalty() {
                     final_loss = final_loss + reg;
                 }
-                loss_sum += final_loss.data_f64()[0];
+                loss_sum += final_loss.data_as_f64_vec()[0];
                 loss_count += 1;
                 final_loss.backward();
                 self.policy.update_achf_after_backward();
@@ -1217,8 +1228,9 @@ impl PpoEnvState {
             .back()
             .expect("history_buffer should not be empty after push")
             .as_slice();
+        let token_f32: Vec<f32> = token.iter().map(|&v| v as f32).collect();
         let (action_idx, log_prob, val) = policy.step_inference_cached_with_value(
-            token,
+            &token_f32,
             &mut self.kv_cache,
             seq_len - 1,
             config.ppo_top_k,
@@ -1307,10 +1319,10 @@ impl PpoEnvState {
             seq_len,
             pity: self.pity_vec.clone(),
             action: action_idx,
-            log_prob,
+            log_prob: log_prob as f64,
             reward,
             done,
-            value: val,
+            value: val as f64,
         };
 
         let finished_reward = if done {
@@ -1912,10 +1924,10 @@ mod tests {
     #[test]
     fn online_trainer_from_policy_preserves_initial_weights() {
         let policy = ActorCritic::new(42, &crate::config::AchfConfig::default(), 64, 2);
-        let expected = policy.parameters()[0].data_f64().clone();
+        let expected = policy.parameters()[0].data_f32().clone();
 
         let trainer = OnlinePpoTrainer::from_policy(policy, 2, 128);
-        let got = trainer.ppo.policy.parameters()[0].data_f64().clone();
+        let got = trainer.ppo.policy.parameters()[0].data_f32().clone();
 
         assert_eq!(got, expected);
     }
@@ -1937,14 +1949,14 @@ mod tests {
 
         // Capture original teacher values (initial = policy values since same seed)
         let teacher_before = ppo.ema_policy.as_ref().unwrap().parameters()[0]
-            .data_f64()
+            .data_f32()
             .clone();
 
         // Modify student first parameter to 1.0
         let params = ppo.policy.parameters();
-        let mut data = params[0].data_write_f64();
+        let mut data = params[0].data_write_f32();
         for val in data.iter_mut() {
-            *val = 1.0;
+            *val = 1.0f32;
         }
         drop(data); // Release lock before EMA update to avoid deadlock
         drop(params); // Explicitly drop to release all locks
@@ -1954,12 +1966,12 @@ mod tests {
 
         // With decay=0.5, teacher_new = 0.5 * teacher_old + 0.5 * student
         let teacher_after = ppo.ema_policy.as_ref().unwrap().parameters()[0]
-            .data_f64()
+            .data_f32()
             .clone();
 
         for (before, after) in teacher_before.iter().zip(teacher_after.iter()) {
-            let expected = 0.5 * before + 0.5 * 1.0;
-            assert!((after - expected).abs() < 1e-9);
+            let expected = 0.5 * before + 0.5 * 1.0f32;
+            assert!((after - expected).abs() < 1e-5);
         }
     }
 
@@ -1982,17 +1994,17 @@ mod tests {
 
         // Record first and last tensor values before update
         let before_first = ppo.ema_policy.as_ref().unwrap().parameters()[0]
-            .data_f64()
+            .data_f32()
             .clone();
         let before_last = ppo.ema_policy.as_ref().unwrap().parameters()[num_params - 1]
-            .data_f64()
+            .data_f32()
             .clone();
 
         // Set all student parameters to 2.0
         for param in ppo.policy.parameters() {
-            let mut data = param.data_write_f64();
+            let mut data = param.data_write_f32();
             for val in data.iter_mut() {
-                *val = 2.0;
+                *val = 2.0f32;
             }
         }
 
@@ -2000,10 +2012,10 @@ mod tests {
 
         // Check first and last tensor values after update
         let after_first = ppo.ema_policy.as_ref().unwrap().parameters()[0]
-            .data_f64()
+            .data_f32()
             .clone();
         let after_last = ppo.ema_policy.as_ref().unwrap().parameters()[num_params - 1]
-            .data_f64()
+            .data_f32()
             .clone();
 
         // First tensor should have changed
@@ -2037,9 +2049,9 @@ mod tests {
 
         // Set all student params to 10.0
         for param in ppo.policy.parameters() {
-            let mut data = param.data_write_f64();
+            let mut data = param.data_write_f32();
             for val in data.iter_mut() {
-                *val = 10.0;
+                *val = 10.0f32;
             }
         }
 
@@ -2050,12 +2062,12 @@ mod tests {
 
         // After 100 updates with decay=0.5, EMA should be very close to student (10.0)
         let teacher_final = ppo.ema_policy.as_ref().unwrap().parameters()[0]
-            .data_f64()
+            .data_f32()
             .clone();
 
         for val in teacher_final.iter() {
             assert!(
-                (*val - 10.0).abs() < 1e-6,
+                (*val - 10.0f32).abs() < 1e-6,
                 "EMA did not converge: got {}",
                 val
             );

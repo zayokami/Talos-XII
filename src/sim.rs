@@ -315,9 +315,10 @@ fn decide_policy(inputs: PolicyInputs<'_>) -> PolicyDecision {
     if config.luck_mode == LuckMode::Dqn {
         if let Some(policy) = dqn_policy {
             if fast_inference {
-                let (idx, modifier) = policy.predict_action_fast(current_features);
+                let features_f32: Vec<f32> = current_features.iter().map(|&v| v as f32).collect();
+                let (idx, modifier) = policy.predict_action_fast(&features_f32);
                 return PolicyDecision {
-                    luck_factor: modifier,
+                    luck_factor: modifier as f64,
                     action: Some(idx),
                     ppo_log_prob: None,
                     ppo_value: None,
@@ -326,7 +327,7 @@ fn decide_policy(inputs: PolicyInputs<'_>) -> PolicyDecision {
             let tensor_x = AutoTensor::new(current_features.to_vec(), vec![DIM]);
             let (idx, modifier) = policy.predict_action(&tensor_x);
             return PolicyDecision {
-                luck_factor: modifier,
+                luck_factor: modifier as f64,
                 action: Some(idx),
                 ppo_log_prob: None,
                 ppo_value: None,
@@ -336,8 +337,10 @@ fn decide_policy(inputs: PolicyInputs<'_>) -> PolicyDecision {
         if let Some(policy) = ppo_policy {
             if fast_inference {
                 if let Some(cache) = kv_cache {
+                    let features_f32: Vec<f32> =
+                        current_features.iter().map(|&v| v as f32).collect();
                     let idx = policy.step_inference_cached(
-                        current_features,
+                        &features_f32,
                         cache,
                         start_pos,
                         config.ppo_top_k,
@@ -350,7 +353,8 @@ fn decide_policy(inputs: PolicyInputs<'_>) -> PolicyDecision {
                     };
                 }
                 if let Some(seq_data) = ppo_seq_data {
-                    let idx = policy.step_inference(seq_data, config.ppo_top_k);
+                    let seq_f32: Vec<f32> = seq_data.iter().map(|&v| v as f32).collect();
+                    let idx = policy.step_inference(&seq_f32, config.ppo_top_k);
                     return PolicyDecision {
                         luck_factor: crate::utils::ACTIONS[idx],
                         action: Some(idx),
@@ -1508,18 +1512,19 @@ mod tests {
         let policy =
             crate::ppo::ActorCritic::new(12345, &crate::config::AchfConfig::default(), 64, 2);
         let seq_len = 6;
-        let mut flat = vec![0.0; seq_len * DIM];
+        let mut flat = vec![0.0f32; seq_len * DIM];
         for t in 0..seq_len {
             for i in 0..DIM {
-                flat[t * DIM + i] = (t as f64) * 0.01 + (i as f64) * 0.001;
+                flat[t * DIM + i] = (t as f32) * 0.01 + (i as f32) * 0.001;
             }
         }
         let pity: Vec<usize> = (0..seq_len).collect();
-        let state_tensor = AutoTensor::new(flat.clone(), vec![seq_len, DIM]);
+        let state_tensor =
+            AutoTensor::new(flat.iter().map(|&v| v as f64).collect(), vec![seq_len, DIM]);
 
         let slow_logits = policy.forward_actor(&state_tensor, &pity);
-        let slow_data = slow_logits.data_f64().clone();
-        let slow_probs = softmax(&slow_data);
+        let slow_data = slow_logits.data_to_f32_vec();
+        let slow_probs = softmax_f32(&slow_data);
 
         let mla_cfg = &policy.backbone.blocks[0].mla_layer.config;
         let num_heads = mla_cfg.num_heads;
@@ -1539,17 +1544,17 @@ mod tests {
         for cache in kv.iter_mut() {
             cache.clear();
         }
-        let mut last = vec![0.0; 0];
+        let mut last = vec![0.0f32; 0];
         for t in 0..seq_len {
             let token = &flat[t * DIM..(t + 1) * DIM];
             last = policy.backbone.forward_inference_step(token, &mut kv, t);
         }
         let fast_logits = policy.actor_head.forward_inference(&last);
-        let fast_probs = softmax(&fast_logits);
+        let fast_probs = softmax_f32(&fast_logits);
 
-        let mut diff_sum = 0.0;
+        let mut diff_sum = 0.0f32;
         for i in 0..5 {
-            diff_sum += (slow_probs[i] - fast_probs[i]).abs();
+            diff_sum += (slow_probs[i] as f32 - fast_probs[i]).abs();
         }
         assert!(
             diff_sum < 0.5,
@@ -1558,7 +1563,8 @@ mod tests {
         );
     }
 
-    fn softmax(logits: &[f64]) -> Vec<f64> {
+    #[allow(dead_code)]
+    fn softmax_f64(logits: &[f64]) -> Vec<f64> {
         let mut max_l = f64::NEG_INFINITY;
         for &v in logits {
             if v > max_l {
@@ -1567,6 +1573,25 @@ mod tests {
         }
         let mut sum = 0.0;
         let mut out = vec![0.0; logits.len()];
+        for (i, &v) in logits.iter().enumerate() {
+            out[i] = (v - max_l).exp();
+            sum += out[i];
+        }
+        for v in out.iter_mut() {
+            *v /= sum;
+        }
+        out
+    }
+
+    fn softmax_f32(logits: &[f32]) -> Vec<f32> {
+        let mut max_l = f32::NEG_INFINITY;
+        for &v in logits {
+            if v > max_l {
+                max_l = v;
+            }
+        }
+        let mut sum = 0.0f32;
+        let mut out = vec![0.0f32; logits.len()];
         for (i, &v) in logits.iter().enumerate() {
             out[i] = (v - max_l).exp();
             sum += out[i];

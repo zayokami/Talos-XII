@@ -376,7 +376,7 @@ fn run_path_comparison(base_config: &Config, seed: u64) -> Vec<(String, Vec<f64>
     let ppo = train_ppo_with_metrics(&mut rng, &env_net, &cfg, None);
 
     let input_dim = crate::neural::DIM;
-    let sample_input: Vec<f64> = (0..input_dim).map(|i| (i as f64) * 0.1 + 0.05).collect();
+    let sample_input: Vec<f32> = (0..input_dim).map(|i| (i as f32) * 0.1 + 0.05).collect();
     let iterations = 2000;
 
     let mut all_latencies: Vec<(String, Vec<f64>)> = Vec::new();

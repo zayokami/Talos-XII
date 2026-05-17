@@ -1,7 +1,6 @@
 use crate::autograd::Tensor;
 use crate::config::AchfConfig;
 use crate::nn::{Linear, Module};
-use crate::simd::dot_product;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
@@ -476,26 +475,18 @@ impl AchfLayer {
             let out = match path {
                 InferencePath::Cached => self
                     .forward_inference_cached(x)
-                    .unwrap_or_else(|| self.weight.forward_inference_f32(x)),
-                InferencePath::Sparse => self
-                    .sparse_weight
-                    .as_ref()
-                    .unwrap()
-                    .forward_inference_f32(x),
-                InferencePath::Dense => self.weight.forward_inference_f32(x),
+                    .unwrap_or_else(|| self.weight.forward_inference(x)),
+                InferencePath::Sparse => self.sparse_weight.as_ref().unwrap().forward_inference(x),
+                InferencePath::Dense => self.weight.forward_inference(x),
             };
             (out, start.elapsed().as_nanos() as f64)
         } else {
             let out = match path {
                 InferencePath::Cached => self
                     .forward_inference_cached(x)
-                    .unwrap_or_else(|| self.weight.forward_inference_f32(x)),
-                InferencePath::Sparse => self
-                    .sparse_weight
-                    .as_ref()
-                    .unwrap()
-                    .forward_inference_f32(x),
-                InferencePath::Dense => self.weight.forward_inference_f32(x),
+                    .unwrap_or_else(|| self.weight.forward_inference(x)),
+                InferencePath::Sparse => self.sparse_weight.as_ref().unwrap().forward_inference(x),
+                InferencePath::Dense => self.weight.forward_inference(x),
             };
             (out, 0.0)
         };
@@ -537,13 +528,9 @@ impl AchfLayer {
         let mut out = match forced_path {
             0 => self
                 .forward_inference_cached(x)
-                .unwrap_or_else(|| self.weight.forward_inference_f32(x)),
-            1 if self.is_sparse() => self
-                .sparse_weight
-                .as_ref()
-                .unwrap()
-                .forward_inference_f32(x),
-            _ => self.weight.forward_inference_f32(x),
+                .unwrap_or_else(|| self.weight.forward_inference(x)),
+            1 if self.is_sparse() => self.sparse_weight.as_ref().unwrap().forward_inference(x),
+            _ => self.weight.forward_inference(x),
         };
         for v in out.iter_mut() {
             *v *= g;
@@ -767,7 +754,7 @@ impl AchfLayer {
     }
 
     fn project_rowcol(&self) {
-        let mut w = self.weight.weight.data_write_f64();
+        let mut w = self.weight.weight.data_write_f32();
         let rows = self.weight.in_features;
         let cols = self.weight.out_features;
         rowcol_project(&mut w, rows, cols);
@@ -780,22 +767,28 @@ impl AchfLayer {
             self.config.proj_steps
         };
         let cache = self.cache.read().unwrap();
-        let row_scales = cache.sinkhorn_row_scales.clone();
-        let col_scales = cache.sinkhorn_col_scales.clone();
+        let row_scales_f32 = cache
+            .sinkhorn_row_scales
+            .as_ref()
+            .map(|v| v.iter().map(|&x| x as f32).collect::<Vec<f32>>());
+        let col_scales_f32 = cache
+            .sinkhorn_col_scales
+            .as_ref()
+            .map(|v| v.iter().map(|&x| x as f32).collect::<Vec<f32>>());
         drop(cache);
-        let mut w = self.weight.weight.data_write_f64();
+        let mut w = self.weight.weight.data_write_f32();
         let (new_row, new_col) = sinkhorn_project(
             &mut w,
             self.weight.in_features,
             self.weight.out_features,
             steps,
-            row_scales.as_deref(),
-            col_scales.as_deref(),
+            row_scales_f32.as_deref(),
+            col_scales_f32.as_deref(),
         );
         drop(w);
         let mut cache = self.cache.write().unwrap();
-        cache.sinkhorn_row_scales = Some(new_row);
-        cache.sinkhorn_col_scales = Some(new_col);
+        cache.sinkhorn_row_scales = Some(new_row.iter().map(|&x| x as f64).collect());
+        cache.sinkhorn_col_scales = Some(new_col.iter().map(|&x| x as f64).collect());
     }
 
     pub fn load_state_dict(&mut self, other: &AchfLayer) {
@@ -824,17 +817,24 @@ impl AchfLayer {
     /// elements below threshold. Idempotent (re-pruning overwrites).
     #[allow(dead_code)]
     pub fn prune(&mut self, threshold: f64) {
-        let w_data = self.weight.weight.data_f64();
+        let w_data = self.weight.weight.data_f32();
+        let threshold_f32 = threshold as f32;
         let pruned: Vec<f64> = w_data
             .iter()
-            .map(|&v| if v.abs() < threshold { 0.0 } else { v })
+            .map(|&v| {
+                if v.abs() < threshold_f32 {
+                    0.0
+                } else {
+                    v as f64
+                }
+            })
             .collect();
         let mask: Vec<u8> = w_data
             .iter()
-            .map(|&v| if v.abs() < threshold { 0 } else { 1 })
+            .map(|&v| if v.abs() < threshold_f32 { 0 } else { 1 })
             .collect();
         drop(w_data);
-        let pruned_weight = Tensor::new(
+        let pruned_weight = Tensor::new_f32(
             pruned,
             vec![self.weight.in_features, self.weight.out_features],
         );
@@ -908,8 +908,8 @@ impl AchfLayer {
         let sparse = self.sparse_weight.as_ref().unwrap();
         let in_dim = sparse.in_features;
         let out_dim = sparse.out_features;
-        let w_data = sparse.weight.data_f64();
-        let dense: Vec<f32> = w_data.iter().map(|&v| v as f32).collect();
+        let w_data = sparse.weight.data_f32();
+        let dense: Vec<f32> = w_data.iter().copied().collect();
         drop(w_data);
         let mut cache = self.cache.write().unwrap();
         cache.dense = Some(dense);
@@ -1148,10 +1148,10 @@ enum InferencePath {
     Dense,
 }
 
-fn rowcol_project(w: &mut [f64], rows: usize, cols: usize) {
+fn rowcol_project(w: &mut [f32], rows: usize, cols: usize) {
     for r in 0..rows {
         let row = &w[r * cols..(r + 1) * cols];
-        let sum_sq = dot_product(row, row);
+        let sum_sq = crate::simd::dot_product_f32(row, row);
         if sum_sq > 0.0 {
             let inv_norm = 1.0 / sum_sq.sqrt();
             for c in 0..cols {
@@ -1160,7 +1160,7 @@ fn rowcol_project(w: &mut [f64], rows: usize, cols: usize) {
         }
     }
     for c in 0..cols {
-        let mut sum_sq = 0.0;
+        let mut sum_sq = 0.0f32;
         for r in 0..rows {
             let v = w[r * cols + c];
             sum_sq += v * v;
@@ -1175,15 +1175,15 @@ fn rowcol_project(w: &mut [f64], rows: usize, cols: usize) {
 }
 
 pub(crate) fn sinkhorn_project(
-    w: &mut [f64],
+    w: &mut [f32],
     rows: usize,
     cols: usize,
     steps: usize,
-    row_scales: Option<&[f64]>,
-    col_scales: Option<&[f64]>,
-) -> (Vec<f64>, Vec<f64>) {
-    let eps = 1e-12;
-    let convergence_tol = 1e-6;
+    row_scales: Option<&[f32]>,
+    col_scales: Option<&[f32]>,
+) -> (Vec<f32>, Vec<f32>) {
+    let eps = 1e-12f32;
+    let convergence_tol = 1e-6f32;
 
     // Apply warm-start scale vectors if dimensions match.
     if let Some(rs) = row_scales {
@@ -1207,17 +1207,17 @@ pub(crate) fn sinkhorn_project(
         }
     }
 
-    let mut out_row_scales = vec![1.0; rows];
-    let mut out_col_scales = vec![1.0; cols];
+    let mut out_row_scales = vec![1.0f32; rows];
+    let mut out_col_scales = vec![1.0f32; cols];
 
     for _ in 0..steps {
         // Row normalization
         for r in 0..rows {
-            let mut sum = 0.0;
+            let mut sum = 0.0f32;
             for c in 0..cols {
                 sum += w[r * cols + c].abs();
             }
-            let denom = if sum < eps { 1.0 } else { sum };
+            let denom = if sum < eps { 1.0f32 } else { sum };
             out_row_scales[r] /= denom;
             for c in 0..cols {
                 w[r * cols + c] /= denom;
@@ -1225,11 +1225,11 @@ pub(crate) fn sinkhorn_project(
         }
         // Column normalization
         for c in 0..cols {
-            let mut sum = 0.0;
+            let mut sum = 0.0f32;
             for r in 0..rows {
                 sum += w[r * cols + c].abs();
             }
-            let denom = if sum < eps { 1.0 } else { sum };
+            let denom = if sum < eps { 1.0f32 } else { sum };
             out_col_scales[c] /= denom;
             for r in 0..rows {
                 w[r * cols + c] /= denom;
@@ -1237,20 +1237,20 @@ pub(crate) fn sinkhorn_project(
         }
 
         // Early termination: check max deviation of both row and column sums from 1.0
-        let mut max_dev = 0.0_f64;
+        let mut max_dev = 0.0f32;
         for r in 0..rows {
-            let mut sum = 0.0;
+            let mut sum = 0.0f32;
             for c in 0..cols {
                 sum += w[r * cols + c].abs();
             }
-            max_dev = max_dev.max((sum - 1.0).abs());
+            max_dev = max_dev.max((sum - 1.0f32).abs());
         }
         for c in 0..cols {
-            let mut sum = 0.0;
+            let mut sum = 0.0f32;
             for r in 0..rows {
                 sum += w[r * cols + c].abs();
             }
-            max_dev = max_dev.max((sum - 1.0).abs());
+            max_dev = max_dev.max((sum - 1.0f32).abs());
         }
         if max_dev < convergence_tol {
             break;
@@ -1261,16 +1261,17 @@ pub(crate) fn sinkhorn_project(
 }
 
 fn copy_linear(dst: &mut Linear, src: &Linear) {
-    let src_data = src.weight.data_f64().clone();
-    let mut dst_data = dst.weight.data_write_f64();
+    let src_data = src.weight.data_f32().clone();
+    let mut dst_data = dst.weight.data_write_f32();
     *dst_data = src_data;
 }
 
 fn soft_update_linear(dst: &mut Linear, src: &Linear, tau: f64) {
-    let mut t_data = dst.weight.data_write_f64();
-    let s_data = src.weight.data_f64();
+    let tau_f32 = tau as f32;
+    let mut t_data = dst.weight.data_write_f32();
+    let s_data = src.weight.data_f32();
     for (t, s) in t_data.iter_mut().zip(s_data.iter()) {
-        *t = *t * (1.0 - tau) + *s * tau;
+        *t = *t * (1.0 - tau_f32) + *s * tau_f32;
     }
 }
 
@@ -1307,7 +1308,7 @@ mod tests {
         let layer = AchfLayer::new_square(4, cfg, 7);
         let x = Tensor::rand(vec![1, 4], -0.1, 0.1, 9);
         let _ = layer.forward_residual(&x);
-        let w = layer.weight.weight.data_f64();
+        let w = layer.weight.weight.data_f32();
         for c in 0..4 {
             let mut sum_sq = 0.0;
             for r in 0..4 {
@@ -1331,10 +1332,10 @@ mod tests {
         let x = Tensor::rand(vec![1, 4], -0.1, 0.1, 12);
         let _ = layer.forward_residual(&x);
         layer.freeze_for_inference();
-        let w_before = layer.weight.weight.data_f64().clone();
+        let w_before = layer.weight.weight.data_f32().clone();
         let x_data = x.data_to_f32_vec();
         let _ = layer.forward_inference_residual(&x_data);
-        let w_after = layer.weight.weight.data_f64().clone();
+        let w_after = layer.weight.weight.data_f32().clone();
         assert_eq!(w_before, w_after);
     }
 
@@ -1537,7 +1538,7 @@ mod tests {
         let mut layer = AchfLayer::new_square(4, cfg, 200);
         // Set some weights to known values
         {
-            let mut w = layer.weight.weight.data_write_f64();
+            let mut w = layer.weight.weight.data_write_f32();
             w[0] = 0.5; // above threshold
             w[1] = 0.005; // below threshold
             w[2] = -0.5; // above threshold
@@ -1545,7 +1546,7 @@ mod tests {
         }
         layer.prune(0.01);
         let sparse = layer.sparse_weight.as_ref().unwrap();
-        let s = sparse.weight.data_f64();
+        let s = sparse.weight.data_f32();
         assert_eq!(s[0], 0.5);
         assert_eq!(s[1], 0.0);
         assert_eq!(s[2], -0.5);
@@ -1561,9 +1562,9 @@ mod tests {
         let mut layer = AchfLayer::new_square(4, cfg, 201);
         // Set deterministic weights
         {
-            let mut w = layer.weight.weight.data_write_f64();
+            let mut w = layer.weight.weight.data_write_f32();
             for (i, v) in w.iter_mut().enumerate() {
-                *v = ((i as f64) * 0.1) - 0.3;
+                *v = ((i as f32) * 0.1) - 0.3;
             }
         }
         let x = vec![0.1, -0.2, 0.3, 0.4, 0.5, -0.1, 0.2, -0.3];
@@ -1606,14 +1607,15 @@ mod tests {
     fn test_sinkhorn_doubly_stochastic() {
         // Build a 4x4 positive matrix
         let mut w = vec![
-            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
+            1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+            16.0,
         ];
         let (row_scales, col_scales) = sinkhorn_project(&mut w, 4, 4, 20, None, None);
         // Verify all row sums equal 1.0
         for r in 0..4 {
-            let sum: f64 = (0..4).map(|c| w[r * 4 + c]).sum();
+            let sum: f32 = (0..4).map(|c| w[r * 4 + c]).sum();
             assert!(
-                (sum - 1.0).abs() < 1e-6,
+                (sum - 1.0).abs() < 1e-5,
                 "Row {} sum = {}, expected 1.0",
                 r,
                 sum
@@ -1621,9 +1623,9 @@ mod tests {
         }
         // Verify all column sums equal 1.0
         for c in 0..4 {
-            let sum: f64 = (0..4).map(|r| w[r * 4 + c]).sum();
+            let sum: f32 = (0..4).map(|r| w[r * 4 + c]).sum();
             assert!(
-                (sum - 1.0).abs() < 1e-6,
+                (sum - 1.0).abs() < 1e-5,
                 "Col {} sum = {}, expected 1.0",
                 c,
                 sum
@@ -1639,7 +1641,8 @@ mod tests {
     #[test]
     fn test_sinkhorn_warm_start_accelerates() {
         let w0 = vec![
-            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
+            1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+            16.0,
         ];
         // First projection with few steps (no warm-start)
         let mut w1 = w0.clone();
@@ -1649,25 +1652,25 @@ mod tests {
         let (rs2, cs2) = sinkhorn_project(&mut w2, 4, 4, 3, Some(&rs1), Some(&cs1));
         // Warm-started result should be closer to doubly-stochastic
         let max_dev1 = {
-            let mut dev = 0.0f64;
+            let mut dev = 0.0f32;
             for r in 0..4 {
-                let s: f64 = (0..4).map(|c| w1[r * 4 + c]).sum();
+                let s: f32 = (0..4).map(|c| w1[r * 4 + c]).sum();
                 dev = dev.max((s - 1.0).abs());
             }
             for c in 0..4 {
-                let s: f64 = (0..4).map(|r| w1[r * 4 + c]).sum();
+                let s: f32 = (0..4).map(|r| w1[r * 4 + c]).sum();
                 dev = dev.max((s - 1.0).abs());
             }
             dev
         };
         let max_dev2 = {
-            let mut dev = 0.0f64;
+            let mut dev = 0.0f32;
             for r in 0..4 {
-                let s: f64 = (0..4).map(|c| w2[r * 4 + c]).sum();
+                let s: f32 = (0..4).map(|c| w2[r * 4 + c]).sum();
                 dev = dev.max((s - 1.0).abs());
             }
             for c in 0..4 {
-                let s: f64 = (0..4).map(|r| w2[r * 4 + c]).sum();
+                let s: f32 = (0..4).map(|r| w2[r * 4 + c]).sum();
                 dev = dev.max((s - 1.0).abs());
             }
             dev

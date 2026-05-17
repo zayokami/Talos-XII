@@ -1,5 +1,5 @@
 use crate::autograd::{Context, Tensor};
-use crate::dtype::Storage;
+use crate::dtype::{Dtype, Storage};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock};
@@ -20,10 +20,10 @@ pub struct Linear {
 impl Linear {
     pub fn new(in_features: usize, out_features: usize, bias: bool, seed: u64) -> Self {
         // Xavier initialization
-        let limit = (6.0 / (in_features + out_features) as f64).sqrt();
-        let weight = Tensor::rand(vec![in_features, out_features], -limit, limit, seed);
+        let limit = (6.0 / (in_features + out_features) as f32).sqrt();
+        let weight = Tensor::rand_f32(vec![in_features, out_features], -limit, limit, seed);
         let bias = if bias {
-            Some(Tensor::zeros(vec![out_features]))
+            Some(Tensor::zeros_f32(vec![out_features]))
         } else {
             None
         };
@@ -35,27 +35,27 @@ impl Linear {
         }
     }
 
-    pub fn forward_inference(&self, input: &[f64]) -> Vec<f64> {
+    pub fn forward_inference(&self, input: &[f32]) -> Vec<f32> {
         let mut out = Vec::new();
         self.forward_inference_into(input, &mut out);
         out
     }
 
-    pub fn forward_inference_into(&self, input: &[f64], out: &mut Vec<f64>) {
+    pub fn forward_inference_into(&self, input: &[f32], out: &mut Vec<f32>) {
         let in_dim = self.in_features;
         let out_dim = self.out_features;
         debug_assert!(
             in_dim > 0 && input.len().is_multiple_of(in_dim),
-            "forward_inference: input length {} is not divisible by in_features {}",
+            "forward_inference: input length {} is not divisible in_features {}",
             input.len(),
             in_dim
         );
         let num_rows = input.len() / in_dim;
-        out.resize(num_rows * out_dim, 0.0);
-        let w_data = self.weight.data_f64();
-        let b_data = self.bias.as_ref().map(|b| b.data_f64());
+        out.resize(num_rows * out_dim, 0.0f32);
+        let w_data = self.weight.data_f32();
+        let b_data = self.bias.as_ref().map(|b| b.data_f32());
 
-        use crate::simd::add_scaled_row;
+        use crate::simd::add_scaled_row_f32;
 
         // Disabled: nested parallelism causes thread pool oversubscription when called
         // from within an outer par_iter. External parallelism handles this better.
@@ -85,7 +85,7 @@ impl Linear {
                             }
                             let w_slice = &w_data
                                 [i * out_dim + col_start..i * out_dim + col_start + chunk.len()];
-                            add_scaled_row(chunk, w_slice, scale);
+                            add_scaled_row_f32(chunk, w_slice, scale);
                         }
                     });
             } else {
@@ -93,7 +93,7 @@ impl Linear {
                 if let Some(b) = &b_data {
                     out_row.copy_from_slice(b);
                 } else {
-                    out_row.fill(0.0);
+                    out_row.fill(0.0f32);
                 }
 
                 for i in 0..in_dim {
@@ -102,7 +102,7 @@ impl Linear {
                         continue;
                     }
                     let w_row = &w_data[i * out_dim..(i + 1) * out_dim];
-                    add_scaled_row(out_row, w_row, scale);
+                    add_scaled_row_f32(out_row, w_row, scale);
                 }
             }
         }
@@ -116,53 +116,6 @@ impl Linear {
         if let Some(ref mut b) = self.bias {
             if let Ok(t) = b.to_cuda() {
                 *b = t;
-            }
-        }
-    }
-
-    /// F32 inference path: reads F64 weights but computes in F32 without
-    /// allocating a temporary F32 weight copy. Useful for ACHF fast-path.
-    pub fn forward_inference_f32(&self, input: &[f32]) -> Vec<f32> {
-        let mut out = Vec::new();
-        self.forward_inference_into_f32(input, &mut out);
-        out
-    }
-
-    pub fn forward_inference_into_f32(&self, input: &[f32], out: &mut Vec<f32>) {
-        let in_dim = self.in_features;
-        let out_dim = self.out_features;
-        debug_assert!(
-            in_dim > 0 && input.len().is_multiple_of(in_dim),
-            "forward_inference_f32: input length {} is not divisible by in_features {}",
-            input.len(),
-            in_dim
-        );
-        let num_rows = input.len() / in_dim;
-        out.resize(num_rows * out_dim, 0.0f32);
-        let w_data = self.weight.data_f64();
-        let b_data = self.bias.as_ref().map(|b| b.data_f64());
-
-        for r in 0..num_rows {
-            let row_offset_in = r * in_dim;
-            let row_offset_out = r * out_dim;
-            let out_row = &mut out[row_offset_out..row_offset_out + out_dim];
-            if let Some(b) = &b_data {
-                for j in 0..out_dim {
-                    out_row[j] = b[j] as f32;
-                }
-            } else {
-                out_row.fill(0.0f32);
-            }
-
-            for i in 0..in_dim {
-                let scale = input[row_offset_in + i];
-                if scale == 0.0 {
-                    continue;
-                }
-                let w_row = &w_data[i * out_dim..(i + 1) * out_dim];
-                for j in 0..out_dim {
-                    out_row[j] += scale * w_row[j] as f32;
-                }
             }
         }
     }
@@ -243,39 +196,39 @@ impl Module for Linear {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RMSNorm {
     pub weight: Tensor,
-    pub eps: f64,
+    pub eps: f32,
     pub dim: usize,
 }
 
 impl RMSNorm {
-    pub fn new(dim: usize, eps: f64, _seed: u64) -> Self {
+    pub fn new(dim: usize, eps: f32, _seed: u64) -> Self {
         Self {
-            weight: Tensor::new(vec![1.0; dim], vec![dim]),
+            weight: Tensor::new_f32(vec![1.0; dim], vec![dim]),
             eps,
             dim,
         }
     }
 
-    pub fn forward_inference(&self, input: &[f64]) -> Vec<f64> {
+    pub fn forward_inference(&self, input: &[f32]) -> Vec<f32> {
         let mut out = Vec::new();
         self.forward_inference_into(input, &mut out);
         out
     }
 
-    pub fn forward_inference_into(&self, input: &[f64], out: &mut Vec<f64>) {
+    pub fn forward_inference_into(&self, input: &[f32], out: &mut Vec<f32>) {
         let dim = self.dim;
         let num_rows = input.len() / dim;
-        out.resize(input.len(), 0.0);
-        let w_data = self.weight.data_f64();
+        out.resize(input.len(), 0.0f32);
+        let w_data = self.weight.data_f32();
 
         for r in 0..num_rows {
             let base = r * dim;
-            let mut sum_sq = 0.0;
+            let mut sum_sq = 0.0f32;
             for i in 0..dim {
                 let val = input[base + i];
                 sum_sq += val * val;
             }
-            let rms = (sum_sq / dim as f64 + self.eps).sqrt();
+            let rms = (sum_sq / dim as f32 + self.eps).sqrt();
             for i in 0..dim {
                 out[base + i] = (input[base + i] / rms) * w_data[i];
             }
@@ -379,12 +332,12 @@ impl Module for RMSNorm {
             log::warn!("[RMSNorm] CUDA forward failed, falling back to CPU");
         }
 
-        let x_data = x.data_f64();
-        let w_data = self.weight.data_f64();
+        let x_data = x.data_to_f32_vec();
+        let w_data = self.weight.data_f32();
 
-        let mut out_data = vec![0.0; num_elements];
-        let mut rms_cache = vec![0.0; num_rows];
-        let mut x_hat_cache = vec![0.0; num_elements];
+        let mut out_data = vec![0.0f32; num_elements];
+        let mut rms_cache = vec![0.0f32; num_rows];
+        let mut x_hat_cache = vec![0.0f32; num_elements];
 
         out_data
             .par_chunks_mut(self.dim)
@@ -393,12 +346,12 @@ impl Module for RMSNorm {
             .enumerate()
             .for_each(|(r, ((out_row, x_hat_row), rms_ref))| {
                 let base = r * self.dim;
-                let mut sum_sq = 0.0;
+                let mut sum_sq = 0.0f32;
                 for i in 0..self.dim {
                     let val = x_data[base + i];
                     sum_sq += val * val;
                 }
-                let rms = (sum_sq / self.dim as f64 + self.eps).sqrt();
+                let rms = (sum_sq / self.dim as f32 + self.eps).sqrt();
                 *rms_ref = rms;
 
                 for i in 0..self.dim {
@@ -412,15 +365,16 @@ impl Module for RMSNorm {
         let parents = vec![x.clone(), self.weight.clone()];
         let dim = self.dim;
 
-        let rms_cache = Arc::new(rms_cache);
-        let x_hat_cache = Arc::new(x_hat_cache);
+        let rms_cache_f64: Arc<Vec<f64>> = Arc::new(rms_cache.iter().map(|&v| v as f64).collect());
+        let x_hat_cache_f64: Arc<Vec<f64>> =
+            Arc::new(x_hat_cache.iter().map(|&v| v as f64).collect());
 
         Tensor {
-            data: Storage::F64(Arc::new(RwLock::new(out_data))),
-            grad: Storage::zeros(num_elements, Tensor::grad_dtype_for(x.dtype)),
+            data: Storage::F32(Arc::new(RwLock::new(out_data))),
+            grad: Storage::zeros(num_elements, Tensor::grad_dtype_for(Dtype::F32)),
             shape: shape.clone(),
             device: x.device,
-            dtype: x.dtype,
+            dtype: Dtype::F32,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -428,9 +382,9 @@ impl Module for RMSNorm {
                     let x_in = &parents[0];
                     let w_in = &parents[1];
 
-                    let mut x_grad = x_in.grad_write_f64();
-                    let mut w_grad = w_in.grad_write_f64();
-                    let w_data = w_in.data_f64();
+                    let mut x_grad = x_in.grad_write_compat();
+                    let mut w_grad = w_in.grad_write_compat();
+                    let w_data = w_in.data_as_f64_vec();
 
                     // 1. Calculate dL/dx parallel over rows
                     x_grad
@@ -439,15 +393,15 @@ impl Module for RMSNorm {
                         .enumerate()
                         .for_each(|(r, (x_g_row, g_out_row))| {
                             let base = r * dim;
-                            let rms = rms_cache[r];
-                            let inv_rms = 1.0 / rms;
+                            let rms = rms_cache_f64[r];
+                            let inv_rms = 1.0f64 / rms;
 
-                            let mut dot_sum = 0.0;
+                            let mut dot_sum = 0.0f64;
                             for i in 0..dim {
                                 let g = g_out_row[i];
                                 let w = w_data[i];
                                 let dl_dxhat = g * w;
-                                dot_sum += dl_dxhat * x_hat_cache[base + i];
+                                dot_sum += dl_dxhat * x_hat_cache_f64[base + i];
                             }
 
                             let mean_dot = dot_sum / dim as f64;
@@ -456,7 +410,7 @@ impl Module for RMSNorm {
                                 let g = g_out_row[i];
                                 let w = w_data[i];
                                 let dl_dxhat = g * w;
-                                let x_hat = x_hat_cache[base + i];
+                                let x_hat = x_hat_cache_f64[base + i];
                                 x_g_row[i] += inv_rms * (dl_dxhat - x_hat * mean_dot);
                             }
                         });
@@ -466,10 +420,10 @@ impl Module for RMSNorm {
 
                     // Parallelize over dimension (feature)
                     w_grad.par_iter_mut().enumerate().for_each(|(i, wg)| {
-                        let mut sum = 0.0;
+                        let mut sum = 0.0f64;
                         for r in 0..num_rows {
                             let base = r * dim;
-                            sum += grad_out_f64[base + i] * x_hat_cache[base + i];
+                            sum += grad_out_f64[base + i] * x_hat_cache_f64[base + i];
                         }
                         *wg += sum;
                     });

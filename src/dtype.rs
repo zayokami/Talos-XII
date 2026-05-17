@@ -103,6 +103,17 @@ impl Storage {
         self.len() == 0
     }
 
+    /// Check if two storages point to the same underlying Arc (same buffer).
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Storage::F64(a), Storage::F64(b)) => Arc::ptr_eq(a, b),
+            (Storage::F32(a), Storage::F32(b)) => Arc::ptr_eq(a, b),
+            (Storage::BF16(a), Storage::BF16(b)) => Arc::ptr_eq(a, b),
+            (Storage::I8(a), Storage::I8(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
     /// Convert storage data to Vec<f64>, regardless of original dtype.
     pub fn to_f64_vec(&self) -> Vec<f64> {
         match self {

@@ -261,32 +261,6 @@ pub fn vector_fma(dst: &mut [f64], a: &[f64], b: &[f64]) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  Public API: vector_scale  —  row[i] *= scale
-// ═══════════════════════════════════════════════════════════════════════════
-
-#[inline(always)]
-pub fn vector_scale(row: &mut [f64], scale: f64) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        let t = tier::get();
-        unsafe {
-            if t >= tier::AVX512 {
-                vector_scale_avx512(row, scale);
-                return;
-            }
-            if t >= tier::AVX2 {
-                vector_scale_avx2(row, scale);
-                return;
-            }
-        }
-    }
-
-    for x in row.iter_mut() {
-        *x *= scale;
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
 //  Public API: vector_add  —  dst[i] = a[i] + b[i]
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -730,30 +704,6 @@ unsafe fn vector_fma_avx512(dst: &mut [f64], a: &[f64], b: &[f64]) {
 
     while i < len {
         *dst.get_unchecked_mut(i) += *a.get_unchecked(i) * *b.get_unchecked(i);
-        i += 1;
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn vector_scale_avx512(row: &mut [f64], scale: f64) {
-    let len = row.len();
-    let mut i = 0;
-    let sv = _mm512_set1_pd(scale);
-
-    while i + 16 <= len {
-        let ptr = row.as_mut_ptr().add(i);
-        _mm512_storeu_pd(ptr, _mm512_mul_pd(_mm512_loadu_pd(ptr), sv));
-        _mm512_storeu_pd(ptr.add(8), _mm512_mul_pd(_mm512_loadu_pd(ptr.add(8)), sv));
-        i += 16;
-    }
-    while i + 8 <= len {
-        let ptr = row.as_mut_ptr().add(i);
-        _mm512_storeu_pd(ptr, _mm512_mul_pd(_mm512_loadu_pd(ptr), sv));
-        i += 8;
-    }
-    while i < len {
-        *row.get_unchecked_mut(i) *= scale;
         i += 1;
     }
 }
@@ -1629,36 +1579,6 @@ unsafe fn vector_fma_avx2_fma(dst: &mut [f64], a: &[f64], b: &[f64]) {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn vector_scale_avx2(row: &mut [f64], scale: f64) {
-    let len = row.len();
-    let mut i = 0;
-    let scale_vec = _mm256_set1_pd(scale);
-
-    while i + 8 <= len {
-        let ptr = row.as_mut_ptr().add(i);
-        _mm256_storeu_pd(ptr, _mm256_mul_pd(_mm256_loadu_pd(ptr), scale_vec));
-        _mm256_storeu_pd(
-            ptr.add(4),
-            _mm256_mul_pd(_mm256_loadu_pd(ptr.add(4)), scale_vec),
-        );
-        i += 8;
-    }
-    while i + 4 <= len {
-        let ptr = row.as_mut_ptr().add(i);
-        let val = _mm256_loadu_pd(ptr);
-        let res = _mm256_mul_pd(val, scale_vec);
-        _mm256_storeu_pd(ptr, res);
-        i += 4;
-    }
-
-    while i < len {
-        *row.get_unchecked_mut(i) *= scale;
-        i += 1;
-    }
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 //  NEON Implementations (aarch64)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2108,4 +2028,66 @@ unsafe fn vector_gelu_neon(dst: &mut [f64], src: &[f64]) {
         dst[i] = 0.5 * x * (1.0 + inner.tanh());
         i += 1;
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  F32 Inference Paths (Scalar fallback; AVX paths TBD in follow-up)
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[inline(always)]
+pub fn add_scaled_row_f32(output: &mut [f32], row: &[f32], scale: f32) {
+    assert_eq!(output.len(), row.len(), "Dimension mismatch");
+    for i in 0..output.len() {
+        output[i] += scale * row[i];
+    }
+}
+
+#[inline(always)]
+pub fn vector_scale_f32(row: &mut [f32], scale: f32) {
+    for x in row.iter_mut() {
+        *x *= scale;
+    }
+}
+
+#[inline(always)]
+pub fn vector_add_f32(dst: &mut [f32], a: &[f32], b: &[f32]) {
+    let len = dst.len();
+    debug_assert!(len <= a.len() && len <= b.len());
+    for i in 0..len {
+        dst[i] = a[i] + b[i];
+    }
+}
+
+#[inline(always)]
+pub fn vector_gelu_f32(dst: &mut [f32], src: &[f32]) {
+    let len = dst.len();
+    debug_assert!(len <= src.len());
+    let sqrt_2_over_pi = (2.0f32 / std::f32::consts::PI).sqrt();
+    let c = 0.044715f32;
+    for i in 0..len {
+        let x = src[i];
+        let x3 = x * x * x;
+        let inner = sqrt_2_over_pi * (x + c * x3);
+        dst[i] = 0.5f32 * x * (1.0f32 + inner.tanh());
+    }
+}
+
+#[inline(always)]
+pub fn softmax_exp_sum_f32(row: &mut [f32]) -> f32 {
+    let len = row.len();
+    if len == 0 {
+        return 0.0f32;
+    }
+    let mut max_val = f32::NEG_INFINITY;
+    for &x in row.iter() {
+        if x > max_val {
+            max_val = x;
+        }
+    }
+    let mut sum = 0.0f32;
+    for x in row.iter_mut() {
+        *x = (*x - max_val).exp();
+        sum += *x;
+    }
+    sum
 }
