@@ -255,24 +255,60 @@ impl Module for RMSNorm {
 
         #[cfg(cuda)]
         if x.device == crate::autograd::Device::Cuda {
+            use crate::cuda::memory::CudaBuffer;
             if let Ok(d_x) = x.cuda_get_or_upload_buffer() {
                 if let Ok(d_weight) = self.weight.cuda_get_or_upload_buffer() {
-                    if let Ok(d_out) = crate::cuda::memory::alloc::<f64>(num_elements) {
+                    let out_dtype = x.dtype;
+                    let d_out = match out_dtype {
+                        Dtype::F32 => crate::cuda::memory::alloc::<f32>(num_elements)
+                            .ok()
+                            .map(CudaBuffer::F32),
+                        Dtype::F64 => crate::cuda::memory::alloc::<f64>(num_elements)
+                            .ok()
+                            .map(CudaBuffer::F64),
+                        _ => None,
+                    };
+                    if let Some(d_out) = d_out {
                         let d_out = std::sync::Arc::new(d_out);
-                        if crate::cuda::kernels::rmsnorm_forward(
-                            &d_x, &d_weight, &d_out, self.dim, self.eps, num_rows,
-                        )
-                        .is_ok()
-                        {
+                        let forward_ok = match (&*d_x, &*d_weight, &*d_out, out_dtype) {
+                            (
+                                CudaBuffer::F32(dx),
+                                CudaBuffer::F32(dw),
+                                CudaBuffer::F32(dout),
+                                Dtype::F32,
+                            ) => crate::cuda::kernels::rmsnorm_forward_f32(
+                                dx, dw, dout, self.dim, self.eps, num_rows,
+                            )
+                            .is_ok(),
+                            (
+                                CudaBuffer::F64(dx),
+                                CudaBuffer::F64(dw),
+                                CudaBuffer::F64(dout),
+                                Dtype::F64,
+                            ) => crate::cuda::kernels::rmsnorm_forward(
+                                dx,
+                                dw,
+                                dout,
+                                self.dim,
+                                self.eps as f64,
+                                num_rows,
+                            )
+                            .is_ok(),
+                            _ => false,
+                        };
+                        if forward_ok {
                             let parents = vec![x.clone(), self.weight.clone()];
                             let dim = self.dim;
                             let eps = self.eps;
                             let out = Tensor {
-                                data: Storage::F64(Arc::new(RwLock::new(vec![0.0; num_elements]))),
-                                grad: Storage::zeros(num_elements, Dtype::F64),
+                                data: Storage::zeros(num_elements, out_dtype),
+                                grad: Storage::zeros(
+                                    num_elements,
+                                    Tensor::grad_dtype_for(out_dtype),
+                                ),
                                 shape: shape.clone(),
                                 device: crate::autograd::Device::Cuda,
-                                dtype: Dtype::F64,
+                                dtype: out_dtype,
                                 _ctx: Some(Arc::new(Context {
                                     parents,
                                     backward_op: Box::new(move |grad_out, parents| {
@@ -281,39 +317,98 @@ impl Module for RMSNorm {
 
                                         #[cfg(cuda)]
                                         if x_in.device == crate::autograd::Device::Cuda {
-                                            let grad_out_f64 = grad_out.to_f64_vec();
-                                            if let Ok(d_grad_tmp) =
-                                                crate::cuda::memory::alloc_pooled::<f64>(
-                                                    grad_out_f64.len(),
-                                                )
-                                            {
-                                                let d_grad_tmp = std::sync::Arc::new(d_grad_tmp);
-                                                if crate::cuda::memory::copy_h2d(
-                                                    &d_grad_tmp,
-                                                    &grad_out_f64,
-                                                )
-                                                .is_ok()
-                                                {
-                                                    if let (Some(d_x), Some(d_weight)) = (
-                                                        x_in.cuda_cached_buffer(),
-                                                        w_in.cuda_cached_buffer(),
+                                            let d_grad_tmp = match grad_out.dtype() {
+                                                Dtype::F32 => {
+                                                    let host = grad_out.to_f32_vec();
+                                                    match crate::cuda::memory::alloc_pooled::<f32>(
+                                                        host.len(),
                                                     ) {
-                                                        if let Some(d_x_grad) =
-                                                            x_in.cuda_grad_ensure_buffer()
-                                                        {
-                                                            if let Some(d_w_grad) =
-                                                                w_in.cuda_grad_ensure_buffer()
+                                                        Ok(buf) => {
+                                                            if crate::cuda::memory::copy_h2d(
+                                                                &buf, &host,
+                                                            )
+                                                            .is_ok()
                                                             {
-                                                                let _ = crate::cuda::kernels::rmsnorm_backward(
-                                                                    &d_grad_tmp,
-                                                                    &d_x,
-                                                                    &d_weight,
-                                                                    &d_x_grad,
-                                                                    &d_w_grad,
-                                                                    dim,
-                                                                    eps,
-                                                                    num_rows,
-                                                                );
+                                                                Some(CudaBuffer::F32(buf))
+                                                            } else {
+                                                                None
+                                                            }
+                                                        }
+                                                        Err(_) => None,
+                                                    }
+                                                }
+                                                Dtype::F64 => {
+                                                    let host = grad_out.to_f64_vec();
+                                                    match crate::cuda::memory::alloc_pooled::<f64>(
+                                                        host.len(),
+                                                    ) {
+                                                        Ok(buf) => {
+                                                            if crate::cuda::memory::copy_h2d(
+                                                                &buf, &host,
+                                                            )
+                                                            .is_ok()
+                                                            {
+                                                                Some(CudaBuffer::F64(buf))
+                                                            } else {
+                                                                None
+                                                            }
+                                                        }
+                                                        Err(_) => None,
+                                                    }
+                                                }
+                                                _ => None,
+                                            };
+                                            if let Some(d_grad_tmp) = d_grad_tmp {
+                                                let d_grad_tmp = std::sync::Arc::new(d_grad_tmp);
+                                                if let (Some(d_x), Some(d_weight)) = (
+                                                    x_in.cuda_cached_buffer(),
+                                                    w_in.cuda_cached_buffer(),
+                                                ) {
+                                                    if let Some(d_x_grad) =
+                                                        x_in.cuda_grad_ensure_buffer()
+                                                    {
+                                                        if let Some(d_w_grad) =
+                                                            w_in.cuda_grad_ensure_buffer()
+                                                        {
+                                                            if grad_out.dtype() == Dtype::F32 {
+                                                                if let (
+                                                                    Some(g),
+                                                                    Some(xb),
+                                                                    Some(wb),
+                                                                    Some(xg),
+                                                                    Some(wg),
+                                                                ) = (
+                                                                    d_grad_tmp.as_f32(),
+                                                                    d_x.as_f32(),
+                                                                    d_weight.as_f32(),
+                                                                    d_x_grad.as_f32(),
+                                                                    d_w_grad.as_f32(),
+                                                                ) {
+                                                                    let _ = crate::cuda::kernels::rmsnorm_backward_f32(
+                                                                        g, xb, wb, xg, wg,
+                                                                        dim, eps, num_rows,
+                                                                    );
+                                                                }
+                                                            } else if grad_out.dtype() == Dtype::F64
+                                                            {
+                                                                if let (
+                                                                    Some(g),
+                                                                    Some(xb),
+                                                                    Some(wb),
+                                                                    Some(xg),
+                                                                    Some(wg),
+                                                                ) = (
+                                                                    d_grad_tmp.as_f64(),
+                                                                    d_x.as_f64(),
+                                                                    d_weight.as_f64(),
+                                                                    d_x_grad.as_f64(),
+                                                                    d_w_grad.as_f64(),
+                                                                ) {
+                                                                    let _ = crate::cuda::kernels::rmsnorm_backward(
+                                                                        g, xb, wb, xg, wg,
+                                                                        dim, eps as f64, num_rows,
+                                                                    );
+                                                                }
                                                             }
                                                         }
                                                     }

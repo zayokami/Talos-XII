@@ -117,4 +117,13 @@ inline dim3 compute_grid_2d(size_t rows, size_t cols, size_t block_rows = 16, si
     return grid;
 }
 
+// Negative infinity helper for templates
+template<typename T> __device__ inline T neg_inf();
+template<> __device__ inline float neg_inf<float>() {
+    return -__int_as_float(0x7f800000);
+}
+template<> __device__ inline double neg_inf<double>() {
+    return -__longlong_as_double(0x7ff0000000000000ULL);
+}
+
 #endif // COMMON_CU

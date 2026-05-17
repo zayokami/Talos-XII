@@ -1,6 +1,8 @@
 use crate::achf::{aggregate_cache_stats_iter, AchfCacheStats, AchfLayer};
 use crate::autograd::{Context, Tensor};
 use crate::config::{AchfConfig, Config};
+#[cfg(cuda)]
+use crate::dtype::Dtype;
 use crate::dtype::Storage;
 use crate::nn::{Linear, Module, RMSNorm};
 use rayon::prelude::*;
@@ -1892,12 +1894,11 @@ impl MultiHeadLatentAttention {
         seq: usize,
         dim_v: usize,
     ) -> Tensor {
-        use crate::cuda::kernels::attention_weighted_sum;
-        use crate::cuda::memory::{alloc, copy_d2h};
+        use crate::cuda::kernels::{attention_weighted_sum, attention_weighted_sum_f32};
+        use crate::cuda::memory::{alloc, copy_d2h, CudaBuffer};
 
-        let _p_len = probs.num_elements();
-        let _v_len = v.num_elements();
         let out_len = b * seq * dim_v;
+        let out_dtype = Tensor::binary_dtype(probs.dtype, v.dtype);
 
         // Upload to GPU
         let d_probs = match probs.cuda_get_or_upload_buffer() {
@@ -1914,27 +1915,56 @@ impl MultiHeadLatentAttention {
                 return self.batched_matmul_probs_v_cpu_fallback(probs, v, b, seq, dim_v);
             }
         };
-        let d_out = match alloc::<f64>(out_len) {
-            Ok(buf) => buf,
-            Err(err) => {
-                log::warn!("[MLA] CUDA alloc failed ({})", err);
+        let d_out = match out_dtype {
+            Dtype::F32 => alloc::<f32>(out_len).ok().map(CudaBuffer::F32),
+            Dtype::F64 => alloc::<f64>(out_len).ok().map(CudaBuffer::F64),
+            _ => None,
+        };
+        let d_out = match d_out {
+            Some(buf) => std::sync::Arc::new(buf),
+            None => {
+                log::warn!("[MLA] CUDA alloc failed");
                 return self.batched_matmul_probs_v_cpu_fallback(probs, v, b, seq, dim_v);
             }
         };
 
-        if let Err(err) = attention_weighted_sum(&d_probs, &d_v, &d_out, b, seq, dim_v) {
-            log::warn!("[MLA] CUDA attention_weighted_sum failed ({})", err);
+        let kernel_ok = match (out_dtype, &*d_probs, &*d_v, &*d_out) {
+            (Dtype::F32, CudaBuffer::F32(p), CudaBuffer::F32(vb), CudaBuffer::F32(o)) => {
+                attention_weighted_sum_f32(p, vb, o, b, seq, dim_v).is_ok()
+            }
+            (Dtype::F64, CudaBuffer::F64(p), CudaBuffer::F64(vb), CudaBuffer::F64(o)) => {
+                attention_weighted_sum(p, vb, o, b, seq, dim_v).is_ok()
+            }
+            _ => false,
+        };
+        if !kernel_ok {
+            log::warn!("[MLA] CUDA attention_weighted_sum failed");
             return self.batched_matmul_probs_v_cpu_fallback(probs, v, b, seq, dim_v);
         }
-
-        let d_out = Arc::new(d_out);
 
         // Copy result back to CPU for backward pass and tensor ops
-        let mut out_data = vec![0.0; out_len];
-        if let Err(err) = copy_d2h(&mut out_data, &d_out) {
-            log::warn!("[MLA] CUDA D2H copy failed ({})", err);
-            return self.batched_matmul_probs_v_cpu_fallback(probs, v, b, seq, dim_v);
-        }
+        let (storage, _out_data) = match (&*d_out, out_dtype) {
+            (CudaBuffer::F32(buf), Dtype::F32) => {
+                let mut data = vec![0.0f32; out_len];
+                if let Err(err) = copy_d2h(&mut data, buf) {
+                    log::warn!("[MLA] CUDA D2H copy failed ({})", err);
+                    return self.batched_matmul_probs_v_cpu_fallback(probs, v, b, seq, dim_v);
+                }
+                let out_f64: Vec<f64> = data.iter().map(|&v| v as f64).collect();
+                (Storage::from_f32_vec(data, out_dtype), out_f64)
+            }
+            (CudaBuffer::F64(buf), Dtype::F64) => {
+                let mut data = vec![0.0f64; out_len];
+                if let Err(err) = copy_d2h(&mut data, buf) {
+                    log::warn!("[MLA] CUDA D2H copy failed ({})", err);
+                    return self.batched_matmul_probs_v_cpu_fallback(probs, v, b, seq, dim_v);
+                }
+                (Storage::f64(data.clone()), data)
+            }
+            _ => {
+                return self.batched_matmul_probs_v_cpu_fallback(probs, v, b, seq, dim_v);
+            }
+        };
 
         // Store probs and v data for backward
         let p_data = probs.data_as_f64_vec();
@@ -1946,7 +1976,7 @@ impl MultiHeadLatentAttention {
         let parents = vec![probs.clone(), v.clone()];
         let out_dtype = Tensor::binary_dtype(probs.dtype, v.dtype);
         Tensor {
-            data: Storage::from_f64_vec(out_data, out_dtype),
+            data: storage,
             grad: Storage::zeros(out_len, Tensor::grad_dtype_for(out_dtype)),
             shape: vec![b, seq, dim_v],
             device: crate::autograd::Device::Cpu,

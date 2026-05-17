@@ -9,7 +9,7 @@ fn to_i32_len(op: &'static str, value: usize) -> CudaResult<i32> {
     i32::try_from(value).map_err(|_| CudaError::SizeOverflow {
         op,
         count: value,
-        elem_size: std::mem::size_of::<f64>(),
+        elem_size: 1,
     })
 }
 
@@ -914,6 +914,990 @@ pub fn sparse_matvec_bias(
     } else {
         Err(CudaError::Runtime {
             op: "cuda::kernels::sparse_matvec_bias",
+            code: status as u32,
+        })
+    }
+}
+
+// =============================================================================
+// F32 kernel wrappers
+// =============================================================================
+
+#[cfg(cuda)]
+pub fn relu_inplace_f32(data: &DevicePtr<f32>) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let size = to_i32_len("cuda::kernels::relu_inplace_f32(size)", data.len())?;
+    if size == 0 {
+        return Ok(());
+    }
+    let status = unsafe {
+        bindings::cuda_relu_f32(
+            std::ptr::null_mut(),
+            size,
+            data.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::relu_inplace_f32",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn gelu_inplace_f32(data: &DevicePtr<f32>) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let size = to_i32_len("cuda::kernels::gelu_inplace_f32(size)", data.len())?;
+    if size == 0 {
+        return Ok(());
+    }
+    let status = unsafe {
+        bindings::cuda_gelu_f32(
+            std::ptr::null_mut(),
+            size,
+            data.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::gelu_inplace_f32",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn softmax_inplace_f32(data: &DevicePtr<f32>, rows: usize, cols: usize) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let expected = rows.checked_mul(cols).ok_or(CudaError::SizeOverflow {
+        op: "cuda::kernels::softmax_inplace_f32(rows*cols)",
+        count: rows,
+        elem_size: cols,
+    })?;
+    if expected != data.len() {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::softmax_inplace_f32",
+            expected,
+            actual: data.len(),
+        });
+    }
+    validate_softmax_dims("cuda::kernels::softmax_inplace_f32", rows, cols)?;
+    if expected == 0 {
+        return Ok(());
+    }
+    let rows_i32 = to_i32_len("cuda::kernels::softmax_inplace_f32(rows)", rows)?;
+    let cols_i32 = to_i32_len("cuda::kernels::softmax_inplace_f32(cols)", cols)?;
+    let status = unsafe {
+        bindings::cuda_softmax_f32(
+            std::ptr::null_mut(),
+            rows_i32,
+            cols_i32,
+            data.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::softmax_inplace_f32",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn softmax_inplace_auto_f32(data: &DevicePtr<f32>, rows: usize, cols: usize) -> CudaResult<()> {
+    if rows <= SOFTMAX_SMALL_BATCH_THRESHOLD && rows > 1 {
+        softmax_small_batch_inplace_f32(data, rows, cols)
+    } else {
+        softmax_inplace_f32(data, rows, cols)
+    }
+}
+
+#[cfg(cuda)]
+pub fn softmax_small_batch_inplace_f32(
+    data: &DevicePtr<f32>,
+    rows: usize,
+    cols: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let expected = rows.checked_mul(cols).ok_or(CudaError::SizeOverflow {
+        op: "cuda::kernels::softmax_small_batch_inplace_f32(rows*cols)",
+        count: rows,
+        elem_size: cols,
+    })?;
+    if expected != data.len() {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::softmax_small_batch_inplace_f32",
+            expected,
+            actual: data.len(),
+        });
+    }
+    validate_softmax_dims("cuda::kernels::softmax_small_batch_inplace_f32", rows, cols)?;
+    if expected == 0 {
+        return Ok(());
+    }
+    let rows_i32 = to_i32_len("cuda::kernels::softmax_small_batch_inplace_f32(rows)", rows)?;
+    let cols_i32 = to_i32_len("cuda::kernels::softmax_small_batch_inplace_f32(cols)", cols)?;
+    let status = unsafe {
+        bindings::cuda_softmax_small_batch_f32(
+            std::ptr::null_mut(),
+            rows_i32,
+            cols_i32,
+            data.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::softmax_small_batch_inplace_f32",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn softmax_causal_inplace_f32(
+    data: &DevicePtr<f32>,
+    rows: usize,
+    cols: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let expected = rows.checked_mul(cols).ok_or(CudaError::SizeOverflow {
+        op: "cuda::kernels::softmax_causal_inplace_f32(rows*cols)",
+        count: rows,
+        elem_size: cols,
+    })?;
+    if expected != data.len() {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::softmax_causal_inplace_f32",
+            expected,
+            actual: data.len(),
+        });
+    }
+    validate_softmax_dims("cuda::kernels::softmax_causal_inplace_f32", rows, cols)?;
+    if expected == 0 {
+        return Ok(());
+    }
+    let rows_i32 = to_i32_len("cuda::kernels::softmax_causal_inplace_f32(rows)", rows)?;
+    let cols_i32 = to_i32_len("cuda::kernels::softmax_causal_inplace_f32(cols)", cols)?;
+    let status = unsafe {
+        bindings::cuda_softmax_causal_f32(
+            std::ptr::null_mut(),
+            rows_i32,
+            cols_i32,
+            data.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::softmax_causal_inplace_f32",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn log_softmax_f32(
+    logits: &DevicePtr<f32>,
+    out: &DevicePtr<f32>,
+    rows: usize,
+    cols: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let expected = rows.checked_mul(cols).ok_or(CudaError::SizeOverflow {
+        op: "cuda::kernels::log_softmax_f32(rows*cols)",
+        count: rows,
+        elem_size: cols,
+    })?;
+    if expected != logits.len() {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::log_softmax_f32(logits)",
+            expected,
+            actual: logits.len(),
+        });
+    }
+    if expected != out.len() {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::log_softmax_f32(out)",
+            expected,
+            actual: out.len(),
+        });
+    }
+    validate_softmax_dims("cuda::kernels::log_softmax_f32", rows, cols)?;
+    if expected == 0 {
+        return Ok(());
+    }
+    let rows_i32 = to_i32_len("cuda::kernels::log_softmax_f32(rows)", rows)?;
+    let cols_i32 = to_i32_len("cuda::kernels::log_softmax_f32(cols)", cols)?;
+    let status = unsafe {
+        bindings::cuda_log_softmax_f32(
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            rows_i32,
+            cols_i32,
+            logits.as_raw() as *mut std::os::raw::c_int,
+            out.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::log_softmax_f32",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn rope_inplace_f32(
+    data: &DevicePtr<f32>,
+    cos_cache: &DevicePtr<f32>,
+    sin_cache: &DevicePtr<f32>,
+    seq_len: usize,
+    dim: usize,
+    total_batches: usize,
+    start_pos: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let half_dim = dim / 2;
+    let expected_data_len = total_batches
+        .checked_mul(seq_len)
+        .and_then(|v| v.checked_mul(dim))
+        .ok_or(CudaError::SizeOverflow {
+            op: "cuda::kernels::rope_inplace_f32(data_len)",
+            count: total_batches,
+            elem_size: seq_len * dim,
+        })?;
+    if expected_data_len != data.len() {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::rope_inplace_f32(data)",
+            expected: expected_data_len,
+            actual: data.len(),
+        });
+    }
+    let expected_cache_len =
+        (seq_len + start_pos)
+            .checked_mul(half_dim)
+            .ok_or(CudaError::SizeOverflow {
+                op: "cuda::kernels::rope_inplace_f32(cache_len)",
+                count: seq_len + start_pos,
+                elem_size: half_dim,
+            })?;
+    if expected_cache_len > cos_cache.len() || expected_cache_len > sin_cache.len() {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::rope_inplace_f32(cache)",
+            expected: expected_cache_len,
+            actual: cos_cache.len().min(sin_cache.len()),
+        });
+    }
+    if !dim.is_multiple_of(2) {
+        return Err(CudaError::InvalidInput {
+            op: "cuda::kernels::rope_inplace_f32",
+            message: "dim must be even for RoPE",
+        });
+    }
+
+    let seq_len_i32 = to_i32_len("cuda::kernels::rope_inplace_f32(seq_len)", seq_len)?;
+    let dim_i32 = to_i32_len("cuda::kernels::rope_inplace_f32(dim)", dim)?;
+    let total_batches_i32 = to_i32_len(
+        "cuda::kernels::rope_inplace_f32(total_batches)",
+        total_batches,
+    )?;
+    let start_pos_i32 = to_i32_len("cuda::kernels::rope_inplace_f32(start_pos)", start_pos)?;
+
+    let status = unsafe {
+        bindings::cuda_rope_f32(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+            seq_len_i32,
+            dim_i32,
+            total_batches_i32,
+            start_pos_i32,
+            data.as_raw() as *mut std::os::raw::c_int,
+            cos_cache.as_raw() as *mut std::os::raw::c_int,
+            sin_cache.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::rope_inplace_f32",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn attention_weighted_sum_f32(
+    attn_weights: &DevicePtr<f32>,
+    values: &DevicePtr<f32>,
+    output: &DevicePtr<f32>,
+    rows: usize,
+    cols: usize,
+    head_dim: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+
+    let expected_attn_len = rows.checked_mul(cols).ok_or(CudaError::SizeOverflow {
+        op: "cuda::kernels::attention_weighted_sum_f32(attn_weights_len)",
+        count: rows,
+        elem_size: cols,
+    })?;
+    if expected_attn_len != attn_weights.len() {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::attention_weighted_sum_f32(attn_weights)",
+            expected: expected_attn_len,
+            actual: attn_weights.len(),
+        });
+    }
+
+    let expected_values_len = cols.checked_mul(head_dim).ok_or(CudaError::SizeOverflow {
+        op: "cuda::kernels::attention_weighted_sum_f32(values_len)",
+        count: cols,
+        elem_size: head_dim,
+    })?;
+    if expected_values_len != values.len() {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::attention_weighted_sum_f32(values)",
+            expected: expected_values_len,
+            actual: values.len(),
+        });
+    }
+
+    let expected_output_len = rows.checked_mul(head_dim).ok_or(CudaError::SizeOverflow {
+        op: "cuda::kernels::attention_weighted_sum_f32(output_len)",
+        count: rows,
+        elem_size: head_dim,
+    })?;
+    if expected_output_len != output.len() {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::attention_weighted_sum_f32(output)",
+            expected: expected_output_len,
+            actual: output.len(),
+        });
+    }
+
+    if cols == 0 || head_dim == 0 {
+        return Err(CudaError::InvalidInput {
+            op: "cuda::kernels::attention_weighted_sum_f32",
+            message: "cols and head_dim must be greater than zero",
+        });
+    }
+
+    let rows_i32 = to_i32_len("cuda::kernels::attention_weighted_sum_f32(rows)", rows)?;
+    let cols_i32 = to_i32_len("cuda::kernels::attention_weighted_sum_f32(cols)", cols)?;
+    let head_dim_i32 = to_i32_len(
+        "cuda::kernels::attention_weighted_sum_f32(head_dim)",
+        head_dim,
+    )?;
+
+    let status = unsafe {
+        bindings::cuda_attention_weighted_sum_f32(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            rows_i32,
+            cols_i32,
+            head_dim_i32,
+            attn_weights.as_raw() as *mut std::os::raw::c_int,
+            values.as_raw() as *mut std::os::raw::c_int,
+            output.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::attention_weighted_sum_f32",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn relu_backward_f32(
+    input: &DevicePtr<f32>,
+    grad_out: &DevicePtr<f32>,
+    input_grad: &DevicePtr<f32>,
+    size: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let size_i32 = to_i32_len("cuda::kernels::relu_backward_f32(size)", size)?;
+    if size == 0 {
+        return Ok(());
+    }
+    let status = unsafe {
+        crate::cuda::bindings::cuda_relu_backward_f32(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            size_i32,
+            input.as_raw() as *mut std::os::raw::c_int,
+            grad_out.as_raw() as *mut std::os::raw::c_int,
+            input_grad.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::relu_backward_f32",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn gelu_backward_f32(
+    input: &DevicePtr<f32>,
+    grad_out: &DevicePtr<f32>,
+    input_grad: &DevicePtr<f32>,
+    size: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let size_i32 = to_i32_len("cuda::kernels::gelu_backward_f32(size)", size)?;
+    if size == 0 {
+        return Ok(());
+    }
+    let status = unsafe {
+        crate::cuda::bindings::cuda_gelu_backward_f32(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            size_i32,
+            input.as_raw() as *mut std::os::raw::c_int,
+            grad_out.as_raw() as *mut std::os::raw::c_int,
+            input_grad.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::gelu_backward_f32",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn add_backward_f32(
+    grad_out: &DevicePtr<f32>,
+    a_grad: &DevicePtr<f32>,
+    b_grad: &DevicePtr<f32>,
+    size: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let size_i32 = to_i32_len("cuda::kernels::add_backward_f32(size)", size)?;
+    if size == 0 {
+        return Ok(());
+    }
+    let status = unsafe {
+        crate::cuda::bindings::cuda_add_backward_f32(
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            size_i32,
+            grad_out.as_raw() as *mut std::os::raw::c_int,
+            a_grad.as_raw() as *mut std::os::raw::c_int,
+            b_grad.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::add_backward_f32",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn mul_backward_f32(
+    grad_out: &DevicePtr<f32>,
+    a_data: &DevicePtr<f32>,
+    b_data: &DevicePtr<f32>,
+    a_grad: &DevicePtr<f32>,
+    b_grad: &DevicePtr<f32>,
+    size: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let size_i32 = to_i32_len("cuda::kernels::mul_backward_f32(size)", size)?;
+    if size == 0 {
+        return Ok(());
+    }
+    let status = unsafe {
+        crate::cuda::bindings::cuda_mul_backward_f32(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            size_i32,
+            grad_out.as_raw() as *mut std::os::raw::c_int,
+            a_data.as_raw() as *mut std::os::raw::c_int,
+            b_data.as_raw() as *mut std::os::raw::c_int,
+            a_grad.as_raw() as *mut std::os::raw::c_int,
+            b_grad.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::mul_backward_f32",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn acc_buffer_f32(dst: &DevicePtr<f32>, src: &DevicePtr<f32>, size: usize) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let size_i32 = to_i32_len("cuda::kernels::acc_buffer_f32(size)", size)?;
+    if size == 0 {
+        return Ok(());
+    }
+    let status = unsafe {
+        crate::cuda::bindings::cuda_acc_buffer_f32(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            size_i32,
+            dst.as_raw() as *mut std::os::raw::c_int,
+            src.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::acc_buffer_f32",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn add_forward_f32(
+    a: &DevicePtr<f32>,
+    b: &DevicePtr<f32>,
+    out: &DevicePtr<f32>,
+    size: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let size_i32 = to_i32_len("cuda::kernels::add_forward_f32(size)", size)?;
+    if size == 0 {
+        return Ok(());
+    }
+    let status = unsafe {
+        crate::cuda::bindings::cuda_add_forward_f32(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            size_i32,
+            a.as_raw() as *mut std::os::raw::c_int,
+            b.as_raw() as *mut std::os::raw::c_int,
+            out.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::add_forward_f32",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn sub_forward_f32(
+    a: &DevicePtr<f32>,
+    b: &DevicePtr<f32>,
+    out: &DevicePtr<f32>,
+    size: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let size_i32 = to_i32_len("cuda::kernels::sub_forward_f32(size)", size)?;
+    if size == 0 {
+        return Ok(());
+    }
+    let status = unsafe {
+        crate::cuda::bindings::cuda_sub_forward_f32(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            size_i32,
+            a.as_raw() as *mut std::os::raw::c_int,
+            b.as_raw() as *mut std::os::raw::c_int,
+            out.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::sub_forward_f32",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn mul_forward_f32(
+    a: &DevicePtr<f32>,
+    b: &DevicePtr<f32>,
+    out: &DevicePtr<f32>,
+    size: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let size_i32 = to_i32_len("cuda::kernels::mul_forward_f32(size)", size)?;
+    if size == 0 {
+        return Ok(());
+    }
+    let status = unsafe {
+        crate::cuda::bindings::cuda_mul_forward_f32(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            size_i32,
+            a.as_raw() as *mut std::os::raw::c_int,
+            b.as_raw() as *mut std::os::raw::c_int,
+            out.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::mul_forward_f32",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn div_forward_f32(
+    a: &DevicePtr<f32>,
+    b: &DevicePtr<f32>,
+    out: &DevicePtr<f32>,
+    size: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let size_i32 = to_i32_len("cuda::kernels::div_forward_f32(size)", size)?;
+    if size == 0 {
+        return Ok(());
+    }
+    let status = unsafe {
+        crate::cuda::bindings::cuda_div_forward_f32(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            size_i32,
+            a.as_raw() as *mut std::os::raw::c_int,
+            b.as_raw() as *mut std::os::raw::c_int,
+            out.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::div_forward_f32",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn adam_step_f32(
+    params: &DevicePtr<f32>,
+    grads: &DevicePtr<f32>,
+    m: &DevicePtr<f32>,
+    v: &DevicePtr<f32>,
+    size: usize,
+    lr: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    weight_decay: f32,
+    bias_correction1: f32,
+    bias_correction2: f32,
+    clip_coef: f32,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let size_i32 = to_i32_len("cuda::kernels::adam_step_f32(size)", size)?;
+    if size == 0 {
+        return Ok(());
+    }
+    let status = unsafe {
+        crate::cuda::bindings::cuda_adam_step_f32(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            size_i32,
+            lr,
+            beta1,
+            beta2,
+            eps,
+            weight_decay,
+            bias_correction1,
+            bias_correction2,
+            clip_coef,
+            params.as_raw() as *mut std::os::raw::c_int,
+            grads.as_raw() as *mut std::os::raw::c_int,
+            m.as_raw() as *mut std::os::raw::c_int,
+            v.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::adam_step_f32",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn rmsnorm_forward_f32(
+    x: &DevicePtr<f32>,
+    weight: &DevicePtr<f32>,
+    out: &DevicePtr<f32>,
+    dim: usize,
+    eps: f32,
+    num_rows: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let dim_i32 = to_i32_len("cuda::kernels::rmsnorm_forward_f32(dim)", dim)?;
+    let num_rows_i32 = to_i32_len("cuda::kernels::rmsnorm_forward_f32(num_rows)", num_rows)?;
+    let expected_len = num_rows.checked_mul(dim).ok_or(CudaError::SizeOverflow {
+        op: "cuda::kernels::rmsnorm_forward_f32(len)",
+        count: num_rows,
+        elem_size: dim,
+    })?;
+    if expected_len != x.len() {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::rmsnorm_forward_f32(x)",
+            expected: expected_len,
+            actual: x.len(),
+        });
+    }
+    if expected_len != out.len() {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::rmsnorm_forward_f32(out)",
+            expected: expected_len,
+            actual: out.len(),
+        });
+    }
+    if weight.len() != dim {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::rmsnorm_forward_f32(weight)",
+            expected: dim,
+            actual: weight.len(),
+        });
+    }
+    let status = unsafe {
+        crate::cuda::bindings::cuda_rmsnorm_forward_f32(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            dim_i32,
+            eps,
+            num_rows_i32,
+            x.as_raw() as *mut std::os::raw::c_int,
+            weight.as_raw() as *mut std::os::raw::c_int,
+            out.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::rmsnorm_forward_f32",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn rmsnorm_backward_f32(
+    grad_out: &DevicePtr<f32>,
+    x: &DevicePtr<f32>,
+    weight: &DevicePtr<f32>,
+    x_grad: &DevicePtr<f32>,
+    w_grad: &DevicePtr<f32>,
+    dim: usize,
+    eps: f32,
+    num_rows: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let dim_i32 = to_i32_len("cuda::kernels::rmsnorm_backward_f32(dim)", dim)?;
+    let num_rows_i32 = to_i32_len("cuda::kernels::rmsnorm_backward_f32(num_rows)", num_rows)?;
+    let expected_len = num_rows.checked_mul(dim).ok_or(CudaError::SizeOverflow {
+        op: "cuda::kernels::rmsnorm_backward_f32(len)",
+        count: num_rows,
+        elem_size: dim,
+    })?;
+    if expected_len != grad_out.len() {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::rmsnorm_backward_f32(grad_out)",
+            expected: expected_len,
+            actual: grad_out.len(),
+        });
+    }
+    if expected_len != x.len() {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::rmsnorm_backward_f32(x)",
+            expected: expected_len,
+            actual: x.len(),
+        });
+    }
+    if expected_len != x_grad.len() {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::rmsnorm_backward_f32(x_grad)",
+            expected: expected_len,
+            actual: x_grad.len(),
+        });
+    }
+    if weight.len() != dim {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::rmsnorm_backward_f32(weight)",
+            expected: dim,
+            actual: weight.len(),
+        });
+    }
+    if w_grad.len() != dim {
+        return Err(CudaError::SizeMismatch {
+            op: "cuda::kernels::rmsnorm_backward_f32(w_grad)",
+            expected: dim,
+            actual: w_grad.len(),
+        });
+    }
+    let status = unsafe {
+        crate::cuda::bindings::cuda_rmsnorm_backward_f32(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dim_i32,
+            eps,
+            num_rows_i32,
+            grad_out.as_raw() as *mut std::os::raw::c_int,
+            x.as_raw() as *mut std::os::raw::c_int,
+            weight.as_raw() as *mut std::os::raw::c_int,
+            x_grad.as_raw() as *mut std::os::raw::c_int,
+            w_grad.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::rmsnorm_backward_f32",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn sparse_matvec_f32(
+    x: &DevicePtr<f32>,
+    w: &DevicePtr<f32>,
+    mask: &DevicePtr<u8>,
+    y: &DevicePtr<f32>,
+    num_rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let num_rows_i32 = to_i32_len("cuda::kernels::sparse_matvec_f32(num_rows)", num_rows)?;
+    let in_dim_i32 = to_i32_len("cuda::kernels::sparse_matvec_f32(in_dim)", in_dim)?;
+    let out_dim_i32 = to_i32_len("cuda::kernels::sparse_matvec_f32(out_dim)", out_dim)?;
+    if num_rows == 0 || in_dim == 0 || out_dim == 0 {
+        return Ok(());
+    }
+    let status = unsafe {
+        bindings::cuda_sparse_matvec_f32(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            num_rows_i32,
+            in_dim_i32,
+            out_dim_i32,
+            x.as_raw() as *mut std::os::raw::c_int,
+            w.as_raw() as *mut std::os::raw::c_int,
+            mask.as_raw() as *mut std::os::raw::c_int,
+            y.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::sparse_matvec_f32",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn sparse_matvec_bias_f32(
+    x: &DevicePtr<f32>,
+    w: &DevicePtr<f32>,
+    mask: &DevicePtr<u8>,
+    bias: &DevicePtr<f32>,
+    y: &DevicePtr<f32>,
+    num_rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let num_rows_i32 = to_i32_len("cuda::kernels::sparse_matvec_bias_f32(num_rows)", num_rows)?;
+    let in_dim_i32 = to_i32_len("cuda::kernels::sparse_matvec_bias_f32(in_dim)", in_dim)?;
+    let out_dim_i32 = to_i32_len("cuda::kernels::sparse_matvec_bias_f32(out_dim)", out_dim)?;
+    if num_rows == 0 || in_dim == 0 || out_dim == 0 {
+        return Ok(());
+    }
+    let status = unsafe {
+        bindings::cuda_sparse_matvec_bias_f32(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            num_rows_i32,
+            in_dim_i32,
+            out_dim_i32,
+            x.as_raw() as *mut std::os::raw::c_int,
+            w.as_raw() as *mut std::os::raw::c_int,
+            mask.as_raw() as *mut std::os::raw::c_int,
+            bias.as_raw() as *mut std::os::raw::c_int,
+            y.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::sparse_matvec_bias_f32",
             code: status as u32,
         })
     }

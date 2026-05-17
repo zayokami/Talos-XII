@@ -585,8 +585,8 @@ impl Adam {
 #[cfg(cuda)]
 struct GpuAdam {
     params: Vec<Tensor>,
-    m: Vec<std::sync::Arc<crate::cuda::memory::DevicePtr<f64>>>,
-    v: Vec<std::sync::Arc<crate::cuda::memory::DevicePtr<f64>>>,
+    m: Vec<std::sync::Arc<crate::cuda::memory::CudaBuffer>>,
+    v: Vec<std::sync::Arc<crate::cuda::memory::CudaBuffer>>,
     t: usize,
     lr: f64,
     beta1: f64,
@@ -598,6 +598,7 @@ struct GpuAdam {
 #[cfg(cuda)]
 impl GpuAdam {
     fn new(params: Vec<Tensor>, lr: f64) -> Option<Self> {
+        use crate::cuda::memory::CudaBuffer;
         let mut m = Vec::with_capacity(params.len());
         let mut v = Vec::with_capacity(params.len());
         for p in &params {
@@ -605,11 +606,25 @@ impl GpuAdam {
             if p.device != crate::autograd::Device::Cuda {
                 return None;
             }
-            let d_m = crate::cuda::memory::alloc::<f64>(len).ok()?;
-            let d_v = crate::cuda::memory::alloc::<f64>(len).ok()?;
-            let zeros = vec![0.0_f64; len];
-            crate::cuda::memory::copy_h2d(&d_m, &zeros).ok()?;
-            crate::cuda::memory::copy_h2d(&d_v, &zeros).ok()?;
+            let (d_m, d_v) = match p.dtype {
+                crate::dtype::Dtype::F32 => {
+                    let dm = crate::cuda::memory::alloc::<f32>(len).ok()?;
+                    let dv = crate::cuda::memory::alloc::<f32>(len).ok()?;
+                    let zeros = vec![0.0f32; len];
+                    crate::cuda::memory::copy_h2d(&dm, &zeros).ok()?;
+                    crate::cuda::memory::copy_h2d(&dv, &zeros).ok()?;
+                    (CudaBuffer::F32(dm), CudaBuffer::F32(dv))
+                }
+                crate::dtype::Dtype::F64 => {
+                    let dm = crate::cuda::memory::alloc::<f64>(len).ok()?;
+                    let dv = crate::cuda::memory::alloc::<f64>(len).ok()?;
+                    let zeros = vec![0.0f64; len];
+                    crate::cuda::memory::copy_h2d(&dm, &zeros).ok()?;
+                    crate::cuda::memory::copy_h2d(&dv, &zeros).ok()?;
+                    (CudaBuffer::F64(dm), CudaBuffer::F64(dv))
+                }
+                _ => return None,
+            };
             m.push(std::sync::Arc::new(d_m));
             v.push(std::sync::Arc::new(d_v));
         }
@@ -627,6 +642,7 @@ impl GpuAdam {
     }
 
     fn step(&mut self) {
+        use crate::cuda::memory::CudaBuffer;
         self.t += 1;
         crate::cuda::record_optimizer_attempt();
         let mut total_norm = 0.0;
@@ -668,26 +684,57 @@ impl GpuAdam {
                     continue;
                 }
             };
-            let d_m = &self.m[i];
-            let d_v = &self.v[i];
+            let d_m = self.m[i].clone();
+            let d_v = self.v[i].clone();
 
-            if crate::cuda::kernels::adam_step(
-                &d_params,
-                &d_grads,
-                d_m,
-                d_v,
-                len,
-                self.lr,
-                self.beta1,
-                self.beta2,
-                self.eps,
-                self.weight_decay,
-                bias_correction1,
-                bias_correction2,
-                clip_coef,
-            )
-            .is_err()
-            {
+            let step_ok = match (param.dtype, &*d_params, &*d_grads, &*d_m, &*d_v) {
+                (
+                    crate::dtype::Dtype::F32,
+                    CudaBuffer::F32(p),
+                    CudaBuffer::F32(g),
+                    CudaBuffer::F32(mbuf),
+                    CudaBuffer::F32(vbuf),
+                ) => crate::cuda::kernels::adam_step_f32(
+                    p,
+                    g,
+                    mbuf,
+                    vbuf,
+                    len,
+                    self.lr as f32,
+                    self.beta1 as f32,
+                    self.beta2 as f32,
+                    self.eps as f32,
+                    self.weight_decay as f32,
+                    bias_correction1 as f32,
+                    bias_correction2 as f32,
+                    clip_coef as f32,
+                )
+                .is_ok(),
+                (
+                    crate::dtype::Dtype::F64,
+                    CudaBuffer::F64(p),
+                    CudaBuffer::F64(g),
+                    CudaBuffer::F64(mbuf),
+                    CudaBuffer::F64(vbuf),
+                ) => crate::cuda::kernels::adam_step(
+                    p,
+                    g,
+                    mbuf,
+                    vbuf,
+                    len,
+                    self.lr,
+                    self.beta1,
+                    self.beta2,
+                    self.eps,
+                    self.weight_decay,
+                    bias_correction1,
+                    bias_correction2,
+                    clip_coef,
+                )
+                .is_ok(),
+                _ => false,
+            };
+            if !step_ok {
                 crate::cuda::record_optimizer_fallback();
                 all_ok = false;
             }

@@ -24,6 +24,7 @@ static GPU_BUFFER_POOL: std::sync::LazyLock<Mutex<std::collections::HashMap<usiz
 const MAX_POOL_ENTRIES_PER_SIZE: usize = 8;
 
 /// Opaque CUDA memory pointer wrapper
+#[derive(Clone)]
 pub struct DevicePtr<T> {
     ptr: usize,
     size: usize,
@@ -72,6 +73,50 @@ impl<T> Drop for DevicePtr<T> {
                     eprintln!("[CUDA] cudaFree failed during drop: {}", result);
                 }
             }
+        }
+    }
+}
+
+/// Type-erased GPU buffer for mixed-dtype cache storage.
+#[derive(Clone)]
+pub enum CudaBuffer {
+    F32(DevicePtr<f32>),
+    F64(DevicePtr<f64>),
+}
+
+impl CudaBuffer {
+    pub fn len(&self) -> usize {
+        match self {
+            CudaBuffer::F32(b) => b.len(),
+            CudaBuffer::F64(b) => b.len(),
+        }
+    }
+
+    pub fn as_raw(&self) -> usize {
+        match self {
+            CudaBuffer::F32(b) => b.as_raw(),
+            CudaBuffer::F64(b) => b.as_raw(),
+        }
+    }
+
+    pub fn dtype(&self) -> crate::dtype::Dtype {
+        match self {
+            CudaBuffer::F32(_) => crate::dtype::Dtype::F32,
+            CudaBuffer::F64(_) => crate::dtype::Dtype::F64,
+        }
+    }
+
+    pub fn as_f32(&self) -> Option<&DevicePtr<f32>> {
+        match self {
+            CudaBuffer::F32(p) => Some(p),
+            CudaBuffer::F64(_) => None,
+        }
+    }
+
+    pub fn as_f64(&self) -> Option<&DevicePtr<f64>> {
+        match self {
+            CudaBuffer::F32(_) => None,
+            CudaBuffer::F64(p) => Some(p),
         }
     }
 }
@@ -336,6 +381,7 @@ pub unsafe fn copy_d2h_raw<T: Copy>(
 // =============================================================================
 
 #[cfg(not(cuda))]
+#[derive(Clone)]
 pub struct DevicePtr<T> {
     _phantom: std::marker::PhantomData<T>,
 }
