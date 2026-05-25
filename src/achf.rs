@@ -1,5 +1,6 @@
 use crate::autograd::Tensor;
 use crate::config::AchfConfig;
+use crate::dtype::{bf16, Dtype};
 use crate::nn::{Linear, Module};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -375,8 +376,10 @@ impl AchfLayer {
             return dense_out;
         }
         let sparse_out = self.sparse_weight.as_ref().unwrap().forward(input);
-        let g_t = Tensor::new(vec![g], vec![1]).broadcast(dense_out.shape.clone());
-        let og_t = Tensor::new(vec![1.0 - g], vec![1]).broadcast(sparse_out.shape.clone());
+        let g_t = Tensor::with_dtype(vec![g], vec![1], dense_out.dtype)
+            .broadcast(dense_out.shape.clone());
+        let og_t = Tensor::with_dtype(vec![1.0 - g], vec![1], sparse_out.dtype)
+            .broadcast(sparse_out.shape.clone());
         &(&dense_out * &g_t) + &(&sparse_out * &og_t)
     }
 
@@ -408,12 +411,12 @@ impl AchfLayer {
     #[allow(dead_code)]
     pub fn forward_residual(&self, x: &Tensor) -> Tensor {
         if !self.config.enabled {
-            return Tensor::zeros(x.shape.clone());
+            return Tensor::zeros_with_dtype(x.shape.clone(), x.dtype);
         }
         self.maybe_project();
         let g = self.compute_gate();
         if g <= 0.001 {
-            return Tensor::zeros(x.shape.clone());
+            return Tensor::zeros_with_dtype(x.shape.clone(), x.dtype);
         }
         self.forward_blend(x, g)
     }
@@ -585,11 +588,11 @@ impl AchfLayer {
         for i in 0..dim {
             id_data[i * dim + i] = 1.0;
         }
-        let id = Tensor::new(id_data, vec![dim, dim]);
+        let id = Tensor::with_dtype(id_data, vec![dim, dim], wtw.dtype);
         let diff = wtw - id;
         let sq = &diff * &diff;
         let mean = sq.mean();
-        let scale = Tensor::new(vec![self.config.lambda_ortho], vec![1]);
+        let scale = Tensor::with_dtype(vec![self.config.lambda_ortho], vec![1], mean.dtype);
         Some(mean * scale)
     }
 
@@ -628,7 +631,14 @@ impl AchfLayer {
         if !self.config.enabled {
             return;
         }
-        self.project_weight();
+        let already_bf16 = self.weight.weight.dtype == Dtype::BF16
+            || self
+                .sparse_weight
+                .as_ref()
+                .is_some_and(|s| s.weight.dtype == Dtype::BF16);
+        if !already_bf16 {
+            self.project_weight();
+        }
         self.prepare_inference_cache();
         let mut state = self.state.write().unwrap();
         state.freeze_projection = true;
@@ -754,10 +764,11 @@ impl AchfLayer {
     }
 
     fn project_rowcol(&self) {
-        let mut w = self.weight.weight.data_write_f32();
+        let mut w = self.weight.weight.data_to_f32_vec();
         let rows = self.weight.in_features;
         let cols = self.weight.out_features;
         rowcol_project(&mut w, rows, cols);
+        write_tensor_from_f32(&self.weight.weight, &w);
     }
 
     fn project_sinkhorn(&self) {
@@ -776,7 +787,7 @@ impl AchfLayer {
             .as_ref()
             .map(|v| v.iter().map(|&x| x as f32).collect::<Vec<f32>>());
         drop(cache);
-        let mut w = self.weight.weight.data_write_f32();
+        let mut w = self.weight.weight.data_to_f32_vec();
         let (new_row, new_col) = sinkhorn_project(
             &mut w,
             self.weight.in_features,
@@ -785,7 +796,7 @@ impl AchfLayer {
             row_scales_f32.as_deref(),
             col_scales_f32.as_deref(),
         );
-        drop(w);
+        write_tensor_from_f32(&self.weight.weight, &w);
         let mut cache = self.cache.write().unwrap();
         cache.sinkhorn_row_scales = Some(new_row.iter().map(|&x| x as f64).collect());
         cache.sinkhorn_col_scales = Some(new_col.iter().map(|&x| x as f64).collect());
@@ -798,6 +809,25 @@ impl AchfLayer {
         // Always copy dense weight as reference/teacher
         copy_linear(&mut self.weight, &other.weight);
         self.clear_cache();
+    }
+
+    pub fn to_inference_bf16(&self) -> Self {
+        let mut state = self.state.read().unwrap().clone();
+        state.freeze_projection = true;
+        let cache = default_cache();
+        {
+            let mut guard = cache.write().unwrap();
+            guard.adaptive_bias = self.config.cache_cost_bias;
+        }
+        Self {
+            weight: self.weight.to_inference_bf16(),
+            sparse_weight: self.sparse_weight.as_ref().map(Linear::to_inference_bf16),
+            sparse_mask: self.sparse_mask.clone(),
+            config: self.config.clone(),
+            state: Arc::new(RwLock::new(state)),
+            cache,
+            metrics: default_metrics(),
+        }
     }
 
     pub fn soft_update(&mut self, source: &AchfLayer, tau: f64) {
@@ -817,7 +847,7 @@ impl AchfLayer {
     /// elements below threshold. Idempotent (re-pruning overwrites).
     #[allow(dead_code)]
     pub fn prune(&mut self, threshold: f64) {
-        let w_data = self.weight.weight.data_f32();
+        let w_data = self.weight.weight.data_to_f32_vec();
         let threshold_f32 = threshold as f32;
         let pruned: Vec<f64> = w_data
             .iter()
@@ -833,10 +863,10 @@ impl AchfLayer {
             .iter()
             .map(|&v| if v.abs() < threshold_f32 { 0 } else { 1 })
             .collect();
-        drop(w_data);
-        let pruned_weight = Tensor::new_f32(
+        let pruned_weight = Tensor::with_dtype(
             pruned,
             vec![self.weight.in_features, self.weight.out_features],
+            self.weight.weight.dtype,
         );
         self.sparse_weight = Some(Linear {
             weight: pruned_weight,
@@ -908,9 +938,7 @@ impl AchfLayer {
         let sparse = self.sparse_weight.as_ref().unwrap();
         let in_dim = sparse.in_features;
         let out_dim = sparse.out_features;
-        let w_data = sparse.weight.data_f32();
-        let dense: Vec<f32> = w_data.iter().copied().collect();
-        drop(w_data);
+        let dense: Vec<f32> = sparse.weight.data_to_f32_vec();
         let mut cache = self.cache.write().unwrap();
         cache.dense = Some(dense);
         cache.in_dim = in_dim;
@@ -1261,17 +1289,122 @@ pub(crate) fn sinkhorn_project(
 }
 
 fn copy_linear(dst: &mut Linear, src: &Linear) {
-    let src_data = src.weight.data_f32().clone();
-    let mut dst_data = dst.weight.data_write_f32();
-    *dst_data = src_data;
+    copy_tensor(&dst.weight, &src.weight);
+    if let (Some(dst_bias), Some(src_bias)) = (&dst.bias, &src.bias) {
+        copy_tensor(dst_bias, src_bias);
+    }
 }
 
 fn soft_update_linear(dst: &mut Linear, src: &Linear, tau: f64) {
+    soft_update_tensor(&dst.weight, &src.weight, tau);
+    if let (Some(dst_bias), Some(src_bias)) = (&dst.bias, &src.bias) {
+        soft_update_tensor(dst_bias, src_bias, tau);
+    }
+}
+
+fn copy_tensor(dst: &Tensor, src: &Tensor) {
+    match (dst.dtype, src.dtype) {
+        (Dtype::F32, Dtype::F32) => {
+            let mut dst_data = dst.data_write_f32();
+            *dst_data = src.data_f32().clone();
+        }
+        (Dtype::BF16, Dtype::BF16) => {
+            let mut dst_data = dst.data_write_bf16();
+            *dst_data = src.data_bf16().clone();
+        }
+        (Dtype::F64, Dtype::F64) => {
+            let mut dst_data = dst.data_write_f64();
+            *dst_data = src.data_f64().clone();
+        }
+        _ => {
+            let data = src.data_as_f64_vec();
+            match dst.dtype {
+                Dtype::F32 => {
+                    let mut dst_data = dst.data_write_f32();
+                    *dst_data = data.iter().map(|&v| v as f32).collect();
+                }
+                Dtype::BF16 => {
+                    let mut dst_data = dst.data_write_bf16();
+                    *dst_data = data.iter().map(|&v| bf16::from_f64(v)).collect();
+                }
+                Dtype::F64 => {
+                    let mut dst_data = dst.data_write_f64();
+                    *dst_data = data;
+                }
+                Dtype::I8 => panic!("copy_tensor does not support I8 tensors"),
+            }
+        }
+    }
+}
+
+fn soft_update_tensor(dst: &Tensor, src: &Tensor, tau: f64) {
     let tau_f32 = tau as f32;
-    let mut t_data = dst.weight.data_write_f32();
-    let s_data = src.weight.data_f32();
-    for (t, s) in t_data.iter_mut().zip(s_data.iter()) {
-        *t = *t * (1.0 - tau_f32) + *s * tau_f32;
+    match (dst.dtype, src.dtype) {
+        (Dtype::F32, Dtype::F32) => {
+            let mut t_data = dst.data_write_f32();
+            let s_data = src.data_f32();
+            for (t, s) in t_data.iter_mut().zip(s_data.iter()) {
+                *t = *t * (1.0 - tau_f32) + *s * tau_f32;
+            }
+        }
+        (Dtype::BF16, Dtype::BF16) => {
+            let mut t_data = dst.data_write_bf16();
+            let s_data = src.data_bf16();
+            for (t, s) in t_data.iter_mut().zip(s_data.iter()) {
+                let tv = t.to_f32();
+                let sv = s.to_f32();
+                *t = bf16::from_f32(tv * (1.0 - tau_f32) + sv * tau_f32);
+            }
+        }
+        (Dtype::F64, Dtype::F64) => {
+            let mut t_data = dst.data_write_f64();
+            let s_data = src.data_f64();
+            for (t, s) in t_data.iter_mut().zip(s_data.iter()) {
+                *t = *t * (1.0 - tau) + *s * tau;
+            }
+        }
+        _ => {
+            let t_data = dst.data_as_f64_vec();
+            let s_data = src.data_as_f64_vec();
+            let blended: Vec<f64> = t_data
+                .iter()
+                .zip(s_data.iter())
+                .map(|(t, s)| t * (1.0 - tau) + s * tau)
+                .collect();
+            match dst.dtype {
+                Dtype::F32 => {
+                    let mut dst_data = dst.data_write_f32();
+                    *dst_data = blended.iter().map(|&v| v as f32).collect();
+                }
+                Dtype::BF16 => {
+                    let mut dst_data = dst.data_write_bf16();
+                    *dst_data = blended.iter().map(|&v| bf16::from_f64(v)).collect();
+                }
+                Dtype::F64 => {
+                    let mut dst_data = dst.data_write_f64();
+                    *dst_data = blended;
+                }
+                Dtype::I8 => panic!("soft_update_tensor does not support I8 tensors"),
+            }
+        }
+    }
+}
+
+fn write_tensor_from_f32(dst: &Tensor, data: &[f32]) {
+    match dst.dtype {
+        Dtype::F32 => {
+            let mut dst_data = dst.data_write_f32();
+            *dst_data = data.to_vec();
+        }
+        Dtype::BF16 => {
+            let mut dst_data = dst.data_write_bf16();
+            *dst_data = data.iter().map(|&v| bf16::from_f32(v)).collect();
+        }
+        Dtype::F64 => {
+            let mut dst_data = dst.data_write_f64();
+            *dst_data = data.iter().map(|&v| v as f64).collect();
+        }
+        Dtype::I8 => panic!("write_tensor_from_f32 does not support I8 tensors"),
     }
 }
 

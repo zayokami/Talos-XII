@@ -49,9 +49,9 @@ struct TrainingScratch {
 impl Default for TrainingScratch {
     fn default() -> Self {
         TrainingScratch {
-            old_log_prob: Tensor::zeros(vec![1]),
-            advantage: Tensor::zeros(vec![1]),
-            return_val: Tensor::zeros(vec![1]),
+            old_log_prob: Tensor::zeros_f32(vec![1]),
+            advantage: Tensor::zeros_f32(vec![1]),
+            return_val: Tensor::zeros_f32(vec![1]),
         }
     }
 }
@@ -232,6 +232,20 @@ impl ActorCritic {
         self.backbone.to_cuda();
         self.actor_head.to_cuda();
         self.critic_head.to_cuda();
+    }
+
+    pub fn to_inference_bf16(&self) -> Self {
+        Self {
+            backbone: self.backbone.to_inference_bf16(),
+            actor_head: self.actor_head.to_inference_bf16(),
+            critic_head: self.critic_head.to_inference_bf16(),
+        }
+    }
+
+    pub fn load_state_dict(&mut self, other: &Self) {
+        self.backbone.load_state_dict(&other.backbone);
+        self.actor_head.load_state_dict(&other.actor_head);
+        self.critic_head.load_state_dict(&other.critic_head);
     }
 
     pub fn update_achf_after_backward(&self) {
@@ -889,7 +903,7 @@ impl Ppo {
         let states: Vec<Tensor> = states_raw
             .into_iter()
             .zip(state_lens)
-            .map(|(data, seq_len)| Tensor::new(data, vec![seq_len, DIM]))
+            .map(|(data, seq_len)| Tensor::new_f32(data, vec![seq_len, DIM]))
             .collect();
         let mut advantages = vec![0.0; len];
         let mut returns = vec![0.0; len];
@@ -934,8 +948,8 @@ impl Ppo {
         // Target KL Divergence for Early Stopping
         let target_kl = 0.015;
         let mut indices: Vec<usize> = (0..len).collect();
-        let value_coef_tensor = Tensor::new(vec![VALUE_COEF], vec![1]);
-        let entropy_coef_tensor = Tensor::new(vec![ENTROPY_COEF], vec![1]);
+        let value_coef_tensor = Tensor::new_f32(vec![VALUE_COEF], vec![1]);
+        let entropy_coef_tensor = Tensor::new_f32(vec![ENTROPY_COEF], vec![1]);
         #[cfg(cuda)]
         let value_coef_tensor = match value_coef_tensor.to_cuda() {
             Ok(t) => t,
@@ -988,7 +1002,7 @@ impl Ppo {
                         batch_data.resize(batch_data.len() + (max_seq_len - seq_len) * DIM, 0.0);
                     }
                 }
-                let batch_states = Tensor::new(batch_data, vec![batch_len, max_seq_len, DIM]);
+                let batch_states = Tensor::new_f32(batch_data, vec![batch_len, max_seq_len, DIM]);
                 #[cfg(cuda)]
                 let batch_states = match batch_states.to_cuda() {
                     Ok(t) => t,
@@ -999,7 +1013,7 @@ impl Ppo {
                 let batch_log_probs = batch_logits.log_softmax();
                 let batch_log_probs_copy = batch_log_probs.clone();
                 let batch_probs = batch_log_probs_copy.exp();
-                let ones_action_1 = Tensor::new(vec![1.0; ACTION_SPACE], vec![ACTION_SPACE, 1]);
+                let ones_action_1 = Tensor::new_f32(vec![1.0; ACTION_SPACE], vec![ACTION_SPACE, 1]);
                 #[cfg(cuda)]
                 let ones_action_1 = match ones_action_1.to_cuda() {
                     Ok(t) => t,
@@ -1020,8 +1034,8 @@ impl Ppo {
                     None
                 };
 
-                let mut loss_accum = Tensor::zeros(vec![1]);
-                let mut distill_accum = Tensor::zeros(vec![1]);
+                let mut loss_accum = Tensor::zeros_f32(vec![1]);
+                let mut distill_accum = Tensor::zeros_f32(vec![1]);
                 #[cfg(cuda)]
                 {
                     loss_accum = match loss_accum.to_cuda() {
@@ -1095,7 +1109,7 @@ impl Ppo {
                     distill_accum = total_kl;
                 }
 
-                let batch_size_tensor = Tensor::new(vec![inv_batch], vec![1]);
+                let batch_size_tensor = Tensor::new_f32(vec![inv_batch], vec![1]);
                 #[cfg(cuda)]
                 let batch_size_tensor = match batch_size_tensor.to_cuda() {
                     Ok(t) => t,
@@ -1106,7 +1120,7 @@ impl Ppo {
                 if teacher_batch_logits.is_some()
                     && self.distill_update_counter >= self.distill_warmup_steps
                 {
-                    let distill_coef_tensor = Tensor::new(vec![self.distill_kl_coef], vec![1]);
+                    let distill_coef_tensor = Tensor::new_f32(vec![self.distill_kl_coef], vec![1]);
                     #[cfg(cuda)]
                     let distill_coef_tensor = match distill_coef_tensor.to_cuda() {
                         Ok(t) => t,
@@ -1821,14 +1835,18 @@ impl OnlinePpoTrainer {
     pub fn sync_to(&self, shared: &std::sync::RwLock<ActorCritic>) {
         for attempt in 0..3u64 {
             if let Ok(mut guard) = shared.try_write() {
-                *guard = self.ppo.policy.clone();
+                guard.load_state_dict(&self.ppo.policy);
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(1 + attempt));
         }
         if let Ok(mut guard) = shared.write() {
-            *guard = self.ppo.policy.clone();
+            guard.load_state_dict(&self.ppo.policy);
         }
+    }
+
+    pub fn policy(&self) -> &ActorCritic {
+        &self.ppo.policy
     }
 
     pub fn steps_done(&self) -> usize {

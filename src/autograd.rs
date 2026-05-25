@@ -80,9 +80,27 @@ impl Drop for Tensor {
     }
 }
 
-/// Batch lock acquisition helper for reducing lock overhead in parallel operations
+enum TensorReadData<'a> {
+    Borrowed(std::sync::RwLockReadGuard<'a, Vec<f64>>),
+    Owned(Vec<f64>),
+}
+
+impl<'a> std::ops::Deref for TensorReadData<'a> {
+    type Target = [f64];
+
+    fn deref(&self) -> &[f64] {
+        match self {
+            TensorReadData::Borrowed(guard) => guard,
+            TensorReadData::Owned(data) => data,
+        }
+    }
+}
+
+/// Batch read helper that exposes tensor data as f64 while preserving native
+/// storage for F32/BF16 tensors. F64 tensors are borrowed; lower-precision
+/// tensors are widened into an owned scratch buffer for compatibility.
 pub struct TensorReadGuard<'a> {
-    guards: Vec<std::sync::RwLockReadGuard<'a, Vec<f64>>>,
+    guards: Vec<TensorReadData<'a>>,
 }
 
 impl<'a> TensorReadGuard<'a> {
@@ -92,23 +110,25 @@ impl<'a> TensorReadGuard<'a> {
     pub fn new(tensors: &[&'a Tensor]) -> Self {
         let guards: Vec<_> = tensors
             .iter()
-            .map(|t| {
-                t.data_read_safe().unwrap_or_else(|| {
-                    log::warn!(
-                        target: "resilience",
-                        "TensorReadGuard: data lock poisoned, proceeding with possibly stale data"
-                    );
-                    // We still need a guard. In the poisoned case we recover the inner data
-                    // by ignoring the poison error. This is safe for neural-network weights.
-                    t.data_f64_poison_resilient()
-                })
+            .map(|t| match &t.data {
+                Storage::F64(v) => match v.read() {
+                    Ok(guard) => TensorReadData::Borrowed(guard),
+                    Err(poison) => {
+                        log::warn!(
+                            target: "resilience",
+                            "TensorReadGuard: data lock poisoned, recovering F64 data"
+                        );
+                        TensorReadData::Borrowed(poison.into_inner())
+                    }
+                },
+                _ => TensorReadData::Owned(t.data_as_f64_vec()),
             })
             .collect();
         TensorReadGuard { guards }
     }
 
     /// Get data by index
-    pub fn get(&self, idx: usize) -> &Vec<f64> {
+    pub fn get(&self, idx: usize) -> &[f64] {
         &self.guards[idx]
     }
 }
@@ -118,9 +138,9 @@ impl Serialize for Tensor {
     where
         S: Serializer,
     {
-        let data = self.data_f64();
+        let data = self.data_as_f64_vec();
         let mut state = serializer.serialize_struct("Tensor", 3)?;
-        state.serialize_field("data", &*data)?;
+        state.serialize_field("data", &data)?;
         state.serialize_field("shape", &self.shape)?;
         state.serialize_field("dtype", &self.dtype)?;
         state.end()
@@ -252,6 +272,11 @@ impl Tensor {
         Self::with_dtype(data, shape, Dtype::F32)
     }
 
+    /// Create a BF16 tensor from f64 data (auto-converts through f32).
+    pub fn new_bf16(data: Vec<f64>, shape: Vec<usize>) -> Self {
+        Self::with_dtype(data, shape, Dtype::BF16)
+    }
+
     /// Create a tensor with explicit dtype.
     pub fn with_dtype(data: Vec<f64>, shape: Vec<usize>, dtype: Dtype) -> Self {
         let len = data.len();
@@ -317,6 +342,11 @@ impl Tensor {
     /// Zeros with F32 dtype.
     pub fn zeros_f32(shape: Vec<usize>) -> Self {
         Self::zeros_with_dtype(shape, Dtype::F32)
+    }
+
+    /// Zeros with BF16 dtype.
+    pub fn zeros_bf16(shape: Vec<usize>) -> Self {
+        Self::zeros_with_dtype(shape, Dtype::BF16)
     }
 
     /// Zeros with explicit dtype.
@@ -400,6 +430,36 @@ impl Tensor {
         }
     }
 
+    /// Read BF16 data lock. Panics if not BF16 or poisoned.
+    #[inline]
+    pub fn data_bf16(&self) -> std::sync::RwLockReadGuard<'_, Vec<crate::dtype::bf16>> {
+        match &self.data {
+            Storage::BF16(v) => v.read().unwrap(),
+            _ => panic!("Expected BF16 storage, got {:?}", self.dtype),
+        }
+    }
+
+    /// Write BF16 data lock. Panics if not BF16 or poisoned.
+    #[inline]
+    pub fn data_write_bf16(&self) -> std::sync::RwLockWriteGuard<'_, Vec<crate::dtype::bf16>> {
+        match &self.data {
+            Storage::BF16(v) => v.write().unwrap(),
+            _ => panic!("Expected BF16 storage, got {:?}", self.dtype),
+        }
+    }
+
+    /// Return a detached copy of this tensor converted to `dtype`.
+    #[inline]
+    pub fn to_dtype(&self, dtype: Dtype) -> Self {
+        Tensor::with_dtype(self.data_as_f64_vec(), self.shape.clone(), dtype)
+    }
+
+    /// Return a detached BF16 copy of this tensor for inference/storage.
+    #[inline]
+    pub fn to_bf16(&self) -> Self {
+        self.to_dtype(Dtype::BF16)
+    }
+
     /// Read F64 data lock, returning `None` if poisoned.
     #[inline]
     pub fn data_read_safe(&self) -> Option<std::sync::RwLockReadGuard<'_, Vec<f64>>> {
@@ -444,13 +504,18 @@ impl Tensor {
         self.data.to_f32_vec()
     }
 
-    /// Output dtype for a binary op: match if same, otherwise promote to F64.
+    /// Output dtype for a binary op.
+    ///
+    /// F64 is preserved only when explicitly present. Mixed F32/BF16 compute
+    /// promotes to F32 so model paths do not silently fall back to F64.
     #[inline]
     pub fn binary_dtype(a: Dtype, b: Dtype) -> Dtype {
         if a == b {
             a
-        } else {
+        } else if a == Dtype::F64 || b == Dtype::F64 {
             Dtype::F64
+        } else {
+            Dtype::F32
         }
     }
 
@@ -3841,27 +3906,26 @@ impl Tensor {
         let total = weighted.sum();
         let w_sum = weights.sum();
 
-        let w_sum_data = w_sum.data_f64();
-        let denom = if w_sum_data[0].abs() < 1e-12 {
+        let out_dtype = Tensor::binary_dtype(self.dtype, target.dtype);
+        let out_dtype = Tensor::binary_dtype(out_dtype, weights.dtype);
+        let total_val = total.data_as_f64_vec()[0];
+        let w_sum_val = w_sum.data_as_f64_vec()[0];
+        let denom = if w_sum_val.abs() < 1e-12 {
             1.0
         } else {
-            w_sum_data[0]
+            w_sum_val
         };
-        drop(w_sum_data);
-
-        let total_data = total.data_f64();
-        let result_val = total_data[0] / denom;
-        drop(total_data);
+        let result_val = total_val / denom;
 
         let parents = vec![total.clone(), w_sum.clone()];
         let denom_cap = denom;
         let numerator_cap = result_val;
         Tensor {
-            data: Storage::F64(Arc::new(RwLock::new(vec![result_val]))),
-            grad: Storage::zeros(1, Tensor::grad_dtype_for(Dtype::F64)),
+            data: Storage::from_f64_vec(vec![result_val], out_dtype),
+            grad: Storage::zeros(1, Tensor::grad_dtype_for(out_dtype)),
             shape: vec![1],
             device: Device::Cpu,
-            dtype: Dtype::F64,
+            dtype: out_dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -6628,6 +6692,20 @@ mod tests {
     }
 
     #[test]
+    fn test_bf16_serde_roundtrip_preserves_dtype() {
+        let tensor = Tensor::new_bf16(vec![1.25, -2.5, 3.5], vec![3]);
+        let buf = crate::binary_codec::to_vec(&tensor).unwrap();
+        let decoded: Tensor = crate::binary_codec::from_slice(&buf).unwrap();
+
+        assert_eq!(decoded.dtype, Dtype::BF16);
+        assert_eq!(decoded.shape, vec![3]);
+        let data = decoded.data_to_f32_vec();
+        assert!((data[0] - 1.25).abs() < 0.01);
+        assert!((data[1] + 2.5).abs() < 0.01);
+        assert!((data[2] - 3.5).abs() < 0.01);
+    }
+
+    #[test]
     fn test_log_softmax_dim_zero_normalization() {
         let t = Tensor::new_f32(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
         let out = t.log_softmax_dim(0);
@@ -6923,12 +7001,22 @@ mod tests {
     }
 
     #[test]
-    fn test_mixed_dtype_promotes_to_f64() {
+    fn test_mixed_dtype_with_f64_promotes_to_f64() {
         let a = Tensor::with_dtype(vec![1.0, 2.0], vec![2], Dtype::F32);
         let b = Tensor::with_dtype(vec![3.0, 4.0], vec![2], Dtype::F64);
 
         let c = &a + &b;
         assert_eq!(c.dtype, Dtype::F64);
+        assert_eq!(c.data_as_f64_vec(), vec![4.0, 6.0]);
+    }
+
+    #[test]
+    fn test_mixed_f32_bf16_promotes_to_f32() {
+        let a = Tensor::with_dtype(vec![1.0, 2.0], vec![2], Dtype::F32);
+        let b = Tensor::with_dtype(vec![3.0, 4.0], vec![2], Dtype::BF16);
+
+        let c = &a + &b;
+        assert_eq!(c.dtype, Dtype::F32);
         assert_eq!(c.data_as_f64_vec(), vec![4.0, 6.0]);
     }
 

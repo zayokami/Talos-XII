@@ -146,12 +146,12 @@ impl DuelingQNetwork {
             // val is (B, 1). Expand to (B, 5).
             // Multiply by ones(1, 5) -> (B, 5)
             // MatMul: (B, 1) x (1, 5) -> (B, 5)
-            let ones_1_5 = Tensor::new(vec![1.0; 5], vec![1, 5]);
+            let ones_1_5 = Tensor::new_f32(vec![1.0; 5], vec![1, 5]);
             let val_expanded = val.matmul(&ones_1_5);
 
             // Mean Adv: (B, 5) -> (B, 1)
             // Multiply by ones(5, 1) / 5.0
-            let ones_5_1 = Tensor::new(vec![0.2; 5], vec![5, 1]); // 1/5 = 0.2
+            let ones_5_1 = Tensor::new_f32(vec![0.2; 5], vec![5, 1]); // 1/5 = 0.2
             let mean_adv = adv.matmul(&ones_5_1); // (B, 1)
             let mean_adv_expanded = mean_adv.matmul(&ones_1_5); // (B, 5)
 
@@ -223,6 +223,17 @@ impl DuelingQNetwork {
             .and_then(|achf| achf.orthogonal_penalty())
     }
 
+    pub fn to_inference_bf16(&self) -> Self {
+        let mut out = self.clone();
+        out.l1 = self.l1.to_inference_bf16();
+        out.l2 = self.l2.to_inference_bf16();
+        out.l3 = self.l3.to_inference_bf16();
+        out.val_head = self.val_head.to_inference_bf16();
+        out.adv_head = self.adv_head.to_inference_bf16();
+        out.achf = self.achf.as_ref().map(AchfLayer::to_inference_bf16);
+        out
+    }
+
     // Copy weights
     pub fn load_state_dict(&mut self, other: &Self) {
         fn copy_tensor(dst: &mut Tensor, src: &Tensor) {
@@ -230,6 +241,11 @@ impl DuelingQNetwork {
                 (crate::dtype::Dtype::F32, crate::dtype::Dtype::F32) => {
                     let src_data = src.data_f32().clone();
                     let mut dst_data = dst.data_write_f32();
+                    *dst_data = src_data;
+                }
+                (crate::dtype::Dtype::BF16, crate::dtype::Dtype::BF16) => {
+                    let src_data = src.data_bf16().clone();
+                    let mut dst_data = dst.data_write_bf16();
                     *dst_data = src_data;
                 }
                 (crate::dtype::Dtype::F64, crate::dtype::Dtype::F64) => {
@@ -242,6 +258,12 @@ impl DuelingQNetwork {
                     if dst.dtype == crate::dtype::Dtype::F32 {
                         let mut dst_data = dst.data_write_f32();
                         *dst_data = src_data.iter().map(|&v| v as f32).collect();
+                    } else if dst.dtype == crate::dtype::Dtype::BF16 {
+                        let mut dst_data = dst.data_write_bf16();
+                        *dst_data = src_data
+                            .iter()
+                            .map(|&v| crate::dtype::bf16::from_f64(v))
+                            .collect();
                     } else {
                         let mut dst_data = dst.data_write_f64();
                         *dst_data = src_data;
@@ -278,6 +300,15 @@ impl DuelingQNetwork {
                         *t = *t * (1.0 - tau_f32) + *s * tau_f32;
                     }
                 }
+                (crate::dtype::Dtype::BF16, crate::dtype::Dtype::BF16) => {
+                    let mut t_data = target.data_write_bf16();
+                    let s_data = source.data_bf16();
+                    for (t, s) in t_data.iter_mut().zip(s_data.iter()) {
+                        let tv = t.to_f32();
+                        let sv = s.to_f32();
+                        *t = crate::dtype::bf16::from_f32(tv * (1.0 - tau_f32) + sv * tau_f32);
+                    }
+                }
                 (crate::dtype::Dtype::F64, crate::dtype::Dtype::F64) => {
                     let mut t_data = target.data_write_f64();
                     let s_data = source.data_f64();
@@ -296,6 +327,12 @@ impl DuelingQNetwork {
                     if target.dtype == crate::dtype::Dtype::F32 {
                         let mut dst = target.data_write_f32();
                         *dst = new_data.iter().map(|&v| v as f32).collect();
+                    } else if target.dtype == crate::dtype::Dtype::BF16 {
+                        let mut dst = target.data_write_bf16();
+                        *dst = new_data
+                            .iter()
+                            .map(|&v| crate::dtype::bf16::from_f64(v))
+                            .collect();
                     } else {
                         let mut dst = target.data_write_f64();
                         *dst = new_data;
@@ -1045,7 +1082,7 @@ fn train_dqn_impl(
 
     // Pre-allocated scratch buffers to avoid per-step heap allocations
     let mut scratch = DqnTrainerScratch::new();
-    let ones_5_1 = Tensor::new(ONES_5_1_DATA.to_vec(), vec![5, 1]);
+    let ones_5_1 = Tensor::new_f32(ONES_5_1_DATA.to_vec(), vec![5, 1]);
     #[cfg(cuda)]
     let ones_5_1 = match ones_5_1.to_cuda() {
         Ok(t) => t,
@@ -1070,7 +1107,7 @@ fn train_dqn_impl(
         )
         .to_vec();
 
-        let current_state_tensor = Tensor::new(current_state_raw.clone(), vec![DIM]);
+        let current_state_tensor = Tensor::new_f32(current_state_raw.clone(), vec![DIM]);
 
         // 2. Select Action
         let action = if rng.next_f64() < epsilon {
@@ -1199,15 +1236,15 @@ fn train_dqn_impl(
                 scratch.dones_vec.push(if exp.done { 1.0 } else { 0.0 });
             }
 
-            let batch_state = Tensor::new(
+            let batch_state = Tensor::new_f32(
                 std::mem::take(&mut scratch.states_vec),
                 vec![BATCH_SIZE, DIM],
             );
-            let batch_next_state = Tensor::new(
+            let batch_next_state = Tensor::new_f32(
                 std::mem::take(&mut scratch.next_states_vec),
                 vec![BATCH_SIZE, DIM],
             );
-            let batch_mask = Tensor::new(
+            let batch_mask = Tensor::new_f32(
                 std::mem::take(&mut scratch.actions_vec),
                 vec![BATCH_SIZE, ACTION_SPACE],
             );
@@ -1272,13 +1309,14 @@ fn train_dqn_impl(
                 scratch.target_vals.push(target);
             }
 
-            let target_tensor = Tensor::new(
+            let target_tensor = Tensor::new_f32(
                 std::mem::take(&mut scratch.target_vals),
                 vec![BATCH_SIZE, 1],
             );
 
             // IS-weighted loss: w_i * (q - target)^2, normalized
-            let is_weights_tensor = Tensor::new(per_sample.is_weights.clone(), vec![BATCH_SIZE, 1]);
+            let is_weights_tensor =
+                Tensor::new_f32(per_sample.is_weights.clone(), vec![BATCH_SIZE, 1]);
             #[cfg(cuda)]
             let target_tensor = match target_tensor.to_cuda() {
                 Ok(t) => t,
@@ -1534,10 +1572,10 @@ impl OnlineDqnTrainer {
                 .push(if exp.done { 1.0 } else { 0.0 });
         }
 
-        let batch_state = Tensor::new(self.scratch.states_vec.clone(), vec![BATCH_SIZE, DIM]);
+        let batch_state = Tensor::new_f32(self.scratch.states_vec.clone(), vec![BATCH_SIZE, DIM]);
         let batch_next_state =
-            Tensor::new(self.scratch.next_states_vec.clone(), vec![BATCH_SIZE, DIM]);
-        let batch_mask = Tensor::new(
+            Tensor::new_f32(self.scratch.next_states_vec.clone(), vec![BATCH_SIZE, DIM]);
+        let batch_mask = Tensor::new_f32(
             self.scratch.actions_vec.clone(),
             vec![BATCH_SIZE, ACTION_SPACE],
         );
@@ -1558,7 +1596,7 @@ impl OnlineDqnTrainer {
         };
 
         let q_values = self.policy.forward(&batch_state);
-        let ones_5_1 = Tensor::new(ONES_5_1_DATA.to_vec(), vec![5, 1]);
+        let ones_5_1 = Tensor::new_f32(ONES_5_1_DATA.to_vec(), vec![5, 1]);
         #[cfg(cuda)]
         let ones_5_1 = match ones_5_1.to_cuda() {
             Ok(t) => t,
@@ -1592,8 +1630,8 @@ impl OnlineDqnTrainer {
             let target = r + GAMMA * next_q_val * (1.0 - d);
             self.scratch.target_vals.push(target);
         }
-        let target_tensor = Tensor::new(self.scratch.target_vals.clone(), vec![BATCH_SIZE, 1]);
-        let is_weights_tensor = Tensor::new(per_sample.is_weights.clone(), vec![BATCH_SIZE, 1]);
+        let target_tensor = Tensor::new_f32(self.scratch.target_vals.clone(), vec![BATCH_SIZE, 1]);
+        let is_weights_tensor = Tensor::new_f32(per_sample.is_weights.clone(), vec![BATCH_SIZE, 1]);
         #[cfg(cuda)]
         let target_tensor = match target_tensor.to_cuda() {
             Ok(t) => t,
@@ -1641,6 +1679,10 @@ impl OnlineDqnTrainer {
         if let Ok(mut guard) = shared.write() {
             guard.load_state_dict(&self.policy);
         }
+    }
+
+    pub fn policy(&self) -> &DuelingQNetwork {
+        &self.policy
     }
 
     pub fn steps_done(&self) -> usize {

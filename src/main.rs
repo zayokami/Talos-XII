@@ -62,6 +62,10 @@ use trainer::{
 };
 
 const NEURAL_CACHE_PATH: &str = "neural.cache";
+const DQN_MASTER_CACHE_PATH: &str = "dqn.cache";
+const DQN_INFERENCE_CACHE_PATH: &str = "dqn.cache.bf16";
+const PPO_MASTER_CACHE_PATH: &str = "ppo.cache";
+const PPO_INFERENCE_CACHE_PATH: &str = "ppo.cache.bf16";
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -248,6 +252,48 @@ fn resolve_ppo_online_train_params(config: &Config) -> (usize, usize) {
         128
     };
     (k_epochs, batch_size)
+}
+
+fn is_inference_cache_fresh(master_path: &str, inference_path: &str) -> bool {
+    let master_bin = format!("{}.bin", master_path);
+    let inference_bin = format!("{}.bin", inference_path);
+    let Ok(master_modified) = std::fs::metadata(master_bin).and_then(|m| m.modified()) else {
+        return false;
+    };
+    let Ok(inference_modified) = std::fs::metadata(inference_bin).and_then(|m| m.modified()) else {
+        return false;
+    };
+    inference_modified >= master_modified
+}
+
+fn prepare_dqn_inference_cache(master: &DuelingQNetwork, force_refresh: bool) -> DuelingQNetwork {
+    if !force_refresh && is_inference_cache_fresh(DQN_MASTER_CACHE_PATH, DQN_INFERENCE_CACHE_PATH) {
+        if let Some(cached) = load_model::<DuelingQNetwork>(DQN_INFERENCE_CACHE_PATH, "DQN BF16") {
+            cached.freeze_achf_for_inference();
+            info!("[DQN] BF16 inference cache loaded.");
+            return cached;
+        }
+    }
+
+    let bf16 = master.to_inference_bf16();
+    bf16.freeze_achf_for_inference();
+    save_model(&bf16, DQN_INFERENCE_CACHE_PATH, "DQN BF16");
+    bf16
+}
+
+fn prepare_ppo_inference_cache(master: &ActorCritic, force_refresh: bool) -> ActorCritic {
+    if !force_refresh && is_inference_cache_fresh(PPO_MASTER_CACHE_PATH, PPO_INFERENCE_CACHE_PATH) {
+        if let Some(cached) = load_model::<ActorCritic>(PPO_INFERENCE_CACHE_PATH, "PPO BF16") {
+            cached.freeze_achf_for_inference();
+            info!("[PPO] BF16 inference cache loaded.");
+            return cached;
+        }
+    }
+
+    let bf16 = master.to_inference_bf16();
+    bf16.freeze_achf_for_inference();
+    save_model(&bf16, PPO_INFERENCE_CACHE_PATH, "PPO BF16");
+    bf16
 }
 
 fn default_pool_index(config: &Config) -> usize {
@@ -606,29 +652,38 @@ fn initialize_system(
     }
 
     // DQN
-    let dqn_policy = if config.online_train && config.online_train_dqn {
-        DuelingQNetwork::new_with_config(&config, rng.next_u64())
-    } else if !args.force {
-        if let Some(cached) = load_model::<DuelingQNetwork>("dqn.cache", "DQN") {
+    let dqn_master = if !args.force {
+        if let Some(cached) = load_model::<DuelingQNetwork>(DQN_MASTER_CACHE_PATH, "DQN") {
             cached.freeze_achf_for_inference();
             info!("[DQN] Cached model loaded.");
             cached
+        } else if config.online_train && config.online_train_dqn {
+            info!("[DQN] Initializing online training model...");
+            let d = DuelingQNetwork::new_with_config(&config, rng.next_u64());
+            save_model(&d, DQN_MASTER_CACHE_PATH, "DQN");
+            d
         } else {
             info!("[DQN] Training new model...");
             let d = train_dqn(&trained_neural_opt, &mut rng, &env_net, &config);
-            save_model(&d, "dqn.cache", "DQN");
+            save_model(&d, DQN_MASTER_CACHE_PATH, "DQN");
             d
         }
+    } else if config.online_train && config.online_train_dqn {
+        info!("[DQN] Force initializing online training model...");
+        let d = DuelingQNetwork::new_with_config(&config, rng.next_u64());
+        save_model(&d, DQN_MASTER_CACHE_PATH, "DQN");
+        d
     } else {
         info!("[DQN] Force training new model...");
         let d = train_dqn(&trained_neural_opt, &mut rng, &env_net, &config);
-        save_model(&d, "dqn.cache", "DQN");
+        save_model(&d, DQN_MASTER_CACHE_PATH, "DQN");
         d
     };
+    let dqn_policy = prepare_dqn_inference_cache(&dqn_master, args.force);
 
     // PPO
-    let ppo_policy = if !args.force {
-        if let Some(cached) = load_model::<ActorCritic>("ppo.cache", "PPO") {
+    let ppo_master = if !args.force {
+        if let Some(cached) = load_model::<ActorCritic>(PPO_MASTER_CACHE_PATH, "PPO") {
             cached.freeze_achf_for_inference();
             info!("[PPO] Cached model loaded.");
             cached
@@ -636,16 +691,17 @@ fn initialize_system(
             info!("[PPO] Training new model...");
             let p = train_ppo(&mut rng, &env_net, &config);
             println!("[PPO] Saving model...");
-            save_model(&p, "ppo.cache", "PPO");
+            save_model(&p, PPO_MASTER_CACHE_PATH, "PPO");
             p
         }
     } else {
         info!("[PPO] Force training new model...");
         let p = train_ppo(&mut rng, &env_net, &config);
         println!("[PPO] Saving model...");
-        save_model(&p, "ppo.cache", "PPO");
+        save_model(&p, PPO_MASTER_CACHE_PATH, "PPO");
         p
     };
+    let ppo_policy = prepare_ppo_inference_cache(&ppo_master, args.force);
 
     (
         config,
@@ -953,6 +1009,14 @@ fn run_interactive(args: RunInteractiveArgs) {
     let dqn_shared = Arc::new(RwLock::new(dqn_policy.clone()));
     let neural_shared = Arc::new(RwLock::new(trained_neural_opt.clone()));
     let ppo_shared = Arc::new(RwLock::new(ppo_policy.clone()));
+    let dqn_train_master = load_model::<DuelingQNetwork>(DQN_MASTER_CACHE_PATH, "DQN")
+        .unwrap_or_else(|| {
+            let mut master = DuelingQNetwork::new_with_config(&config, rng.next_u64());
+            master.load_state_dict(&dqn_policy);
+            master
+        });
+    let ppo_train_master = load_model::<ActorCritic>(PPO_MASTER_CACHE_PATH, "PPO")
+        .unwrap_or_else(|| ActorCritic::new_with_config(&config, rng.next_u64()));
     let stop_flag = Arc::new(AtomicBool::new(false));
     let mut online_handles: Vec<thread::JoinHandle<()>> = Vec::new();
     let mut dqn_sender: Option<mpsc::Sender<Experience>> = None;
@@ -967,7 +1031,7 @@ fn run_interactive(args: RunInteractiveArgs) {
         let interval_ms = config.train_interval_ms.max(1) as u64;
         let max_steps = config.max_train_steps_per_tick;
         let trainer_seed = rng.next_u64();
-        let mut trainer = OnlineDqnTrainer::from_policy(dqn_policy, trainer_seed);
+        let mut trainer = OnlineDqnTrainer::from_policy(dqn_train_master, trainer_seed);
         online_handles.push(thread::spawn(move || {
             let mut local_rng = Rng::from_seed(trainer_seed.wrapping_add(1));
             let mut last_report = Instant::now();
@@ -1007,6 +1071,10 @@ fn run_interactive(args: RunInteractiveArgs) {
                 }
                 thread::sleep(Duration::from_millis(interval_ms));
             }
+            let master = trainer.policy();
+            save_model(master, DQN_MASTER_CACHE_PATH, "DQN");
+            let bf16 = master.to_inference_bf16();
+            save_model(&bf16, DQN_INFERENCE_CACHE_PATH, "DQN BF16");
         }));
     }
 
@@ -1057,7 +1125,7 @@ fn run_interactive(args: RunInteractiveArgs) {
         let interval_ms = (config.train_interval_ms.max(1) as u64).max(5);
         let max_steps = config.max_train_steps_per_tick;
         let (k_epochs, batch_size) = resolve_ppo_online_train_params(&config);
-        let mut trainer = OnlinePpoTrainer::from_policy(ppo_policy, k_epochs, batch_size);
+        let mut trainer = OnlinePpoTrainer::from_policy(ppo_train_master, k_epochs, batch_size);
         online_handles.push(thread::spawn(move || {
             let mut last_report = Instant::now();
             let mut last_sync = Instant::now();
@@ -1096,6 +1164,10 @@ fn run_interactive(args: RunInteractiveArgs) {
                 }
                 thread::sleep(Duration::from_millis(interval_ms));
             }
+            let master = trainer.policy();
+            save_model(master, PPO_MASTER_CACHE_PATH, "PPO");
+            let bf16 = master.to_inference_bf16();
+            save_model(&bf16, PPO_INFERENCE_CACHE_PATH, "PPO BF16");
         }));
     }
 
@@ -2079,6 +2151,7 @@ fn run_interactive(args: RunInteractiveArgs) {
 mod tests {
     use super::*;
     use crate::config::PoolConfig;
+    use crate::nn::Module;
     use sim::{simulate_core, simulate_fast, simulate_one, SimControl, SimModelContext};
 
     fn build_context() -> (Config, EnvNet, NeuralLuckOptimizer) {
@@ -2094,6 +2167,17 @@ mod tests {
         let env_net = EnvNet::new(&mut rng);
         let neural_opt = NeuralLuckOptimizer::new(5678);
         (config, env_net, neural_opt)
+    }
+
+    fn temp_cache_stem(prefix: &str) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir()
+            .join(format!("{}_{}_{}", prefix, std::process::id(), now))
+            .to_string_lossy()
+            .into_owned()
     }
 
     #[test]
@@ -2273,6 +2357,42 @@ mod tests {
         for &v in q_data.iter() {
             assert!(v.is_finite(), "Q-values must be finite, got {}", v);
         }
+    }
+
+    #[test]
+    fn dqn_parameters_are_f32_by_default() {
+        let dqn = DuelingQNetwork::new(42, &crate::config::AchfConfig::default());
+        assert!(dqn
+            .parameters()
+            .iter()
+            .all(|param| param.dtype == crate::dtype::Dtype::F32));
+    }
+
+    #[test]
+    fn dqn_bf16_inference_cache_roundtrips() {
+        let master_path = temp_cache_stem("dqn_master_cache");
+        let inference_path = temp_cache_stem("dqn_bf16_cache");
+        let mut config = Config::default();
+        config.model_hidden_dim = 64;
+        let dqn = DuelingQNetwork::new_with_config(&config, 42);
+        let bf16 = dqn.to_inference_bf16();
+
+        save_model(&dqn, &master_path, "DQN test");
+        save_model(&bf16, &inference_path, "DQN BF16 test");
+        assert!(is_inference_cache_fresh(&master_path, &inference_path));
+        let loaded: DuelingQNetwork = load_model(&inference_path, "DQN BF16 test").unwrap();
+
+        let _ = std::fs::remove_file(format!("{}.bin", master_path));
+        let _ = std::fs::remove_file(format!("{}.bin", inference_path));
+
+        assert!(loaded
+            .parameters()
+            .iter()
+            .all(|param| param.dtype == crate::dtype::Dtype::BF16));
+        let features = [0.5_f32; DIM];
+        let (idx, value) = loaded.predict_action_fast(&features);
+        assert!(idx < crate::utils::ACTION_SPACE);
+        assert!(value.is_finite());
     }
 
     #[test]

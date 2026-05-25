@@ -176,6 +176,31 @@ impl Storage {
         }
     }
 
+    /// Convert storage data to Vec<bf16>, regardless of original dtype.
+    pub fn to_bf16_vec(&self) -> Vec<bf16> {
+        match self {
+            Storage::F64(v) => v
+                .read()
+                .unwrap()
+                .iter()
+                .map(|&x| bf16::from_f64(x))
+                .collect(),
+            Storage::F32(v) => v
+                .read()
+                .unwrap()
+                .iter()
+                .map(|&x| bf16::from_f32(x))
+                .collect(),
+            Storage::BF16(v) => v.read().unwrap().clone(),
+            Storage::I8(v) => v
+                .read()
+                .unwrap()
+                .iter()
+                .map(|&x| bf16::from_f32(x as f32))
+                .collect(),
+        }
+    }
+
     /// Accumulate an f32 slice into an F32 storage (panics if not F32).
     pub fn accumulate_f32(&self, slice: &[f32]) {
         match self {

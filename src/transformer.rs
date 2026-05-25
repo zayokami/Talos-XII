@@ -175,6 +175,25 @@ impl MhcResidual {
             post.to_cuda();
         }
     }
+
+    pub fn to_inference_bf16(&self) -> Self {
+        Self {
+            h_pre: self.h_pre.iter().map(Linear::to_inference_bf16).collect(),
+            h_res: self.h_res.to_inference_bf16(),
+            h_post: self.h_post.iter().map(Linear::to_inference_bf16).collect(),
+            n: self.n,
+        }
+    }
+
+    pub fn load_state_dict(&mut self, other: &Self) {
+        for (dst, src) in self.h_pre.iter_mut().zip(other.h_pre.iter()) {
+            dst.load_state_dict(src);
+        }
+        self.h_res.load_state_dict(&other.h_res);
+        for (dst, src) in self.h_post.iter_mut().zip(other.h_post.iter()) {
+            dst.load_state_dict(src);
+        }
+    }
 }
 
 /// Concatenate n tensors along the last dimension.
@@ -216,8 +235,10 @@ fn concat_last_dim(tensors: &[Tensor]) -> Tensor {
     *out_shape.last_mut().unwrap() = out_last_dim;
     let out_dtype = if tensors.iter().all(|t| t.dtype == tensors[0].dtype) {
         tensors[0].dtype
-    } else {
+    } else if tensors.iter().any(|t| t.dtype == crate::dtype::Dtype::F64) {
         crate::dtype::Dtype::F64
+    } else {
+        crate::dtype::Dtype::F32
     };
     Tensor::with_dtype(out_data, out_shape, out_dtype)
 }
@@ -264,6 +285,34 @@ pub struct TransformerBlock {
     pub ffn_1: Linear,
     pub ffn_2: Linear,
     pub achf_ffn: Option<AchfLayer>,
+}
+
+impl TransformerBlock {
+    pub fn to_inference_bf16(&self) -> Self {
+        Self {
+            norm_1: self.norm_1.to_inference_bf16(),
+            mla_layer: self.mla_layer.to_inference_bf16(),
+            mhc: self.mhc.as_ref().map(MhcResidual::to_inference_bf16),
+            norm_2: self.norm_2.to_inference_bf16(),
+            ffn_1: self.ffn_1.to_inference_bf16(),
+            ffn_2: self.ffn_2.to_inference_bf16(),
+            achf_ffn: self.achf_ffn.as_ref().map(AchfLayer::to_inference_bf16),
+        }
+    }
+
+    pub fn load_state_dict(&mut self, other: &Self) {
+        self.norm_1.load_state_dict(&other.norm_1);
+        self.mla_layer.load_state_dict(&other.mla_layer);
+        if let (Some(dst), Some(src)) = (&mut self.mhc, &other.mhc) {
+            dst.load_state_dict(src);
+        }
+        self.norm_2.load_state_dict(&other.norm_2);
+        self.ffn_1.load_state_dict(&other.ffn_1);
+        self.ffn_2.load_state_dict(&other.ffn_2);
+        if let (Some(dst), Some(src)) = (&mut self.achf_ffn, &other.achf_ffn) {
+            dst.load_state_dict(src);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -412,6 +461,28 @@ impl LuckTransformer {
         }
         self.norm_final.to_cuda();
         self.out_proj.to_cuda();
+    }
+
+    pub fn to_inference_bf16(&self) -> Self {
+        Self {
+            embed: self.embed.to_inference_bf16(),
+            blocks: self
+                .blocks
+                .iter()
+                .map(TransformerBlock::to_inference_bf16)
+                .collect(),
+            norm_final: self.norm_final.to_inference_bf16(),
+            out_proj: self.out_proj.to_inference_bf16(),
+        }
+    }
+
+    pub fn load_state_dict(&mut self, other: &Self) {
+        self.embed.load_state_dict(&other.embed);
+        for (dst, src) in self.blocks.iter_mut().zip(other.blocks.iter()) {
+            dst.load_state_dict(src);
+        }
+        self.norm_final.load_state_dict(&other.norm_final);
+        self.out_proj.load_state_dict(&other.out_proj);
     }
 
     pub fn forward(&self, x: &Tensor, _pity: &[usize]) -> Tensor {
@@ -1046,6 +1117,30 @@ impl MultiHeadLatentAttention {
         self.w_kr.to_cuda();
         self.w_qr.to_cuda();
         self.w_o.to_cuda();
+    }
+
+    pub fn to_inference_bf16(&self) -> Self {
+        Self {
+            config: self.config.clone(),
+            w_dkv: self.w_dkv.to_inference_bf16(),
+            w_uk: self.w_uk.to_inference_bf16(),
+            w_uv: self.w_uv.to_inference_bf16(),
+            w_q: self.w_q.to_inference_bf16(),
+            w_kr: self.w_kr.to_inference_bf16(),
+            w_qr: self.w_qr.to_inference_bf16(),
+            w_o: self.w_o.to_inference_bf16(),
+            rope: self.rope.clone(),
+        }
+    }
+
+    pub fn load_state_dict(&mut self, other: &Self) {
+        self.w_dkv.load_state_dict(&other.w_dkv);
+        self.w_uk.load_state_dict(&other.w_uk);
+        self.w_uv.load_state_dict(&other.w_uv);
+        self.w_q.load_state_dict(&other.w_q);
+        self.w_kr.load_state_dict(&other.w_kr);
+        self.w_qr.load_state_dict(&other.w_qr);
+        self.w_o.load_state_dict(&other.w_o);
     }
 
     pub fn forward(&self, x: &Tensor) -> Tensor {

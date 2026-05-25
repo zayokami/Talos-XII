@@ -52,8 +52,8 @@ impl Linear {
         );
         let num_rows = input.len() / in_dim;
         out.resize(num_rows * out_dim, 0.0f32);
-        let w_data = self.weight.data_f32();
-        let b_data = self.bias.as_ref().map(|b| b.data_f32());
+        let w_data = self.weight.data_to_f32_vec();
+        let b_data = self.bias.as_ref().map(|b| b.data_to_f32_vec());
 
         use crate::simd::add_scaled_row_f32;
 
@@ -105,6 +105,22 @@ impl Linear {
                     add_scaled_row_f32(out_row, w_row, scale);
                 }
             }
+        }
+    }
+
+    pub fn to_inference_bf16(&self) -> Self {
+        Self {
+            weight: self.weight.to_bf16(),
+            bias: self.bias.as_ref().map(Tensor::to_bf16),
+            in_features: self.in_features,
+            out_features: self.out_features,
+        }
+    }
+
+    pub fn load_state_dict(&mut self, other: &Self) {
+        copy_tensor_data(&self.weight, &other.weight);
+        if let (Some(dst), Some(src)) = (&self.bias, &other.bias) {
+            copy_tensor_data(dst, src);
         }
     }
 
@@ -219,7 +235,7 @@ impl RMSNorm {
         let dim = self.dim;
         let num_rows = input.len() / dim;
         out.resize(input.len(), 0.0f32);
-        let w_data = self.weight.data_f32();
+        let w_data = self.weight.data_to_f32_vec();
 
         for r in 0..num_rows {
             let base = r * dim;
@@ -240,6 +256,36 @@ impl RMSNorm {
         if let Ok(t) = self.weight.to_cuda() {
             self.weight = t;
         }
+    }
+
+    pub fn to_inference_bf16(&self) -> Self {
+        Self {
+            weight: self.weight.to_bf16(),
+            eps: self.eps,
+            dim: self.dim,
+        }
+    }
+
+    pub fn load_state_dict(&mut self, other: &Self) {
+        copy_tensor_data(&self.weight, &other.weight);
+    }
+}
+
+fn copy_tensor_data(dst: &Tensor, src: &Tensor) {
+    match dst.dtype {
+        Dtype::F32 => {
+            let mut dst_data = dst.data_write_f32();
+            *dst_data = src.data_to_f32_vec();
+        }
+        Dtype::BF16 => {
+            let mut dst_data = dst.data_write_bf16();
+            *dst_data = src.data.to_bf16_vec();
+        }
+        Dtype::F64 => {
+            let mut dst_data = dst.data_write_f64();
+            *dst_data = src.data_as_f64_vec();
+        }
+        Dtype::I8 => panic!("copy_tensor_data does not support I8 tensors"),
     }
 }
 
