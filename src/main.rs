@@ -2372,8 +2372,10 @@ mod tests {
     fn dqn_bf16_inference_cache_roundtrips() {
         let master_path = temp_cache_stem("dqn_master_cache");
         let inference_path = temp_cache_stem("dqn_bf16_cache");
-        let mut config = Config::default();
-        config.model_hidden_dim = 64;
+        let config = Config {
+            model_hidden_dim: 64,
+            ..Config::default()
+        };
         let dqn = DuelingQNetwork::new_with_config(&config, 42);
         let bf16 = dqn.to_inference_bf16();
 
