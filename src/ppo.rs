@@ -538,7 +538,7 @@ impl GpuAdam {
         let mut m = Vec::with_capacity(params.len());
         let mut v = Vec::with_capacity(params.len());
         for p in &params {
-            let len = p.data.len();
+            let len = p.cuda_storage_len();
             if p.device != crate::autograd::Device::Cuda {
                 return None;
             }
@@ -604,7 +604,7 @@ impl GpuAdam {
 
         let mut all_ok = true;
         for (i, param) in self.params.iter().enumerate() {
-            let len = param.data.len();
+            let len = param.cuda_storage_len();
             if len == 0 {
                 continue;
             }

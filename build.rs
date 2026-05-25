@@ -127,6 +127,7 @@ fn main() {
         "cuda/backward.cu",
         "cuda/rmsnorm.cu",
         "cuda/sparse.cu",
+        "cuda/tensor_ops.cu",
     ];
 
     // Output directory for compiled objects

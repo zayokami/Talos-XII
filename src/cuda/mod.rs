@@ -210,37 +210,6 @@ pub fn runtime_stats() -> CudaRuntimeStats {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn activation_counters_are_monotonic() {
-        let before = runtime_stats();
-        record_activation_attempt();
-        record_activation_fallback("kernel");
-        record_activation_success();
-        let after = runtime_stats();
-
-        assert!(after.activation_attempts >= before.activation_attempts + 1);
-        assert!(after.activation_fallback_kernel >= before.activation_fallback_kernel + 1);
-        assert!(after.activation_successes >= before.activation_successes + 1);
-    }
-
-    #[test]
-    fn log_softmax_counters_are_monotonic() {
-        let before = runtime_stats();
-        record_log_softmax_attempt();
-        record_log_softmax_fallback("copy");
-        record_log_softmax_success();
-        let after = runtime_stats();
-
-        assert!(after.log_softmax_attempts >= before.log_softmax_attempts + 1);
-        assert!(after.log_softmax_fallback_copy >= before.log_softmax_fallback_copy + 1);
-        assert!(after.log_softmax_successes >= before.log_softmax_successes + 1);
-    }
-}
-
 /// Device information
 pub struct CudaDevice {
     pub id: usize,
@@ -478,4 +447,35 @@ pub fn device_count() -> CudaResult<usize> {
     Err(CudaError::UnsupportedBuild {
         op: "cuda::device_count",
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn activation_counters_are_monotonic() {
+        let before = runtime_stats();
+        record_activation_attempt();
+        record_activation_fallback("kernel");
+        record_activation_success();
+        let after = runtime_stats();
+
+        assert!(after.activation_attempts > before.activation_attempts);
+        assert!(after.activation_fallback_kernel > before.activation_fallback_kernel);
+        assert!(after.activation_successes > before.activation_successes);
+    }
+
+    #[test]
+    fn log_softmax_counters_are_monotonic() {
+        let before = runtime_stats();
+        record_log_softmax_attempt();
+        record_log_softmax_fallback("copy");
+        record_log_softmax_success();
+        let after = runtime_stats();
+
+        assert!(after.log_softmax_attempts > before.log_softmax_attempts);
+        assert!(after.log_softmax_fallback_copy > before.log_softmax_fallback_copy);
+        assert!(after.log_softmax_successes > before.log_softmax_successes);
+    }
 }

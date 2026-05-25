@@ -281,6 +281,29 @@ fn prepare_dqn_inference_cache(master: &DuelingQNetwork, force_refresh: bool) ->
     bf16
 }
 
+#[cfg(cuda)]
+fn prepare_dqn_gpu_policy(
+    master: &DuelingQNetwork,
+    force_refresh: bool,
+    device: ComputeDevice,
+) -> DuelingQNetwork {
+    let mut policy = prepare_dqn_inference_cache(master, force_refresh);
+    if device == ComputeDevice::Cuda {
+        policy.to_cuda();
+        info!("[DQN] BF16 inference cache moved to CUDA for Tensor Core matmul.");
+    }
+    policy
+}
+
+#[cfg(not(cuda))]
+fn prepare_dqn_gpu_policy(
+    master: &DuelingQNetwork,
+    force_refresh: bool,
+    _device: ComputeDevice,
+) -> DuelingQNetwork {
+    prepare_dqn_inference_cache(master, force_refresh)
+}
+
 fn prepare_ppo_inference_cache(master: &ActorCritic, force_refresh: bool) -> ActorCritic {
     if !force_refresh && is_inference_cache_fresh(PPO_MASTER_CACHE_PATH, PPO_INFERENCE_CACHE_PATH) {
         if let Some(cached) = load_model::<ActorCritic>(PPO_INFERENCE_CACHE_PATH, "PPO BF16") {
@@ -294,6 +317,29 @@ fn prepare_ppo_inference_cache(master: &ActorCritic, force_refresh: bool) -> Act
     bf16.freeze_achf_for_inference();
     save_model(&bf16, PPO_INFERENCE_CACHE_PATH, "PPO BF16");
     bf16
+}
+
+#[cfg(cuda)]
+fn prepare_ppo_gpu_policy(
+    master: &ActorCritic,
+    force_refresh: bool,
+    device: ComputeDevice,
+) -> ActorCritic {
+    let mut policy = prepare_ppo_inference_cache(master, force_refresh);
+    if device == ComputeDevice::Cuda {
+        policy.to_cuda();
+        info!("[PPO] BF16 inference cache moved to CUDA for Tensor Core matmul.");
+    }
+    policy
+}
+
+#[cfg(not(cuda))]
+fn prepare_ppo_gpu_policy(
+    master: &ActorCritic,
+    force_refresh: bool,
+    _device: ComputeDevice,
+) -> ActorCritic {
+    prepare_ppo_inference_cache(master, force_refresh)
 }
 
 fn default_pool_index(config: &Config) -> usize {
@@ -679,7 +725,7 @@ fn initialize_system(
         save_model(&d, DQN_MASTER_CACHE_PATH, "DQN");
         d
     };
-    let dqn_policy = prepare_dqn_inference_cache(&dqn_master, args.force);
+    let dqn_policy = prepare_dqn_gpu_policy(&dqn_master, args.force, config.device);
 
     // PPO
     let ppo_master = if !args.force {
@@ -701,7 +747,7 @@ fn initialize_system(
         save_model(&p, PPO_MASTER_CACHE_PATH, "PPO");
         p
     };
-    let ppo_policy = prepare_ppo_inference_cache(&ppo_master, args.force);
+    let ppo_policy = prepare_ppo_gpu_policy(&ppo_master, args.force, config.device);
 
     (
         config,

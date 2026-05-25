@@ -17,6 +17,7 @@ pub enum Dtype {
 
 /// Brain float 16 wrapper (16 bits: 1 sign, 8 exponent, 7 mantissa).
 #[allow(non_camel_case_types)]
+#[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub struct bf16(pub u16);
 

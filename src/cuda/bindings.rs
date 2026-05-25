@@ -18,6 +18,9 @@ pub type CUcontext = *mut std::ffi::c_void;
 pub type cublasHandle_t = *mut std::ffi::c_void;
 pub type cublasStatus_t = i32;
 pub type cublasOperation_t = u32;
+pub type cudaDataType_t = i32;
+pub type cublasComputeType_t = i32;
+pub type cublasGemmAlgo_t = i32;
 
 // =============================================================================
 // CUDA Constants
@@ -32,6 +35,10 @@ pub const CUBLAS_STATUS_SUCCESS: cublasStatus_t = 0;
 pub const CUBLAS_OP_N: cublasOperation_t = 0; // non-transpose
 pub const CUBLAS_OP_T: cublasOperation_t = 1; // transpose
 pub const CUBLAS_OP_C: cublasOperation_t = 2; // conjugate transpose
+pub const CUBLAS_GEMM_DEFAULT_TENSOR_OP: cublasGemmAlgo_t = 99;
+pub const CUBLAS_COMPUTE_32F: cublasComputeType_t = 68;
+pub const CUDA_R_16BF: cudaDataType_t = 14;
+pub const CUDA_R_32F: cudaDataType_t = 0;
 
 // =============================================================================
 // CUDA Runtime API (libcudart.so / cudart.dll)
@@ -152,6 +159,28 @@ extern "C" {
         C: *mut f64,
         ldc: i32,
     ) -> cublasStatus_t;
+
+    pub fn cublasGemmEx(
+        handle: cublasHandle_t,
+        transa: cublasOperation_t,
+        transb: cublasOperation_t,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: *const std::ffi::c_void,
+        A: *const std::ffi::c_void,
+        Atype: cudaDataType_t,
+        lda: i32,
+        B: *const std::ffi::c_void,
+        Btype: cudaDataType_t,
+        ldb: i32,
+        beta: *const std::ffi::c_void,
+        C: *mut std::ffi::c_void,
+        Ctype: cudaDataType_t,
+        ldc: i32,
+        computeType: cublasComputeType_t,
+        algo: cublasGemmAlgo_t,
+    ) -> cublasStatus_t;
 }
 
 // =============================================================================
@@ -225,6 +254,52 @@ extern "C" {
         d_out: *mut c_int,
     ) -> c_int;
 
+    #[link_name = "softmax_backward_f64"]
+    pub fn cuda_softmax_backward(
+        h_out: *const f64,
+        h_grad_out: *const f64,
+        h_input_grad: *mut f64,
+        rows: c_int,
+        cols: c_int,
+        d_out: *mut c_int,
+        d_grad_out: *mut c_int,
+        d_input_grad: *mut c_int,
+    ) -> c_int;
+    #[link_name = "softmax_backward_f32"]
+    pub fn cuda_softmax_backward_f32(
+        h_out: *const f32,
+        h_grad_out: *const f32,
+        h_input_grad: *mut f32,
+        rows: c_int,
+        cols: c_int,
+        d_out: *mut c_int,
+        d_grad_out: *mut c_int,
+        d_input_grad: *mut c_int,
+    ) -> c_int;
+
+    #[link_name = "log_softmax_backward_f64"]
+    pub fn cuda_log_softmax_backward(
+        h_out: *const f64,
+        h_grad_out: *const f64,
+        h_input_grad: *mut f64,
+        rows: c_int,
+        cols: c_int,
+        d_out: *mut c_int,
+        d_grad_out: *mut c_int,
+        d_input_grad: *mut c_int,
+    ) -> c_int;
+    #[link_name = "log_softmax_backward_f32"]
+    pub fn cuda_log_softmax_backward_f32(
+        h_out: *const f32,
+        h_grad_out: *const f32,
+        h_input_grad: *mut f32,
+        rows: c_int,
+        cols: c_int,
+        d_out: *mut c_int,
+        d_grad_out: *mut c_int,
+        d_input_grad: *mut c_int,
+    ) -> c_int;
+
     // RoPE
     #[link_name = "cuda_rope_f64"]
     pub fn cuda_rope(
@@ -251,6 +326,37 @@ extern "C" {
         d_data: *mut c_int,
         d_cos_cache: *mut c_int,
         d_sin_cache: *mut c_int,
+    ) -> c_int;
+
+    #[link_name = "cuda_rope_backward_f64"]
+    pub fn cuda_rope_backward(
+        h_grad_out: *const f64,
+        h_cos_cache: *const f64,
+        h_sin_cache: *const f64,
+        h_input_grad: *mut f64,
+        seq_len: c_int,
+        dim: c_int,
+        total_batches: c_int,
+        start_pos: c_int,
+        d_grad_out: *mut c_int,
+        d_cos_cache: *mut c_int,
+        d_sin_cache: *mut c_int,
+        d_input_grad: *mut c_int,
+    ) -> c_int;
+    #[link_name = "cuda_rope_backward_f32"]
+    pub fn cuda_rope_backward_f32(
+        h_grad_out: *const f32,
+        h_cos_cache: *const f32,
+        h_sin_cache: *const f32,
+        h_input_grad: *mut f32,
+        seq_len: c_int,
+        dim: c_int,
+        total_batches: c_int,
+        start_pos: c_int,
+        d_grad_out: *mut c_int,
+        d_cos_cache: *mut c_int,
+        d_sin_cache: *mut c_int,
+        d_input_grad: *mut c_int,
     ) -> c_int;
 
     // Attention weighted sum
@@ -343,6 +449,27 @@ extern "C" {
         d_b_grad: *mut c_int,
     ) -> c_int;
 
+    #[link_name = "sub_backward_f64"]
+    pub fn cuda_sub_backward(
+        h_grad_out: *const f64,
+        h_a_grad: *mut f64,
+        h_b_grad: *mut f64,
+        size: c_int,
+        d_grad_out: *mut c_int,
+        d_a_grad: *mut c_int,
+        d_b_grad: *mut c_int,
+    ) -> c_int;
+    #[link_name = "sub_backward_f32"]
+    pub fn cuda_sub_backward_f32(
+        h_grad_out: *const f32,
+        h_a_grad: *mut f32,
+        h_b_grad: *mut f32,
+        size: c_int,
+        d_grad_out: *mut c_int,
+        d_a_grad: *mut c_int,
+        d_b_grad: *mut c_int,
+    ) -> c_int;
+
     #[link_name = "mul_backward_f64"]
     pub fn cuda_mul_backward(
         h_grad_out: *const f64,
@@ -359,6 +486,35 @@ extern "C" {
     ) -> c_int;
     #[link_name = "mul_backward_f32"]
     pub fn cuda_mul_backward_f32(
+        h_grad_out: *const f32,
+        h_a_data: *const f32,
+        h_b_data: *const f32,
+        h_a_grad: *mut f32,
+        h_b_grad: *mut f32,
+        size: c_int,
+        d_grad_out: *mut c_int,
+        d_a_data: *mut c_int,
+        d_b_data: *mut c_int,
+        d_a_grad: *mut c_int,
+        d_b_grad: *mut c_int,
+    ) -> c_int;
+
+    #[link_name = "div_backward_f64"]
+    pub fn cuda_div_backward(
+        h_grad_out: *const f64,
+        h_a_data: *const f64,
+        h_b_data: *const f64,
+        h_a_grad: *mut f64,
+        h_b_grad: *mut f64,
+        size: c_int,
+        d_grad_out: *mut c_int,
+        d_a_data: *mut c_int,
+        d_b_data: *mut c_int,
+        d_a_grad: *mut c_int,
+        d_b_grad: *mut c_int,
+    ) -> c_int;
+    #[link_name = "div_backward_f32"]
+    pub fn cuda_div_backward_f32(
         h_grad_out: *const f32,
         h_a_data: *const f32,
         h_b_data: *const f32,
@@ -634,6 +790,347 @@ extern "C" {
         d_mask: *mut c_int,
         d_bias: *mut c_int,
         d_y: *mut c_int,
+    ) -> c_int;
+
+    #[link_name = "scale_f64"]
+    pub fn cuda_scale(
+        h_in: *const f64,
+        h_out: *mut f64,
+        scale: f64,
+        size: c_int,
+        d_in: *mut c_int,
+        d_out: *mut c_int,
+    ) -> c_int;
+    #[link_name = "scale_f32"]
+    pub fn cuda_scale_f32(
+        h_in: *const f32,
+        h_out: *mut f32,
+        scale: f32,
+        size: c_int,
+        d_in: *mut c_int,
+        d_out: *mut c_int,
+    ) -> c_int;
+    #[link_name = "scale_backward_f64"]
+    pub fn cuda_scale_backward(
+        h_grad_out: *const f64,
+        h_input_grad: *mut f64,
+        scale: f64,
+        size: c_int,
+        d_grad_out: *mut c_int,
+        d_input_grad: *mut c_int,
+    ) -> c_int;
+    #[link_name = "scale_backward_f32"]
+    pub fn cuda_scale_backward_f32(
+        h_grad_out: *const f32,
+        h_input_grad: *mut f32,
+        scale: f32,
+        size: c_int,
+        d_grad_out: *mut c_int,
+        d_input_grad: *mut c_int,
+    ) -> c_int;
+
+    #[link_name = "causal_mask_f64"]
+    pub fn cuda_causal_mask(
+        h_in: *const f64,
+        h_out: *mut f64,
+        batches: c_int,
+        seq: c_int,
+        d_in: *mut c_int,
+        d_out: *mut c_int,
+    ) -> c_int;
+    #[link_name = "causal_mask_f32"]
+    pub fn cuda_causal_mask_f32(
+        h_in: *const f32,
+        h_out: *mut f32,
+        batches: c_int,
+        seq: c_int,
+        d_in: *mut c_int,
+        d_out: *mut c_int,
+    ) -> c_int;
+    #[link_name = "causal_mask_backward_f64"]
+    pub fn cuda_causal_mask_backward(
+        h_grad_out: *const f64,
+        h_input_grad: *mut f64,
+        batches: c_int,
+        seq: c_int,
+        d_grad_out: *mut c_int,
+        d_input_grad: *mut c_int,
+    ) -> c_int;
+    #[link_name = "causal_mask_backward_f32"]
+    pub fn cuda_causal_mask_backward_f32(
+        h_grad_out: *const f32,
+        h_input_grad: *mut f32,
+        batches: c_int,
+        seq: c_int,
+        d_grad_out: *mut c_int,
+        d_input_grad: *mut c_int,
+    ) -> c_int;
+
+    #[link_name = "concat_last_dim_f64"]
+    pub fn cuda_concat_last_dim(
+        h_a: *const f64,
+        h_b: *const f64,
+        h_out: *mut f64,
+        rows: c_int,
+        a_dim: c_int,
+        b_dim: c_int,
+        d_a: *mut c_int,
+        d_b: *mut c_int,
+        d_out: *mut c_int,
+    ) -> c_int;
+    #[link_name = "concat_last_dim_f32"]
+    pub fn cuda_concat_last_dim_f32(
+        h_a: *const f32,
+        h_b: *const f32,
+        h_out: *mut f32,
+        rows: c_int,
+        a_dim: c_int,
+        b_dim: c_int,
+        d_a: *mut c_int,
+        d_b: *mut c_int,
+        d_out: *mut c_int,
+    ) -> c_int;
+    #[link_name = "concat_last_dim_backward_f64"]
+    pub fn cuda_concat_last_dim_backward(
+        h_grad_out: *const f64,
+        h_a_grad: *mut f64,
+        h_b_grad: *mut f64,
+        rows: c_int,
+        a_dim: c_int,
+        b_dim: c_int,
+        d_grad_out: *mut c_int,
+        d_a_grad: *mut c_int,
+        d_b_grad: *mut c_int,
+    ) -> c_int;
+    #[link_name = "concat_last_dim_backward_f32"]
+    pub fn cuda_concat_last_dim_backward_f32(
+        h_grad_out: *const f32,
+        h_a_grad: *mut f32,
+        h_b_grad: *mut f32,
+        rows: c_int,
+        a_dim: c_int,
+        b_dim: c_int,
+        d_grad_out: *mut c_int,
+        d_a_grad: *mut c_int,
+        d_b_grad: *mut c_int,
+    ) -> c_int;
+
+    #[link_name = "split_last_dim_f64"]
+    pub fn cuda_split_last_dim(
+        h_in: *const f64,
+        h_out: *mut f64,
+        rows: c_int,
+        input_dim: c_int,
+        part_dim: c_int,
+        part_idx: c_int,
+        d_in: *mut c_int,
+        d_out: *mut c_int,
+    ) -> c_int;
+    #[link_name = "split_last_dim_f32"]
+    pub fn cuda_split_last_dim_f32(
+        h_in: *const f32,
+        h_out: *mut f32,
+        rows: c_int,
+        input_dim: c_int,
+        part_dim: c_int,
+        part_idx: c_int,
+        d_in: *mut c_int,
+        d_out: *mut c_int,
+    ) -> c_int;
+    #[link_name = "split_last_dim_backward_f64"]
+    pub fn cuda_split_last_dim_backward(
+        h_grad_out: *const f64,
+        h_input_grad: *mut f64,
+        rows: c_int,
+        input_dim: c_int,
+        part_dim: c_int,
+        part_idx: c_int,
+        d_grad_out: *mut c_int,
+        d_input_grad: *mut c_int,
+    ) -> c_int;
+    #[link_name = "split_last_dim_backward_f32"]
+    pub fn cuda_split_last_dim_backward_f32(
+        h_grad_out: *const f32,
+        h_input_grad: *mut f32,
+        rows: c_int,
+        input_dim: c_int,
+        part_dim: c_int,
+        part_idx: c_int,
+        d_grad_out: *mut c_int,
+        d_input_grad: *mut c_int,
+    ) -> c_int;
+
+    #[link_name = "broadcast_batch_f64"]
+    pub fn cuda_broadcast_batch(
+        h_in: *const f64,
+        h_out: *mut f64,
+        batch_size: c_int,
+        inner_len: c_int,
+        d_in: *mut c_int,
+        d_out: *mut c_int,
+    ) -> c_int;
+    #[link_name = "broadcast_batch_f32"]
+    pub fn cuda_broadcast_batch_f32(
+        h_in: *const f32,
+        h_out: *mut f32,
+        batch_size: c_int,
+        inner_len: c_int,
+        d_in: *mut c_int,
+        d_out: *mut c_int,
+    ) -> c_int;
+    #[link_name = "broadcast_batch_backward_f64"]
+    pub fn cuda_broadcast_batch_backward(
+        h_grad_out: *const f64,
+        h_input_grad: *mut f64,
+        batch_size: c_int,
+        inner_len: c_int,
+        d_grad_out: *mut c_int,
+        d_input_grad: *mut c_int,
+    ) -> c_int;
+    #[link_name = "broadcast_batch_backward_f32"]
+    pub fn cuda_broadcast_batch_backward_f32(
+        h_grad_out: *const f32,
+        h_input_grad: *mut f32,
+        batch_size: c_int,
+        inner_len: c_int,
+        d_grad_out: *mut c_int,
+        d_input_grad: *mut c_int,
+    ) -> c_int;
+
+    #[link_name = "transpose_last_two_f64"]
+    pub fn cuda_transpose_last_two(
+        h_in: *const f64,
+        h_out: *mut f64,
+        outer: c_int,
+        rows: c_int,
+        cols: c_int,
+        d_in: *mut c_int,
+        d_out: *mut c_int,
+    ) -> c_int;
+    #[link_name = "transpose_last_two_f32"]
+    pub fn cuda_transpose_last_two_f32(
+        h_in: *const f32,
+        h_out: *mut f32,
+        outer: c_int,
+        rows: c_int,
+        cols: c_int,
+        d_in: *mut c_int,
+        d_out: *mut c_int,
+    ) -> c_int;
+    #[link_name = "transpose_4d_f64"]
+    pub fn cuda_transpose_4d(
+        h_in: *const f64,
+        h_out: *mut f64,
+        d0: c_int,
+        d1: c_int,
+        d2: c_int,
+        d3: c_int,
+        dim0: c_int,
+        dim1: c_int,
+        d_in: *mut c_int,
+        d_out: *mut c_int,
+    ) -> c_int;
+    #[link_name = "transpose_4d_f32"]
+    pub fn cuda_transpose_4d_f32(
+        h_in: *const f32,
+        h_out: *mut f32,
+        d0: c_int,
+        d1: c_int,
+        d2: c_int,
+        d3: c_int,
+        dim0: c_int,
+        dim1: c_int,
+        d_in: *mut c_int,
+        d_out: *mut c_int,
+    ) -> c_int;
+
+    #[link_name = "batched_qk_scores_f64"]
+    pub fn cuda_batched_qk_scores(
+        h_q: *const f64,
+        h_k: *const f64,
+        h_out: *mut f64,
+        batches: c_int,
+        seq: c_int,
+        dim: c_int,
+        d_q: *mut c_int,
+        d_k: *mut c_int,
+        d_out: *mut c_int,
+    ) -> c_int;
+    #[link_name = "batched_qk_scores_f32"]
+    pub fn cuda_batched_qk_scores_f32(
+        h_q: *const f32,
+        h_k: *const f32,
+        h_out: *mut f32,
+        batches: c_int,
+        seq: c_int,
+        dim: c_int,
+        d_q: *mut c_int,
+        d_k: *mut c_int,
+        d_out: *mut c_int,
+    ) -> c_int;
+    #[link_name = "batched_qk_scores_backward_f64"]
+    pub fn cuda_batched_qk_scores_backward(
+        h_grad_out: *const f64,
+        h_q: *const f64,
+        h_k: *const f64,
+        h_q_grad: *mut f64,
+        h_k_grad: *mut f64,
+        batches: c_int,
+        seq: c_int,
+        dim: c_int,
+        d_grad_out: *mut c_int,
+        d_q: *mut c_int,
+        d_k: *mut c_int,
+        d_q_grad: *mut c_int,
+        d_k_grad: *mut c_int,
+    ) -> c_int;
+    #[link_name = "batched_qk_scores_backward_f32"]
+    pub fn cuda_batched_qk_scores_backward_f32(
+        h_grad_out: *const f32,
+        h_q: *const f32,
+        h_k: *const f32,
+        h_q_grad: *mut f32,
+        h_k_grad: *mut f32,
+        batches: c_int,
+        seq: c_int,
+        dim: c_int,
+        d_grad_out: *mut c_int,
+        d_q: *mut c_int,
+        d_k: *mut c_int,
+        d_q_grad: *mut c_int,
+        d_k_grad: *mut c_int,
+    ) -> c_int;
+    #[link_name = "attention_weighted_sum_backward_f64"]
+    pub fn cuda_attention_weighted_sum_backward(
+        h_grad_out: *const f64,
+        h_probs: *const f64,
+        h_values: *const f64,
+        h_probs_grad: *mut f64,
+        h_values_grad: *mut f64,
+        batches: c_int,
+        seq: c_int,
+        head_dim: c_int,
+        d_grad_out: *mut c_int,
+        d_probs: *mut c_int,
+        d_values: *mut c_int,
+        d_probs_grad: *mut c_int,
+        d_values_grad: *mut c_int,
+    ) -> c_int;
+    #[link_name = "attention_weighted_sum_backward_f32"]
+    pub fn cuda_attention_weighted_sum_backward_f32(
+        h_grad_out: *const f32,
+        h_probs: *const f32,
+        h_values: *const f32,
+        h_probs_grad: *mut f32,
+        h_values_grad: *mut f32,
+        batches: c_int,
+        seq: c_int,
+        head_dim: c_int,
+        d_grad_out: *mut c_int,
+        d_probs: *mut c_int,
+        d_values: *mut c_int,
+        d_probs_grad: *mut c_int,
+        d_values_grad: *mut c_int,
     ) -> c_int;
 }
 

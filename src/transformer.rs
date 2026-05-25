@@ -200,6 +200,12 @@ impl MhcResidual {
 /// All tensors must share the same shape except the last dim.
 fn concat_last_dim(tensors: &[Tensor]) -> Tensor {
     assert!(!tensors.is_empty(), "concat_last_dim: empty input");
+    #[cfg(cuda)]
+    if tensors.len() == 2 {
+        if let Some(out) = Tensor::concat_last_dim_cuda(&tensors[0], &tensors[1]) {
+            return out;
+        }
+    }
     let first_shape = &tensors[0].shape;
     let prefix_len: usize = first_shape[..first_shape.len() - 1].iter().product();
     let last_dim = first_shape[first_shape.len() - 1];
@@ -246,6 +252,10 @@ fn concat_last_dim(tensors: &[Tensor]) -> Tensor {
 /// Split a tensor along the last dimension into n equal parts.
 fn split_last_dim(tensor: &Tensor, n: usize) -> Vec<Tensor> {
     assert!(n > 0, "split_last_dim: n must be > 0");
+    #[cfg(cuda)]
+    if let Some(out) = tensor.split_last_dim_cuda(n) {
+        return out;
+    }
     let shape = &tensor.shape;
     let prefix_len: usize = shape[..shape.len() - 1].iter().product();
     let last_dim = shape[shape.len() - 1];
@@ -1798,6 +1808,12 @@ impl MultiHeadLatentAttention {
         // q: [B, Seq, Dim], k: [B, Seq, Dim]
         // out: [B, Seq, Seq]
         // out[b, i, j] = sum_d (q[b, i, d] * k[b, j, d])
+        #[cfg(cuda)]
+        if q.device == crate::autograd::Device::Cuda && k.device == crate::autograd::Device::Cuda {
+            if let Some(out) = self.batched_matmul_qt_k_cuda(q, k, b, seq, dim) {
+                return out;
+            }
+        }
 
         let q_data = q.data_as_f64_vec();
         let k_data = k.data_as_f64_vec();
@@ -1872,6 +1888,128 @@ impl MultiHeadLatentAttention {
                 }),
             })),
         }
+    }
+
+    #[cfg(cuda)]
+    fn batched_matmul_qt_k_cuda(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        b: usize,
+        seq: usize,
+        dim: usize,
+    ) -> Option<Tensor> {
+        use crate::cuda::memory::{alloc, CudaBuffer};
+
+        if q.dtype != k.dtype || (q.dtype != Dtype::F32 && q.dtype != Dtype::F64) {
+            return None;
+        }
+        let out_len = b.checked_mul(seq)?.checked_mul(seq)?;
+        let d_q = q.cuda_get_or_upload_buffer().ok()?;
+        let d_k = k.cuda_get_or_upload_buffer().ok()?;
+        let d_out = match q.dtype {
+            Dtype::F32 => CudaBuffer::F32(alloc::<f32>(out_len).ok()?),
+            Dtype::F64 => CudaBuffer::F64(alloc::<f64>(out_len).ok()?),
+            _ => return None,
+        };
+        let d_out = Arc::new(d_out);
+        let ok = match (&*d_q, &*d_k, &*d_out, q.dtype) {
+            (CudaBuffer::F32(qb), CudaBuffer::F32(kb), CudaBuffer::F32(out), Dtype::F32) => {
+                crate::cuda::kernels::batched_qk_scores_f32(qb, kb, out, b, seq, dim).is_ok()
+            }
+            (CudaBuffer::F64(qb), CudaBuffer::F64(kb), CudaBuffer::F64(out), Dtype::F64) => {
+                crate::cuda::kernels::batched_qk_scores(qb, kb, out, b, seq, dim).is_ok()
+            }
+            _ => false,
+        };
+        if !ok {
+            return None;
+        }
+
+        let dtype = q.dtype;
+        let parents = vec![q.clone(), k.clone()];
+        let out = Tensor::cuda_device_tensor(
+            d_out,
+            vec![b, seq, seq],
+            dtype,
+            parents,
+            Box::new(move |grad_out, parents| {
+                let q_in = &parents[0];
+                let k_in = &parents[1];
+                if q_in.device == crate::autograd::Device::Cuda
+                    && k_in.device == crate::autograd::Device::Cuda
+                {
+                    if let (Some(d_q), Some(d_k), Some(d_grad_tmp)) = (
+                        q_in.cuda_cached_buffer(),
+                        k_in.cuda_cached_buffer(),
+                        crate::autograd::cuda_grad_out_buffer(grad_out),
+                    ) {
+                        if let (Some(d_q_grad), Some(d_k_grad)) = (
+                            q_in.cuda_grad_ensure_buffer(),
+                            k_in.cuda_grad_ensure_buffer(),
+                        ) {
+                            let ok =
+                                match (&*d_grad_tmp, &*d_q, &*d_k, &*d_q_grad, &*d_k_grad, dtype) {
+                                    (
+                                        CudaBuffer::F32(gt),
+                                        CudaBuffer::F32(qb),
+                                        CudaBuffer::F32(kb),
+                                        CudaBuffer::F32(qg),
+                                        CudaBuffer::F32(kg),
+                                        Dtype::F32,
+                                    ) => crate::cuda::kernels::batched_qk_scores_backward_f32(
+                                        gt, qb, kb, qg, kg, b, seq, dim,
+                                    )
+                                    .is_ok(),
+                                    (
+                                        CudaBuffer::F64(gt),
+                                        CudaBuffer::F64(qb),
+                                        CudaBuffer::F64(kb),
+                                        CudaBuffer::F64(qg),
+                                        CudaBuffer::F64(kg),
+                                        Dtype::F64,
+                                    ) => crate::cuda::kernels::batched_qk_scores_backward(
+                                        gt, qb, kb, qg, kg, b, seq, dim,
+                                    )
+                                    .is_ok(),
+                                    _ => false,
+                                };
+                            if ok {
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                let grad_out_f64 = grad_out.to_f64_vec();
+                let q_data = q_in.data_as_f64_vec();
+                let k_data = k_in.data_as_f64_vec();
+                let mut q_grad = q_in.grad_write_compat();
+                let mut k_grad = k_in.grad_write_compat();
+                let chunk_size_grad = seq * dim;
+                let chunk_size_out = seq * seq;
+                q_grad
+                    .par_chunks_mut(chunk_size_grad)
+                    .zip(k_grad.par_chunks_mut(chunk_size_grad))
+                    .zip(grad_out_f64.par_chunks(chunk_size_out))
+                    .enumerate()
+                    .for_each(|(batch_idx, ((q_g_chunk, k_g_chunk), g_out_chunk))| {
+                        let base_data = batch_idx * seq * dim;
+                        let q_slice = &q_data[base_data..base_data + chunk_size_grad];
+                        let k_slice = &k_data[base_data..base_data + chunk_size_grad];
+                        for i in 0..seq {
+                            for j in 0..seq {
+                                let g = g_out_chunk[i * seq + j];
+                                for d in 0..dim {
+                                    q_g_chunk[i * dim + d] += g * k_slice[j * dim + d];
+                                    k_g_chunk[j * dim + d] += g * q_slice[i * dim + d];
+                                }
+                            }
+                        }
+                    });
+            }),
+        );
+        Some(out)
     }
 
     // Batched MatMul: probs * v -> out
@@ -1990,7 +2128,7 @@ impl MultiHeadLatentAttention {
         dim_v: usize,
     ) -> Tensor {
         use crate::cuda::kernels::{attention_weighted_sum, attention_weighted_sum_f32};
-        use crate::cuda::memory::{alloc, copy_d2h, CudaBuffer};
+        use crate::cuda::memory::{alloc, CudaBuffer};
 
         let out_len = b * seq * dim_v;
         let out_dtype = Tensor::binary_dtype(probs.dtype, v.dtype);
@@ -2037,84 +2175,99 @@ impl MultiHeadLatentAttention {
             return self.batched_matmul_probs_v_cpu_fallback(probs, v, b, seq, dim_v);
         }
 
-        // Copy result back to CPU for backward pass and tensor ops
-        let (storage, _out_data) = match (&*d_out, out_dtype) {
-            (CudaBuffer::F32(buf), Dtype::F32) => {
-                let mut data = vec![0.0f32; out_len];
-                if let Err(err) = copy_d2h(&mut data, buf) {
-                    log::warn!("[MLA] CUDA D2H copy failed ({})", err);
-                    return self.batched_matmul_probs_v_cpu_fallback(probs, v, b, seq, dim_v);
-                }
-                let out_f64: Vec<f64> = data.iter().map(|&v| v as f64).collect();
-                (Storage::from_f32_vec(data, out_dtype), out_f64)
-            }
-            (CudaBuffer::F64(buf), Dtype::F64) => {
-                let mut data = vec![0.0f64; out_len];
-                if let Err(err) = copy_d2h(&mut data, buf) {
-                    log::warn!("[MLA] CUDA D2H copy failed ({})", err);
-                    return self.batched_matmul_probs_v_cpu_fallback(probs, v, b, seq, dim_v);
-                }
-                (Storage::f64(data.clone()), data)
-            }
-            _ => {
-                return self.batched_matmul_probs_v_cpu_fallback(probs, v, b, seq, dim_v);
-            }
-        };
-
-        // Store probs and v data for backward
-        let p_data = probs.data_as_f64_vec();
-        let v_data = v.data_as_f64_vec();
-        let _b_cap = b;
-        let seq_cap = seq;
-        let dim_v_cap = dim_v;
-
         let parents = vec![probs.clone(), v.clone()];
-        let out_dtype = Tensor::binary_dtype(probs.dtype, v.dtype);
-        Tensor {
-            data: storage,
-            grad: Storage::zeros(out_len, Tensor::grad_dtype_for(out_dtype)),
-            shape: vec![b, seq, dim_v],
-            device: crate::autograd::Device::Cpu,
-            dtype: out_dtype,
-            _ctx: Some(Arc::new(Context {
-                parents,
-                backward_op: Box::new(move |grad_out, parents| {
-                    let grad_out_f64 = grad_out.to_f64_vec();
-                    let p_in = &parents[0];
-                    let v_in = &parents[1];
-                    let mut p_grad = p_in.grad_write_compat();
-                    let mut v_grad = v_in.grad_write_compat();
+        Tensor::cuda_device_tensor(
+            d_out,
+            vec![b, seq, dim_v],
+            out_dtype,
+            parents,
+            Box::new(move |grad_out, parents| {
+                let p_in = &parents[0];
+                let v_in = &parents[1];
+                if p_in.device == crate::autograd::Device::Cuda
+                    && v_in.device == crate::autograd::Device::Cuda
+                {
+                    if let (Some(d_probs), Some(d_values), Some(d_grad_tmp)) = (
+                        p_in.cuda_cached_buffer(),
+                        v_in.cuda_cached_buffer(),
+                        crate::autograd::cuda_grad_out_buffer(grad_out),
+                    ) {
+                        if let (Some(d_probs_grad), Some(d_values_grad)) = (
+                            p_in.cuda_grad_ensure_buffer(),
+                            v_in.cuda_grad_ensure_buffer(),
+                        ) {
+                            let ok = match (
+                                &*d_grad_tmp,
+                                &*d_probs,
+                                &*d_values,
+                                &*d_probs_grad,
+                                &*d_values_grad,
+                                out_dtype,
+                            ) {
+                                (
+                                    CudaBuffer::F32(gt),
+                                    CudaBuffer::F32(p),
+                                    CudaBuffer::F32(vb),
+                                    CudaBuffer::F32(pg),
+                                    CudaBuffer::F32(vg),
+                                    Dtype::F32,
+                                ) => crate::cuda::kernels::attention_weighted_sum_backward_f32(
+                                    gt, p, vb, pg, vg, b, seq, dim_v,
+                                )
+                                .is_ok(),
+                                (
+                                    CudaBuffer::F64(gt),
+                                    CudaBuffer::F64(p),
+                                    CudaBuffer::F64(vb),
+                                    CudaBuffer::F64(pg),
+                                    CudaBuffer::F64(vg),
+                                    Dtype::F64,
+                                ) => crate::cuda::kernels::attention_weighted_sum_backward(
+                                    gt, p, vb, pg, vg, b, seq, dim_v,
+                                )
+                                .is_ok(),
+                                _ => false,
+                            };
+                            if ok {
+                                return;
+                            }
+                        }
+                    }
+                }
 
-                    let chunk_size_p = seq_cap * seq_cap;
-                    let chunk_size_v = seq_cap * dim_v_cap;
-                    let chunk_size_grad = seq_cap * dim_v_cap;
+                let grad_out_f64 = grad_out.to_f64_vec();
+                let p_data = p_in.data_as_f64_vec();
+                let v_data = v_in.data_as_f64_vec();
+                let mut p_grad = p_in.grad_write_compat();
+                let mut v_grad = v_in.grad_write_compat();
 
-                    p_grad
-                        .par_chunks_mut(chunk_size_p)
-                        .zip(v_grad.par_chunks_mut(chunk_size_v))
-                        .zip(grad_out_f64.par_chunks(chunk_size_grad))
-                        .enumerate()
-                        .for_each(|(batch_idx, ((p_g_chunk, v_g_chunk), g_out_chunk))| {
-                            let base_p = batch_idx * seq_cap * seq_cap;
-                            let base_v = batch_idx * seq_cap * dim_v_cap;
-                            let p_slice = &p_data[base_p..base_p + chunk_size_p];
-                            let v_slice = &v_data[base_v..base_v + chunk_size_v];
+                let chunk_size_p = seq * seq;
+                let chunk_size_v = seq * dim_v;
+                let chunk_size_grad = seq * dim_v;
 
-                            for i in 0..seq_cap {
-                                for d in 0..dim_v_cap {
-                                    let g = g_out_chunk[i * dim_v_cap + d];
-                                    for j in 0..seq_cap {
-                                        p_g_chunk[i * seq_cap + j] +=
-                                            g * v_slice[j * dim_v_cap + d];
-                                        v_g_chunk[j * dim_v_cap + d] +=
-                                            g * p_slice[i * seq_cap + j];
-                                    }
+                p_grad
+                    .par_chunks_mut(chunk_size_p)
+                    .zip(v_grad.par_chunks_mut(chunk_size_v))
+                    .zip(grad_out_f64.par_chunks(chunk_size_grad))
+                    .enumerate()
+                    .for_each(|(batch_idx, ((p_g_chunk, v_g_chunk), g_out_chunk))| {
+                        let base_p = batch_idx * seq * seq;
+                        let base_v = batch_idx * seq * dim_v;
+                        let p_slice = &p_data[base_p..base_p + chunk_size_p];
+                        let v_slice = &v_data[base_v..base_v + chunk_size_v];
+
+                        for i in 0..seq {
+                            for d in 0..dim_v {
+                                let g = g_out_chunk[i * dim_v + d];
+                                for j in 0..seq {
+                                    p_g_chunk[i * seq + j] += g * v_slice[j * dim_v + d];
+                                    v_g_chunk[j * dim_v + d] += g * p_slice[i * seq + j];
                                 }
                             }
-                        });
-                }),
-            })),
-        }
+                        }
+                    });
+            }),
+        )
     }
 
     /// CPU fallback for batched_matmul_probs_v (used when CUDA fails)
@@ -2206,6 +2359,10 @@ impl MultiHeadLatentAttention {
     // Apply causal mask: set positions where j > i to -inf (upper triangle excluding diagonal).
     // Input shape: [BH, Seq, Seq]. Backward zeroes out masked gradient positions.
     fn apply_causal_mask(&self, t: &Tensor, seq_len: usize) -> Tensor {
+        #[cfg(cuda)]
+        if let Some(out) = t.causal_mask_cuda(seq_len) {
+            return out;
+        }
         let data = t.data_as_f64_vec();
         let bh = data.len() / (seq_len * seq_len);
         let mut new_data = data.clone();
@@ -2249,6 +2406,10 @@ impl MultiHeadLatentAttention {
     }
 
     fn scale_tensor(&self, t: &Tensor, scale: f64) -> Tensor {
+        #[cfg(cuda)]
+        if let Some(out) = t.scale_cuda(scale) {
+            return out;
+        }
         let data = t.data_as_f64_vec();
         let new_data: Vec<f64> = data.par_iter().map(|&x| x * scale).collect();
 
@@ -2334,6 +2495,10 @@ impl MultiHeadLatentAttention {
     }
 
     fn concat_last_dim(&self, a: &Tensor, b: &Tensor) -> Tensor {
+        #[cfg(cuda)]
+        if let Some(out) = Tensor::concat_last_dim_cuda(a, b) {
+            return out;
+        }
         // Concatenate tensors. This is slow because it allocates.
         let shape_a = &a.shape;
         let shape_b = &b.shape;

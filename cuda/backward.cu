@@ -95,6 +95,21 @@ __global__ void add_backward_kernel(
 }
 
 template<typename T>
+__global__ void sub_backward_kernel(
+    const T* __restrict__ grad_out,
+    T* __restrict__ a_grad,
+    T* __restrict__ b_grad,
+    int size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        T g = grad_out[idx];
+        a_grad[idx] += g;
+        b_grad[idx] -= g;
+    }
+}
+
+template<typename T>
 __global__ void mul_backward_kernel(
     const T* __restrict__ grad_out,
     const T* __restrict__ a_data,
@@ -108,6 +123,26 @@ __global__ void mul_backward_kernel(
         T g = grad_out[idx];
         a_grad[idx] += g * b_data[idx];
         b_grad[idx] += g * a_data[idx];
+    }
+}
+
+template<typename T>
+__global__ void div_backward_kernel(
+    const T* __restrict__ grad_out,
+    const T* __restrict__ a_data,
+    const T* __restrict__ b_data,
+    T* __restrict__ a_grad,
+    T* __restrict__ b_grad,
+    int size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        T g = grad_out[idx];
+        T a = a_data[idx];
+        T b = b_data[idx];
+        T safe_b = (b != T(0.0)) ? b : T(1e-12);
+        a_grad[idx] += g / safe_b;
+        b_grad[idx] += g * (-a / (safe_b * safe_b));
     }
 }
 
@@ -218,6 +253,26 @@ extern "C" int add_backward_f32(
     BW_LAUNCH_F32(add_backward_kernel, dev_grad_out, dev_a_grad, dev_b_grad, size)
 }
 
+extern "C" int sub_backward_f64(
+    const double* h_grad_out, double* h_a_grad, double* h_b_grad,
+    int size, int* d_grad_out, int* d_a_grad, int* d_b_grad
+) {
+    const double* dev_grad_out = (const double*)d_grad_out;
+    double* dev_a_grad = (double*)d_a_grad;
+    double* dev_b_grad = (double*)d_b_grad;
+    BW_LAUNCH_F64(sub_backward_kernel, dev_grad_out, dev_a_grad, dev_b_grad, size)
+}
+
+extern "C" int sub_backward_f32(
+    const float* h_grad_out, float* h_a_grad, float* h_b_grad,
+    int size, int* d_grad_out, int* d_a_grad, int* d_b_grad
+) {
+    const float* dev_grad_out = (const float*)d_grad_out;
+    float* dev_a_grad = (float*)d_a_grad;
+    float* dev_b_grad = (float*)d_b_grad;
+    BW_LAUNCH_F32(sub_backward_kernel, dev_grad_out, dev_a_grad, dev_b_grad, size)
+}
+
 extern "C" int mul_backward_f64(
     const double* h_grad_out, const double* h_a_data, const double* h_b_data,
     double* h_a_grad, double* h_b_grad,
@@ -242,6 +297,32 @@ extern "C" int mul_backward_f32(
     float* dev_a_grad = (float*)d_a_grad;
     float* dev_b_grad = (float*)d_b_grad;
     BW_LAUNCH_F32(mul_backward_kernel, dev_grad_out, dev_a_data, dev_b_data, dev_a_grad, dev_b_grad, size)
+}
+
+extern "C" int div_backward_f64(
+    const double* h_grad_out, const double* h_a_data, const double* h_b_data,
+    double* h_a_grad, double* h_b_grad,
+    int size, int* d_grad_out, int* d_a_data, int* d_b_data, int* d_a_grad, int* d_b_grad
+) {
+    const double* dev_grad_out = (const double*)d_grad_out;
+    const double* dev_a_data = (const double*)d_a_data;
+    const double* dev_b_data = (const double*)d_b_data;
+    double* dev_a_grad = (double*)d_a_grad;
+    double* dev_b_grad = (double*)d_b_grad;
+    BW_LAUNCH_F64(div_backward_kernel, dev_grad_out, dev_a_data, dev_b_data, dev_a_grad, dev_b_grad, size)
+}
+
+extern "C" int div_backward_f32(
+    const float* h_grad_out, const float* h_a_data, const float* h_b_data,
+    float* h_a_grad, float* h_b_grad,
+    int size, int* d_grad_out, int* d_a_data, int* d_b_data, int* d_a_grad, int* d_b_grad
+) {
+    const float* dev_grad_out = (const float*)d_grad_out;
+    const float* dev_a_data = (const float*)d_a_data;
+    const float* dev_b_data = (const float*)d_b_data;
+    float* dev_a_grad = (float*)d_a_grad;
+    float* dev_b_grad = (float*)d_b_grad;
+    BW_LAUNCH_F32(div_backward_kernel, dev_grad_out, dev_a_data, dev_b_data, dev_a_grad, dev_b_grad, size)
 }
 
 extern "C" int acc_buffer_f64(

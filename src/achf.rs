@@ -1,3 +1,5 @@
+#[cfg(cuda)]
+use crate::autograd::Context;
 use crate::autograd::Tensor;
 use crate::config::AchfConfig;
 use crate::dtype::{bf16, Dtype};
@@ -6,6 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
+
+#[cfg(cuda)]
+use crate::autograd::Device;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GateMode {
@@ -390,6 +395,193 @@ impl AchfLayer {
             s.to_cuda();
         }
     }
+
+    #[cfg(cuda)]
+    fn forward_sparse_inference_cuda(&self, x: &[f32]) -> Option<Vec<f32>> {
+        use crate::cuda::memory::{alloc, copy_d2h, copy_h2d};
+
+        if !crate::cuda::is_available() {
+            return None;
+        }
+        let sparse = self.sparse_weight.as_ref()?;
+        let mask = self.sparse_mask.as_ref()?;
+        let in_dim = sparse.in_features;
+        let out_dim = sparse.out_features;
+        if in_dim == 0 || out_dim == 0 || !x.len().is_multiple_of(in_dim) {
+            return None;
+        }
+        let expected_mask_len = in_dim.checked_mul(out_dim)?;
+        if mask.len() != expected_mask_len {
+            return None;
+        }
+        let num_rows = x.len() / in_dim;
+        if sparse.weight.device != Device::Cuda || sparse.weight.dtype != Dtype::F32 {
+            return None;
+        }
+        let d_weight = sparse.weight.cuda_get_or_upload_buffer().ok()?;
+        let d_weight = d_weight.as_f32()?;
+        let d_x = alloc::<f32>(x.len()).ok()?;
+        copy_h2d(&d_x, x).ok()?;
+        let d_mask = alloc::<u8>(mask.len()).ok()?;
+        copy_h2d(&d_mask, mask).ok()?;
+        let out_len = num_rows.checked_mul(out_dim)?;
+        let d_y = alloc::<f32>(out_len).ok()?;
+
+        let kernel_ok = if let Some(bias) = &sparse.bias {
+            if bias.device != Device::Cuda || bias.dtype != Dtype::F32 {
+                return None;
+            }
+            let d_bias = bias.cuda_get_or_upload_buffer().ok()?;
+            let d_bias = d_bias.as_f32()?;
+            crate::cuda::kernels::sparse_matvec_bias_f32(
+                &d_x, d_weight, &d_mask, d_bias, &d_y, num_rows, in_dim, out_dim,
+            )
+            .is_ok()
+        } else {
+            crate::cuda::kernels::sparse_matvec_f32(
+                &d_x, d_weight, &d_mask, &d_y, num_rows, in_dim, out_dim,
+            )
+            .is_ok()
+        };
+        if !kernel_ok {
+            return None;
+        }
+
+        let mut out = vec![0.0f32; out_len];
+        copy_d2h(&mut out, &d_y).ok()?;
+        Some(out)
+    }
+
+    #[cfg(cuda)]
+    fn forward_sparse_tensor_cuda(&self, input: &Tensor) -> Option<Tensor> {
+        use crate::cuda::memory::{alloc, copy_h2d, CudaBuffer};
+
+        if !crate::cuda::is_available() || input.device != Device::Cuda || input.dtype != Dtype::F32
+        {
+            return None;
+        }
+        let sparse = self.sparse_weight.as_ref()?;
+        let mask = self.sparse_mask.as_ref()?;
+        let in_dim = sparse.in_features;
+        let out_dim = sparse.out_features;
+        if in_dim == 0 || out_dim == 0 || !input.numel().is_multiple_of(in_dim) {
+            return None;
+        }
+        let expected_mask_len = in_dim.checked_mul(out_dim)?;
+        if mask.len() != expected_mask_len
+            || sparse.weight.device != Device::Cuda
+            || sparse.weight.dtype != Dtype::F32
+        {
+            return None;
+        }
+        let num_rows = input.numel() / in_dim;
+        let d_input = input.cuda_get_or_upload_buffer().ok()?;
+        let d_input = d_input.as_f32()?;
+        let d_weight = sparse.weight.cuda_get_or_upload_buffer().ok()?;
+        let d_weight = d_weight.as_f32()?;
+        let d_mask = alloc::<u8>(mask.len()).ok()?;
+        copy_h2d(&d_mask, mask).ok()?;
+        let d_out = alloc::<f32>(num_rows.checked_mul(out_dim)?).ok()?;
+
+        let kernel_ok = if let Some(bias) = &sparse.bias {
+            if bias.device != Device::Cuda || bias.dtype != Dtype::F32 {
+                return None;
+            }
+            let d_bias = bias.cuda_get_or_upload_buffer().ok()?;
+            let d_bias = d_bias.as_f32()?;
+            crate::cuda::kernels::sparse_matvec_bias_f32(
+                d_input, d_weight, &d_mask, d_bias, &d_out, num_rows, in_dim, out_dim,
+            )
+            .is_ok()
+        } else {
+            crate::cuda::kernels::sparse_matvec_f32(
+                d_input, d_weight, &d_mask, &d_out, num_rows, in_dim, out_dim,
+            )
+            .is_ok()
+        };
+        if !kernel_ok {
+            return None;
+        }
+
+        let mut out_shape = input.shape.clone();
+        *out_shape.last_mut()? = out_dim;
+        let d_out = Arc::new(CudaBuffer::F32(d_out));
+        let out_len = num_rows * out_dim;
+        let parents = vec![input.clone(), sparse.weight.clone()];
+        let bias_parent_index = sparse.bias.as_ref().map(|_| parents.len());
+        let mut parents = parents;
+        if let Some(bias) = &sparse.bias {
+            parents.push(bias.clone());
+        }
+        let mask = Arc::new(mask.clone());
+        let out = Tensor {
+            data: Tensor::empty_storage(Dtype::F32),
+            grad: crate::dtype::Storage::zeros(out_len, Tensor::grad_dtype_for(Dtype::F32)),
+            shape: out_shape,
+            device: Device::Cuda,
+            dtype: Dtype::F32,
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f32 = grad_out.to_f32_vec();
+                    let input = &parents[0];
+                    let weight = &parents[1];
+                    let input_data = input.data_to_f32_vec();
+                    let weight_data = weight.data_to_f32_vec();
+
+                    {
+                        let mut input_grad = input.grad_write_compat();
+                        for row in 0..num_rows {
+                            let ig_row = &mut input_grad[row * in_dim..(row + 1) * in_dim];
+                            let go_row = &grad_out_f32[row * out_dim..(row + 1) * out_dim];
+                            for (i, ig) in ig_row.iter_mut().enumerate().take(in_dim) {
+                                let mut sum = 0.0f32;
+                                for (j, &go) in go_row.iter().enumerate().take(out_dim) {
+                                    let w_idx = i * out_dim + j;
+                                    if mask[w_idx] != 0 {
+                                        sum += go * weight_data[w_idx];
+                                    }
+                                }
+                                *ig += sum as f64;
+                            }
+                        }
+                    }
+
+                    {
+                        let mut weight_grad = weight.grad_write_compat();
+                        for row in 0..num_rows {
+                            let x_row = &input_data[row * in_dim..(row + 1) * in_dim];
+                            let go_row = &grad_out_f32[row * out_dim..(row + 1) * out_dim];
+                            for (i, &x_f32) in x_row.iter().enumerate().take(in_dim) {
+                                let x = x_f32 as f64;
+                                if x == 0.0 {
+                                    continue;
+                                }
+                                for (j, &go) in go_row.iter().enumerate().take(out_dim) {
+                                    let w_idx = i * out_dim + j;
+                                    if mask[w_idx] != 0 {
+                                        weight_grad[w_idx] += x * go as f64;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(idx) = bias_parent_index {
+                        let mut bias_grad = parents[idx].grad_write_compat();
+                        for row in 0..num_rows {
+                            let go_row = &grad_out_f32[row * out_dim..(row + 1) * out_dim];
+                            for j in 0..out_dim {
+                                bias_grad[j] += go_row[j] as f64;
+                            }
+                        }
+                    }
+                }),
+            })),
+        };
+        out.cuda_set_cached_buffer(d_out);
+        Some(out)
+    }
 }
 
 impl Module for AchfLayer {
@@ -399,6 +591,17 @@ impl Module for AchfLayer {
         }
         self.maybe_project();
         let g = self.compute_gate();
+        #[cfg(cuda)]
+        if self.is_sparse() && input.device == Device::Cuda {
+            if let Some(sparse_out) = self.forward_sparse_tensor_cuda(input) {
+                let dense_out = self.weight.forward(input);
+                if let (Some(dense_scaled), Some(sparse_scaled)) =
+                    (dense_out.scale_cuda(g), sparse_out.scale_cuda(1.0 - g))
+                {
+                    return &dense_scaled + &sparse_scaled;
+                }
+            }
+        }
         self.forward_blend(input, g)
     }
 
@@ -479,7 +682,18 @@ impl AchfLayer {
                 InferencePath::Cached => self
                     .forward_inference_cached(x)
                     .unwrap_or_else(|| self.weight.forward_inference(x)),
-                InferencePath::Sparse => self.sparse_weight.as_ref().unwrap().forward_inference(x),
+                InferencePath::Sparse => {
+                    #[cfg(cuda)]
+                    if let Some(out) = self.forward_sparse_inference_cuda(x) {
+                        out
+                    } else {
+                        self.sparse_weight.as_ref().unwrap().forward_inference(x)
+                    }
+                    #[cfg(not(cuda))]
+                    {
+                        self.sparse_weight.as_ref().unwrap().forward_inference(x)
+                    }
+                }
                 InferencePath::Dense => self.weight.forward_inference(x),
             };
             (out, start.elapsed().as_nanos() as f64)
@@ -488,7 +702,18 @@ impl AchfLayer {
                 InferencePath::Cached => self
                     .forward_inference_cached(x)
                     .unwrap_or_else(|| self.weight.forward_inference(x)),
-                InferencePath::Sparse => self.sparse_weight.as_ref().unwrap().forward_inference(x),
+                InferencePath::Sparse => {
+                    #[cfg(cuda)]
+                    if let Some(out) = self.forward_sparse_inference_cuda(x) {
+                        out
+                    } else {
+                        self.sparse_weight.as_ref().unwrap().forward_inference(x)
+                    }
+                    #[cfg(not(cuda))]
+                    {
+                        self.sparse_weight.as_ref().unwrap().forward_inference(x)
+                    }
+                }
                 InferencePath::Dense => self.weight.forward_inference(x),
             };
             (out, 0.0)
@@ -532,7 +757,18 @@ impl AchfLayer {
             0 => self
                 .forward_inference_cached(x)
                 .unwrap_or_else(|| self.weight.forward_inference(x)),
-            1 if self.is_sparse() => self.sparse_weight.as_ref().unwrap().forward_inference(x),
+            1 if self.is_sparse() => {
+                #[cfg(cuda)]
+                if let Some(out) = self.forward_sparse_inference_cuda(x) {
+                    out
+                } else {
+                    self.sparse_weight.as_ref().unwrap().forward_inference(x)
+                }
+                #[cfg(not(cuda))]
+                {
+                    self.sparse_weight.as_ref().unwrap().forward_inference(x)
+                }
+            }
             _ => self.weight.forward_inference(x),
         };
         for v in out.iter_mut() {
@@ -1707,6 +1943,59 @@ mod tests {
         assert_eq!(dense_out.len(), sparse_out.len());
         // Outputs differ because pruning changes weights, but shapes match
         assert_eq!(dense_out.len(), x.len());
+    }
+
+    #[cfg(cuda)]
+    #[test]
+    fn achf_sparse_tensor_cuda_matches_cpu_sparse_forward() {
+        if crate::cuda::init().is_err() {
+            return;
+        }
+
+        let cfg = AchfConfig {
+            enabled: true,
+            gate_warmup_steps: 0,
+            gate_transition_steps: 0,
+            g_min: 0.0,
+            infer_gate: "one".to_string(),
+            ..Default::default()
+        };
+        let mut cpu_layer = AchfLayer::new_square(4, cfg, 301);
+        {
+            let mut w = cpu_layer.weight.weight.data_write_f32();
+            for (i, v) in w.iter_mut().enumerate() {
+                *v = ((i as f32) * 0.07) - 0.4;
+            }
+        }
+        cpu_layer.prune(0.2);
+        {
+            let mut state = cpu_layer.state.write().unwrap();
+            state.last_gate = 0.0;
+        }
+        let mut cuda_layer = cpu_layer.clone();
+        cuda_layer.to_cuda();
+
+        let x = Tensor::new_f32(vec![0.1, -0.2, 0.3, 0.4, 0.5, -0.1, 0.2, -0.3], vec![2, 4]);
+        let x_cuda = match x.to_cuda() {
+            Ok(tensor) => tensor,
+            Err(_) => return,
+        };
+
+        let cpu_out = cpu_layer.forward(&x);
+        let cuda_out = cuda_layer.forward(&x_cuda);
+        assert_eq!(cuda_out.device, Device::Cuda);
+        let cpu_data = cpu_out.data_as_f64_vec();
+        let cuda_data = cuda_out.data_as_f64_vec();
+        assert_eq!(cpu_data.len(), cuda_data.len());
+        for i in 0..cpu_data.len() {
+            assert!(
+                (cpu_data[i] - cuda_data[i]).abs() < 1e-5,
+                "idx {} cpu={} cuda={}",
+                i,
+                cpu_data[i],
+                cuda_data[i]
+            );
+        }
     }
 
     #[test]

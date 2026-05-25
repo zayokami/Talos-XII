@@ -80,6 +80,8 @@ impl<T> Drop for DevicePtr<T> {
 /// Type-erased GPU buffer for mixed-dtype cache storage.
 #[derive(Clone)]
 pub enum CudaBuffer {
+    BF16(DevicePtr<crate::dtype::bf16>),
+    I8(DevicePtr<i8>),
     F32(DevicePtr<f32>),
     F64(DevicePtr<f64>),
 }
@@ -87,6 +89,8 @@ pub enum CudaBuffer {
 impl CudaBuffer {
     pub fn len(&self) -> usize {
         match self {
+            CudaBuffer::BF16(b) => b.len(),
+            CudaBuffer::I8(b) => b.len(),
             CudaBuffer::F32(b) => b.len(),
             CudaBuffer::F64(b) => b.len(),
         }
@@ -94,6 +98,8 @@ impl CudaBuffer {
 
     pub fn as_raw(&self) -> usize {
         match self {
+            CudaBuffer::BF16(b) => b.as_raw(),
+            CudaBuffer::I8(b) => b.as_raw(),
             CudaBuffer::F32(b) => b.as_raw(),
             CudaBuffer::F64(b) => b.as_raw(),
         }
@@ -101,22 +107,38 @@ impl CudaBuffer {
 
     pub fn dtype(&self) -> crate::dtype::Dtype {
         match self {
+            CudaBuffer::BF16(_) => crate::dtype::Dtype::BF16,
+            CudaBuffer::I8(_) => crate::dtype::Dtype::I8,
             CudaBuffer::F32(_) => crate::dtype::Dtype::F32,
             CudaBuffer::F64(_) => crate::dtype::Dtype::F64,
+        }
+    }
+
+    pub fn as_bf16(&self) -> Option<&DevicePtr<crate::dtype::bf16>> {
+        match self {
+            CudaBuffer::BF16(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn as_i8(&self) -> Option<&DevicePtr<i8>> {
+        match self {
+            CudaBuffer::I8(p) => Some(p),
+            _ => None,
         }
     }
 
     pub fn as_f32(&self) -> Option<&DevicePtr<f32>> {
         match self {
             CudaBuffer::F32(p) => Some(p),
-            CudaBuffer::F64(_) => None,
+            _ => None,
         }
     }
 
     pub fn as_f64(&self) -> Option<&DevicePtr<f64>> {
         match self {
-            CudaBuffer::F32(_) => None,
             CudaBuffer::F64(p) => Some(p),
+            _ => None,
         }
     }
 }

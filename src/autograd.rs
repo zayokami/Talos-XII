@@ -39,10 +39,17 @@ const PAR_THRESHOLD: usize = 4096;
 type CudaTensorBufferMap = HashMap<usize, Arc<crate::cuda::memory::CudaBuffer>>;
 #[cfg(cuda)]
 static CUDA_TENSOR_BUFFER_CACHE: OnceLock<Mutex<CudaTensorBufferMap>> = OnceLock::new();
+#[cfg(cuda)]
+static CUDA_GRAD_BUFFER_CACHE: OnceLock<Mutex<CudaTensorBufferMap>> = OnceLock::new();
 
 #[cfg(cuda)]
 fn cuda_tensor_buffer_cache() -> &'static Mutex<CudaTensorBufferMap> {
     CUDA_TENSOR_BUFFER_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(cuda)]
+fn cuda_grad_buffer_cache() -> &'static Mutex<CudaTensorBufferMap> {
+    CUDA_GRAD_BUFFER_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[derive(Clone)]
@@ -72,6 +79,26 @@ impl Drop for Tensor {
                 Storage::I8(v) => Arc::as_ptr(v) as usize,
             };
             if let Some(cache) = CUDA_TENSOR_BUFFER_CACHE.get() {
+                if let Ok(mut map) = cache.lock() {
+                    map.remove(&key);
+                }
+            }
+        }
+
+        let grad_is_last = match &self.grad {
+            Storage::F64(v) => Arc::strong_count(v) == 1,
+            Storage::F32(v) => Arc::strong_count(v) == 1,
+            Storage::BF16(v) => Arc::strong_count(v) == 1,
+            Storage::I8(v) => Arc::strong_count(v) == 1,
+        };
+        if grad_is_last {
+            let key = match &self.grad {
+                Storage::F64(v) => Arc::as_ptr(v) as usize,
+                Storage::F32(v) => Arc::as_ptr(v) as usize,
+                Storage::BF16(v) => Arc::as_ptr(v) as usize,
+                Storage::I8(v) => Arc::as_ptr(v) as usize,
+            };
+            if let Some(cache) = CUDA_GRAD_BUFFER_CACHE.get() {
                 if let Ok(mut map) = cache.lock() {
                     map.remove(&key);
                 }
@@ -167,6 +194,15 @@ impl<'de> Deserialize<'de> for Tensor {
 
 type BackwardOp = Box<dyn Fn(&Storage, &Vec<Tensor>) + Send + Sync>;
 
+#[cfg(cuda)]
+#[derive(Clone, Copy)]
+enum CudaBinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
 pub struct Context {
     pub parents: Vec<Tensor>,
     pub backward_op: BackwardOp, // receives grad_output Storage, parents
@@ -207,7 +243,73 @@ impl<'a> Drop for GradWriteCompat<'a> {
     }
 }
 
+#[cfg(cuda)]
+pub(crate) fn cuda_grad_out_buffer(
+    grad_out: &Storage,
+) -> Option<Arc<crate::cuda::memory::CudaBuffer>> {
+    use crate::cuda::memory::{alloc_pooled, copy_h2d, CudaBuffer};
+
+    let len = grad_out.len();
+    if len == 0 {
+        return Some(Arc::new(CudaBuffer::F64(
+            crate::cuda::memory::DevicePtr::zero_sized(),
+        )));
+    }
+    match grad_out.dtype() {
+        Dtype::F32 => {
+            let buffer = alloc_pooled::<f32>(len).ok()?;
+            copy_h2d(&buffer, &grad_out.to_f32_vec()).ok()?;
+            Some(Arc::new(CudaBuffer::F32(buffer)))
+        }
+        Dtype::F64 => {
+            let buffer = alloc_pooled::<f64>(len).ok()?;
+            copy_h2d(&buffer, &grad_out.to_f64_vec()).ok()?;
+            Some(Arc::new(CudaBuffer::F64(buffer)))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(cuda)]
+fn cuda_sync_grad_to_host(tensor: &Tensor) -> bool {
+    use crate::cuda::memory::{copy_d2h, CudaBuffer};
+
+    let Some(buffer) = tensor.cuda_grad_cached_buffer() else {
+        return false;
+    };
+    match (&tensor.grad, &*buffer) {
+        (Storage::F32(storage), CudaBuffer::F32(device)) => {
+            let mut host = vec![0.0f32; device.len()];
+            if copy_d2h(&mut host, device).is_err() {
+                return false;
+            }
+            *storage.write().unwrap() = host;
+            true
+        }
+        (Storage::F64(storage), CudaBuffer::F64(device)) => {
+            let mut host = vec![0.0f64; device.len()];
+            if copy_d2h(&mut host, device).is_err() {
+                return false;
+            }
+            *storage.write().unwrap() = host;
+            true
+        }
+        _ => false,
+    }
+}
+
 impl Tensor {
+    #[inline]
+    #[cfg_attr(not(cuda), allow(dead_code))]
+    pub(crate) fn empty_storage(dtype: Dtype) -> Storage {
+        Storage::zeros(0, dtype)
+    }
+
+    #[inline]
+    pub fn numel(&self) -> usize {
+        self.shape.iter().product()
+    }
+
     pub fn from_mmap(path: &str, shape: Vec<usize>) -> std::io::Result<Self> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
@@ -397,6 +499,8 @@ impl Tensor {
     /// Read F64 data lock. Panics if not F64 or poisoned.
     #[inline]
     pub fn data_f64(&self) -> std::sync::RwLockReadGuard<'_, Vec<f64>> {
+        #[cfg(cuda)]
+        self.cuda_materialize();
         match &self.data {
             Storage::F64(v) => v.read().unwrap(),
             _ => panic!("Expected F64 storage, got {:?}", self.dtype),
@@ -406,6 +510,8 @@ impl Tensor {
     /// Read F32 data lock. Panics if not F32 or poisoned.
     #[inline]
     pub fn data_f32(&self) -> std::sync::RwLockReadGuard<'_, Vec<f32>> {
+        #[cfg(cuda)]
+        self.cuda_materialize();
         match &self.data {
             Storage::F32(v) => v.read().unwrap(),
             _ => panic!("Expected F32 storage, got {:?}", self.dtype),
@@ -415,6 +521,10 @@ impl Tensor {
     /// Write F64 data lock. Panics if not F64 or poisoned.
     #[inline]
     pub fn data_write_f64(&self) -> std::sync::RwLockWriteGuard<'_, Vec<f64>> {
+        #[cfg(cuda)]
+        self.cuda_materialize();
+        #[cfg(cuda)]
+        self.cuda_remove_cached_buffer();
         match &self.data {
             Storage::F64(v) => v.write().unwrap(),
             _ => panic!("Expected F64 storage, got {:?}", self.dtype),
@@ -424,6 +534,10 @@ impl Tensor {
     /// Write F32 data lock. Panics if not F32 or poisoned.
     #[inline]
     pub fn data_write_f32(&self) -> std::sync::RwLockWriteGuard<'_, Vec<f32>> {
+        #[cfg(cuda)]
+        self.cuda_materialize();
+        #[cfg(cuda)]
+        self.cuda_remove_cached_buffer();
         match &self.data {
             Storage::F32(v) => v.write().unwrap(),
             _ => panic!("Expected F32 storage, got {:?}", self.dtype),
@@ -433,6 +547,8 @@ impl Tensor {
     /// Read BF16 data lock. Panics if not BF16 or poisoned.
     #[inline]
     pub fn data_bf16(&self) -> std::sync::RwLockReadGuard<'_, Vec<crate::dtype::bf16>> {
+        #[cfg(cuda)]
+        self.cuda_materialize();
         match &self.data {
             Storage::BF16(v) => v.read().unwrap(),
             _ => panic!("Expected BF16 storage, got {:?}", self.dtype),
@@ -442,6 +558,10 @@ impl Tensor {
     /// Write BF16 data lock. Panics if not BF16 or poisoned.
     #[inline]
     pub fn data_write_bf16(&self) -> std::sync::RwLockWriteGuard<'_, Vec<crate::dtype::bf16>> {
+        #[cfg(cuda)]
+        self.cuda_materialize();
+        #[cfg(cuda)]
+        self.cuda_remove_cached_buffer();
         match &self.data {
             Storage::BF16(v) => v.write().unwrap(),
             _ => panic!("Expected BF16 storage, got {:?}", self.dtype),
@@ -495,12 +615,16 @@ impl Tensor {
     /// dtypes it converts element-wise.
     #[inline]
     pub fn data_as_f64_vec(&self) -> Vec<f64> {
+        #[cfg(cuda)]
+        self.cuda_materialize();
         self.data.to_f64_vec()
     }
 
     /// Read data as Vec<f32>, converting from native dtype as needed.
     #[inline]
     pub fn data_to_f32_vec(&self) -> Vec<f32> {
+        #[cfg(cuda)]
+        self.cuda_materialize();
         self.data.to_f32_vec()
     }
 
@@ -535,6 +659,8 @@ impl Tensor {
     /// Read F32 grad lock. Panics if grad is not F32.
     #[inline]
     pub fn grad_read_f32(&self) -> std::sync::RwLockReadGuard<'_, Vec<f32>> {
+        #[cfg(cuda)]
+        let _ = cuda_sync_grad_to_host(self);
         match &self.grad {
             Storage::F32(v) => v.read().unwrap(),
             _ => panic!("Expected F32 grad, got {:?}", self.grad.dtype()),
@@ -544,6 +670,11 @@ impl Tensor {
     /// Write F32 grad lock. Panics if grad is not F32.
     #[inline]
     pub fn grad_write_f32(&self) -> std::sync::RwLockWriteGuard<'_, Vec<f32>> {
+        #[cfg(cuda)]
+        {
+            let _ = cuda_sync_grad_to_host(self);
+            self.cuda_grad_remove_cached_buffer();
+        }
         match &self.grad {
             Storage::F32(v) => v.write().unwrap(),
             _ => panic!("Expected F32 grad, got {:?}", self.grad.dtype()),
@@ -553,6 +684,8 @@ impl Tensor {
     /// Read F64 grad lock. Panics if grad is not F64.
     #[inline]
     pub fn grad_read_f64(&self) -> std::sync::RwLockReadGuard<'_, Vec<f64>> {
+        #[cfg(cuda)]
+        let _ = cuda_sync_grad_to_host(self);
         match &self.grad {
             Storage::F64(v) => v.read().unwrap(),
             _ => panic!("Expected F64 grad, got {:?}", self.grad.dtype()),
@@ -562,6 +695,11 @@ impl Tensor {
     /// Write F64 grad lock. Panics if grad is not F64.
     #[inline]
     pub fn grad_write_f64(&self) -> std::sync::RwLockWriteGuard<'_, Vec<f64>> {
+        #[cfg(cuda)]
+        {
+            let _ = cuda_sync_grad_to_host(self);
+            self.cuda_grad_remove_cached_buffer();
+        }
         match &self.grad {
             Storage::F64(v) => v.write().unwrap(),
             _ => panic!("Expected F64 grad, got {:?}", self.grad.dtype()),
@@ -571,24 +709,38 @@ impl Tensor {
     /// Convert grad to Vec<f32>.
     #[inline]
     pub fn grad_to_f32_vec(&self) -> Vec<f32> {
+        #[cfg(cuda)]
+        let _ = cuda_sync_grad_to_host(self);
         self.grad.to_f32_vec()
     }
 
     /// Convert grad to Vec<f64>.
     #[inline]
     pub fn grad_to_f64_vec(&self) -> Vec<f64> {
+        #[cfg(cuda)]
+        let _ = cuda_sync_grad_to_host(self);
         self.grad.to_f64_vec()
     }
 
     /// Accumulate f32 slice into grad.
     #[inline]
     pub fn grad_accumulate_f32(&self, slice: &[f32]) {
+        #[cfg(cuda)]
+        {
+            let _ = cuda_sync_grad_to_host(self);
+            self.cuda_grad_remove_cached_buffer();
+        }
         self.grad.accumulate_f32(slice);
     }
 
     /// Accumulate f64 slice into grad.
     #[inline]
     pub fn grad_accumulate_f64(&self, slice: &[f64]) {
+        #[cfg(cuda)]
+        {
+            let _ = cuda_sync_grad_to_host(self);
+            self.cuda_grad_remove_cached_buffer();
+        }
         self.grad.accumulate_f64(slice);
     }
 
@@ -597,6 +749,11 @@ impl Tensor {
     /// For F32 grad, returns a temporary f64 buffer that flushes back on Drop.
     #[inline]
     pub fn grad_write_compat(&self) -> GradWriteCompat<'_> {
+        #[cfg(cuda)]
+        {
+            let _ = cuda_sync_grad_to_host(self);
+            self.cuda_grad_remove_cached_buffer();
+        }
         match &self.grad {
             Storage::F64(v) => GradWriteCompat::F64(v.write().unwrap()),
             Storage::F32(v) => {
@@ -712,12 +869,18 @@ impl Tensor {
         }
 
         // Seed gradient of this tensor to 1.0
+        #[cfg(cuda)]
+        if self.device == Device::Cuda {
+            self.cuda_grad_remove_cached_buffer();
+        }
         self.grad.fill_f64(1.0);
         #[cfg(cuda)]
         if self.device == Device::Cuda {
-            if let Some(d_grad) = self.cuda_grad_ensure_buffer() {
+            if let Some(d_grad) = self.cuda_grad_zero_buffer() {
                 if d_grad.len() > 0 {
                     match &*d_grad {
+                        crate::cuda::memory::CudaBuffer::BF16(_) => {}
+                        crate::cuda::memory::CudaBuffer::I8(_) => {}
                         crate::cuda::memory::CudaBuffer::F32(buf) => {
                             let ones = vec![1.0f32; d_grad.len()];
                             let _ = crate::cuda::memory::copy_h2d(buf, &ones);
@@ -734,6 +897,10 @@ impl Tensor {
         // Backprop
         for t in topo.iter().rev() {
             if let Some(ctx) = &t._ctx {
+                #[cfg(cuda)]
+                if t.device == Device::Cuda {
+                    let _ = cuda_sync_grad_to_host(t);
+                }
                 // GPU-aware backward ops read from GPU buffers directly;
                 // we no longer force materialization of all parents to CPU.
                 (ctx.backward_op)(&t.grad, &ctx.parents);
@@ -747,18 +914,20 @@ impl Tensor {
     }
 
     pub fn zero_grad(&self) {
+        #[cfg(cuda)]
+        if self.device == Device::Cuda {
+            self.cuda_grad_remove_cached_buffer();
+        }
         self.grad.zero();
         #[cfg(cuda)]
         if self.device == Device::Cuda {
-            if let Some(d_grad) = self.cuda_grad_ensure_buffer() {
-                // cuda_grad_ensure_buffer already zeros the buffer
+            if let Some(d_grad) = self.cuda_grad_zero_buffer() {
                 let _ = d_grad;
             }
         }
     }
 
-    /// Copy tensor data to CUDA GPU.
-    /// Current implementation keeps data on host while marking device intent.
+    /// Copy tensor data to CUDA GPU and keep host data lazy until materialized.
     #[cfg(cuda)]
     #[allow(dead_code)]
     pub fn to_cuda(&self) -> crate::cuda::error::CudaResult<Tensor> {
@@ -768,7 +937,7 @@ impl Tensor {
         }
 
         let tensor = Tensor {
-            data: self.data.clone(),
+            data: Storage::zeros(0, self.dtype),
             grad: self.grad.clone(),
             shape: self.shape.clone(),
             device: Device::Cuda,
@@ -776,15 +945,53 @@ impl Tensor {
             _ctx: self._ctx.clone(),
         };
 
-        let len = tensor.data_f64().len();
+        let len = self.numel();
         if len > 0 {
-            if let Err((_, err)) = tensor.cuda_get_or_upload_buffer() {
+            if let Err((_, err)) = self.cuda_get_or_upload_buffer() {
                 log::warn!("[Tensor] CUDA upload failed: {err}");
                 return Err(err);
+            }
+            if let Some(buffer) = self.cuda_cached_buffer() {
+                tensor.cuda_set_cached_buffer(buffer);
             }
         }
 
         Ok(tensor)
+    }
+
+    #[cfg(cuda)]
+    #[inline]
+    pub(crate) fn cuda_storage_len(&self) -> usize {
+        let host_len = self.data.len();
+        if host_len > 0 {
+            host_len
+        } else {
+            self.numel()
+        }
+    }
+
+    #[cfg(cuda)]
+    pub(crate) fn cuda_device_tensor(
+        data: Arc<crate::cuda::memory::CudaBuffer>,
+        shape: Vec<usize>,
+        dtype: Dtype,
+        parents: Vec<Tensor>,
+        backward_op: BackwardOp,
+    ) -> Tensor {
+        let len: usize = shape.iter().product();
+        let out = Tensor {
+            data: Tensor::empty_storage(dtype),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(dtype)),
+            shape,
+            device: Device::Cuda,
+            dtype,
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op,
+            })),
+        };
+        out.cuda_set_cached_buffer(data);
+        out
     }
 
     /// Copy tensor data from CUDA GPU back to CPU.
@@ -802,6 +1009,16 @@ impl Tensor {
 
         if let Some(buffer) = self.cuda_cached_buffer() {
             match &*buffer {
+                CudaBuffer::BF16(b) => {
+                    let mut host = vec![crate::dtype::bf16::default(); buffer.len()];
+                    crate::cuda::memory::copy_d2h(&mut host, b)?;
+                    return Ok(host.iter().map(|&v| v.to_f64()).collect());
+                }
+                CudaBuffer::I8(b) => {
+                    let mut host = vec![0i8; buffer.len()];
+                    crate::cuda::memory::copy_d2h(&mut host, b)?;
+                    return Ok(host.iter().map(|&v| v as f64).collect());
+                }
                 CudaBuffer::F32(b) => {
                     let mut host = vec![0.0f32; buffer.len()];
                     crate::cuda::memory::copy_d2h(&mut host, b)?;
@@ -831,12 +1048,17 @@ impl Tensor {
         let (k2, n) = (other.shape[0], other.shape[1]);
         assert_eq!(k, k2, "MatMul dimension mismatch");
 
-        // GPU routing: use CUDA if both tensors are on GPU and large enough
+        // GPU routing: keep CUDA tensors on GPU for supported GEMM dtypes.
         #[cfg(cuda)]
         {
-            let ops = m * n * k;
-            let use_gpu =
-                ops >= 32768 && self.device == Device::Cuda && other.device == Device::Cuda;
+            let use_gpu = self.device == Device::Cuda
+                && other.device == Device::Cuda
+                && matches!(
+                    (self.dtype, other.dtype),
+                    (Dtype::F32, Dtype::F32)
+                        | (Dtype::F64, Dtype::F64)
+                        | (Dtype::BF16, Dtype::BF16)
+                );
             if use_gpu {
                 return self.matmul_cuda(other, m, k, n);
             }
@@ -1287,8 +1509,7 @@ impl Tensor {
         use crate::cuda::memory::{alloc, copy_d2d, CudaBuffer};
 
         let len = match self.dtype {
-            Dtype::F32 => self.data_f32().len(),
-            Dtype::F64 => self.data_f64().len(),
+            Dtype::F32 | Dtype::F64 => self.numel(),
             _ => return self.relu_cpu_fallback(),
         };
         if len == 0 {
@@ -1361,7 +1582,7 @@ impl Tensor {
         let out_dtype = self.dtype;
         let grad_dtype = Tensor::grad_dtype_for(out_dtype);
         let out = Tensor {
-            data: Storage::zeros(len, out_dtype),
+            data: Tensor::empty_storage(out_dtype),
             grad: Storage::zeros(len, grad_dtype),
             shape: self.shape.clone(),
             device: Device::Cuda,
@@ -1374,59 +1595,35 @@ impl Tensor {
                     #[cfg(cuda)]
                     if input.device == Device::Cuda {
                         if let Some(d_input) = input.cuda_cached_buffer() {
-                            let grad_dtype = grad_out.dtype();
-                            let d_grad_tmp = match grad_dtype {
-                                Dtype::F32 => {
-                                    crate::cuda::memory::alloc_pooled::<f32>(grad_out_f64.len())
-                                        .ok()
-                                        .map(CudaBuffer::F32)
-                                }
-                                Dtype::F64 => {
-                                    crate::cuda::memory::alloc_pooled::<f64>(grad_out_f64.len())
-                                        .ok()
-                                        .map(CudaBuffer::F64)
-                                }
-                                _ => None,
-                            };
+                            let d_grad_tmp = cuda_grad_out_buffer(grad_out);
                             if let Some(d_grad_tmp) = d_grad_tmp {
-                                let d_grad_tmp = std::sync::Arc::new(d_grad_tmp);
-                                let copy_ok = match (&*d_grad_tmp, grad_dtype) {
-                                    (CudaBuffer::F32(b), Dtype::F32) => {
-                                        let host = grad_out.to_f32_vec();
-                                        crate::cuda::memory::copy_h2d(b, &host).is_ok()
-                                    }
-                                    (CudaBuffer::F64(b), Dtype::F64) => {
-                                        crate::cuda::memory::copy_h2d(b, &grad_out_f64).is_ok()
-                                    }
-                                    _ => false,
-                                };
-                                if copy_ok {
-                                    if let Some(d_in_grad) = input.cuda_grad_ensure_buffer() {
-                                        match (&*d_input, &*d_grad_tmp, &*d_in_grad, input.dtype) {
-                                            (
-                                                CudaBuffer::F32(inp),
-                                                CudaBuffer::F32(gt),
-                                                CudaBuffer::F32(ig),
-                                                Dtype::F32,
-                                            ) => {
-                                                let _ = relu_backward_f32(
-                                                    inp,
-                                                    gt,
-                                                    ig,
-                                                    grad_out_f64.len(),
-                                                );
+                                if let Some(d_in_grad) = input.cuda_grad_ensure_buffer() {
+                                    match (&*d_input, &*d_grad_tmp, &*d_in_grad, input.dtype) {
+                                        (
+                                            CudaBuffer::F32(inp),
+                                            CudaBuffer::F32(gt),
+                                            CudaBuffer::F32(ig),
+                                            Dtype::F32,
+                                        ) => {
+                                            if relu_backward_f32(inp, gt, ig, grad_out_f64.len())
+                                                .is_ok()
+                                            {
+                                                return;
                                             }
-                                            (
-                                                CudaBuffer::F64(inp),
-                                                CudaBuffer::F64(gt),
-                                                CudaBuffer::F64(ig),
-                                                Dtype::F64,
-                                            ) => {
-                                                let _ =
-                                                    relu_backward(inp, gt, ig, grad_out_f64.len());
-                                            }
-                                            _ => {}
                                         }
+                                        (
+                                            CudaBuffer::F64(inp),
+                                            CudaBuffer::F64(gt),
+                                            CudaBuffer::F64(ig),
+                                            Dtype::F64,
+                                        ) => {
+                                            if relu_backward(inp, gt, ig, grad_out_f64.len())
+                                                .is_ok()
+                                            {
+                                                return;
+                                            }
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }
@@ -2143,13 +2340,12 @@ impl Tensor {
                             let base = outer_idx * dim_size_cap;
                             let mut sum_term = 0.0;
                             for dim_idx in 0..dim_size_cap {
-                                let idx = base + dim_idx;
-                                sum_term += grad_out_f64[idx] * softmax_cache_for_backward[idx];
+                                sum_term += grad_out_f64[base + dim_idx];
                             }
                             for dim_idx in 0..dim_size_cap {
                                 let idx = base + dim_idx;
-                                inp_grad[idx] += softmax_cache_for_backward[idx]
-                                    * (grad_out_f64[idx] - sum_term);
+                                inp_grad[idx] +=
+                                    grad_out_f64[idx] - softmax_cache_for_backward[idx] * sum_term;
                             }
                         }
                     } else {
@@ -2159,12 +2355,12 @@ impl Tensor {
                                 let mut sum_term = 0.0;
                                 for dim_idx in 0..dim_size_cap {
                                     let idx = base_outer + dim_idx * inner_cap + inner_idx;
-                                    sum_term += grad_out_f64[idx] * softmax_cache_for_backward[idx];
+                                    sum_term += grad_out_f64[idx];
                                 }
                                 for dim_idx in 0..dim_size_cap {
                                     let idx = base_outer + dim_idx * inner_cap + inner_idx;
-                                    inp_grad[idx] += softmax_cache_for_backward[idx]
-                                        * (grad_out_f64[idx] - sum_term);
+                                    inp_grad[idx] += grad_out_f64[idx]
+                                        - softmax_cache_for_backward[idx] * sum_term;
                                 }
                             }
                         }
@@ -2425,6 +2621,10 @@ impl Tensor {
 
     pub fn transpose2d(&self) -> Tensor {
         assert_eq!(self.shape.len(), 2, "Transpose requires 2D tensor");
+        #[cfg(cuda)]
+        if let Some(out) = self.transpose_cuda(0, 1) {
+            return out;
+        }
         let rows = self.shape[0];
         let cols = self.shape[1];
         if self.dtype != Dtype::F64 {
@@ -2619,6 +2819,10 @@ impl Tensor {
     }
 
     pub fn broadcast_to_batch(&self, batch_size: usize) -> Tensor {
+        #[cfg(cuda)]
+        if let Some(out) = self.broadcast_to_batch_cuda(batch_size) {
+            return out;
+        }
         let self_data = self.data_as_f64_vec();
         let len = self_data.len();
         let mut new_data = Vec::with_capacity(len * batch_size);
@@ -2902,10 +3106,15 @@ impl Tensor {
     }
 
     pub fn transpose(&self, dim0: usize, dim1: usize) -> Tensor {
-        let self_data = self.data_as_f64_vec();
         let shape = &self.shape;
         let rank = shape.len();
         assert!(dim0 < rank && dim1 < rank);
+        #[cfg(cuda)]
+        if let Some(out) = self.transpose_cuda(dim0, dim1) {
+            return out;
+        }
+
+        let self_data = self.data_as_f64_vec();
         assert!(
             rank <= 8,
             "transpose: rank > 8 not supported by stack-allocated coords"
@@ -3037,14 +3246,14 @@ impl Tensor {
 
     pub fn reshape(&self, new_shape: Vec<usize>) -> Tensor {
         let len: usize = new_shape.iter().product::<usize>();
-        assert_eq!(len, self.data.len(), "Reshape dimension mismatch");
+        assert_eq!(len, self.numel(), "Reshape dimension mismatch");
 
         // Zero-copy: share the same data Arc, only change shape metadata
         let parents = vec![self.clone()];
 
-        Tensor {
+        let out = Tensor {
             data: self.data.clone(),
-            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(self.dtype)),
             shape: new_shape,
             device: self.device,
             dtype: self.dtype,
@@ -3066,7 +3275,14 @@ impl Tensor {
                     }
                 }),
             })),
+        };
+        #[cfg(cuda)]
+        if self.device == Device::Cuda {
+            if let Some(buffer) = self.cuda_cached_buffer() {
+                out.cuda_set_cached_buffer(buffer);
+            }
         }
+        out
     }
 
     // Winograd F(2x2, 3x3) implementation
@@ -3946,18 +4162,32 @@ impl Tensor {
     // Generic element-wise binary ops for non-F64 dtypes.
     // -------------------------------------------------------------------------
 
+    fn assert_same_numel(&self, rhs: &Tensor, op: &'static str) {
+        assert_eq!(
+            self.numel(),
+            rhs.numel(),
+            "{} data length mismatch: left shape {:?} ({} elems), right shape {:?} ({} elems)",
+            op,
+            self.shape,
+            self.numel(),
+            rhs.shape,
+            rhs.numel()
+        );
+    }
+
     fn add_generic(&self, rhs: &Tensor) -> Tensor {
+        self.assert_same_numel(rhs, "add_generic");
         let self_f32 = self.data_to_f32_vec();
         let rhs_f32 = rhs.data_to_f32_vec();
-        let len = self_f32.len();
-        let mut data = vec![0.0f32; len];
-        for i in 0..len {
+        let out_len = self_f32.len();
+        let mut data = vec![0.0f32; out_len];
+        for i in 0..out_len {
             data[i] = self_f32[i] + rhs_f32[i];
         }
         let out_dtype = Tensor::binary_dtype(self.dtype, rhs.dtype);
         Tensor {
             data: Storage::from_f32_vec(data, out_dtype),
-            grad: Storage::zeros(len, Tensor::grad_dtype_for(out_dtype)),
+            grad: Storage::zeros(out_len, Tensor::grad_dtype_for(out_dtype)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: out_dtype,
@@ -3968,13 +4198,13 @@ impl Tensor {
                     let same_grad = _parents[0].grad.ptr_eq(&_parents[1].grad);
                     if same_grad {
                         let mut grad = _parents[0].grad_write_compat();
-                        for i in 0..len {
+                        for i in 0..out_len {
                             grad[i] += grad_out_f64[i] * 2.0;
                         }
                     } else {
                         let mut lhs_grad = _parents[0].grad_write_compat();
                         let mut rhs_grad = _parents[1].grad_write_compat();
-                        for i in 0..len {
+                        for i in 0..out_len {
                             lhs_grad[i] += grad_out_f64[i];
                             rhs_grad[i] += grad_out_f64[i];
                         }
@@ -3985,17 +4215,18 @@ impl Tensor {
     }
 
     fn sub_generic(&self, rhs: &Tensor) -> Tensor {
+        self.assert_same_numel(rhs, "sub_generic");
         let self_f32 = self.data_to_f32_vec();
         let rhs_f32 = rhs.data_to_f32_vec();
-        let len = self_f32.len();
-        let mut data = vec![0.0f32; len];
-        for i in 0..len {
+        let out_len = self_f32.len();
+        let mut data = vec![0.0f32; out_len];
+        for i in 0..out_len {
             data[i] = self_f32[i] - rhs_f32[i];
         }
         let out_dtype = Tensor::binary_dtype(self.dtype, rhs.dtype);
         Tensor {
             data: Storage::from_f32_vec(data, out_dtype),
-            grad: Storage::zeros(len, Tensor::grad_dtype_for(out_dtype)),
+            grad: Storage::zeros(out_len, Tensor::grad_dtype_for(out_dtype)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: out_dtype,
@@ -4009,7 +4240,7 @@ impl Tensor {
                     } else {
                         let mut lhs_grad = _parents[0].grad_write_compat();
                         let mut rhs_grad = _parents[1].grad_write_compat();
-                        for i in 0..len {
+                        for i in 0..out_len {
                             lhs_grad[i] += grad_out_f64[i];
                             rhs_grad[i] -= grad_out_f64[i];
                         }
@@ -4020,11 +4251,12 @@ impl Tensor {
     }
 
     fn mul_generic(&self, rhs: &Tensor) -> Tensor {
+        self.assert_same_numel(rhs, "mul_generic");
         let self_f32 = self.data_to_f32_vec();
         let rhs_f32 = rhs.data_to_f32_vec();
-        let len = self_f32.len();
-        let mut data = vec![0.0f32; len];
-        for i in 0..len {
+        let out_len = self_f32.len();
+        let mut data = vec![0.0f32; out_len];
+        for i in 0..out_len {
             data[i] = self_f32[i] * rhs_f32[i];
         }
         let out_dtype = Tensor::binary_dtype(self.dtype, rhs.dtype);
@@ -4032,7 +4264,7 @@ impl Tensor {
         let self_cache: Arc<Vec<f64>> = Arc::new(self_f32.iter().map(|&v| v as f64).collect());
         Tensor {
             data: Storage::from_f32_vec(data, out_dtype),
-            grad: Storage::zeros(len, Tensor::grad_dtype_for(out_dtype)),
+            grad: Storage::zeros(out_len, Tensor::grad_dtype_for(out_dtype)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: out_dtype,
@@ -4043,13 +4275,13 @@ impl Tensor {
                     let same_grad = _parents[0].grad.ptr_eq(&_parents[1].grad);
                     if same_grad {
                         let mut grad = _parents[0].grad_write_compat();
-                        for i in 0..len {
+                        for i in 0..out_len {
                             grad[i] += grad_out_f64[i] * 2.0 * rhs_cache[i];
                         }
                     } else {
                         let mut lhs_grad = _parents[0].grad_write_compat();
                         let mut rhs_grad = _parents[1].grad_write_compat();
-                        for i in 0..len {
+                        for i in 0..out_len {
                             lhs_grad[i] += grad_out_f64[i] * rhs_cache[i];
                             rhs_grad[i] += grad_out_f64[i] * self_cache[i];
                         }
@@ -4060,11 +4292,12 @@ impl Tensor {
     }
 
     fn div_generic(&self, rhs: &Tensor) -> Tensor {
+        self.assert_same_numel(rhs, "div_generic");
         let self_f32 = self.data_to_f32_vec();
         let rhs_f32 = rhs.data_to_f32_vec();
-        let len = self_f32.len();
-        let mut data = vec![0.0f32; len];
-        for i in 0..len {
+        let out_len = self_f32.len();
+        let mut data = vec![0.0f32; out_len];
+        for i in 0..out_len {
             data[i] = self_f32[i] / rhs_f32[i];
         }
         let out_dtype = Tensor::binary_dtype(self.dtype, rhs.dtype);
@@ -4072,7 +4305,7 @@ impl Tensor {
         let self_cache: Arc<Vec<f64>> = Arc::new(self_f32.iter().map(|&v| v as f64).collect());
         Tensor {
             data: Storage::from_f32_vec(data, out_dtype),
-            grad: Storage::zeros(len, Tensor::grad_dtype_for(out_dtype)),
+            grad: Storage::zeros(out_len, Tensor::grad_dtype_for(out_dtype)),
             shape: self.shape.clone(),
             device: Device::Cpu,
             dtype: out_dtype,
@@ -4086,7 +4319,7 @@ impl Tensor {
                     } else {
                         let mut lhs_grad = _parents[0].grad_write_compat();
                         let mut rhs_grad = _parents[1].grad_write_compat();
-                        for i in 0..len {
+                        for i in 0..out_len {
                             lhs_grad[i] += grad_out_f64[i] / rhs_cache[i];
                             rhs_grad[i] +=
                                 grad_out_f64[i] * (-self_cache[i] / (rhs_cache[i] * rhs_cache[i]));
@@ -4103,7 +4336,7 @@ impl Tensor {
 impl Add for Tensor {
     type Output = Tensor;
     fn add(self, rhs: Tensor) -> Tensor {
-        assert_eq!(self.shape, rhs.shape, "Add shape mismatch");
+        assert_eq!(self.numel(), rhs.numel(), "Add data length mismatch");
         if self.dtype != rhs.dtype {
             return self.add_generic(&rhs);
         }
@@ -4169,7 +4402,7 @@ impl Add for Tensor {
 impl<'b> Add<&'b Tensor> for &Tensor {
     type Output = Tensor;
     fn add(self, rhs: &'b Tensor) -> Tensor {
-        assert_eq!(self.shape, rhs.shape, "Add shape mismatch");
+        assert_eq!(self.numel(), rhs.numel(), "Add data length mismatch");
         if self.dtype != rhs.dtype {
             return self.add_generic(rhs);
         }
@@ -4235,7 +4468,7 @@ impl<'b> Add<&'b Tensor> for &Tensor {
 impl Sub for Tensor {
     type Output = Tensor;
     fn sub(self, rhs: Tensor) -> Tensor {
-        assert_eq!(self.shape, rhs.shape, "Sub shape mismatch");
+        assert_eq!(self.numel(), rhs.numel(), "Sub data length mismatch");
         if self.dtype != rhs.dtype {
             return self.sub_generic(&rhs);
         }
@@ -4303,7 +4536,7 @@ impl Sub for Tensor {
 impl<'b> Sub<&'b Tensor> for &Tensor {
     type Output = Tensor;
     fn sub(self, rhs: &'b Tensor) -> Tensor {
-        assert_eq!(self.shape, rhs.shape, "Sub shape mismatch");
+        assert_eq!(self.numel(), rhs.numel(), "Sub data length mismatch");
         if self.dtype != rhs.dtype {
             return self.sub_generic(rhs);
         }
@@ -4371,7 +4604,7 @@ impl<'b> Sub<&'b Tensor> for &Tensor {
 impl Mul for Tensor {
     type Output = Tensor;
     fn mul(self, rhs: Tensor) -> Tensor {
-        assert_eq!(self.shape, rhs.shape, "Mul shape mismatch");
+        assert_eq!(self.numel(), rhs.numel(), "Mul data length mismatch");
         if self.dtype != rhs.dtype {
             return self.mul_generic(&rhs);
         }
@@ -4465,7 +4698,7 @@ impl Mul for Tensor {
 impl<'b> Mul<&'b Tensor> for &Tensor {
     type Output = Tensor;
     fn mul(self, rhs: &'b Tensor) -> Tensor {
-        assert_eq!(self.shape, rhs.shape, "Mul shape mismatch");
+        assert_eq!(self.numel(), rhs.numel(), "Mul data length mismatch");
         if self.dtype != rhs.dtype {
             return self.mul_generic(rhs);
         }
@@ -4533,7 +4766,7 @@ impl<'b> Mul<&'b Tensor> for &Tensor {
 impl Div for Tensor {
     type Output = Tensor;
     fn div(self, rhs: Tensor) -> Tensor {
-        assert_eq!(self.shape, rhs.shape, "Div shape mismatch");
+        assert_eq!(self.numel(), rhs.numel(), "Div data length mismatch");
         if self.dtype != rhs.dtype {
             return self.div_generic(&rhs);
         }
@@ -4673,7 +4906,7 @@ impl Div for Tensor {
 impl<'b> Div<&'b Tensor> for &Tensor {
     type Output = Tensor;
     fn div(self, rhs: &'b Tensor) -> Tensor {
-        assert_eq!(self.shape, rhs.shape, "Div shape mismatch");
+        assert_eq!(self.numel(), rhs.numel(), "Div data length mismatch");
         if self.dtype != rhs.dtype {
             return self.div_generic(rhs);
         }
@@ -4840,21 +5073,21 @@ impl Tensor {
 
     fn cuda_grad_cached_buffer(&self) -> Option<Arc<crate::cuda::memory::CudaBuffer>> {
         let key = self.cuda_grad_cache_key();
-        let cache = cuda_tensor_buffer_cache();
+        let cache = cuda_grad_buffer_cache();
         let map = cache.lock().ok()?;
         map.get(&key).cloned()
     }
 
     fn cuda_grad_set_cached_buffer(&self, buffer: Arc<crate::cuda::memory::CudaBuffer>) {
         let key = self.cuda_grad_cache_key();
-        if let Ok(mut map) = cuda_tensor_buffer_cache().lock() {
+        if let Ok(mut map) = cuda_grad_buffer_cache().lock() {
             map.insert(key, buffer);
         }
     }
 
     fn cuda_grad_remove_cached_buffer(&self) {
         let key = self.cuda_grad_cache_key();
-        if let Ok(mut map) = cuda_tensor_buffer_cache().lock() {
+        if let Ok(mut map) = cuda_grad_buffer_cache().lock() {
             map.remove(&key);
         }
     }
@@ -4870,29 +5103,6 @@ impl Tensor {
         let len = self.grad.len();
         if let Some(buffer) = self.cuda_grad_cached_buffer() {
             if buffer.len() == len && buffer.dtype() == grad_dtype {
-                match (&*buffer, grad_dtype) {
-                    (CudaBuffer::F32(b), Dtype::F32) => {
-                        let host = self.grad_to_f32_vec();
-                        if !host.is_empty() {
-                            if let Err(err) = copy_h2d(b, &host) {
-                                self.cuda_grad_remove_cached_buffer();
-                                return Err(("copy", err));
-                            }
-                        }
-                    }
-                    (CudaBuffer::F64(b), Dtype::F64) => {
-                        let host = self.grad_to_f64_vec();
-                        if !host.is_empty() {
-                            if let Err(err) = copy_h2d(b, &host) {
-                                self.cuda_grad_remove_cached_buffer();
-                                return Err(("copy", err));
-                            }
-                        }
-                    }
-                    _ => {
-                        self.cuda_grad_remove_cached_buffer();
-                    }
-                }
                 return Ok(buffer);
             }
             self.cuda_grad_remove_cached_buffer();
@@ -4944,52 +5154,27 @@ impl Tensor {
 
     /// Ensure a zero-initialized GPU grad buffer exists for this tensor.
     pub(crate) fn cuda_grad_ensure_buffer(&self) -> Option<Arc<crate::cuda::memory::CudaBuffer>> {
-        use crate::cuda::memory::{alloc, copy_h2d, CudaBuffer};
+        self.cuda_grad_get_or_upload_buffer().ok()
+    }
 
-        let grad_dtype = self.grad.dtype();
-        let len = self.grad.len();
+    pub(crate) fn cuda_grad_zero_buffer(&self) -> Option<Arc<crate::cuda::memory::CudaBuffer>> {
+        let buffer = self.cuda_grad_ensure_buffer()?;
+        let len = buffer.len();
         if len == 0 {
-            return Some(Arc::new(CudaBuffer::F64(
-                crate::cuda::memory::DevicePtr::zero_sized(),
-            )));
+            return Some(buffer);
         }
-        if let Some(buffer) = self.cuda_grad_cached_buffer() {
-            if buffer.len() == len && buffer.dtype() == grad_dtype {
-                match (&*buffer, grad_dtype) {
-                    (CudaBuffer::F32(b), Dtype::F32) => {
-                        let zeros = vec![0.0f32; len];
-                        let _ = copy_h2d(b, &zeros);
-                    }
-                    (CudaBuffer::F64(b), Dtype::F64) => {
-                        let zeros = vec![0.0f64; len];
-                        let _ = copy_h2d(b, &zeros);
-                    }
-                    _ => {
-                        self.cuda_grad_remove_cached_buffer();
-                    }
-                }
-                return Some(buffer);
-            }
-            self.cuda_grad_remove_cached_buffer();
-        }
-        let device = match grad_dtype {
-            Dtype::F32 => alloc::<f32>(len).ok().map(CudaBuffer::F32),
-            Dtype::F64 => alloc::<f64>(len).ok().map(CudaBuffer::F64),
-            _ => None,
-        }?;
-        match &device {
-            CudaBuffer::F32(b) => {
+        match &*buffer {
+            crate::cuda::memory::CudaBuffer::F32(b) => {
                 let zeros = vec![0.0f32; len];
-                let _ = copy_h2d(b, &zeros);
+                let _ = crate::cuda::memory::copy_h2d(b, &zeros);
             }
-            CudaBuffer::F64(b) => {
+            crate::cuda::memory::CudaBuffer::F64(b) => {
                 let zeros = vec![0.0f64; len];
-                let _ = copy_h2d(b, &zeros);
+                let _ = crate::cuda::memory::copy_h2d(b, &zeros);
             }
+            crate::cuda::memory::CudaBuffer::BF16(_) | crate::cuda::memory::CudaBuffer::I8(_) => {}
         }
-        let device = Arc::new(device);
-        self.cuda_grad_set_cached_buffer(device.clone());
-        Some(device)
+        Some(buffer)
     }
 
     /// Materialize GPU data to CPU if this tensor lives on GPU but has empty CPU data.
@@ -5000,12 +5185,38 @@ impl Tensor {
         if self.device != Device::Cuda {
             return;
         }
-        if self.data.len() > 0 {
+        if !self.data.is_empty() {
             return;
         }
 
         if let Some(buffer) = self.cuda_cached_buffer() {
             match &*buffer {
+                CudaBuffer::BF16(b) => {
+                    let mut data = vec![crate::dtype::bf16::default(); b.len()];
+                    if let Err(err) = copy_d2h(&mut data, b) {
+                        log::warn!(
+                            "[Tensor] CUDA materialize D2H failed ({}), data remains empty",
+                            err
+                        );
+                        return;
+                    }
+                    if let Storage::BF16(v) = &self.data {
+                        *v.write().unwrap() = data;
+                    }
+                }
+                CudaBuffer::I8(b) => {
+                    let mut data = vec![0i8; b.len()];
+                    if let Err(err) = copy_d2h(&mut data, b) {
+                        log::warn!(
+                            "[Tensor] CUDA materialize D2H failed ({}), data remains empty",
+                            err
+                        );
+                        return;
+                    }
+                    if let Storage::I8(v) = &self.data {
+                        *v.write().unwrap() = data;
+                    }
+                }
                 CudaBuffer::F32(b) => {
                     let mut data = vec![0.0f32; b.len()];
                     if let Err(err) = copy_d2h(&mut data, b) {
@@ -5015,8 +5226,9 @@ impl Tensor {
                         );
                         return;
                     }
-                    let mut self_data = self.data_write_f32();
-                    *self_data = data;
+                    if let Storage::F32(v) = &self.data {
+                        *v.write().unwrap() = data;
+                    }
                 }
                 CudaBuffer::F64(b) => {
                     let mut data = vec![0.0f64; b.len()];
@@ -5027,8 +5239,9 @@ impl Tensor {
                         );
                         return;
                     }
-                    let mut self_data = self.data_write_f64();
-                    *self_data = data;
+                    if let Storage::F64(v) = &self.data {
+                        *v.write().unwrap() = data;
+                    }
                 }
             }
         }
@@ -5040,41 +5253,57 @@ impl Tensor {
     {
         use crate::cuda::memory::{alloc, copy_h2d, CudaBuffer};
 
-        let len = match self.dtype {
-            Dtype::F32 => self.data_f32().len(),
-            Dtype::F64 => self.data_f64().len(),
-            _ => {
-                return Err((
-                    "alloc",
-                    crate::cuda::error::CudaError::UnsupportedBuild {
-                        op: "cuda upload for non-float dtype",
-                    },
-                ))
-            }
-        };
+        let host_len = self.data.len();
+        let len = if host_len > 0 { host_len } else { self.numel() };
+        let expected_len = self.numel();
+        if len != expected_len {
+            return Err((
+                "alloc",
+                crate::cuda::error::CudaError::SizeMismatch {
+                    op: "cuda upload length",
+                    expected: expected_len,
+                    actual: len,
+                },
+            ));
+        }
+
         if let Some(buffer) = self.cuda_cached_buffer() {
             if buffer.len() == len && buffer.dtype() == self.dtype {
-                match (&*buffer, self.dtype) {
-                    (CudaBuffer::F32(b), Dtype::F32) => {
-                        let host = self.data_f32();
-                        if !host.is_empty() {
+                if host_len > 0 {
+                    match (&*buffer, self.dtype) {
+                        (CudaBuffer::BF16(b), Dtype::BF16) => {
+                            let host = self.data_bf16();
                             if let Err(err) = copy_h2d(b, &host) {
                                 self.cuda_remove_cached_buffer();
                                 return Err(("copy", err));
                             }
                         }
-                    }
-                    (CudaBuffer::F64(b), Dtype::F64) => {
-                        let host = self.data_f64();
-                        if !host.is_empty() {
+                        (CudaBuffer::I8(b), Dtype::I8) => {
+                            if let Storage::I8(v) = &self.data {
+                                let host = v.read().unwrap();
+                                if let Err(err) = copy_h2d(b, &host) {
+                                    self.cuda_remove_cached_buffer();
+                                    return Err(("copy", err));
+                                }
+                            }
+                        }
+                        (CudaBuffer::F32(b), Dtype::F32) => {
+                            let host = self.data_f32();
                             if let Err(err) = copy_h2d(b, &host) {
                                 self.cuda_remove_cached_buffer();
                                 return Err(("copy", err));
                             }
                         }
-                    }
-                    _ => {
-                        self.cuda_remove_cached_buffer();
+                        (CudaBuffer::F64(b), Dtype::F64) => {
+                            let host = self.data_f64();
+                            if let Err(err) = copy_h2d(b, &host) {
+                                self.cuda_remove_cached_buffer();
+                                return Err(("copy", err));
+                            }
+                        }
+                        _ => {
+                            self.cuda_remove_cached_buffer();
+                        }
                     }
                 }
                 return Ok(buffer);
@@ -5087,8 +5316,41 @@ impl Tensor {
                 crate::cuda::memory::DevicePtr::zero_sized(),
             )));
         }
+        if host_len == 0 {
+            return Err((
+                "copy",
+                crate::cuda::error::CudaError::InvalidInput {
+                    op: "cuda upload",
+                    message: "host data is empty and no CUDA buffer is cached",
+                },
+            ));
+        }
 
         let buffer = match self.dtype {
+            Dtype::BF16 => {
+                let host = self.data_bf16();
+                let device = match alloc::<crate::dtype::bf16>(len) {
+                    Ok(buf) => buf,
+                    Err(err) => return Err(("alloc", err)),
+                };
+                if let Err(err) = copy_h2d(&device, &host) {
+                    return Err(("copy", err));
+                }
+                CudaBuffer::BF16(device)
+            }
+            Dtype::I8 => {
+                let device = match alloc::<i8>(len) {
+                    Ok(buf) => buf,
+                    Err(err) => return Err(("alloc", err)),
+                };
+                if let Storage::I8(v) = &self.data {
+                    let host = v.read().unwrap();
+                    if let Err(err) = copy_h2d(&device, &host) {
+                        return Err(("copy", err));
+                    }
+                }
+                CudaBuffer::I8(device)
+            }
             Dtype::F32 => {
                 let host = self.data_f32();
                 let device = match alloc::<f32>(len) {
@@ -5111,19 +5373,631 @@ impl Tensor {
                 }
                 CudaBuffer::F64(device)
             }
-            _ => {
-                return Err((
-                    "alloc",
-                    crate::cuda::error::CudaError::UnsupportedBuild {
-                        op: "cuda upload for non-float dtype",
-                    },
-                ))
-            }
         };
 
         let buffer = Arc::new(buffer);
         self.cuda_set_cached_buffer(buffer.clone());
         Ok(buffer)
+    }
+
+    #[cfg(cuda)]
+    pub(crate) fn scale_cuda(&self, scale: f64) -> Option<Tensor> {
+        use crate::cuda::memory::{alloc, CudaBuffer};
+
+        if self.device != Device::Cuda || (self.dtype != Dtype::F32 && self.dtype != Dtype::F64) {
+            return None;
+        }
+        let len = self.numel();
+        let d_in = self.cuda_get_or_upload_buffer().ok()?;
+        let d_out = match self.dtype {
+            Dtype::F32 => CudaBuffer::F32(alloc::<f32>(len).ok()?),
+            Dtype::F64 => CudaBuffer::F64(alloc::<f64>(len).ok()?),
+            _ => return None,
+        };
+        let d_out = Arc::new(d_out);
+        let ok = match (&*d_in, &*d_out, self.dtype) {
+            (CudaBuffer::F32(input), CudaBuffer::F32(output), Dtype::F32) => {
+                crate::cuda::kernels::scale_f32(input, output, scale as f32, len).is_ok()
+            }
+            (CudaBuffer::F64(input), CudaBuffer::F64(output), Dtype::F64) => {
+                crate::cuda::kernels::scale(input, output, scale, len).is_ok()
+            }
+            _ => false,
+        };
+        if !ok {
+            return None;
+        }
+
+        let parents = vec![self.clone()];
+        let out = Tensor {
+            data: Tensor::empty_storage(self.dtype),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(self.dtype)),
+            shape: self.shape.clone(),
+            device: Device::Cuda,
+            dtype: self.dtype,
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    let input = &parents[0];
+                    if input.device == Device::Cuda {
+                        if let Some(d_grad_tmp) = cuda_grad_out_buffer(grad_out) {
+                            if let Some(d_input_grad) = input.cuda_grad_ensure_buffer() {
+                                let ok = match (&*d_grad_tmp, &*d_input_grad, input.dtype) {
+                                    (CudaBuffer::F32(gt), CudaBuffer::F32(ig), Dtype::F32) => {
+                                        crate::cuda::kernels::scale_backward_f32(
+                                            gt,
+                                            ig,
+                                            scale as f32,
+                                            gt.len(),
+                                        )
+                                        .is_ok()
+                                    }
+                                    (CudaBuffer::F64(gt), CudaBuffer::F64(ig), Dtype::F64) => {
+                                        crate::cuda::kernels::scale_backward(
+                                            gt,
+                                            ig,
+                                            scale,
+                                            gt.len(),
+                                        )
+                                        .is_ok()
+                                    }
+                                    _ => false,
+                                };
+                                if ok {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = input.grad_write_compat();
+                    inp_grad
+                        .par_iter_mut()
+                        .zip(grad_out_f64.par_iter())
+                        .for_each(|(ig, &g)| *ig += g * scale);
+                }),
+            })),
+        };
+        out.cuda_set_cached_buffer(d_out);
+        Some(out)
+    }
+
+    #[cfg(cuda)]
+    pub(crate) fn causal_mask_cuda(&self, seq_len: usize) -> Option<Tensor> {
+        use crate::cuda::memory::{alloc, CudaBuffer};
+
+        if self.device != Device::Cuda || (self.dtype != Dtype::F32 && self.dtype != Dtype::F64) {
+            return None;
+        }
+        let len = self.numel();
+        let seq_area = seq_len.checked_mul(seq_len)?;
+        if seq_len == 0 || !len.is_multiple_of(seq_area) {
+            return None;
+        }
+        let batches = len / seq_area;
+        let d_in = self.cuda_get_or_upload_buffer().ok()?;
+        let d_out = match self.dtype {
+            Dtype::F32 => CudaBuffer::F32(alloc::<f32>(len).ok()?),
+            Dtype::F64 => CudaBuffer::F64(alloc::<f64>(len).ok()?),
+            _ => return None,
+        };
+        let d_out = Arc::new(d_out);
+        let ok = match (&*d_in, &*d_out, self.dtype) {
+            (CudaBuffer::F32(input), CudaBuffer::F32(output), Dtype::F32) => {
+                crate::cuda::kernels::causal_mask_f32(input, output, batches, seq_len).is_ok()
+            }
+            (CudaBuffer::F64(input), CudaBuffer::F64(output), Dtype::F64) => {
+                crate::cuda::kernels::causal_mask(input, output, batches, seq_len).is_ok()
+            }
+            _ => false,
+        };
+        if !ok {
+            return None;
+        }
+
+        let parents = vec![self.clone()];
+        let out = Tensor {
+            data: Tensor::empty_storage(self.dtype),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(self.dtype)),
+            shape: self.shape.clone(),
+            device: Device::Cuda,
+            dtype: self.dtype,
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    let input = &parents[0];
+                    if input.device == Device::Cuda {
+                        if let Some(d_grad_tmp) = cuda_grad_out_buffer(grad_out) {
+                            if let Some(d_input_grad) = input.cuda_grad_ensure_buffer() {
+                                let ok = match (&*d_grad_tmp, &*d_input_grad, input.dtype) {
+                                    (CudaBuffer::F32(gt), CudaBuffer::F32(ig), Dtype::F32) => {
+                                        crate::cuda::kernels::causal_mask_backward_f32(
+                                            gt, ig, batches, seq_len,
+                                        )
+                                        .is_ok()
+                                    }
+                                    (CudaBuffer::F64(gt), CudaBuffer::F64(ig), Dtype::F64) => {
+                                        crate::cuda::kernels::causal_mask_backward(
+                                            gt, ig, batches, seq_len,
+                                        )
+                                        .is_ok()
+                                    }
+                                    _ => false,
+                                };
+                                if ok {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = input.grad_write_compat();
+                    for (idx, (&g, ig)) in grad_out_f64.iter().zip(inp_grad.iter_mut()).enumerate()
+                    {
+                        let local = idx % (seq_len * seq_len);
+                        let i = local / seq_len;
+                        let j = local % seq_len;
+                        if j <= i {
+                            *ig += g;
+                        }
+                    }
+                }),
+            })),
+        };
+        out.cuda_set_cached_buffer(d_out);
+        Some(out)
+    }
+
+    #[cfg(cuda)]
+    pub(crate) fn concat_last_dim_cuda(a: &Tensor, b: &Tensor) -> Option<Tensor> {
+        use crate::cuda::memory::{alloc, CudaBuffer};
+
+        if a.device != Device::Cuda || b.device != Device::Cuda {
+            return None;
+        }
+        if a.shape.len() != b.shape.len() || a.shape.is_empty() {
+            return None;
+        }
+        if a.dtype != b.dtype || (a.dtype != Dtype::F32 && a.dtype != Dtype::F64) {
+            return None;
+        }
+        if a.shape[..a.shape.len() - 1] != b.shape[..b.shape.len() - 1] {
+            return None;
+        }
+        let a_dim = *a.shape.last()?;
+        let b_dim = *b.shape.last()?;
+        let rows = a.numel() / a_dim;
+        let out_len = rows * (a_dim + b_dim);
+        let d_a = a.cuda_get_or_upload_buffer().ok()?;
+        let d_b = b.cuda_get_or_upload_buffer().ok()?;
+        let d_out = match a.dtype {
+            Dtype::F32 => CudaBuffer::F32(alloc::<f32>(out_len).ok()?),
+            Dtype::F64 => CudaBuffer::F64(alloc::<f64>(out_len).ok()?),
+            _ => return None,
+        };
+        let d_out = Arc::new(d_out);
+        let ok = match (&*d_a, &*d_b, &*d_out, a.dtype) {
+            (CudaBuffer::F32(da), CudaBuffer::F32(db), CudaBuffer::F32(out), Dtype::F32) => {
+                crate::cuda::kernels::concat_last_dim_f32(da, db, out, rows, a_dim, b_dim).is_ok()
+            }
+            (CudaBuffer::F64(da), CudaBuffer::F64(db), CudaBuffer::F64(out), Dtype::F64) => {
+                crate::cuda::kernels::concat_last_dim(da, db, out, rows, a_dim, b_dim).is_ok()
+            }
+            _ => false,
+        };
+        if !ok {
+            return None;
+        }
+
+        let mut shape = a.shape.clone();
+        *shape.last_mut()? = a_dim + b_dim;
+        let dtype = a.dtype;
+        let parents = vec![a.clone(), b.clone()];
+        let out = Tensor {
+            data: Tensor::empty_storage(dtype),
+            grad: Storage::zeros(out_len, Tensor::grad_dtype_for(dtype)),
+            shape,
+            device: Device::Cuda,
+            dtype,
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let a_in = &parents[0];
+                    let b_in = &parents[1];
+                    if a_in.device == Device::Cuda && b_in.device == Device::Cuda {
+                        if let Some(d_grad_tmp) = cuda_grad_out_buffer(grad_out) {
+                            if let (Some(d_a_grad), Some(d_b_grad)) = (
+                                a_in.cuda_grad_ensure_buffer(),
+                                b_in.cuda_grad_ensure_buffer(),
+                            ) {
+                                let ok = match (&*d_grad_tmp, &*d_a_grad, &*d_b_grad, dtype) {
+                                    (
+                                        CudaBuffer::F32(gt),
+                                        CudaBuffer::F32(ag),
+                                        CudaBuffer::F32(bg),
+                                        Dtype::F32,
+                                    ) => crate::cuda::kernels::concat_last_dim_backward_f32(
+                                        gt, ag, bg, rows, a_dim, b_dim,
+                                    )
+                                    .is_ok(),
+                                    (
+                                        CudaBuffer::F64(gt),
+                                        CudaBuffer::F64(ag),
+                                        CudaBuffer::F64(bg),
+                                        Dtype::F64,
+                                    ) => crate::cuda::kernels::concat_last_dim_backward(
+                                        gt, ag, bg, rows, a_dim, b_dim,
+                                    )
+                                    .is_ok(),
+                                    _ => false,
+                                };
+                                if ok {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    let mut a_grad = a_in.grad_write_compat();
+                    let mut b_grad = b_in.grad_write_compat();
+                    let stride = a_dim + b_dim;
+                    a_grad
+                        .par_chunks_mut(a_dim)
+                        .zip(b_grad.par_chunks_mut(b_dim))
+                        .zip(grad_out_f64.par_chunks(stride))
+                        .for_each(|((ag_row, bg_row), g_row)| {
+                            for k in 0..a_dim {
+                                ag_row[k] += g_row[k];
+                            }
+                            for k in 0..b_dim {
+                                bg_row[k] += g_row[a_dim + k];
+                            }
+                        });
+                }),
+            })),
+        };
+        out.cuda_set_cached_buffer(d_out);
+        Some(out)
+    }
+
+    #[cfg(cuda)]
+    pub(crate) fn split_last_dim_cuda(&self, parts: usize) -> Option<Vec<Tensor>> {
+        use crate::cuda::memory::{alloc, CudaBuffer};
+
+        if self.device != Device::Cuda
+            || (self.dtype != Dtype::F32 && self.dtype != Dtype::F64)
+            || self.shape.is_empty()
+            || parts == 0
+        {
+            return None;
+        }
+        let input_dim = *self.shape.last()?;
+        if !input_dim.is_multiple_of(parts) {
+            return None;
+        }
+        let part_dim = input_dim / parts;
+        let rows = self.numel() / input_dim;
+        let d_input = self.cuda_get_or_upload_buffer().ok()?;
+        let mut out = Vec::with_capacity(parts);
+        for part_idx in 0..parts {
+            let d_part = match self.dtype {
+                Dtype::F32 => CudaBuffer::F32(alloc::<f32>(rows * part_dim).ok()?),
+                Dtype::F64 => CudaBuffer::F64(alloc::<f64>(rows * part_dim).ok()?),
+                _ => return None,
+            };
+            let d_part = Arc::new(d_part);
+            let ok = match (&*d_input, &*d_part, self.dtype) {
+                (CudaBuffer::F32(input), CudaBuffer::F32(part), Dtype::F32) => {
+                    crate::cuda::kernels::split_last_dim_f32(
+                        input, part, rows, input_dim, part_dim, part_idx,
+                    )
+                    .is_ok()
+                }
+                (CudaBuffer::F64(input), CudaBuffer::F64(part), Dtype::F64) => {
+                    crate::cuda::kernels::split_last_dim(
+                        input, part, rows, input_dim, part_dim, part_idx,
+                    )
+                    .is_ok()
+                }
+                _ => false,
+            };
+            if !ok {
+                return None;
+            }
+            let mut shape = self.shape.clone();
+            *shape.last_mut()? = part_dim;
+            let input = self.clone();
+            let dtype = self.dtype;
+            let tensor = Tensor {
+                data: Tensor::empty_storage(dtype),
+                grad: Storage::zeros(rows * part_dim, Tensor::grad_dtype_for(dtype)),
+                shape,
+                device: Device::Cuda,
+                dtype,
+                _ctx: Some(Arc::new(Context {
+                    parents: vec![input],
+                    backward_op: Box::new(move |grad_out, parents| {
+                        let grad_out_f64 = grad_out.to_f64_vec();
+                        let input = &parents[0];
+                        if input.device == Device::Cuda {
+                            if let Some(d_grad_tmp) = cuda_grad_out_buffer(grad_out) {
+                                if let Some(d_input_grad) = input.cuda_grad_ensure_buffer() {
+                                    let ok = match (&*d_grad_tmp, &*d_input_grad, dtype) {
+                                        (CudaBuffer::F32(gt), CudaBuffer::F32(ig), Dtype::F32) => {
+                                            crate::cuda::kernels::split_last_dim_backward_f32(
+                                                gt, ig, rows, input_dim, part_dim, part_idx,
+                                            )
+                                            .is_ok()
+                                        }
+                                        (CudaBuffer::F64(gt), CudaBuffer::F64(ig), Dtype::F64) => {
+                                            crate::cuda::kernels::split_last_dim_backward(
+                                                gt, ig, rows, input_dim, part_dim, part_idx,
+                                            )
+                                            .is_ok()
+                                        }
+                                        _ => false,
+                                    };
+                                    if ok {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        let mut input_grad = input.grad_write_compat();
+                        for r in 0..rows {
+                            let src = r * part_dim;
+                            let dst = r * input_dim + part_idx * part_dim;
+                            for c in 0..part_dim {
+                                input_grad[dst + c] += grad_out_f64[src + c];
+                            }
+                        }
+                    }),
+                })),
+            };
+            tensor.cuda_set_cached_buffer(d_part);
+            out.push(tensor);
+        }
+        Some(out)
+    }
+
+    #[cfg(cuda)]
+    pub(crate) fn broadcast_to_batch_cuda(&self, batch_size: usize) -> Option<Tensor> {
+        use crate::cuda::memory::{alloc, CudaBuffer};
+
+        if self.device != Device::Cuda || (self.dtype != Dtype::F32 && self.dtype != Dtype::F64) {
+            return None;
+        }
+        let inner_len = self.numel();
+        let out_len = inner_len.checked_mul(batch_size)?;
+        let d_in = self.cuda_get_or_upload_buffer().ok()?;
+        let d_out = match self.dtype {
+            Dtype::F32 => CudaBuffer::F32(alloc::<f32>(out_len).ok()?),
+            Dtype::F64 => CudaBuffer::F64(alloc::<f64>(out_len).ok()?),
+            _ => return None,
+        };
+        let d_out = Arc::new(d_out);
+        let ok = match (&*d_in, &*d_out, self.dtype) {
+            (CudaBuffer::F32(input), CudaBuffer::F32(output), Dtype::F32) => {
+                crate::cuda::kernels::broadcast_batch_f32(input, output, batch_size, inner_len)
+                    .is_ok()
+            }
+            (CudaBuffer::F64(input), CudaBuffer::F64(output), Dtype::F64) => {
+                crate::cuda::kernels::broadcast_batch(input, output, batch_size, inner_len).is_ok()
+            }
+            _ => false,
+        };
+        if !ok {
+            return None;
+        }
+
+        let mut shape = vec![batch_size];
+        shape.extend_from_slice(&self.shape);
+        let dtype = self.dtype;
+        let parents = vec![self.clone()];
+        let out = Tensor {
+            data: Tensor::empty_storage(dtype),
+            grad: Storage::zeros(out_len, Tensor::grad_dtype_for(dtype)),
+            shape,
+            device: Device::Cuda,
+            dtype,
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    let input = &parents[0];
+                    if input.device == Device::Cuda {
+                        if let Some(d_grad_tmp) = cuda_grad_out_buffer(grad_out) {
+                            if let Some(d_input_grad) = input.cuda_grad_ensure_buffer() {
+                                let ok = match (&*d_grad_tmp, &*d_input_grad, dtype) {
+                                    (CudaBuffer::F32(gt), CudaBuffer::F32(ig), Dtype::F32) => {
+                                        crate::cuda::kernels::broadcast_batch_backward_f32(
+                                            gt, ig, batch_size, inner_len,
+                                        )
+                                        .is_ok()
+                                    }
+                                    (CudaBuffer::F64(gt), CudaBuffer::F64(ig), Dtype::F64) => {
+                                        crate::cuda::kernels::broadcast_batch_backward(
+                                            gt, ig, batch_size, inner_len,
+                                        )
+                                        .is_ok()
+                                    }
+                                    _ => false,
+                                };
+                                if ok {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = input.grad_write_compat();
+                    for chunk in grad_out_f64.chunks(inner_len) {
+                        for (i, &g) in chunk.iter().enumerate() {
+                            inp_grad[i] += g;
+                        }
+                    }
+                }),
+            })),
+        };
+        out.cuda_set_cached_buffer(d_out);
+        Some(out)
+    }
+
+    #[cfg(cuda)]
+    pub(crate) fn transpose_cuda(&self, dim0: usize, dim1: usize) -> Option<Tensor> {
+        use crate::cuda::memory::{alloc, CudaBuffer};
+
+        if self.device != Device::Cuda || (self.dtype != Dtype::F32 && self.dtype != Dtype::F64) {
+            return None;
+        }
+        let rank = self.shape.len();
+        if dim0 >= rank || dim1 >= rank || dim0 == dim1 {
+            return None;
+        }
+        if rank != 2 && rank != 4 {
+            return None;
+        }
+        let len = self.numel();
+        let mut new_shape = self.shape.clone();
+        new_shape.swap(dim0, dim1);
+        let d_in = self.cuda_get_or_upload_buffer().ok()?;
+        let d_out = match self.dtype {
+            Dtype::F32 => CudaBuffer::F32(alloc::<f32>(len).ok()?),
+            Dtype::F64 => CudaBuffer::F64(alloc::<f64>(len).ok()?),
+            _ => return None,
+        };
+        let d_out = Arc::new(d_out);
+        let ok = if rank == 2 {
+            let rows = self.shape[0];
+            let cols = self.shape[1];
+            match (&*d_in, &*d_out, self.dtype) {
+                (CudaBuffer::F32(input), CudaBuffer::F32(output), Dtype::F32) => {
+                    crate::cuda::kernels::transpose_last_two_f32(input, output, 1, rows, cols)
+                        .is_ok()
+                }
+                (CudaBuffer::F64(input), CudaBuffer::F64(output), Dtype::F64) => {
+                    crate::cuda::kernels::transpose_last_two(input, output, 1, rows, cols).is_ok()
+                }
+                _ => false,
+            }
+        } else {
+            let shape = [self.shape[0], self.shape[1], self.shape[2], self.shape[3]];
+            match (&*d_in, &*d_out, self.dtype) {
+                (CudaBuffer::F32(input), CudaBuffer::F32(output), Dtype::F32) => {
+                    crate::cuda::kernels::transpose_4d_f32(input, output, shape, dim0, dim1).is_ok()
+                }
+                (CudaBuffer::F64(input), CudaBuffer::F64(output), Dtype::F64) => {
+                    crate::cuda::kernels::transpose_4d(input, output, shape, dim0, dim1).is_ok()
+                }
+                _ => false,
+            }
+        };
+        if !ok {
+            return None;
+        }
+
+        let dtype = self.dtype;
+        let parents = vec![self.clone()];
+        let out = Tensor {
+            data: Tensor::empty_storage(dtype),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(dtype)),
+            shape: new_shape,
+            device: Device::Cuda,
+            dtype,
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let input = &parents[0];
+                    if input.device == Device::Cuda {
+                        if let Some(d_grad_tmp) = cuda_grad_out_buffer(grad_out) {
+                            if let Some(d_input_grad) = input.cuda_grad_ensure_buffer() {
+                                let ok = if rank == 2 {
+                                    let rows = input.shape[1];
+                                    let cols = input.shape[0];
+                                    match (&*d_grad_tmp, &*d_input_grad, dtype) {
+                                        (CudaBuffer::F32(gt), CudaBuffer::F32(ig), Dtype::F32) => {
+                                            crate::cuda::kernels::transpose_last_two_f32(
+                                                gt, ig, 1, rows, cols,
+                                            )
+                                            .is_ok()
+                                        }
+                                        (CudaBuffer::F64(gt), CudaBuffer::F64(ig), Dtype::F64) => {
+                                            crate::cuda::kernels::transpose_last_two(
+                                                gt, ig, 1, rows, cols,
+                                            )
+                                            .is_ok()
+                                        }
+                                        _ => false,
+                                    }
+                                } else {
+                                    let mut shape = [
+                                        input.shape[0],
+                                        input.shape[1],
+                                        input.shape[2],
+                                        input.shape[3],
+                                    ];
+                                    shape.swap(dim0, dim1);
+                                    match (&*d_grad_tmp, &*d_input_grad, dtype) {
+                                        (CudaBuffer::F32(gt), CudaBuffer::F32(ig), Dtype::F32) => {
+                                            crate::cuda::kernels::transpose_4d_f32(
+                                                gt, ig, shape, dim0, dim1,
+                                            )
+                                            .is_ok()
+                                        }
+                                        (CudaBuffer::F64(gt), CudaBuffer::F64(ig), Dtype::F64) => {
+                                            crate::cuda::kernels::transpose_4d(
+                                                gt, ig, shape, dim0, dim1,
+                                            )
+                                            .is_ok()
+                                        }
+                                        _ => false,
+                                    }
+                                };
+                                if ok {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+
+                    let mut inp_grad = input.grad_write_compat();
+                    if rank == 2 {
+                        let rows = input.shape[0];
+                        let cols = input.shape[1];
+                        for r in 0..rows {
+                            for c in 0..cols {
+                                inp_grad[r * cols + c] += grad_out_f64[c * rows + r];
+                            }
+                        }
+                    } else {
+                        let shape = &input.shape;
+                        for (idx, &g) in grad_out_f64.iter().enumerate() {
+                            let mut coords = [0usize; 4];
+                            let mut tmp = idx;
+                            let out_shape = {
+                                let mut s = shape.clone();
+                                s.swap(dim0, dim1);
+                                s
+                            };
+                            coords[0] = tmp / (out_shape[1] * out_shape[2] * out_shape[3]);
+                            tmp %= out_shape[1] * out_shape[2] * out_shape[3];
+                            coords[1] = tmp / (out_shape[2] * out_shape[3]);
+                            tmp %= out_shape[2] * out_shape[3];
+                            coords[2] = tmp / out_shape[3];
+                            coords[3] = tmp % out_shape[3];
+                            coords.swap(dim0, dim1);
+                            let old_idx = ((coords[0] * shape[1] + coords[1]) * shape[2]
+                                + coords[2])
+                                * shape[3]
+                                + coords[3];
+                            inp_grad[old_idx] += g;
+                        }
+                    }
+                }),
+            })),
+        };
+        out.cuda_set_cached_buffer(d_out);
+        Some(out)
     }
 
     /// GPU-accelerated matrix multiplication using CUDA cuBLAS
@@ -5151,9 +6025,22 @@ impl Tensor {
         };
 
         let out_dtype = Tensor::binary_dtype(self.dtype, other.dtype);
-        let grad_dtype = Tensor::grad_dtype_for(out_dtype);
+        let supported_forward = matches!(
+            (self.dtype, other.dtype),
+            (Dtype::F32, Dtype::F32) | (Dtype::F64, Dtype::F64) | (Dtype::BF16, Dtype::BF16)
+        );
+        if !supported_forward {
+            crate::cuda::record_matmul_fallback("gemm");
+            return self.matmul_cpu_fallback(other, m, k, n);
+        }
+        let compute_out_dtype = if self.dtype == Dtype::BF16 && other.dtype == Dtype::BF16 {
+            Dtype::F32
+        } else {
+            out_dtype
+        };
+        let grad_dtype = Tensor::grad_dtype_for(compute_out_dtype);
 
-        let d_c = match out_dtype {
+        let d_c = match compute_out_dtype {
             Dtype::F32 => match alloc::<f32>(m * n) {
                 Ok(buf) => crate::cuda::memory::CudaBuffer::F32(buf),
                 Err(_err) => {
@@ -5183,8 +6070,26 @@ impl Tensor {
                 }
             };
 
-        let gemm_ok = match out_dtype {
-            Dtype::F32 => crate::cuda::blas::gemm_thread_local_f32(
+        let gemm_ok = match (self.dtype, other.dtype, compute_out_dtype) {
+            (Dtype::BF16, Dtype::BF16, Dtype::F32) => {
+                crate::cuda::blas::gemm_thread_local_bf16_to_f32(
+                    false,
+                    false,
+                    m_i32,
+                    n_i32,
+                    k_i32,
+                    1.0f32,
+                    d_a.as_raw(),
+                    k_i32,
+                    d_b.as_raw(),
+                    n_i32,
+                    0.0f32,
+                    d_c.as_raw(),
+                    n_i32,
+                )
+                .is_ok()
+            }
+            (Dtype::F32, Dtype::F32, Dtype::F32) => crate::cuda::blas::gemm_thread_local_f32(
                 false,
                 false,
                 m_i32,
@@ -5200,7 +6105,7 @@ impl Tensor {
                 n_i32,
             )
             .is_ok(),
-            _ => gemm_thread_local(
+            (Dtype::F64, Dtype::F64, Dtype::F64) => gemm_thread_local(
                 false,
                 false,
                 m_i32,
@@ -5216,6 +6121,7 @@ impl Tensor {
                 n_i32,
             )
             .is_ok(),
+            _ => false,
         };
 
         if !gemm_ok {
@@ -5232,11 +6138,11 @@ impl Tensor {
         };
         let parents = vec![self.clone(), other.clone()];
         let out = Tensor {
-            data: Storage::zeros(m * n, out_dtype),
+            data: Tensor::empty_storage(compute_out_dtype),
             grad: Storage::zeros(m * n, grad_dtype),
             shape: out_shape,
             device: Device::Cuda,
-            dtype: out_dtype,
+            dtype: compute_out_dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
@@ -5252,140 +6158,118 @@ impl Tensor {
                             (lhs.cuda_cached_buffer(), rhs.cuda_cached_buffer())
                         {
                             let grad_dtype = grad_out.dtype();
-                            let grad_len = grad_out.len();
-                            let d_grad_tmp = match grad_dtype {
-                                Dtype::F32 => crate::cuda::memory::alloc_pooled::<f32>(grad_len)
-                                    .ok()
-                                    .map(crate::cuda::memory::CudaBuffer::F32),
-                                _ => crate::cuda::memory::alloc_pooled::<f64>(grad_len)
-                                    .ok()
-                                    .map(crate::cuda::memory::CudaBuffer::F64),
-                            };
+                            let d_grad_tmp = cuda_grad_out_buffer(grad_out);
                             if let Some(d_grad_tmp) = d_grad_tmp {
-                                let d_grad_tmp = std::sync::Arc::new(d_grad_tmp);
-                                let copy_ok = match (&*d_grad_tmp, grad_dtype) {
-                                    (crate::cuda::memory::CudaBuffer::F32(b), Dtype::F32) => {
-                                        let host = grad_out.to_f32_vec();
-                                        crate::cuda::memory::copy_h2d(b, &host).is_ok()
+                                let lhs_ok = if let Some(d_lhs_grad) = lhs.cuda_grad_ensure_buffer()
+                                {
+                                    match (&*d_grad_tmp, &*d_rhs, &*d_lhs_grad, grad_dtype) {
+                                        (
+                                            crate::cuda::memory::CudaBuffer::F32(gt),
+                                            crate::cuda::memory::CudaBuffer::F32(r),
+                                            crate::cuda::memory::CudaBuffer::F32(lg),
+                                            Dtype::F32,
+                                        ) => crate::cuda::blas::gemm_thread_local_f32(
+                                            false,
+                                            true,
+                                            m as i32,
+                                            k as i32,
+                                            n as i32,
+                                            1.0f32,
+                                            gt.as_raw(),
+                                            n as i32,
+                                            r.as_raw(),
+                                            n as i32,
+                                            1.0f32,
+                                            lg.as_raw(),
+                                            k as i32,
+                                        )
+                                        .is_ok(),
+                                        (
+                                            crate::cuda::memory::CudaBuffer::F64(gt),
+                                            crate::cuda::memory::CudaBuffer::F64(r),
+                                            crate::cuda::memory::CudaBuffer::F64(lg),
+                                            Dtype::F64,
+                                        ) => gemm_thread_local(
+                                            false,
+                                            true,
+                                            m as i32,
+                                            k as i32,
+                                            n as i32,
+                                            1.0,
+                                            gt.as_raw(),
+                                            n as i32,
+                                            r.as_raw(),
+                                            n as i32,
+                                            1.0,
+                                            lg.as_raw(),
+                                            k as i32,
+                                        )
+                                        .is_ok(),
+                                        _ => false,
                                     }
-                                    (crate::cuda::memory::CudaBuffer::F64(b), Dtype::F64) => {
-                                        crate::cuda::memory::copy_h2d(b, &grad_out_f64).is_ok()
-                                    }
-                                    _ => false,
+                                } else {
+                                    false
                                 };
-                                if copy_ok {
-                                    let lhs_ok = if let Some(d_lhs_grad) =
-                                        lhs.cuda_grad_ensure_buffer()
-                                    {
-                                        match (&*d_grad_tmp, &*d_rhs, &*d_lhs_grad, grad_dtype) {
-                                            (
-                                                crate::cuda::memory::CudaBuffer::F32(gt),
-                                                crate::cuda::memory::CudaBuffer::F32(r),
-                                                crate::cuda::memory::CudaBuffer::F32(lg),
-                                                Dtype::F32,
-                                            ) => crate::cuda::blas::gemm_thread_local_f32(
-                                                false,
-                                                true,
-                                                m as i32,
-                                                k as i32,
-                                                n as i32,
-                                                1.0f32,
-                                                gt.as_raw(),
-                                                n as i32,
-                                                r.as_raw(),
-                                                n as i32,
-                                                1.0f32,
-                                                lg.as_raw(),
-                                                k as i32,
-                                            )
-                                            .is_ok(),
-                                            (
-                                                crate::cuda::memory::CudaBuffer::F64(gt),
-                                                crate::cuda::memory::CudaBuffer::F64(r),
-                                                crate::cuda::memory::CudaBuffer::F64(lg),
-                                                Dtype::F64,
-                                            ) => gemm_thread_local(
-                                                false,
-                                                true,
-                                                m as i32,
-                                                k as i32,
-                                                n as i32,
-                                                1.0,
-                                                gt.as_raw(),
-                                                n as i32,
-                                                r.as_raw(),
-                                                n as i32,
-                                                1.0,
-                                                lg.as_raw(),
-                                                k as i32,
-                                            )
-                                            .is_ok(),
-                                            _ => false,
-                                        }
-                                    } else {
-                                        false
-                                    };
 
-                                    let rhs_ok = if let Some(d_rhs_grad) =
-                                        rhs.cuda_grad_ensure_buffer()
-                                    {
-                                        match (&*d_grad_tmp, &*d_lhs, &*d_rhs_grad, grad_dtype) {
-                                            (
-                                                crate::cuda::memory::CudaBuffer::F32(gt),
-                                                crate::cuda::memory::CudaBuffer::F32(l),
-                                                crate::cuda::memory::CudaBuffer::F32(rg),
-                                                Dtype::F32,
-                                            ) => crate::cuda::blas::gemm_thread_local_f32(
-                                                true,
-                                                false,
-                                                k as i32,
-                                                n as i32,
-                                                m as i32,
-                                                1.0f32,
-                                                l.as_raw(),
-                                                k as i32,
-                                                gt.as_raw(),
-                                                n as i32,
-                                                1.0f32,
-                                                rg.as_raw(),
-                                                n as i32,
-                                            )
-                                            .is_ok(),
-                                            (
-                                                crate::cuda::memory::CudaBuffer::F64(gt),
-                                                crate::cuda::memory::CudaBuffer::F64(l),
-                                                crate::cuda::memory::CudaBuffer::F64(rg),
-                                                Dtype::F64,
-                                            ) => gemm_thread_local(
-                                                true,
-                                                false,
-                                                k as i32,
-                                                n as i32,
-                                                m as i32,
-                                                1.0,
-                                                l.as_raw(),
-                                                k as i32,
-                                                gt.as_raw(),
-                                                n as i32,
-                                                1.0,
-                                                rg.as_raw(),
-                                                n as i32,
-                                            )
-                                            .is_ok(),
-                                            _ => false,
-                                        }
-                                    } else {
-                                        false
-                                    };
-
-                                    if lhs_ok && rhs_ok {
-                                        gpu_backward_ok = true;
+                                let rhs_ok = if let Some(d_rhs_grad) = rhs.cuda_grad_ensure_buffer()
+                                {
+                                    match (&*d_grad_tmp, &*d_lhs, &*d_rhs_grad, grad_dtype) {
+                                        (
+                                            crate::cuda::memory::CudaBuffer::F32(gt),
+                                            crate::cuda::memory::CudaBuffer::F32(l),
+                                            crate::cuda::memory::CudaBuffer::F32(rg),
+                                            Dtype::F32,
+                                        ) => crate::cuda::blas::gemm_thread_local_f32(
+                                            true,
+                                            false,
+                                            k as i32,
+                                            n as i32,
+                                            m as i32,
+                                            1.0f32,
+                                            l.as_raw(),
+                                            k as i32,
+                                            gt.as_raw(),
+                                            n as i32,
+                                            1.0f32,
+                                            rg.as_raw(),
+                                            n as i32,
+                                        )
+                                        .is_ok(),
+                                        (
+                                            crate::cuda::memory::CudaBuffer::F64(gt),
+                                            crate::cuda::memory::CudaBuffer::F64(l),
+                                            crate::cuda::memory::CudaBuffer::F64(rg),
+                                            Dtype::F64,
+                                        ) => gemm_thread_local(
+                                            true,
+                                            false,
+                                            k as i32,
+                                            n as i32,
+                                            m as i32,
+                                            1.0,
+                                            l.as_raw(),
+                                            k as i32,
+                                            gt.as_raw(),
+                                            n as i32,
+                                            1.0,
+                                            rg.as_raw(),
+                                            n as i32,
+                                        )
+                                        .is_ok(),
+                                        _ => false,
                                     }
+                                } else {
+                                    false
+                                };
+
+                                if lhs_ok && rhs_ok {
+                                    gpu_backward_ok = true;
                                 }
                             }
                         }
                         if gpu_backward_ok {
                             crate::cuda::record_backward_success();
+                            return;
                         } else {
                             crate::cuda::record_backward_fallback();
                         }
@@ -5513,8 +6397,7 @@ impl Tensor {
         use crate::cuda::memory::{alloc, copy_d2d, CudaBuffer};
 
         let len = match self.dtype {
-            Dtype::F32 => self.data_f32().len(),
-            Dtype::F64 => self.data_f64().len(),
+            Dtype::F32 | Dtype::F64 => self.numel(),
             _ => return self.gelu_cpu_fallback(),
         };
         if len == 0 {
@@ -5587,7 +6470,7 @@ impl Tensor {
         let out_dtype = self.dtype;
         let grad_dtype = Tensor::grad_dtype_for(out_dtype);
         let out = Tensor {
-            data: Storage::zeros(len, out_dtype),
+            data: Tensor::empty_storage(out_dtype),
             grad: Storage::zeros(len, grad_dtype),
             shape: self.shape.clone(),
             device: Device::Cuda,
@@ -5600,59 +6483,35 @@ impl Tensor {
                     #[cfg(cuda)]
                     if input.device == Device::Cuda {
                         if let Some(d_input) = input.cuda_cached_buffer() {
-                            let grad_dtype = grad_out.dtype();
-                            let d_grad_tmp = match grad_dtype {
-                                Dtype::F32 => {
-                                    crate::cuda::memory::alloc_pooled::<f32>(grad_out_f64.len())
-                                        .ok()
-                                        .map(CudaBuffer::F32)
-                                }
-                                Dtype::F64 => {
-                                    crate::cuda::memory::alloc_pooled::<f64>(grad_out_f64.len())
-                                        .ok()
-                                        .map(CudaBuffer::F64)
-                                }
-                                _ => None,
-                            };
+                            let d_grad_tmp = cuda_grad_out_buffer(grad_out);
                             if let Some(d_grad_tmp) = d_grad_tmp {
-                                let d_grad_tmp = std::sync::Arc::new(d_grad_tmp);
-                                let copy_ok = match (&*d_grad_tmp, grad_dtype) {
-                                    (CudaBuffer::F32(b), Dtype::F32) => {
-                                        let host = grad_out.to_f32_vec();
-                                        crate::cuda::memory::copy_h2d(b, &host).is_ok()
-                                    }
-                                    (CudaBuffer::F64(b), Dtype::F64) => {
-                                        crate::cuda::memory::copy_h2d(b, &grad_out_f64).is_ok()
-                                    }
-                                    _ => false,
-                                };
-                                if copy_ok {
-                                    if let Some(d_in_grad) = input.cuda_grad_ensure_buffer() {
-                                        match (&*d_input, &*d_grad_tmp, &*d_in_grad, input.dtype) {
-                                            (
-                                                CudaBuffer::F32(inp),
-                                                CudaBuffer::F32(gt),
-                                                CudaBuffer::F32(ig),
-                                                Dtype::F32,
-                                            ) => {
-                                                let _ = gelu_backward_f32(
-                                                    inp,
-                                                    gt,
-                                                    ig,
-                                                    grad_out_f64.len(),
-                                                );
+                                if let Some(d_in_grad) = input.cuda_grad_ensure_buffer() {
+                                    match (&*d_input, &*d_grad_tmp, &*d_in_grad, input.dtype) {
+                                        (
+                                            CudaBuffer::F32(inp),
+                                            CudaBuffer::F32(gt),
+                                            CudaBuffer::F32(ig),
+                                            Dtype::F32,
+                                        ) => {
+                                            if gelu_backward_f32(inp, gt, ig, grad_out_f64.len())
+                                                .is_ok()
+                                            {
+                                                return;
                                             }
-                                            (
-                                                CudaBuffer::F64(inp),
-                                                CudaBuffer::F64(gt),
-                                                CudaBuffer::F64(ig),
-                                                Dtype::F64,
-                                            ) => {
-                                                let _ =
-                                                    gelu_backward(inp, gt, ig, grad_out_f64.len());
-                                            }
-                                            _ => {}
                                         }
+                                        (
+                                            CudaBuffer::F64(inp),
+                                            CudaBuffer::F64(gt),
+                                            CudaBuffer::F64(ig),
+                                            Dtype::F64,
+                                        ) => {
+                                            if gelu_backward(inp, gt, ig, grad_out_f64.len())
+                                                .is_ok()
+                                            {
+                                                return;
+                                            }
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }
@@ -5737,8 +6596,7 @@ impl Tensor {
         use crate::cuda::memory::{alloc, copy_d2d, CudaBuffer};
 
         let len = match self.dtype {
-            Dtype::F32 => self.data_f32().len(),
-            Dtype::F64 => self.data_f64().len(),
+            Dtype::F32 | Dtype::F64 => self.numel(),
             _ => return self.softmax_cpu_fallback(),
         };
         if len == 0 {
@@ -5827,10 +6685,11 @@ impl Tensor {
         let parents = vec![self.clone()];
         let rows_cap = rows;
         let cols_cap = cols;
+        let d_data_for_backward = d_data.clone();
         let out_dtype = self.dtype;
         let grad_dtype = Tensor::grad_dtype_for(out_dtype);
         let out = Tensor {
-            data: Storage::zeros(len, out_dtype),
+            data: Tensor::empty_storage(out_dtype),
             grad: Storage::zeros(len, grad_dtype),
             shape: self.shape.clone(),
             device: Device::Cuda,
@@ -5839,27 +6698,61 @@ impl Tensor {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
                     let grad_out_f64 = grad_out.to_f64_vec();
-                    let out_data: Vec<f64> = if let Some(buf) = parents[0].cuda_cached_buffer() {
-                        match &*buf {
-                            CudaBuffer::F32(b) => {
-                                let mut cpu = vec![0.0f32; b.len()];
-                                if crate::cuda::memory::copy_d2h(&mut cpu, b).is_ok() {
-                                    cpu.iter().map(|&v| v as f64).collect()
-                                } else {
-                                    return;
-                                }
-                            }
-                            CudaBuffer::F64(b) => {
-                                let mut cpu = vec![0.0f64; b.len()];
-                                if crate::cuda::memory::copy_d2h(&mut cpu, b).is_ok() {
-                                    cpu
-                                } else {
+                    let input = &parents[0];
+                    if input.device == Device::Cuda {
+                        if let Some(d_grad_tmp) = cuda_grad_out_buffer(grad_out) {
+                            if let Some(d_input_grad) = input.cuda_grad_ensure_buffer() {
+                                let ok = match (
+                                    &*d_data_for_backward,
+                                    &*d_grad_tmp,
+                                    &*d_input_grad,
+                                    input.dtype,
+                                ) {
+                                    (
+                                        CudaBuffer::F32(out),
+                                        CudaBuffer::F32(gt),
+                                        CudaBuffer::F32(ig),
+                                        Dtype::F32,
+                                    ) => crate::cuda::kernels::softmax_backward_f32(
+                                        out, gt, ig, rows_cap, cols_cap,
+                                    )
+                                    .is_ok(),
+                                    (
+                                        CudaBuffer::F64(out),
+                                        CudaBuffer::F64(gt),
+                                        CudaBuffer::F64(ig),
+                                        Dtype::F64,
+                                    ) => crate::cuda::kernels::softmax_backward(
+                                        out, gt, ig, rows_cap, cols_cap,
+                                    )
+                                    .is_ok(),
+                                    _ => false,
+                                };
+                                if ok {
                                     return;
                                 }
                             }
                         }
-                    } else {
-                        return;
+                    }
+
+                    let out_data: Vec<f64> = match &*d_data_for_backward {
+                        CudaBuffer::F32(b) => {
+                            let mut cpu = vec![0.0f32; b.len()];
+                            if crate::cuda::memory::copy_d2h(&mut cpu, b).is_ok() {
+                                cpu.iter().map(|&v| v as f64).collect()
+                            } else {
+                                return;
+                            }
+                        }
+                        CudaBuffer::F64(b) => {
+                            let mut cpu = vec![0.0f64; b.len()];
+                            if crate::cuda::memory::copy_d2h(&mut cpu, b).is_ok() {
+                                cpu
+                            } else {
+                                return;
+                            }
+                        }
+                        CudaBuffer::BF16(_) | CudaBuffer::I8(_) => return,
                     };
 
                     let mut inp_grad = parents[0].grad_write_compat();
@@ -5906,8 +6799,7 @@ impl Tensor {
         use crate::cuda::memory::{alloc, copy_d2d, CudaBuffer};
 
         let len = match self.dtype {
-            Dtype::F32 => self.data_f32().len(),
-            Dtype::F64 => self.data_f64().len(),
+            Dtype::F32 | Dtype::F64 => self.numel(),
             _ => return self.softmax_cpu_fallback(),
         };
         if len == 0 {
@@ -5994,10 +6886,11 @@ impl Tensor {
         let parents = vec![self.clone()];
         let rows_cap = rows;
         let cols_cap = cols;
+        let d_data_for_backward = d_data.clone();
         let out_dtype = self.dtype;
         let grad_dtype = Tensor::grad_dtype_for(out_dtype);
         let out = Tensor {
-            data: Storage::zeros(len, out_dtype),
+            data: Tensor::empty_storage(out_dtype),
             grad: Storage::zeros(len, grad_dtype),
             shape: self.shape.clone(),
             device: Device::Cuda,
@@ -6006,27 +6899,61 @@ impl Tensor {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
                     let grad_out_f64 = grad_out.to_f64_vec();
-                    let out_data: Vec<f64> = if let Some(buf) = parents[0].cuda_cached_buffer() {
-                        match &*buf {
-                            CudaBuffer::F32(b) => {
-                                let mut cpu = vec![0.0f32; b.len()];
-                                if crate::cuda::memory::copy_d2h(&mut cpu, b).is_ok() {
-                                    cpu.iter().map(|&v| v as f64).collect()
-                                } else {
-                                    return;
-                                }
-                            }
-                            CudaBuffer::F64(b) => {
-                                let mut cpu = vec![0.0f64; b.len()];
-                                if crate::cuda::memory::copy_d2h(&mut cpu, b).is_ok() {
-                                    cpu
-                                } else {
+                    let input = &parents[0];
+                    if input.device == Device::Cuda {
+                        if let Some(d_grad_tmp) = cuda_grad_out_buffer(grad_out) {
+                            if let Some(d_input_grad) = input.cuda_grad_ensure_buffer() {
+                                let ok = match (
+                                    &*d_data_for_backward,
+                                    &*d_grad_tmp,
+                                    &*d_input_grad,
+                                    input.dtype,
+                                ) {
+                                    (
+                                        CudaBuffer::F32(out),
+                                        CudaBuffer::F32(gt),
+                                        CudaBuffer::F32(ig),
+                                        Dtype::F32,
+                                    ) => crate::cuda::kernels::softmax_backward_f32(
+                                        out, gt, ig, rows_cap, cols_cap,
+                                    )
+                                    .is_ok(),
+                                    (
+                                        CudaBuffer::F64(out),
+                                        CudaBuffer::F64(gt),
+                                        CudaBuffer::F64(ig),
+                                        Dtype::F64,
+                                    ) => crate::cuda::kernels::softmax_backward(
+                                        out, gt, ig, rows_cap, cols_cap,
+                                    )
+                                    .is_ok(),
+                                    _ => false,
+                                };
+                                if ok {
                                     return;
                                 }
                             }
                         }
-                    } else {
-                        return;
+                    }
+
+                    let out_data: Vec<f64> = match &*d_data_for_backward {
+                        CudaBuffer::F32(b) => {
+                            let mut cpu = vec![0.0f32; b.len()];
+                            if crate::cuda::memory::copy_d2h(&mut cpu, b).is_ok() {
+                                cpu.iter().map(|&v| v as f64).collect()
+                            } else {
+                                return;
+                            }
+                        }
+                        CudaBuffer::F64(b) => {
+                            let mut cpu = vec![0.0f64; b.len()];
+                            if crate::cuda::memory::copy_d2h(&mut cpu, b).is_ok() {
+                                cpu
+                            } else {
+                                return;
+                            }
+                        }
+                        CudaBuffer::BF16(_) | CudaBuffer::I8(_) => return,
                     };
 
                     let mut inp_grad = parents[0].grad_write_compat();
@@ -6065,8 +6992,7 @@ impl Tensor {
         use crate::cuda::memory::{alloc, copy_d2d, copy_h2d, CudaBuffer};
 
         let len = match self.dtype {
-            Dtype::F32 => self.data_f32().len(),
-            Dtype::F64 => self.data_f64().len(),
+            Dtype::F32 | Dtype::F64 => self.numel(),
             _ => return self.clone(),
         };
         if len == 0 {
@@ -6168,65 +7094,130 @@ impl Tensor {
         crate::cuda::record_activation_success();
 
         let d_data = Arc::new(d_data);
+        let d_cos_for_backward;
+        let d_sin_for_backward;
         let parents = vec![self.clone()];
         let dim_cap = dim;
-        let cos_cache = cos_cache.to_vec();
-        let sin_cache = sin_cache.to_vec();
+        let cos_cache_for_backward = Arc::new(cos_cache.to_vec());
+        let sin_cache_for_backward = Arc::new(sin_cache.to_vec());
         let seq_len_cap = seq_len;
         let total_batches_cap = total_batches;
         let start_pos_cap = start_pos;
         let out_dtype = self.dtype;
         let grad_dtype = Tensor::grad_dtype_for(out_dtype);
 
+        match self.dtype {
+            Dtype::F32 => {
+                let cos_f32: Vec<f32> = cos_cache.iter().map(|&v| v as f32).collect();
+                let sin_f32: Vec<f32> = sin_cache.iter().map(|&v| v as f32).collect();
+                let Ok(d_cos) = alloc::<f32>(cos_f32.len()) else {
+                    return self.clone();
+                };
+                let Ok(d_sin) = alloc::<f32>(sin_f32.len()) else {
+                    return self.clone();
+                };
+                if copy_h2d(&d_cos, &cos_f32).is_err() || copy_h2d(&d_sin, &sin_f32).is_err() {
+                    return self.clone();
+                }
+                d_cos_for_backward = Arc::new(CudaBuffer::F32(d_cos));
+                d_sin_for_backward = Arc::new(CudaBuffer::F32(d_sin));
+            }
+            Dtype::F64 => {
+                let Ok(d_cos) = alloc::<f64>(cos_cache.len()) else {
+                    return self.clone();
+                };
+                let Ok(d_sin) = alloc::<f64>(sin_cache.len()) else {
+                    return self.clone();
+                };
+                if copy_h2d(&d_cos, cos_cache).is_err() || copy_h2d(&d_sin, sin_cache).is_err() {
+                    return self.clone();
+                }
+                d_cos_for_backward = Arc::new(CudaBuffer::F64(d_cos));
+                d_sin_for_backward = Arc::new(CudaBuffer::F64(d_sin));
+            }
+            _ => return self.clone(),
+        }
+
         let out = Tensor {
-            data: Storage::zeros(len, out_dtype),
+            data: Tensor::empty_storage(out_dtype),
             grad: Storage::zeros(len, grad_dtype),
             shape: self.shape.clone(),
             device: Device::Cuda,
             dtype: out_dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
-                backward_op: Box::new(move |_grad_out, parents| {
-                    let cos_cache = cos_cache.clone();
-                    let sin_cache = sin_cache.clone();
-                    let grad_out_data: Vec<f64> = if let Some(buf) = parents[0].cuda_cached_buffer()
-                    {
-                        match &*buf {
-                            CudaBuffer::F32(b) => {
-                                let mut cpu = vec![0.0f32; b.len()];
-                                if crate::cuda::memory::copy_d2h(&mut cpu, b).is_ok() {
-                                    cpu.iter().map(|&v| v as f64).collect()
-                                } else {
-                                    return;
-                                }
-                            }
-                            CudaBuffer::F64(b) => {
-                                let mut cpu = vec![0.0f64; b.len()];
-                                if crate::cuda::memory::copy_d2h(&mut cpu, b).is_ok() {
-                                    cpu
-                                } else {
+                backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let input = &parents[0];
+                    if input.device == Device::Cuda {
+                        if let Some(d_grad_tmp) = cuda_grad_out_buffer(grad_out) {
+                            if let Some(d_input_grad) = input.cuda_grad_ensure_buffer() {
+                                let ok = match (
+                                    &*d_grad_tmp,
+                                    &*d_cos_for_backward,
+                                    &*d_sin_for_backward,
+                                    &*d_input_grad,
+                                    input.dtype,
+                                ) {
+                                    (
+                                        CudaBuffer::F32(gt),
+                                        CudaBuffer::F32(cos),
+                                        CudaBuffer::F32(sin),
+                                        CudaBuffer::F32(ig),
+                                        Dtype::F32,
+                                    ) => crate::cuda::kernels::rope_backward_f32(
+                                        gt,
+                                        cos,
+                                        sin,
+                                        ig,
+                                        seq_len_cap,
+                                        dim_cap,
+                                        total_batches_cap,
+                                        start_pos_cap,
+                                    )
+                                    .is_ok(),
+                                    (
+                                        CudaBuffer::F64(gt),
+                                        CudaBuffer::F64(cos),
+                                        CudaBuffer::F64(sin),
+                                        CudaBuffer::F64(ig),
+                                        Dtype::F64,
+                                    ) => crate::cuda::kernels::rope_backward(
+                                        gt,
+                                        cos,
+                                        sin,
+                                        ig,
+                                        seq_len_cap,
+                                        dim_cap,
+                                        total_batches_cap,
+                                        start_pos_cap,
+                                    )
+                                    .is_ok(),
+                                    _ => false,
+                                };
+                                if ok {
                                     return;
                                 }
                             }
                         }
-                    } else {
-                        return;
-                    };
-                    let mut inp_grad = parents[0].grad_write_f64();
+                    }
+                    let mut inp_grad = parents[0].grad_write_compat();
                     let half_dim = dim_cap / 2;
                     for b in 0..total_batches_cap {
                         for t in 0..seq_len_cap {
                             let pos = start_pos_cap + t;
-                            if pos * half_dim >= cos_cache.len() {
+                            let cache_idx = pos * half_dim;
+                            if cache_idx + half_dim > cos_cache_for_backward.len()
+                                || cache_idx + half_dim > sin_cache_for_backward.len()
+                            {
                                 continue;
                             }
-                            let cache_idx = pos * half_dim;
                             let base_idx = b * (seq_len_cap * dim_cap) + t * dim_cap;
                             for i in 0..half_dim {
-                                let c = cos_cache[cache_idx + i];
-                                let s = sin_cache[cache_idx + i];
-                                let g1 = grad_out_data[base_idx + 2 * i];
-                                let g2 = grad_out_data[base_idx + 2 * i + 1];
+                                let c = cos_cache_for_backward[cache_idx + i];
+                                let s = sin_cache_for_backward[cache_idx + i];
+                                let g1 = grad_out_f64[base_idx + 2 * i];
+                                let g2 = grad_out_f64[base_idx + 2 * i + 1];
                                 inp_grad[base_idx + 2 * i] += g1 * c + g2 * s;
                                 inp_grad[base_idx + 2 * i + 1] += -g1 * s + g2 * c;
                             }
@@ -6244,7 +7235,7 @@ impl Tensor {
     #[allow(dead_code)]
     fn log_softmax_cuda_last_dim(&self) -> Tensor {
         use crate::cuda::kernels::log_softmax_f32;
-        use crate::cuda::memory::{alloc, copy_d2h, CudaBuffer};
+        use crate::cuda::memory::{alloc, CudaBuffer};
 
         let shape = self.shape.clone();
         let dim_size = *shape.last().unwrap_or(&1);
@@ -6253,8 +7244,7 @@ impl Tensor {
         }
 
         let len = match self.dtype {
-            Dtype::F32 => self.data_f32().len(),
-            Dtype::F64 => self.data_f64().len(),
+            Dtype::F32 | Dtype::F64 => self.numel(),
             _ => return self.log_softmax_last_dim_cpu_fallback(),
         };
         let num_slices = len / dim_size;
@@ -6316,41 +7306,17 @@ impl Tensor {
             return self.log_softmax_last_dim_cpu_fallback();
         }
 
-        let (data, softmax_cache) = match (&*d_out, self.dtype) {
-            (CudaBuffer::F32(b), Dtype::F32) => {
-                let mut data = vec![0.0f32; len];
-                if let Err(err) = copy_d2h(&mut data, b) {
-                    crate::cuda::record_log_softmax_fallback("copy");
-                    log::warn!("[Autograd] CUDA D2H LogSoftmax failed ({}), using CPU", err);
-                    return self.log_softmax_last_dim_cpu_fallback();
-                }
-                let cache: Arc<Vec<f64>> =
-                    Arc::new(data.iter().map(|&v| (v as f64).exp()).collect());
-                (Storage::from_f32_vec(data, self.dtype), cache)
-            }
-            (CudaBuffer::F64(b), Dtype::F64) => {
-                let mut data = vec![0.0f64; len];
-                if let Err(err) = copy_d2h(&mut data, b) {
-                    crate::cuda::record_log_softmax_fallback("copy");
-                    log::warn!("[Autograd] CUDA D2H LogSoftmax failed ({}), using CPU", err);
-                    return self.log_softmax_last_dim_cpu_fallback();
-                }
-                let cache: Arc<Vec<f64>> = Arc::new(data.iter().map(|&v| v.exp()).collect());
-                (Storage::f64(data), cache)
-            }
-            _ => return self.log_softmax_last_dim_cpu_fallback(),
-        };
         crate::cuda::record_log_softmax_success();
 
         let parents = vec![self.clone()];
         let dim_size_cap = dim_size;
         let num_slices_cap = num_slices;
-        let softmax_cache_for_backward = softmax_cache.clone();
+        let d_out_for_backward = d_out.clone();
         let out_dtype = self.dtype;
         let grad_dtype = Tensor::grad_dtype_for(out_dtype);
 
         let out = Tensor {
-            data,
+            data: Tensor::empty_storage(out_dtype),
             grad: Storage::zeros(len, grad_dtype),
             shape,
             device: Device::Cuda,
@@ -6359,25 +7325,81 @@ impl Tensor {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
                     let grad_out_f64 = grad_out.to_f64_vec();
-                    let mut sum_terms = vec![0.0; num_slices_cap];
-                    for (slice_idx, sum_term) in sum_terms.iter_mut().enumerate() {
+                    let input = &parents[0];
+                    if input.device == Device::Cuda {
+                        if let Some(d_grad_tmp) = cuda_grad_out_buffer(grad_out) {
+                            if let Some(d_input_grad) = input.cuda_grad_ensure_buffer() {
+                                let ok = match (
+                                    &*d_out_for_backward,
+                                    &*d_grad_tmp,
+                                    &*d_input_grad,
+                                    input.dtype,
+                                ) {
+                                    (
+                                        CudaBuffer::F32(out),
+                                        CudaBuffer::F32(gt),
+                                        CudaBuffer::F32(ig),
+                                        Dtype::F32,
+                                    ) => crate::cuda::kernels::log_softmax_backward_f32(
+                                        out,
+                                        gt,
+                                        ig,
+                                        num_slices_cap,
+                                        dim_size_cap,
+                                    )
+                                    .is_ok(),
+                                    (
+                                        CudaBuffer::F64(out),
+                                        CudaBuffer::F64(gt),
+                                        CudaBuffer::F64(ig),
+                                        Dtype::F64,
+                                    ) => crate::cuda::kernels::log_softmax_backward(
+                                        out,
+                                        gt,
+                                        ig,
+                                        num_slices_cap,
+                                        dim_size_cap,
+                                    )
+                                    .is_ok(),
+                                    _ => false,
+                                };
+                                if ok {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+
+                    let log_softmax_data: Vec<f64> = match &*d_out_for_backward {
+                        CudaBuffer::F32(b) => {
+                            let mut cpu = vec![0.0f32; b.len()];
+                            if crate::cuda::memory::copy_d2h(&mut cpu, b).is_ok() {
+                                cpu.iter().map(|&v| v as f64).collect()
+                            } else {
+                                return;
+                            }
+                        }
+                        CudaBuffer::F64(b) => {
+                            let mut cpu = vec![0.0f64; b.len()];
+                            if crate::cuda::memory::copy_d2h(&mut cpu, b).is_ok() {
+                                cpu
+                            } else {
+                                return;
+                            }
+                        }
+                        CudaBuffer::BF16(_) | CudaBuffer::I8(_) => return,
+                    };
+                    let mut inp_grad = parents[0].grad_write_compat();
+                    for slice_idx in 0..num_slices_cap {
                         let base = slice_idx * dim_size_cap;
                         let mut slice_sum = 0.0;
                         for j in 0..dim_size_cap {
-                            let idx = base + j;
-                            slice_sum += grad_out_f64[idx] * softmax_cache_for_backward[idx];
+                            slice_sum += grad_out_f64[base + j];
                         }
-                        *sum_term = slice_sum;
-                    }
-
-                    let mut inp_grad = parents[0].grad_write_compat();
-                    #[allow(clippy::needless_range_loop)]
-                    for slice_idx in 0..num_slices_cap {
-                        let base = slice_idx * dim_size_cap;
                         for j in 0..dim_size_cap {
                             let idx = base + j;
-                            inp_grad[idx] += softmax_cache_for_backward[idx]
-                                * (grad_out_f64[idx] - sum_terms[slice_idx]);
+                            inp_grad[idx] +=
+                                grad_out_f64[idx] - log_softmax_data[idx].exp() * slice_sum;
                         }
                     }
                 }),
@@ -6407,6 +7429,7 @@ impl Tensor {
     fn elementwise_op_cuda(
         &self,
         rhs: &Tensor,
+        op: CudaBinaryOp,
         forward_f32: fn(
             &crate::cuda::memory::DevicePtr<f32>,
             &crate::cuda::memory::DevicePtr<f32>,
@@ -6449,11 +7472,7 @@ impl Tensor {
         if out_dtype != Dtype::F32 && out_dtype != Dtype::F64 {
             return None;
         }
-        let len = match out_dtype {
-            Dtype::F32 => self.data_f32().len(),
-            Dtype::F64 => self.data_f64().len(),
-            _ => return None,
-        };
+        let len = self.numel();
         let d_a = self.cuda_get_or_upload_buffer().ok()?;
         let d_b = rhs.cuda_get_or_upload_buffer().ok()?;
         let d_out = match out_dtype {
@@ -6478,7 +7497,7 @@ impl Tensor {
 
         let parents = vec![self.clone(), rhs.clone()];
         let out = Tensor {
-            data: Storage::zeros(len, out_dtype),
+            data: Tensor::empty_storage(out_dtype),
             grad: Storage::zeros(len, Tensor::grad_dtype_for(out_dtype)),
             shape: self.shape.clone(),
             device: Device::Cuda,
@@ -6489,100 +7508,108 @@ impl Tensor {
                     let grad_out_f64 = grad_out.to_f64_vec();
                     let a = &parents[0];
                     let b = &parents[1];
+                    let mut gpu_backward_ok = false;
                     #[cfg(cuda)]
                     if a.device == Device::Cuda && b.device == Device::Cuda {
                         if let (Some(d_a), Some(d_b)) =
                             (a.cuda_cached_buffer(), b.cuda_cached_buffer())
                         {
                             let grad_dtype = grad_out.dtype();
-                            let d_grad_tmp = match grad_dtype {
-                                Dtype::F32 => {
-                                    crate::cuda::memory::alloc_pooled::<f32>(grad_out_f64.len())
-                                        .ok()
-                                        .map(CudaBuffer::F32)
-                                }
-                                Dtype::F64 => {
-                                    crate::cuda::memory::alloc_pooled::<f64>(grad_out_f64.len())
-                                        .ok()
-                                        .map(CudaBuffer::F64)
-                                }
-                                _ => None,
-                            };
+                            let d_grad_tmp = cuda_grad_out_buffer(grad_out);
                             if let Some(d_grad_tmp) = d_grad_tmp {
-                                let d_grad_tmp = std::sync::Arc::new(d_grad_tmp);
-                                let copy_ok = match (&*d_grad_tmp, grad_dtype) {
-                                    (CudaBuffer::F32(buf), Dtype::F32) => {
-                                        let host = grad_out.to_f32_vec();
-                                        crate::cuda::memory::copy_h2d(buf, &host).is_ok()
-                                    }
-                                    (CudaBuffer::F64(buf), Dtype::F64) => {
-                                        crate::cuda::memory::copy_h2d(buf, &grad_out_f64).is_ok()
-                                    }
-                                    _ => false,
-                                };
-                                if copy_ok {
-                                    if let Some(d_a_grad) = a.cuda_grad_ensure_buffer() {
-                                        if let Some(d_b_grad) = b.cuda_grad_ensure_buffer() {
-                                            match (
-                                                &*d_grad_tmp,
-                                                &*d_a,
-                                                &*d_b,
-                                                &*d_a_grad,
-                                                &*d_b_grad,
-                                                grad_dtype,
-                                            ) {
-                                                (
-                                                    CudaBuffer::F32(gt),
-                                                    CudaBuffer::F32(a_buf),
-                                                    CudaBuffer::F32(b_buf),
-                                                    CudaBuffer::F32(ag),
-                                                    CudaBuffer::F32(bg),
-                                                    Dtype::F32,
-                                                ) => {
-                                                    if let Some(bk) = backward_f32 {
-                                                        let _ = bk(
-                                                            gt,
-                                                            a_buf,
-                                                            b_buf,
-                                                            ag,
-                                                            bg,
-                                                            grad_out_f64.len(),
-                                                        );
-                                                    }
+                                if let Some(d_a_grad) = a.cuda_grad_ensure_buffer() {
+                                    if let Some(d_b_grad) = b.cuda_grad_ensure_buffer() {
+                                        match (
+                                            &*d_grad_tmp,
+                                            &*d_a,
+                                            &*d_b,
+                                            &*d_a_grad,
+                                            &*d_b_grad,
+                                            grad_dtype,
+                                        ) {
+                                            (
+                                                CudaBuffer::F32(gt),
+                                                CudaBuffer::F32(a_buf),
+                                                CudaBuffer::F32(b_buf),
+                                                CudaBuffer::F32(ag),
+                                                CudaBuffer::F32(bg),
+                                                Dtype::F32,
+                                            ) => {
+                                                if let Some(bk) = backward_f32 {
+                                                    gpu_backward_ok = bk(
+                                                        gt,
+                                                        a_buf,
+                                                        b_buf,
+                                                        ag,
+                                                        bg,
+                                                        grad_out_f64.len(),
+                                                    )
+                                                    .is_ok();
                                                 }
-                                                (
-                                                    CudaBuffer::F64(gt),
-                                                    CudaBuffer::F64(a_buf),
-                                                    CudaBuffer::F64(b_buf),
-                                                    CudaBuffer::F64(ag),
-                                                    CudaBuffer::F64(bg),
-                                                    Dtype::F64,
-                                                ) => {
-                                                    if let Some(bk) = backward_f64 {
-                                                        let _ = bk(
-                                                            gt,
-                                                            a_buf,
-                                                            b_buf,
-                                                            ag,
-                                                            bg,
-                                                            grad_out_f64.len(),
-                                                        );
-                                                    }
-                                                }
-                                                _ => {}
                                             }
+                                            (
+                                                CudaBuffer::F64(gt),
+                                                CudaBuffer::F64(a_buf),
+                                                CudaBuffer::F64(b_buf),
+                                                CudaBuffer::F64(ag),
+                                                CudaBuffer::F64(bg),
+                                                Dtype::F64,
+                                            ) => {
+                                                if let Some(bk) = backward_f64 {
+                                                    gpu_backward_ok = bk(
+                                                        gt,
+                                                        a_buf,
+                                                        b_buf,
+                                                        ag,
+                                                        bg,
+                                                        grad_out_f64.len(),
+                                                    )
+                                                    .is_ok();
+                                                }
+                                            }
+                                            _ => {}
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                    // CPU backward fallback
+                    if gpu_backward_ok {
+                        return;
+                    }
+
                     let mut a_grad = a.grad_write_compat();
                     let mut b_grad = b.grad_write_compat();
-                    for i in 0..grad_out_f64.len() {
-                        a_grad[i] += grad_out_f64[i];
-                        b_grad[i] += grad_out_f64[i];
+                    match op {
+                        CudaBinaryOp::Add => {
+                            for i in 0..grad_out_f64.len() {
+                                a_grad[i] += grad_out_f64[i];
+                                b_grad[i] += grad_out_f64[i];
+                            }
+                        }
+                        CudaBinaryOp::Sub => {
+                            for i in 0..grad_out_f64.len() {
+                                a_grad[i] += grad_out_f64[i];
+                                b_grad[i] -= grad_out_f64[i];
+                            }
+                        }
+                        CudaBinaryOp::Mul => {
+                            let a_data = a.data_as_f64_vec();
+                            let b_data = b.data_as_f64_vec();
+                            for i in 0..grad_out_f64.len() {
+                                a_grad[i] += grad_out_f64[i] * b_data[i];
+                                b_grad[i] += grad_out_f64[i] * a_data[i];
+                            }
+                        }
+                        CudaBinaryOp::Div => {
+                            let a_data = a.data_as_f64_vec();
+                            let b_data = b.data_as_f64_vec();
+                            for i in 0..grad_out_f64.len() {
+                                let safe_b = if b_data[i] != 0.0 { b_data[i] } else { 1e-12 };
+                                a_grad[i] += grad_out_f64[i] / safe_b;
+                                b_grad[i] += grad_out_f64[i] * (-a_data[i] / (safe_b * safe_b));
+                            }
+                        }
                     }
                 }),
             })),
@@ -6595,10 +7622,15 @@ impl Tensor {
     fn add_cuda(&self, rhs: &Tensor) -> Option<Tensor> {
         self.elementwise_op_cuda(
             rhs,
+            CudaBinaryOp::Add,
             crate::cuda::kernels::add_forward_f32,
             crate::cuda::kernels::add_forward,
-            None, // Add backward is simple accumulation handled by CPU fallback
-            None,
+            Some(|grad_out, _a_data, _b_data, a_grad, b_grad, size| {
+                crate::cuda::kernels::add_backward_f32(grad_out, a_grad, b_grad, size)
+            }),
+            Some(|grad_out, _a_data, _b_data, a_grad, b_grad, size| {
+                crate::cuda::kernels::add_backward(grad_out, a_grad, b_grad, size)
+            }),
         )
     }
 
@@ -6606,10 +7638,15 @@ impl Tensor {
     fn sub_cuda(&self, rhs: &Tensor) -> Option<Tensor> {
         self.elementwise_op_cuda(
             rhs,
+            CudaBinaryOp::Sub,
             crate::cuda::kernels::sub_forward_f32,
             crate::cuda::kernels::sub_forward,
-            None, // Sub backward is same as Add: accumulate grad_out
-            None,
+            Some(|grad_out, _a_data, _b_data, a_grad, b_grad, size| {
+                crate::cuda::kernels::sub_backward_f32(grad_out, a_grad, b_grad, size)
+            }),
+            Some(|grad_out, _a_data, _b_data, a_grad, b_grad, size| {
+                crate::cuda::kernels::sub_backward(grad_out, a_grad, b_grad, size)
+            }),
         )
     }
 
@@ -6617,6 +7654,7 @@ impl Tensor {
     fn mul_cuda(&self, rhs: &Tensor) -> Option<Tensor> {
         self.elementwise_op_cuda(
             rhs,
+            CudaBinaryOp::Mul,
             crate::cuda::kernels::mul_forward_f32,
             crate::cuda::kernels::mul_forward,
             Some(crate::cuda::kernels::mul_backward_f32),
@@ -6628,10 +7666,11 @@ impl Tensor {
     fn div_cuda(&self, rhs: &Tensor) -> Option<Tensor> {
         self.elementwise_op_cuda(
             rhs,
+            CudaBinaryOp::Div,
             crate::cuda::kernels::div_forward_f32,
             crate::cuda::kernels::div_forward,
-            None, // TODO: implement div_backward kernel
-            None,
+            Some(crate::cuda::kernels::div_backward_f32),
+            Some(crate::cuda::kernels::div_backward),
         )
     }
 }
@@ -6857,6 +7896,156 @@ mod tests {
 
     #[cfg(cuda)]
     #[test]
+    fn test_cuda_softmax_small_batch_rows_match_cpu() {
+        if crate::cuda::init().is_err() {
+            return;
+        }
+
+        for rows in [2usize, 3, 5] {
+            let cols = 7usize;
+            let values: Vec<f64> = (0..rows * cols)
+                .map(|i| (i as f64 * 0.37).sin() * 3.0)
+                .collect();
+            let t = Tensor::new_f32(values, vec![rows, cols]);
+            let t_cuda = match t.to_cuda() {
+                Ok(tensor) => tensor,
+                Err(_) => return,
+            };
+            let cpu = t.softmax();
+            let cuda = t_cuda.softmax();
+            let cpu_d = cpu.data_as_f64_vec();
+            let cuda_d = cuda.data_as_f64_vec();
+            for i in 0..cpu_d.len() {
+                assert!(
+                    (cpu_d[i] - cuda_d[i]).abs() < 1e-5,
+                    "rows={} idx={} cpu={} cuda={}",
+                    rows,
+                    i,
+                    cpu_d[i],
+                    cuda_d[i]
+                );
+            }
+        }
+    }
+
+    #[cfg(cuda)]
+    #[test]
+    fn test_cuda_device_only_reshape_transpose_roundtrip() {
+        if crate::cuda::init().is_err() {
+            return;
+        }
+
+        let t = Tensor::new_f32((0..24).map(|v| v as f64).collect(), vec![2, 3, 4]);
+        let t_cuda = match t.to_cuda() {
+            Ok(tensor) => tensor,
+            Err(_) => return,
+        };
+        let reshaped = t_cuda.reshape(vec![2, 3, 2, 2]);
+        assert_eq!(reshaped.device, Device::Cuda);
+        let transposed = reshaped.transpose(1, 2);
+        assert_eq!(transposed.device, Device::Cuda);
+        let data = transposed.data_as_f64_vec();
+        assert_eq!(data.len(), 24);
+        assert_eq!(data[0], 0.0);
+        assert_eq!(data[23], 23.0);
+    }
+
+    #[cfg(cuda)]
+    #[test]
+    fn test_cuda_div_backward_matches_cpu() {
+        if crate::cuda::init().is_err() {
+            return;
+        }
+
+        let a = Tensor::new_f32(vec![2.0, 4.0, 6.0, 8.0], vec![4]);
+        let b = Tensor::new_f32(vec![1.0, 2.0, 3.0, 4.0], vec![4]);
+        let cpu = (&a / &b).sum();
+        cpu.backward();
+        let a_cpu_grad = a.grad_to_f64_vec();
+        let b_cpu_grad = b.grad_to_f64_vec();
+
+        let a_cuda = match Tensor::new_f32(vec![2.0, 4.0, 6.0, 8.0], vec![4]).to_cuda() {
+            Ok(tensor) => tensor,
+            Err(_) => return,
+        };
+        let b_cuda = match Tensor::new_f32(vec![1.0, 2.0, 3.0, 4.0], vec![4]).to_cuda() {
+            Ok(tensor) => tensor,
+            Err(_) => return,
+        };
+        let cuda = (&a_cuda / &b_cuda).sum();
+        cuda.backward();
+        let a_cuda_grad = a_cuda.grad_to_f64_vec();
+        let b_cuda_grad = b_cuda.grad_to_f64_vec();
+
+        for i in 0..4 {
+            assert!((a_cpu_grad[i] - a_cuda_grad[i]).abs() < 1e-5);
+            assert!((b_cpu_grad[i] - b_cuda_grad[i]).abs() < 1e-5);
+        }
+    }
+
+    #[cfg(cuda)]
+    #[test]
+    fn test_cuda_softmax_log_softmax_backward_matches_cpu() {
+        if crate::cuda::init().is_err() {
+            return;
+        }
+
+        let values = vec![0.2, -1.0, 2.0, 0.7, -0.3, 1.4];
+        let cpu_in = Tensor::new_f32(values.clone(), vec![2, 3]);
+        cpu_in.softmax().sum().backward();
+        let cpu_grad = cpu_in.grad_to_f64_vec();
+
+        let cuda_in = match Tensor::new_f32(values.clone(), vec![2, 3]).to_cuda() {
+            Ok(tensor) => tensor,
+            Err(_) => return,
+        };
+        cuda_in.softmax().sum().backward();
+        let cuda_grad = cuda_in.grad_to_f64_vec();
+        for i in 0..cpu_grad.len() {
+            assert!((cpu_grad[i] - cuda_grad[i]).abs() < 1e-5);
+        }
+
+        let cpu_in = Tensor::new_f32(values.clone(), vec![2, 3]);
+        cpu_in.log_softmax_dim(1).sum().backward();
+        let cpu_grad = cpu_in.grad_to_f64_vec();
+        let cuda_in = match Tensor::new_f32(values, vec![2, 3]).to_cuda() {
+            Ok(tensor) => tensor,
+            Err(_) => return,
+        };
+        cuda_in.log_softmax_dim(1).sum().backward();
+        let cuda_grad = cuda_in.grad_to_f64_vec();
+        for i in 0..cpu_grad.len() {
+            assert!((cpu_grad[i] - cuda_grad[i]).abs() < 1e-5);
+        }
+    }
+
+    #[cfg(cuda)]
+    #[test]
+    fn test_cuda_bf16_matmul_tensor_core_path() {
+        if crate::cuda::init().is_err() {
+            return;
+        }
+
+        let a = Tensor::with_dtype(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], Dtype::BF16);
+        let b = Tensor::with_dtype(vec![5.0, 6.0, 7.0, 8.0], vec![2, 2], Dtype::BF16);
+        let a_cuda = match a.to_cuda() {
+            Ok(tensor) => tensor,
+            Err(_) => return,
+        };
+        let b_cuda = match b.to_cuda() {
+            Ok(tensor) => tensor,
+            Err(_) => return,
+        };
+        let out = a_cuda.matmul(&b_cuda);
+        assert_eq!(out.device, Device::Cuda);
+        assert_eq!(out.dtype, Dtype::F32);
+        let data = out.data_as_f64_vec();
+        assert!((data[0] - 19.0).abs() < 1e-2);
+        assert!((data[3] - 50.0).abs() < 1e-2);
+    }
+
+    #[cfg(cuda)]
+    #[test]
     fn test_cuda_detach_preserves_device() {
         if crate::cuda::init().is_err() {
             return;
@@ -6869,6 +8058,30 @@ mod tests {
         };
         let detached = t_cuda.detach();
         assert_eq!(detached.device, Device::Cuda);
+    }
+
+    #[cfg(cuda)]
+    #[test]
+    fn test_cuda_grad_cache_is_separate_from_data_cache() {
+        if crate::cuda::init().is_err() {
+            return;
+        }
+
+        let a = match Tensor::new_f32(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]).to_cuda() {
+            Ok(tensor) => tensor,
+            Err(_) => return,
+        };
+        let b = match Tensor::new_f32(vec![5.0, 6.0, 7.0, 8.0], vec![2, 2]).to_cuda() {
+            Ok(tensor) => tensor,
+            Err(_) => return,
+        };
+        let out = (&a + &b).sum();
+        out.backward();
+
+        let grad = a.grad_to_f64_vec();
+        assert_eq!(grad.len(), 4);
+        assert_eq!(a.data_as_f64_vec(), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(grad, vec![1.0, 1.0, 1.0, 1.0]);
     }
 
     #[test]

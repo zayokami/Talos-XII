@@ -347,7 +347,7 @@ impl Module for RMSNorm {
                             let dim = self.dim;
                             let eps = self.eps;
                             let out = Tensor {
-                                data: Storage::zeros(num_elements, out_dtype),
+                                data: Tensor::empty_storage(out_dtype),
                                 grad: Storage::zeros(
                                     num_elements,
                                     Tensor::grad_dtype_for(out_dtype),
@@ -363,49 +363,9 @@ impl Module for RMSNorm {
 
                                         #[cfg(cuda)]
                                         if x_in.device == crate::autograd::Device::Cuda {
-                                            let d_grad_tmp = match grad_out.dtype() {
-                                                Dtype::F32 => {
-                                                    let host = grad_out.to_f32_vec();
-                                                    match crate::cuda::memory::alloc_pooled::<f32>(
-                                                        host.len(),
-                                                    ) {
-                                                        Ok(buf) => {
-                                                            if crate::cuda::memory::copy_h2d(
-                                                                &buf, &host,
-                                                            )
-                                                            .is_ok()
-                                                            {
-                                                                Some(CudaBuffer::F32(buf))
-                                                            } else {
-                                                                None
-                                                            }
-                                                        }
-                                                        Err(_) => None,
-                                                    }
-                                                }
-                                                Dtype::F64 => {
-                                                    let host = grad_out.to_f64_vec();
-                                                    match crate::cuda::memory::alloc_pooled::<f64>(
-                                                        host.len(),
-                                                    ) {
-                                                        Ok(buf) => {
-                                                            if crate::cuda::memory::copy_h2d(
-                                                                &buf, &host,
-                                                            )
-                                                            .is_ok()
-                                                            {
-                                                                Some(CudaBuffer::F64(buf))
-                                                            } else {
-                                                                None
-                                                            }
-                                                        }
-                                                        Err(_) => None,
-                                                    }
-                                                }
-                                                _ => None,
-                                            };
+                                            let d_grad_tmp =
+                                                crate::autograd::cuda_grad_out_buffer(grad_out);
                                             if let Some(d_grad_tmp) = d_grad_tmp {
-                                                let d_grad_tmp = std::sync::Arc::new(d_grad_tmp);
                                                 if let (Some(d_x), Some(d_weight)) = (
                                                     x_in.cuda_cached_buffer(),
                                                     w_in.cuda_cached_buffer(),
