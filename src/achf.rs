@@ -110,6 +110,7 @@ fn default_metrics() -> Arc<AchfMetrics> {
 #[derive(Clone)]
 pub struct AchfCache {
     pub dense: Option<Vec<f32>>,
+    pub bias: Option<Vec<f32>>,
     pub in_dim: usize,
     pub out_dim: usize,
     pub ema_cached_ns: f64,
@@ -143,6 +144,7 @@ fn default_state() -> Arc<RwLock<AchfState>> {
 fn default_cache() -> Arc<RwLock<AchfCache>> {
     Arc::new(RwLock::new(AchfCache {
         dense: None,
+        bias: None,
         in_dim: 0,
         out_dim: 0,
         ema_cached_ns: 0.0,
@@ -377,10 +379,10 @@ impl AchfLayer {
 
     fn forward_blend(&self, input: &Tensor, g: f64) -> Tensor {
         let dense_out = self.weight.forward(input);
-        if !self.is_sparse() {
+        let Some(sparse) = self.valid_sparse_weight() else {
             return dense_out;
-        }
-        let sparse_out = self.sparse_weight.as_ref().unwrap().forward(input);
+        };
+        let sparse_out = sparse.forward(input);
         let g_t = Tensor::with_dtype(vec![g], vec![1], dense_out.dtype)
             .broadcast(dense_out.shape.clone());
         let og_t = Tensor::with_dtype(vec![1.0 - g], vec![1], sparse_out.dtype)
@@ -394,6 +396,7 @@ impl AchfLayer {
         if let Some(ref mut s) = self.sparse_weight {
             s.to_cuda();
         }
+        self.clear_cache();
     }
 
     #[cfg(cuda)]
@@ -403,15 +406,11 @@ impl AchfLayer {
         if !crate::cuda::is_available() {
             return None;
         }
-        let sparse = self.sparse_weight.as_ref()?;
-        let mask = self.sparse_mask.as_ref()?;
+        let sparse = self.valid_sparse_weight()?;
+        let mask = self.valid_sparse_mask()?;
         let in_dim = sparse.in_features;
         let out_dim = sparse.out_features;
         if in_dim == 0 || out_dim == 0 || !x.len().is_multiple_of(in_dim) {
-            return None;
-        }
-        let expected_mask_len = in_dim.checked_mul(out_dim)?;
-        if mask.len() != expected_mask_len {
             return None;
         }
         let num_rows = x.len() / in_dim;
@@ -460,18 +459,14 @@ impl AchfLayer {
         {
             return None;
         }
-        let sparse = self.sparse_weight.as_ref()?;
-        let mask = self.sparse_mask.as_ref()?;
+        let sparse = self.valid_sparse_weight()?;
+        let mask = self.valid_sparse_mask()?;
         let in_dim = sparse.in_features;
         let out_dim = sparse.out_features;
         if in_dim == 0 || out_dim == 0 || !input.numel().is_multiple_of(in_dim) {
             return None;
         }
-        let expected_mask_len = in_dim.checked_mul(out_dim)?;
-        if mask.len() != expected_mask_len
-            || sparse.weight.device != Device::Cuda
-            || sparse.weight.dtype != Dtype::F32
-        {
+        if sparse.weight.device != Device::Cuda || sparse.weight.dtype != Dtype::F32 {
             return None;
         }
         let num_rows = input.numel() / in_dim;
@@ -513,7 +508,7 @@ impl AchfLayer {
         if let Some(bias) = &sparse.bias {
             parents.push(bias.clone());
         }
-        let mask = Arc::new(mask.clone());
+        let mask = Arc::new(mask.to_vec());
         let out = Tensor {
             data: Tensor::empty_storage(Dtype::F32),
             grad: crate::dtype::Storage::zeros(out_len, Tensor::grad_dtype_for(Dtype::F32)),
@@ -586,13 +581,18 @@ impl AchfLayer {
 
 impl Module for AchfLayer {
     fn forward(&self, input: &Tensor) -> Tensor {
+        if input.shape.last().copied() != Some(self.weight.in_features) {
+            self.metrics.calls.fetch_add(1, Ordering::Relaxed);
+            self.metrics.cache_skips.fetch_add(1, Ordering::Relaxed);
+            return self.zero_tensor_output(input);
+        }
         if !self.config.enabled {
             return self.weight.forward(input);
         }
         self.maybe_project();
         let g = self.compute_gate();
         #[cfg(cuda)]
-        if self.is_sparse() && input.device == Device::Cuda {
+        if self.has_valid_sparse_state() && input.device == Device::Cuda {
             if let Some(sparse_out) = self.forward_sparse_tensor_cuda(input) {
                 let dense_out = self.weight.forward(input);
                 if let (Some(dense_scaled), Some(sparse_scaled)) =
@@ -614,24 +614,29 @@ impl AchfLayer {
     #[allow(dead_code)]
     pub fn forward_residual(&self, x: &Tensor) -> Tensor {
         if !self.config.enabled {
-            return Tensor::zeros_with_dtype(x.shape.clone(), x.dtype);
+            return self.zero_tensor_output(x);
+        }
+        if x.shape.last().copied() != Some(self.weight.in_features) {
+            self.metrics.calls.fetch_add(1, Ordering::Relaxed);
+            self.metrics.cache_skips.fetch_add(1, Ordering::Relaxed);
+            return self.zero_tensor_output(x);
         }
         self.maybe_project();
         let g = self.compute_gate();
         if g <= 0.001 {
-            return Tensor::zeros_with_dtype(x.shape.clone(), x.dtype);
+            return self.zero_tensor_output(x);
         }
         self.forward_blend(x, g)
     }
 
     pub fn forward_inference_residual(&self, x: &[f32]) -> Vec<f32> {
         if !self.config.enabled {
-            return vec![0.0f32; x.len()];
+            return self.zero_inference_output(x);
         }
         if self.weight.in_features == 0 || !x.len().is_multiple_of(self.weight.in_features) {
             self.metrics.calls.fetch_add(1, Ordering::Relaxed);
             self.metrics.cache_skips.fetch_add(1, Ordering::Relaxed);
-            return vec![0.0f32; x.len()];
+            return self.zero_inference_output(x);
         }
         self.maybe_project();
         let g = self.infer_gate_value() as f32;
@@ -686,12 +691,16 @@ impl AchfLayer {
                     #[cfg(cuda)]
                     if let Some(out) = self.forward_sparse_inference_cuda(x) {
                         out
+                    } else if let Some(sparse) = self.valid_sparse_weight() {
+                        sparse.forward_inference(x)
                     } else {
-                        self.sparse_weight.as_ref().unwrap().forward_inference(x)
+                        self.weight.forward_inference(x)
                     }
                     #[cfg(not(cuda))]
                     {
-                        self.sparse_weight.as_ref().unwrap().forward_inference(x)
+                        self.valid_sparse_weight()
+                            .unwrap_or(&self.weight)
+                            .forward_inference(x)
                     }
                 }
                 InferencePath::Dense => self.weight.forward_inference(x),
@@ -706,12 +715,16 @@ impl AchfLayer {
                     #[cfg(cuda)]
                     if let Some(out) = self.forward_sparse_inference_cuda(x) {
                         out
+                    } else if let Some(sparse) = self.valid_sparse_weight() {
+                        sparse.forward_inference(x)
                     } else {
-                        self.sparse_weight.as_ref().unwrap().forward_inference(x)
+                        self.weight.forward_inference(x)
                     }
                     #[cfg(not(cuda))]
                     {
-                        self.sparse_weight.as_ref().unwrap().forward_inference(x)
+                        self.valid_sparse_weight()
+                            .unwrap_or(&self.weight)
+                            .forward_inference(x)
                     }
                 }
                 InferencePath::Dense => self.weight.forward_inference(x),
@@ -750,23 +763,32 @@ impl AchfLayer {
     /// `forced_path`: 0 = Cached, 1 = Sparse, 2 = Dense.
     pub fn forward_inference_forced_path(&self, x: &[f32], forced_path: u8) -> Vec<f32> {
         if !self.config.enabled {
-            return vec![0.0f32; x.len()];
+            return self.zero_inference_output(x);
+        }
+        if self.weight.in_features == 0 || !x.len().is_multiple_of(self.weight.in_features) {
+            self.metrics.calls.fetch_add(1, Ordering::Relaxed);
+            self.metrics.cache_skips.fetch_add(1, Ordering::Relaxed);
+            return self.zero_inference_output(x);
         }
         let g = self.infer_gate_value() as f32;
         let mut out = match forced_path {
             0 => self
                 .forward_inference_cached(x)
                 .unwrap_or_else(|| self.weight.forward_inference(x)),
-            1 if self.is_sparse() => {
+            1 if self.has_valid_sparse_state() => {
                 #[cfg(cuda)]
                 if let Some(out) = self.forward_sparse_inference_cuda(x) {
                     out
+                } else if let Some(sparse) = self.valid_sparse_weight() {
+                    sparse.forward_inference(x)
                 } else {
-                    self.sparse_weight.as_ref().unwrap().forward_inference(x)
+                    self.weight.forward_inference(x)
                 }
                 #[cfg(not(cuda))]
                 {
-                    self.sparse_weight.as_ref().unwrap().forward_inference(x)
+                    self.valid_sparse_weight()
+                        .unwrap_or(&self.weight)
+                        .forward_inference(x)
                 }
             }
             _ => self.weight.forward_inference(x),
@@ -1039,9 +1061,13 @@ impl AchfLayer {
     }
 
     pub fn load_state_dict(&mut self, other: &AchfLayer) {
-        if let (Some(dst), Some(src)) = (&mut self.sparse_weight, &other.sparse_weight) {
-            copy_linear(dst, src);
+        match (&mut self.sparse_weight, &other.sparse_weight) {
+            (Some(dst), Some(src)) if same_linear_layout(dst, src) => copy_linear(dst, src),
+            (_, Some(src)) => self.sparse_weight = Some(clone_linear_detached(src)),
+            (Some(_), None) => self.sparse_weight = None,
+            (None, None) => {}
         }
+        self.sparse_mask = other.sparse_mask.clone();
         // Always copy dense weight as reference/teacher
         copy_linear(&mut self.weight, &other.weight);
         self.clear_cache();
@@ -1067,16 +1093,74 @@ impl AchfLayer {
     }
 
     pub fn soft_update(&mut self, source: &AchfLayer, tau: f64) {
-        if let (Some(dst), Some(src)) = (&mut self.sparse_weight, &source.sparse_weight) {
-            soft_update_linear(dst, src, tau);
+        match (&mut self.sparse_weight, &source.sparse_weight) {
+            (Some(dst), Some(src)) if same_linear_layout(dst, src) => {
+                soft_update_linear(dst, src, tau);
+            }
+            (_, Some(src)) => self.sparse_weight = Some(clone_linear_detached(src)),
+            (Some(_), None) => self.sparse_weight = None,
+            (None, None) => {}
         }
+        self.sparse_mask = source.sparse_mask.clone();
         // Always update dense weight as reference/teacher
         soft_update_linear(&mut self.weight, &source.weight, tau);
         self.clear_cache();
     }
 
-    fn is_sparse(&self) -> bool {
-        self.sparse_weight.is_some()
+    fn has_valid_sparse_state(&self) -> bool {
+        self.valid_sparse_weight().is_some() && self.valid_sparse_mask().is_some()
+    }
+
+    fn valid_sparse_weight(&self) -> Option<&Linear> {
+        let sparse = self.sparse_weight.as_ref()?;
+        if sparse.in_features != self.weight.in_features
+            || sparse.out_features != self.weight.out_features
+            || sparse.weight.shape != [self.weight.in_features, self.weight.out_features]
+            || sparse.weight.numel()
+                != self
+                    .weight
+                    .in_features
+                    .checked_mul(self.weight.out_features)?
+            || sparse
+                .bias
+                .as_ref()
+                .is_some_and(|bias| bias.numel() != sparse.out_features)
+        {
+            None
+        } else {
+            Some(sparse)
+        }
+    }
+
+    fn valid_sparse_mask(&self) -> Option<&[u8]> {
+        let mask = self.sparse_mask.as_deref()?;
+        let expected_len = self
+            .weight
+            .in_features
+            .checked_mul(self.weight.out_features)?;
+        if mask.len() == expected_len {
+            Some(mask)
+        } else {
+            None
+        }
+    }
+
+    fn zero_tensor_output(&self, input: &Tensor) -> Tensor {
+        let mut out_shape = input.shape.clone();
+        if let Some(last) = out_shape.last_mut() {
+            *last = self.weight.out_features;
+        }
+        Tensor::zeros_with_dtype(out_shape, input.dtype)
+    }
+
+    fn zero_inference_output(&self, input: &[f32]) -> Vec<f32> {
+        let out_len =
+            if self.weight.in_features > 0 && input.len().is_multiple_of(self.weight.in_features) {
+                (input.len() / self.weight.in_features).saturating_mul(self.weight.out_features)
+            } else {
+                input.len()
+            };
+        vec![0.0f32; out_len]
     }
 
     /// Post-training magnitude pruning: create sparse_weight by zeroing
@@ -1111,11 +1195,13 @@ impl AchfLayer {
             out_features: self.weight.out_features,
         });
         self.sparse_mask = Some(mask);
+        self.clear_cache();
     }
 
     fn clear_cache(&self) {
         let mut cache = self.cache.write().unwrap();
         cache.dense = None;
+        cache.bias = None;
         cache.in_dim = 0;
         cache.out_dim = 0;
         cache.ema_cached_ns = 0.0;
@@ -1137,12 +1223,21 @@ impl AchfLayer {
     }
 
     fn ensure_cache(&self) {
-        if !self.is_sparse() {
+        let Some(sparse) = self.valid_sparse_weight() else {
             return;
-        }
+        };
         let need_init = {
             let cache = self.cache.read().unwrap();
-            cache.dense.is_none()
+            let expected_len = sparse.in_features.checked_mul(sparse.out_features);
+            cache.dense.as_ref().is_none_or(|dense| {
+                Some(dense.len()) != expected_len
+                    || cache.in_dim != sparse.in_features
+                    || cache.out_dim != sparse.out_features
+                    || cache
+                        .bias
+                        .as_ref()
+                        .is_some_and(|bias| bias.len() != sparse.out_features)
+            })
         };
         if need_init {
             self.prepare_inference_cache();
@@ -1168,15 +1263,17 @@ impl AchfLayer {
     }
 
     fn prepare_inference_cache(&self) {
-        if !self.is_sparse() {
+        let Some(sparse) = self.valid_sparse_weight() else {
+            self.clear_cache();
             return;
-        }
-        let sparse = self.sparse_weight.as_ref().unwrap();
+        };
         let in_dim = sparse.in_features;
         let out_dim = sparse.out_features;
         let dense: Vec<f32> = sparse.weight.data_to_f32_vec();
+        let bias = sparse.bias.as_ref().map(|b| b.data_to_f32_vec());
         let mut cache = self.cache.write().unwrap();
         cache.dense = Some(dense);
+        cache.bias = bias;
         cache.in_dim = in_dim;
         cache.out_dim = out_dim;
     }
@@ -1184,9 +1281,16 @@ impl AchfLayer {
     fn forward_inference_cached(&self, x: &[f32]) -> Option<Vec<f32>> {
         let cache = self.cache.read().unwrap();
         let dense = cache.dense.as_ref()?;
+        let bias = cache.bias.as_ref();
         let in_dim = cache.in_dim;
         let out_dim = cache.out_dim;
         if in_dim == 0 || out_dim == 0 {
+            return None;
+        }
+        if dense.len() != in_dim.checked_mul(out_dim)? {
+            return None;
+        }
+        if bias.is_some_and(|b| b.len() != out_dim) {
             return None;
         }
         if !x.len().is_multiple_of(in_dim) {
@@ -1200,13 +1304,16 @@ impl AchfLayer {
         for r in 0..num_rows {
             let row_offset_in = r * in_dim;
             let row_offset_out = r * out_dim;
+            let out_row = &mut out[row_offset_out..row_offset_out + out_dim];
+            if let Some(bias) = bias {
+                out_row.copy_from_slice(bias);
+            }
             for i in 0..in_dim {
                 let scale = x[row_offset_in + i];
                 if scale == 0.0 {
                     continue;
                 }
                 let w_row = &dense[i * out_dim..(i + 1) * out_dim];
-                let out_row = &mut out[row_offset_out..row_offset_out + out_dim];
                 for j in 0..out_dim {
                     out_row[j] += scale * w_row[j];
                 }
@@ -1216,7 +1323,7 @@ impl AchfLayer {
     }
 
     fn choose_inference_path(&self, x: &[f32]) -> InferencePath {
-        if !self.is_sparse() {
+        if !self.has_valid_sparse_state() {
             self.metrics.calls.fetch_add(1, Ordering::Relaxed);
             self.metrics.dense_paths.fetch_add(1, Ordering::Relaxed);
             return InferencePath::Dense;
@@ -1531,6 +1638,30 @@ fn copy_linear(dst: &mut Linear, src: &Linear) {
     }
 }
 
+fn same_linear_layout(lhs: &Linear, rhs: &Linear) -> bool {
+    lhs.in_features == rhs.in_features
+        && lhs.out_features == rhs.out_features
+        && lhs.weight.shape == rhs.weight.shape
+        && lhs.weight.numel() == rhs.weight.numel()
+        && lhs.bias.as_ref().map(Tensor::numel) == rhs.bias.as_ref().map(Tensor::numel)
+}
+
+fn clone_linear_detached(src: &Linear) -> Linear {
+    Linear {
+        weight: Tensor::with_dtype(
+            src.weight.data_as_f64_vec(),
+            src.weight.shape.clone(),
+            src.weight.dtype,
+        ),
+        bias: src
+            .bias
+            .as_ref()
+            .map(|bias| Tensor::with_dtype(bias.data_as_f64_vec(), bias.shape.clone(), bias.dtype)),
+        in_features: src.in_features,
+        out_features: src.out_features,
+    }
+}
+
 fn soft_update_linear(dst: &mut Linear, src: &Linear, tau: f64) {
     soft_update_tensor(&dst.weight, &src.weight, tau);
     if let (Some(dst_bias), Some(src_bias)) = (&dst.bias, &src.bias) {
@@ -1745,6 +1876,150 @@ mod tests {
         for (a, b) in out_cached.iter().zip(out_unfused.iter()) {
             assert!((a - b).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn achf_cached_path_includes_sparse_bias() {
+        let cfg = AchfConfig {
+            enabled: true,
+            cache_cost_bias: 0.0,
+            infer_gate: "one".to_string(),
+            ..Default::default()
+        };
+        let mut layer = AchfLayer::new(3, 2, true, cfg, 33);
+        {
+            let mut w = layer.weight.weight.data_write_f32();
+            *w = vec![1.0, -1.0, 2.0, 0.5, -0.25, 0.75];
+        }
+        {
+            let bias = layer.weight.bias.as_ref().unwrap();
+            let mut b = bias.data_write_f32();
+            *b = vec![0.5, -1.5];
+        }
+        layer.prune(0.0);
+        layer.freeze_for_inference();
+
+        let x = vec![2.0, -1.0, 4.0, 0.5, 1.5, -2.0];
+        let out = layer.forward_inference_residual(&x);
+        let expected = layer.sparse_weight.as_ref().unwrap().forward_inference(&x);
+
+        assert_eq!(out.len(), expected.len());
+        for (a, b) in out.iter().zip(expected.iter()) {
+            assert!((a - b).abs() < 1e-5, "cached={a} expected={b}");
+        }
+        let stats = layer.cache_stats();
+        assert_eq!(stats.cache_hits, 1);
+    }
+
+    #[test]
+    fn achf_prune_invalidates_cached_weight() {
+        let cfg = AchfConfig {
+            enabled: true,
+            cache_cost_bias: 0.0,
+            infer_gate: "one".to_string(),
+            ..Default::default()
+        };
+        let mut layer = AchfLayer::new_square(2, cfg, 34);
+        {
+            let mut w = layer.weight.weight.data_write_f32();
+            *w = vec![1.0, 0.0, 0.0, 1.0];
+        }
+        layer.prune(0.0);
+        layer.freeze_for_inference();
+
+        let x = vec![2.0, 3.0];
+        let first = layer.forward_inference_residual(&x);
+        assert_eq!(first, vec![2.0, 3.0]);
+
+        {
+            let mut w = layer.weight.weight.data_write_f32();
+            *w = vec![2.0, 0.0, 0.0, 2.0];
+        }
+        layer.prune(0.0);
+        let second = layer.forward_inference_residual(&x);
+        assert_eq!(second, vec![4.0, 6.0]);
+    }
+
+    #[test]
+    fn achf_invalid_sparse_mask_falls_back_to_dense() {
+        let cfg = AchfConfig {
+            enabled: true,
+            cache_cost_bias: 0.0,
+            infer_gate: "one".to_string(),
+            ..Default::default()
+        };
+        let mut layer = AchfLayer::new(3, 2, false, cfg, 35);
+        {
+            let mut w = layer.weight.weight.data_write_f32();
+            *w = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        }
+        layer.prune(0.0);
+        if let Some(sparse) = &layer.sparse_weight {
+            let mut w = sparse.weight.data_write_f32();
+            w.fill(0.0);
+        }
+        layer.sparse_mask = Some(vec![1]);
+
+        let x = vec![1.0, 0.5, -1.0];
+        let out = layer.forward_inference_residual(&x);
+        let expected = layer.weight.forward_inference(&x);
+        assert_eq!(out, expected);
+
+        let stats = layer.cache_stats();
+        assert_eq!(stats.dense_paths, 1);
+        assert_eq!(stats.cache_hits, 0);
+        assert_eq!(stats.sparse_paths, 0);
+    }
+
+    #[test]
+    fn achf_forced_sparse_invalid_state_falls_back_to_dense() {
+        let cfg = AchfConfig {
+            enabled: true,
+            infer_gate: "one".to_string(),
+            ..Default::default()
+        };
+        let mut layer = AchfLayer::new(3, 2, false, cfg, 36);
+        {
+            let mut w = layer.weight.weight.data_write_f32();
+            *w = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        }
+        layer.prune(0.0);
+        if let Some(sparse) = &layer.sparse_weight {
+            let mut w = sparse.weight.data_write_f32();
+            w.fill(0.0);
+        }
+        layer.sparse_mask = None;
+
+        let x = vec![1.0, 0.5, -1.0];
+        let out = layer.forward_inference_forced_path(&x, 1);
+        let expected = layer.weight.forward_inference(&x);
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn achf_load_state_dict_copies_sparse_state() {
+        let cfg = AchfConfig {
+            enabled: true,
+            infer_gate: "one".to_string(),
+            ..Default::default()
+        };
+        let mut src = AchfLayer::new_square(2, cfg.clone(), 37);
+        {
+            let mut w = src.weight.weight.data_write_f32();
+            *w = vec![1.0, 0.001, -0.001, 2.0];
+        }
+        src.prune(0.01);
+
+        let mut dst = AchfLayer::new_square(2, cfg, 38);
+        dst.load_state_dict(&src);
+
+        assert!(dst.sparse_weight.is_some());
+        assert_eq!(dst.sparse_mask, src.sparse_mask);
+        let x = vec![3.0, 4.0];
+        assert_eq!(
+            dst.forward_inference_forced_path(&x, 1),
+            src.forward_inference_forced_path(&x, 1)
+        );
     }
 
     #[test]
