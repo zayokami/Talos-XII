@@ -17,6 +17,7 @@ mod env_net;
 #[cfg(test)]
 mod grad_check;
 mod i18n;
+mod model_init;
 mod model_io;
 mod neural;
 mod nn;
@@ -25,7 +26,9 @@ mod ppo;
 mod rng;
 mod sim;
 mod simd;
+mod strategy;
 mod trainer;
+mod training_metrics;
 mod transformer;
 mod utils;
 mod worker;
@@ -35,13 +38,20 @@ use calibrate::{apply_calibration, run_calibration, CalibrationData};
 use clap::{Parser, Subcommand};
 use collect::{add_session_interactive, import_from_json, print_stats, PlayerDatabase};
 use colored::Colorize;
-use config::{ComputeDevice, Config, LuckMode};
-use dqn::{train_dqn, DuelingQNetwork, Experience, OnlineDqnTrainer};
+use config::{Config, LuckMode};
+#[cfg(test)]
+use dqn::train_dqn;
+use dqn::{DuelingQNetwork, Experience, OnlineDqnTrainer};
 use env_net::EnvNet;
 use i18n::{I18n, Language};
-use log::{info, warn};
+use log::info;
+use model_init::{
+    dqn_training_quality, initialize_system, ppo_training_quality, ModelInitOptions,
+    DQN_INFERENCE_CACHE_PATH, DQN_MASTER_CACHE_PATH, ENV_NET_CACHE_PATH, NEURAL_CACHE_PATH,
+    PPO_INFERENCE_CACHE_PATH, PPO_MASTER_CACHE_PATH,
+};
 use neural::{NeuralLuckOptimizer, DIM};
-use ppo::{train_ppo, ActorCritic, OnlinePpoTrainer};
+use ppo::{ActorCritic, OnlinePpoTrainer};
 use rng::Rng;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,15 +67,7 @@ use sim::{
     simulate_stats, simulate_stats_with_progress, NeuralSample, PpoExperience, SimModelContext,
     SimRunContext, COST_PER_PULL, FREE_PULLS_WELFARE,
 };
-use trainer::{
-    train_linear_regression, train_manifold_rl, train_neural_optimizer, OnlineNeuralTrainer,
-};
-
-const NEURAL_CACHE_PATH: &str = "neural.cache";
-const DQN_MASTER_CACHE_PATH: &str = "dqn.cache";
-const DQN_INFERENCE_CACHE_PATH: &str = "dqn.cache.bf16";
-const PPO_MASTER_CACHE_PATH: &str = "ppo.cache";
-const PPO_INFERENCE_CACHE_PATH: &str = "ppo.cache.bf16";
+use trainer::OnlineNeuralTrainer;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -183,8 +185,9 @@ fn prompt_yes_no(prompt: &str, default_yes: bool) -> bool {
 }
 
 use model_io::{
-    load_env_net_cache, load_model, load_neural_cache, save_env_net_cache, save_model,
-    save_neural_cache,
+    cache_artifact_hash, dqn_inference_cache_manifest, dqn_master_cache_manifest,
+    load_model_with_manifest, ppo_inference_cache_manifest, ppo_master_cache_manifest,
+    save_model_with_manifest, serialized_model_hash, CacheQualitySummary,
 };
 use utils::{
     INPUT_CAP, MAX_DRAIN_PER_TICK, ONLINE_REPORT_INTERVAL_SECS, PPO_ONLINE_LR, PULL_DISPLAY_LIMIT,
@@ -252,94 +255,6 @@ fn resolve_ppo_online_train_params(config: &Config) -> (usize, usize) {
         128
     };
     (k_epochs, batch_size)
-}
-
-fn is_inference_cache_fresh(master_path: &str, inference_path: &str) -> bool {
-    let master_bin = format!("{}.bin", master_path);
-    let inference_bin = format!("{}.bin", inference_path);
-    let Ok(master_modified) = std::fs::metadata(master_bin).and_then(|m| m.modified()) else {
-        return false;
-    };
-    let Ok(inference_modified) = std::fs::metadata(inference_bin).and_then(|m| m.modified()) else {
-        return false;
-    };
-    inference_modified >= master_modified
-}
-
-fn prepare_dqn_inference_cache(master: &DuelingQNetwork, force_refresh: bool) -> DuelingQNetwork {
-    if !force_refresh && is_inference_cache_fresh(DQN_MASTER_CACHE_PATH, DQN_INFERENCE_CACHE_PATH) {
-        if let Some(cached) = load_model::<DuelingQNetwork>(DQN_INFERENCE_CACHE_PATH, "DQN BF16") {
-            cached.freeze_achf_for_inference();
-            info!("[DQN] BF16 inference cache loaded.");
-            return cached;
-        }
-    }
-
-    let bf16 = master.to_inference_bf16();
-    bf16.freeze_achf_for_inference();
-    save_model(&bf16, DQN_INFERENCE_CACHE_PATH, "DQN BF16");
-    bf16
-}
-
-#[cfg(cuda)]
-fn prepare_dqn_gpu_policy(
-    master: &DuelingQNetwork,
-    force_refresh: bool,
-    device: ComputeDevice,
-) -> DuelingQNetwork {
-    let mut policy = prepare_dqn_inference_cache(master, force_refresh);
-    if device == ComputeDevice::Cuda {
-        policy.to_cuda();
-        info!("[DQN] BF16 inference cache moved to CUDA for Tensor Core matmul.");
-    }
-    policy
-}
-
-#[cfg(not(cuda))]
-fn prepare_dqn_gpu_policy(
-    master: &DuelingQNetwork,
-    force_refresh: bool,
-    _device: ComputeDevice,
-) -> DuelingQNetwork {
-    prepare_dqn_inference_cache(master, force_refresh)
-}
-
-fn prepare_ppo_inference_cache(master: &ActorCritic, force_refresh: bool) -> ActorCritic {
-    if !force_refresh && is_inference_cache_fresh(PPO_MASTER_CACHE_PATH, PPO_INFERENCE_CACHE_PATH) {
-        if let Some(cached) = load_model::<ActorCritic>(PPO_INFERENCE_CACHE_PATH, "PPO BF16") {
-            cached.freeze_achf_for_inference();
-            info!("[PPO] BF16 inference cache loaded.");
-            return cached;
-        }
-    }
-
-    let bf16 = master.to_inference_bf16();
-    bf16.freeze_achf_for_inference();
-    save_model(&bf16, PPO_INFERENCE_CACHE_PATH, "PPO BF16");
-    bf16
-}
-
-#[cfg(cuda)]
-fn prepare_ppo_gpu_policy(
-    master: &ActorCritic,
-    force_refresh: bool,
-    device: ComputeDevice,
-) -> ActorCritic {
-    let mut policy = prepare_ppo_inference_cache(master, force_refresh);
-    if device == ComputeDevice::Cuda {
-        policy.to_cuda();
-        info!("[PPO] BF16 inference cache moved to CUDA for Tensor Core matmul.");
-    }
-    policy
-}
-
-#[cfg(not(cuda))]
-fn prepare_ppo_gpu_policy(
-    master: &ActorCritic,
-    force_refresh: bool,
-    _device: ComputeDevice,
-) -> ActorCritic {
-    prepare_ppo_inference_cache(master, force_refresh)
 }
 
 fn default_pool_index(config: &Config) -> usize {
@@ -602,239 +517,6 @@ fn benchmark_simulation(
     );
 }
 
-fn initialize_system(
-    args: &Args,
-) -> (
-    Config,
-    EnvNet,
-    NeuralLuckOptimizer,
-    DuelingQNetwork,
-    ActorCritic,
-    GoodJobWorker,
-    Rng,
-) {
-    let mut config = Config::load(&args.config);
-    apply_compute_device_policy(&mut config);
-    if config.model_hidden_dim >= 8192 {
-        warn!(
-            "Large model detected ({} dim x {} layers). Training will take significantly longer and may require substantial memory.",
-            config.model_hidden_dim, config.model_num_layers
-        );
-    }
-    let mut rng = if let Some(seed) = args.seed {
-        Rng::from_seed(seed)
-    } else {
-        Rng::new()
-    };
-
-    let worker = match GoodJobWorker::new_with_config(&config) {
-        Ok(w) => w,
-        Err(e) => {
-            log::error!(
-                "Worker initialization failed: {}. Running without worker pool.",
-                e
-            );
-            // Create a minimal fallback worker with a single thread.
-            // This preserves all functionality but may be slower.
-            match GoodJobWorker::new(1) {
-                Ok(w) => w,
-                Err(_) => {
-                    log::error!("Fallback worker also failed. Exiting.");
-                    std::process::exit(1);
-                }
-            }
-        }
-    };
-
-    let env_net = if !args.force {
-        if let Some(cached) = load_env_net_cache("env_net.cache") {
-            info!("[EnvNet] Cache loaded.");
-            cached
-        } else {
-            info!("[EnvNet] Pre-training environment noise model...");
-            let mut env_net = EnvNet::new(&mut rng);
-            let (count, epochs) = if config.fast_init {
-                (256, 10)
-            } else {
-                (1024, 50)
-            };
-            env_net.pretrain(&mut rng, &config, count, epochs);
-            if save_env_net_cache("env_net.cache", &env_net) {
-                info!("[EnvNet] Cache saved.");
-            }
-            env_net
-        }
-    } else {
-        info!("[EnvNet] Force pre-training...");
-        let mut env_net = EnvNet::new(&mut rng);
-        env_net.pretrain(&mut rng, &config, 1024, 50);
-        env_net
-    };
-
-    let mut trained_neural_opt = if !args.force {
-        if let Some(cached) = load_neural_cache(NEURAL_CACHE_PATH) {
-            info!("[Neural Core] Cache detected. Cached weights loaded.");
-            cached
-        } else {
-            info!("[Neural Core] Cache not found. Training new weights...");
-            train_neural_optimizer(rng.next_u64(), &env_net, &config, &worker)
-        }
-    } else {
-        info!("[Neural Core] Force training new weights...");
-        train_neural_optimizer(rng.next_u64(), &env_net, &config, &worker)
-    };
-
-    info!("[Linear] Training linear regression...");
-    let (lin_w, lin_b) = train_linear_regression(&trained_neural_opt, &mut rng, &env_net, &config);
-    trained_neural_opt.set_linear_params(lin_w, lin_b);
-
-    info!("[RL] Manifold Optimization (Parallel)...");
-    trained_neural_opt =
-        train_manifold_rl(&trained_neural_opt, &mut rng, &env_net, &config, &worker);
-
-    // Save Neural Cache
-    if save_neural_cache(NEURAL_CACHE_PATH, &trained_neural_opt) {
-        info!("[Neural Core] Cache saved.");
-    }
-
-    // DQN
-    let dqn_master = if !args.force {
-        if let Some(cached) = load_model::<DuelingQNetwork>(DQN_MASTER_CACHE_PATH, "DQN") {
-            cached.freeze_achf_for_inference();
-            info!("[DQN] Cached model loaded.");
-            cached
-        } else if config.online_train && config.online_train_dqn {
-            info!("[DQN] Initializing online training model...");
-            let d = DuelingQNetwork::new_with_config(&config, rng.next_u64());
-            save_model(&d, DQN_MASTER_CACHE_PATH, "DQN");
-            d
-        } else {
-            info!("[DQN] Training new model...");
-            let d = train_dqn(&trained_neural_opt, &mut rng, &env_net, &config);
-            save_model(&d, DQN_MASTER_CACHE_PATH, "DQN");
-            d
-        }
-    } else if config.online_train && config.online_train_dqn {
-        info!("[DQN] Force initializing online training model...");
-        let d = DuelingQNetwork::new_with_config(&config, rng.next_u64());
-        save_model(&d, DQN_MASTER_CACHE_PATH, "DQN");
-        d
-    } else {
-        info!("[DQN] Force training new model...");
-        let d = train_dqn(&trained_neural_opt, &mut rng, &env_net, &config);
-        save_model(&d, DQN_MASTER_CACHE_PATH, "DQN");
-        d
-    };
-    let dqn_policy = prepare_dqn_gpu_policy(&dqn_master, args.force, config.device);
-
-    // PPO
-    let ppo_master = if !args.force {
-        if let Some(cached) = load_model::<ActorCritic>(PPO_MASTER_CACHE_PATH, "PPO") {
-            cached.freeze_achf_for_inference();
-            info!("[PPO] Cached model loaded.");
-            cached
-        } else {
-            info!("[PPO] Training new model...");
-            let p = train_ppo(&mut rng, &env_net, &config);
-            println!("[PPO] Saving model...");
-            save_model(&p, PPO_MASTER_CACHE_PATH, "PPO");
-            p
-        }
-    } else {
-        info!("[PPO] Force training new model...");
-        let p = train_ppo(&mut rng, &env_net, &config);
-        println!("[PPO] Saving model...");
-        save_model(&p, PPO_MASTER_CACHE_PATH, "PPO");
-        p
-    };
-    let ppo_policy = prepare_ppo_gpu_policy(&ppo_master, args.force, config.device);
-
-    (
-        config,
-        env_net,
-        trained_neural_opt,
-        dqn_policy,
-        ppo_policy,
-        worker,
-        rng,
-    )
-}
-
-fn apply_compute_device_policy(config: &mut Config) {
-    match config.device {
-        ComputeDevice::Cpu => {
-            info!("[Device] Using CPU backend.");
-        }
-        ComputeDevice::Auto => {
-            #[cfg(cuda)]
-            {
-                match cuda::device_count() {
-                    Ok(count) if count > 0 => {
-                        if let Ok(dev) = cuda::get_device_info(0) {
-                            info!(
-                                "[Device] Auto-selected CUDA: {} (CC {}.{})",
-                                dev.name, dev.compute_capability.0, dev.compute_capability.1
-                            );
-                        } else {
-                            info!("[Device] Auto-selected CUDA.");
-                        }
-                        config.device = ComputeDevice::Cuda;
-                    }
-                    Ok(_) => {
-                        info!("[Device] Auto requested, but no CUDA devices found. Falling back to CPU.");
-                        config.device = ComputeDevice::Cpu;
-                    }
-                    Err(err) => {
-                        info!(
-                            "[Device] Auto requested, CUDA unavailable ({}). Falling back to CPU.",
-                            err
-                        );
-                        config.device = ComputeDevice::Cpu;
-                    }
-                }
-            }
-            #[cfg(not(cuda))]
-            {
-                info!("[Device] Auto requested, but binary was built without CUDA. Using CPU.");
-                config.device = ComputeDevice::Cpu;
-            }
-        }
-        ComputeDevice::Cuda => {
-            #[cfg(cuda)]
-            {
-                match cuda::device_count() {
-                    Ok(count) if count > 0 => {
-                        if let Ok(dev) = cuda::get_device_info(0) {
-                            info!(
-                                "[Device] CUDA requested: {} (CC {}.{})",
-                                dev.name, dev.compute_capability.0, dev.compute_capability.1
-                            );
-                        } else {
-                            info!("[Device] CUDA requested and initialized.");
-                        }
-                    }
-                    Ok(_) => {
-                        info!("[Device] CUDA requested, but no CUDA devices found. Falling back to CPU.");
-                        config.device = ComputeDevice::Cpu;
-                    }
-                    Err(err) => {
-                        info!(
-                            "[Device] CUDA requested, but unavailable ({}). Falling back to CPU.",
-                            err
-                        );
-                        config.device = ComputeDevice::Cpu;
-                    }
-                }
-            }
-            #[cfg(not(cuda))]
-            {
-                info!("[Device] CUDA requested, but binary was built without CUDA. Using CPU.");
-                config.device = ComputeDevice::Cpu;
-            }
-        }
-    }
-}
-
 fn main() {
     panic_guard::install();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -898,8 +580,13 @@ fn main() {
         return;
     }
 
+    let command = args.command.clone().unwrap_or(Commands::Interactive);
+    let init_options = ModelInitOptions {
+        force: args.force,
+        allow_online_bootstrap: matches!(command, Commands::Interactive),
+    };
     let (mut config, env_net, trained_neural_opt, dqn_policy, ppo_policy, worker, mut rng) =
-        initialize_system(&args);
+        initialize_system(&args.config, args.seed, init_options);
     let lang = Language::from_config(&config);
 
     // Auto-load calibrated parameters if available
@@ -916,7 +603,7 @@ fn main() {
         None
     };
 
-    match args.command.clone().unwrap_or(Commands::Interactive) {
+    match command {
         Commands::Interactive => {
             run_interactive(RunInteractiveArgs {
                 config,
@@ -1055,14 +742,20 @@ fn run_interactive(args: RunInteractiveArgs) {
     let dqn_shared = Arc::new(RwLock::new(dqn_policy.clone()));
     let neural_shared = Arc::new(RwLock::new(trained_neural_opt.clone()));
     let ppo_shared = Arc::new(RwLock::new(ppo_policy.clone()));
-    let dqn_train_master = load_model::<DuelingQNetwork>(DQN_MASTER_CACHE_PATH, "DQN")
-        .unwrap_or_else(|| {
-            let mut master = DuelingQNetwork::new_with_config(&config, rng.next_u64());
-            master.load_state_dict(&dqn_policy);
-            master
-        });
-    let ppo_train_master = load_model::<ActorCritic>(PPO_MASTER_CACHE_PATH, "PPO")
-        .unwrap_or_else(|| ActorCritic::new_with_config(&config, rng.next_u64()));
+    let dqn_manifest = dqn_master_cache_manifest(&config, dqn_training_quality(&config))
+        .with_source_hash(cache_artifact_hash(NEURAL_CACHE_PATH));
+    let ppo_manifest = ppo_master_cache_manifest(&config, ppo_training_quality(&config))
+        .with_source_hash(cache_artifact_hash(ENV_NET_CACHE_PATH));
+    let dqn_train_master =
+        load_model_with_manifest::<DuelingQNetwork>(DQN_MASTER_CACHE_PATH, "DQN", &dqn_manifest)
+            .unwrap_or_else(|| {
+                let mut master = DuelingQNetwork::new_with_config(&config, rng.next_u64());
+                master.load_state_dict(&dqn_policy);
+                master
+            });
+    let ppo_train_master =
+        load_model_with_manifest::<ActorCritic>(PPO_MASTER_CACHE_PATH, "PPO", &ppo_manifest)
+            .unwrap_or_else(|| ActorCritic::new_with_config(&config, rng.next_u64()));
     let stop_flag = Arc::new(AtomicBool::new(false));
     let mut online_handles: Vec<thread::JoinHandle<()>> = Vec::new();
     let mut dqn_sender: Option<mpsc::Sender<Experience>> = None;
@@ -1078,6 +771,12 @@ fn run_interactive(args: RunInteractiveArgs) {
         let max_steps = config.max_train_steps_per_tick;
         let trainer_seed = rng.next_u64();
         let mut trainer = OnlineDqnTrainer::from_policy(dqn_train_master, trainer_seed);
+        let dqn_manifest = dqn_manifest
+            .clone()
+            .with_quality(CacheQualitySummary::online_updated(
+                "online training updated master weights",
+            ));
+        let config_for_dqn = config.clone();
         online_handles.push(thread::spawn(move || {
             let mut local_rng = Rng::from_seed(trainer_seed.wrapping_add(1));
             let mut last_report = Instant::now();
@@ -1118,9 +817,13 @@ fn run_interactive(args: RunInteractiveArgs) {
                 thread::sleep(Duration::from_millis(interval_ms));
             }
             let master = trainer.policy();
-            save_model(master, DQN_MASTER_CACHE_PATH, "DQN");
-            let bf16 = master.to_inference_bf16();
-            save_model(&bf16, DQN_INFERENCE_CACHE_PATH, "DQN BF16");
+            if save_model_with_manifest(master, DQN_MASTER_CACHE_PATH, "DQN", dqn_manifest) {
+                let bf16 = master.to_inference_bf16();
+                let manifest =
+                    dqn_inference_cache_manifest(&config_for_dqn, serialized_model_hash(master));
+                let _ =
+                    save_model_with_manifest(&bf16, DQN_INFERENCE_CACHE_PATH, "DQN BF16", manifest);
+            }
         }));
     }
 
@@ -1172,6 +875,12 @@ fn run_interactive(args: RunInteractiveArgs) {
         let max_steps = config.max_train_steps_per_tick;
         let (k_epochs, batch_size) = resolve_ppo_online_train_params(&config);
         let mut trainer = OnlinePpoTrainer::from_policy(ppo_train_master, k_epochs, batch_size);
+        let ppo_manifest = ppo_manifest
+            .clone()
+            .with_quality(CacheQualitySummary::online_updated(
+                "online training updated master weights",
+            ));
+        let config_for_ppo = config.clone();
         online_handles.push(thread::spawn(move || {
             let mut last_report = Instant::now();
             let mut last_sync = Instant::now();
@@ -1211,9 +920,13 @@ fn run_interactive(args: RunInteractiveArgs) {
                 thread::sleep(Duration::from_millis(interval_ms));
             }
             let master = trainer.policy();
-            save_model(master, PPO_MASTER_CACHE_PATH, "PPO");
-            let bf16 = master.to_inference_bf16();
-            save_model(&bf16, PPO_INFERENCE_CACHE_PATH, "PPO BF16");
+            if save_model_with_manifest(master, PPO_MASTER_CACHE_PATH, "PPO", ppo_manifest) {
+                let bf16 = master.to_inference_bf16();
+                let manifest =
+                    ppo_inference_cache_manifest(&config_for_ppo, serialized_model_hash(master));
+                let _ =
+                    save_model_with_manifest(&bf16, PPO_INFERENCE_CACHE_PATH, "PPO BF16", manifest);
+            }
         }));
     }
 
@@ -2424,14 +2137,24 @@ mod tests {
         };
         let dqn = DuelingQNetwork::new_with_config(&config, 42);
         let bf16 = dqn.to_inference_bf16();
+        let master_manifest = dqn_master_cache_manifest(&config, dqn_training_quality(&config));
 
-        save_model(&dqn, &master_path, "DQN test");
-        save_model(&bf16, &inference_path, "DQN BF16 test");
-        assert!(is_inference_cache_fresh(&master_path, &inference_path));
-        let loaded: DuelingQNetwork = load_model(&inference_path, "DQN BF16 test").unwrap();
+        save_model_with_manifest(&dqn, &master_path, "DQN test", master_manifest);
+        let inference_manifest = dqn_inference_cache_manifest(&config, serialized_model_hash(&dqn));
+        save_model_with_manifest(
+            &bf16,
+            &inference_path,
+            "DQN BF16 test",
+            inference_manifest.clone(),
+        );
+        let loaded: DuelingQNetwork =
+            load_model_with_manifest(&inference_path, "DQN BF16 test", &inference_manifest)
+                .unwrap();
 
         let _ = std::fs::remove_file(format!("{}.bin", master_path));
+        let _ = std::fs::remove_file(format!("{}.manifest.json", master_path));
         let _ = std::fs::remove_file(format!("{}.bin", inference_path));
+        let _ = std::fs::remove_file(format!("{}.manifest.json", inference_path));
 
         assert!(loaded
             .parameters()
