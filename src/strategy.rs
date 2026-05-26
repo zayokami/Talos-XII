@@ -182,8 +182,10 @@ mod tests {
 
     #[test]
     fn neural_fallback_uses_existing_dropout_seed_formula() {
-        let mut config = Config::default();
-        config.luck_mode = LuckMode::Probability;
+        let config = Config {
+            luck_mode: LuckMode::Probability,
+            ..Default::default()
+        };
         let neural_opt = NeuralLuckOptimizer::new(7);
         let state = test_state();
         let nn_total_pulls = 11;
@@ -222,10 +224,15 @@ mod tests {
 
     #[test]
     fn dqn_slow_path_returns_discrete_luck_action() {
-        let mut config = Config::default();
-        config.luck_mode = LuckMode::Dqn;
-        config.model_hidden_dim = 8;
-        config.achf.enabled = false;
+        let config = Config {
+            luck_mode: LuckMode::Dqn,
+            model_hidden_dim: 8,
+            achf: crate::config::AchfConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let neural_opt = NeuralLuckOptimizer::new(7);
         let dqn = DuelingQNetwork::new_with_config(&config, 13);
         let state = test_state();
@@ -257,9 +264,11 @@ mod tests {
 
     #[test]
     fn ppo_slow_path_returns_action_log_prob_and_value() {
-        let mut config = Config::default();
-        config.luck_mode = LuckMode::Ppo;
-        config.ppo_top_k = 0;
+        let config = Config {
+            luck_mode: LuckMode::Ppo,
+            ppo_top_k: 0,
+            ..Default::default()
+        };
         let neural_opt = NeuralLuckOptimizer::new(7);
         let policy = ActorCritic::new(17, &crate::config::AchfConfig::default(), 64, 2);
         let state = test_state();
@@ -293,9 +302,11 @@ mod tests {
 
     #[test]
     fn ppo_fast_missing_sequence_falls_back_to_slow_path() {
-        let mut config = Config::default();
-        config.luck_mode = LuckMode::Ppo;
-        config.ppo_top_k = 0;
+        let config = Config {
+            luck_mode: LuckMode::Ppo,
+            ppo_top_k: 0,
+            ..Default::default()
+        };
         let neural_opt = NeuralLuckOptimizer::new(7);
         let policy = ActorCritic::new(19, &crate::config::AchfConfig::default(), 64, 2);
         let state = test_state();
