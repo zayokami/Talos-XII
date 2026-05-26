@@ -93,7 +93,7 @@ cargo build --release
 ./target/release/talos_xii
 ```
 
-On first launch, the program trains DBN, DQN (50k steps), and PPO (200k steps), taking ~30–45 seconds. Models are cached to `neural.cache`, `dqn.cache.bin`, `ppo.cache.bin`; subsequent launches complete in under 1 second.
+On first launch, the program trains EnvNet, NeuralLuckOptimizer, DQN (50k steps), and PPO (20k steps by default), taking ~30–45 seconds. Models are cached to `env_net.cache`, `neural.cache`, `dqn.cache.bin`, and `ppo.cache.bin`; BF16 inference caches are written to `dqn.cache.bf16.bin` and `ppo.cache.bf16.bin`. Subsequent launches complete in under 1 second.
 
 ### CUDA Support (Optional)
 
@@ -227,7 +227,7 @@ Weapon UP pool: 4% base 6-star rate, hard pity at 40, mega pity at 180, UP weapo
 
 ### Simulation Engine (`src/sim.rs`)
 
-Each simulation constructs an 8-dimensional feature vector (pity progress, env noise, consecutive non-UP count, etc.) and feeds it to the neural network for decision guidance. Three modes:
+Each simulation constructs a 32-dimensional feature vector (pity progress, env noise, consecutive non-UP count, engineered interaction terms, etc.) and feeds it to the neural network for decision guidance. Three modes:
 - **probability** — pure dice roll per config probability table
 - **dqn** — Dueling Q-Network provides discrete action suggestions
 - **ppo** — Actor-Critic network provides continuous pull strategy optimization
@@ -236,14 +236,14 @@ The engine also supports a fast inference path (`fast_inference`) that skips ful
 
 ### Neural Networks
 
-On first run, four components are trained sequentially:
+On first run, four components are trained or loaded sequentially:
 
-1. **DBN** (8→16→8) — models gacha environment noise distribution; samples (env_noise, env_bias) per simulation as environment parameters
-2. **NeuralLuckOptimizer** — linear regression + manifold RL on DBN-provided environment; learns 8-dim → "luck value" mapping
+1. **EnvNet** (5→64→32→16→2) — models gacha environment noise/bias from RNG, pity, pull count, streak, and loss streak inputs; samples (env_noise, env_bias) per simulation as environment parameters
+2. **NeuralLuckOptimizer** — evolutionary training + linear regression + manifold RL on EnvNet-provided environment; learns 32-dim → "luck value" mapping
 3. **DQN** (Dueling, 50k steps) — maps state to discrete action Q-values; decides "pull or wait"
-4. **PPO** (Actor-Critic + MLA Transformer, 200k steps) — learns continuous pull strategy distribution; the heaviest and most expressive model
+4. **PPO** (Actor-Critic + MLA Transformer, 20k steps by default) — learns continuous pull strategy distribution; the heaviest and most expressive model
 
-Cached models are portable — they learn pity/probability mechanisms, not character names — so no retraining needed after pool updates.
+Cached models are portable — they learn pity/probability mechanisms, not character names — so no retraining is usually needed after pool updates. Use `-f` to force retraining, or delete the relevant cache files when model architecture, feature construction, or training configuration changes.
 
 ### ACHF (Adaptive Cache-aware Hyper-Connections)
 
@@ -274,13 +274,13 @@ Runtime CPU capability detection with automatic dispatch: Scalar → AVX2 → AV
 
 ---
 
-## Testing (105 tests)
+## Testing (142 tests)
 
 ```bash
 cargo test
 ```
 
-Covers: pity logic, probability monotonicity, F2P verification, DQN/Q-value validation, PPO fast/slow alignment, Actor-Critic shapes, ACHF consistency, Transformer MLA/RoPE/RMSNorm, binary codec, config parsing, Beta calibration, and more.
+Covers: pity logic, probability monotonicity, F2P verification, DQN/Q-value validation, PPO fast/slow alignment, Actor-Critic shapes, ACHF consistency, Transformer MLA/RoPE/RMSNorm, binary codec, config parsing, Beta calibration, EnvNet serialization/training, autograd gradient checks, and more.
 
 CI runs on Ubuntu, Windows, and macOS with ARM64 cross-compilation validation.
 
@@ -299,13 +299,13 @@ Branch strategy: `main` is production (merged from release/hotfix only), `dev` i
 ## FAQ
 
 **Why is first launch so slow?**
-Training DBN, DQN, and PPO models takes ~30–45 seconds. Results are cached; subsequent launches take under 1 second. Enable `fast_init` in config to skip training during development.
+Training EnvNet, NeuralLuckOptimizer, DQN, and PPO models takes ~30–45 seconds. Results are cached; subsequent launches take under 1 second. Enable `fast_init` in config to use shorter training settings during development.
 
 **What does "Avg Extra Jade Cost: N/A" mean in F2P analysis?**
 All simulations obtained UP within the free pull budget — no paid spending was required. This means free resources are sufficient under current pool conditions.
 
 **Can I delete the cache files?**
-Yes. Deleting `neural.cache`, `dqn.cache.bin`, `ppo.cache.bin` triggers retraining on next run. Usually only needed when pity/probability mechanics change.
+Yes. Deleting `env_net.cache`, `neural.cache`, `dqn.cache.bin`, or `ppo.cache.bin` triggers retraining for the corresponding model on next run. Deleting `dqn.cache.bf16.bin` or `ppo.cache.bf16.bin` only rebuilds the BF16 inference cache from the master model. Usually only needed when pity/probability mechanics, model architecture, feature construction, or training configuration changes.
 
 ---
 
@@ -401,7 +401,7 @@ cargo build --release
 ./target/release/talos_xii
 ```
 
-首次启动训练 DBN、DQN（50k 步）和 PPO（200k 步），约 30～45 秒。模型缓存至 `neural.cache`、`dqn.cache.bin`、`ppo.cache.bin`，之后启动不到 1 秒。
+首次启动会训练 EnvNet、NeuralLuckOptimizer、DQN（50k 步）和 PPO（默认 20k 步），约 30～45 秒。模型缓存至 `env_net.cache`、`neural.cache`、`dqn.cache.bin`、`ppo.cache.bin`；BF16 推理缓存写入 `dqn.cache.bf16.bin` 和 `ppo.cache.bf16.bin`，之后启动不到 1 秒。
 
 ### CUDA 支持（可选）
 
@@ -535,7 +535,7 @@ cargo run --release -- benchmark paper --output-dir results # 指定输出目录
 
 ### 模拟引擎（`src/sim.rs`）
 
-每次模拟构建 8 维特征向量（保底进度、环境噪声、连续未出 UP 次数等），送入神经网络获取决策建议。三种模式：
+每次模拟构建 32 维特征向量（保底进度、环境噪声、连续未出 UP 次数以及工程化交互特征等），送入神经网络获取决策建议。三种模式：
 - **probability** — 纯概率，按配置的概率表投骰
 - **dqn** — Dueling Q-Network 提供离散动作建议
 - **ppo** — Actor-Critic 网络提供连续抽卡策略优化
@@ -544,14 +544,14 @@ cargo run --release -- benchmark paper --output-dir results # 指定输出目录
 
 ### 神经网络
 
-初始化时依次训练四个组件：
+初始化时依次训练或加载四个组件：
 
-1. **DBN**（8→16→8）— 建模抽卡环境噪声分布，每次模拟采样一组 (env_noise, env_bias) 作为环境参数
-2. **NeuralLuckOptimizer** — 在 DBN 提供的环境上做线性回归与流形 RL 优化，学习 8 维特征到"运气值"的映射
+1. **EnvNet**（5→64→32→16→2）— 基于 RNG、保底、总抽数、连抽星级和歪 UP 次数建模环境噪声/偏置，每次模拟采样一组 (env_noise, env_bias) 作为环境参数
+2. **NeuralLuckOptimizer** — 在 EnvNet 提供的环境上做进化训练、线性回归与流形 RL 优化，学习 32 维特征到"运气值"的映射
 3. **DQN**（Dueling，50k 步）— 将状态映射为离散动作 Q 值，决定"抽还是不抽"
-4. **PPO**（Actor-Critic + MLA Transformer，200k 步）— 学习连续抽卡策略分布，是最重也是最有表达力的模型
+4. **PPO**（Actor-Critic + MLA Transformer，默认 20k 步）— 学习连续抽卡策略分布，是最重也是最有表达力的模型
 
-训练完成后缓存到磁盘。缓存是通用的——它们学习的是保底/概率机制，不依赖角色名，因此卡池更新后无需重训。
+训练完成后缓存到磁盘。缓存是通用的——它们学习的是保底/概率机制，不依赖角色名，因此卡池更新后通常无需重训。需要强制重训时使用 `-f`，模型结构、特征构造或训练配置变化时建议删除对应缓存。
 
 ### ACHF（Adaptive Cache-aware Hyper-Connections）
 
@@ -582,13 +582,13 @@ cargo run --release -- benchmark paper --output-dir results # 指定输出目录
 
 ---
 
-## 测试（105 个测试）
+## 测试（142 个测试）
 
 ```bash
 cargo test
 ```
 
-覆盖：保底逻辑、概率单调性、F2P 验证、DQN Q 值有效性、PPO 快慢路径对齐、Actor-Critic 形状、ACHF 一致性、Transformer MLA/RoPE/RMSNorm、二进制编解码、配置解析、Beta 校准等。CI 在 Ubuntu、Windows、macOS 上执行，并验证 ARM64 交叉编译。
+覆盖：保底逻辑、概率单调性、F2P 验证、DQN Q 值有效性、PPO 快慢路径对齐、Actor-Critic 形状、ACHF 一致性、Transformer MLA/RoPE/RMSNorm、二进制编解码、配置解析、Beta 校准、EnvNet 序列化/训练、autograd 梯度检查等。CI 在 Ubuntu、Windows、macOS 上执行，并验证 ARM64 交叉编译。
 
 ---
 
@@ -605,13 +605,13 @@ cargo test
 ## 常见问题
 
 **首次启动为什么要等很久？**
-需要训练 DBN、DQN、PPO 三个模型。完成后写入缓存，之后启动不到 1 秒。开发调试可开启配置中的 `fast_init` 跳过训练。
+需要训练 EnvNet、NeuralLuckOptimizer、DQN、PPO 四个模型。完成后写入缓存，之后启动不到 1 秒。开发调试可开启配置中的 `fast_init` 使用更短的训练设置。
 
 **F2P 分析的 "Avg Extra Jade Cost: N/A" 是什么意思？**
 所有模拟都在免费抽数内出了 UP，没有产生需要额外付费的样本，说明当前卡池条件下免费资源够用。
 
 **可以删除缓存文件吗？**
-可以。删除 `neural.cache`、`dqn.cache.bin`、`ppo.cache.bin` 后下次运行会重新训练，一般只在保底/概率机制变化时才需要清缓存。
+可以。删除 `env_net.cache`、`neural.cache`、`dqn.cache.bin` 或 `ppo.cache.bin` 后，下次运行会重训对应模型。删除 `dqn.cache.bf16.bin` 或 `ppo.cache.bf16.bin` 只会从主模型重建 BF16 推理缓存。一般只在保底/概率机制、模型结构、特征构造或训练配置变化时才需要清缓存。
 
 ---
 
