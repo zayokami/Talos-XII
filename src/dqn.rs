@@ -6,6 +6,7 @@ use crate::neural::{NeuralLuckOptimizer, DIM};
 use crate::nn::{Linear, Module};
 use crate::rng::Rng;
 use crate::sim::{build_features, env_net_env, prob_6, PullState};
+use crate::training_metrics::{StepSnapshot, TrainingMetrics, TrainingMetricsSink};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 
@@ -1024,7 +1025,13 @@ pub fn train_dqn(
     env_net: &EnvNet,
     config: &Config,
 ) -> DuelingQNetwork {
-    train_dqn_impl(_initial_model, rng, env_net, config, None)
+    train_dqn_impl(
+        _initial_model,
+        rng,
+        env_net,
+        config,
+        TrainingMetricsSink::noop(),
+    )
 }
 
 fn train_dqn_impl(
@@ -1032,7 +1039,7 @@ fn train_dqn_impl(
     rng: &mut Rng,
     env_net: &EnvNet,
     config: &Config,
-    metrics_tx: Option<std::sync::mpsc::Sender<crate::bench::StepSnapshot>>,
+    mut metrics: impl TrainingMetrics,
 ) -> DuelingQNetwork {
     println!("\n[DQN] Initializing Double Dueling DQN Training...");
 
@@ -1410,29 +1417,13 @@ fn train_dqn_impl(
             ));
         }
 
-        if let Some(ref tx) = metrics_tx {
-            if step % snapshot_every == 0 {
-                let avg_r = if recent_rewards.is_empty() {
-                    0.0
-                } else {
-                    recent_rewards.iter().sum::<f64>() / recent_rewards.len() as f64
-                };
-                let achf_snap = policy_net.snapshot_achf();
-                let snapshot = crate::bench::StepSnapshot {
-                    step,
-                    gate_value: achf_snap.map_or(1.0, |s| s.gate),
-                    g_min: achf_snap.map_or(0.0, |s| s.g_min),
-                    grad_ema: achf_snap.map_or(0.0, |s| s.grad_ema),
-                    loss: last_train_loss,
-                    reward: avg_r,
-                    cache_hit_rate: achf_snap.map_or(0.0, |s| s.cache_hit_rate),
-                    sparse_ratio: achf_snap.map_or(0.0, |s| s.low_rank_ratio),
-                    ema_cached_ns: achf_snap.map_or(0.0, |s| s.ema_cached_ns),
-                    ema_sparse_ns: achf_snap.map_or(0.0, |s| s.ema_sparse_ns),
-                    adaptive_bias: achf_snap.map_or(1.0, |s| s.adaptive_bias),
-                };
-                let _ = tx.send(snapshot);
-            }
+        if metrics.is_enabled() && step % snapshot_every == 0 {
+            let avg_r = if recent_rewards.is_empty() {
+                0.0
+            } else {
+                recent_rewards.iter().sum::<f64>() / recent_rewards.len() as f64
+            };
+            metrics.emit_achf_snapshot(step, last_train_loss, avg_r, policy_net.snapshot_achf());
         }
 
         if config.achf.cache_log_interval_steps > 0
@@ -1456,9 +1447,15 @@ pub fn train_dqn_with_metrics(
     rng: &mut Rng,
     env_net: &EnvNet,
     config: &Config,
-    metrics_tx: Option<std::sync::mpsc::Sender<crate::bench::StepSnapshot>>,
+    metrics_tx: Option<std::sync::mpsc::Sender<StepSnapshot>>,
 ) -> DuelingQNetwork {
-    train_dqn_impl(initial_model, rng, env_net, config, metrics_tx)
+    train_dqn_impl(
+        initial_model,
+        rng,
+        env_net,
+        config,
+        TrainingMetricsSink::from(metrics_tx),
+    )
 }
 
 /// Scratch buffers for DQN training to avoid per-step heap allocations.

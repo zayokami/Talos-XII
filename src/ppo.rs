@@ -5,6 +5,7 @@ use crate::neural::DIM;
 use crate::nn::{Linear, Module};
 use crate::rng::Rng;
 use crate::sim::{build_features, env_net_env, prob_6, PpoExperience, PullState};
+use crate::training_metrics::{StepSnapshot, TrainingMetrics, TrainingMetricsSink};
 use crate::transformer::{KVCache, LuckTransformer};
 use crate::utils::{
     create_bar, normalize_slice, sum_f64, sum_sq_diff, ACTIONS, ACTION_SPACE, EPISODE_MAX_PULLS,
@@ -1408,6 +1409,15 @@ struct PpoStepResult {
 
 /// Train a PPO agent with multi-environment rollouts.
 pub fn train_ppo(rng: &mut Rng, env_net: &EnvNet, config: &Config) -> ActorCritic {
+    train_ppo_impl(rng, env_net, config, TrainingMetricsSink::noop())
+}
+
+fn train_ppo_impl(
+    rng: &mut Rng,
+    env_net: &EnvNet,
+    config: &Config,
+    mut metrics: impl TrainingMetrics,
+) -> ActorCritic {
     println!("\n[PPO] Initializing PPO Training (Actor-Critic)...");
     let fast_mode = config.fast_init || config.ppo_mode == "fast";
     let total_steps = if config.ppo_total_steps > 0 {
@@ -1481,6 +1491,7 @@ pub fn train_ppo(rng: &mut Rng, env_net: &EnvNet, config: &Config) -> ActorCriti
     let heartbeat_every = if fast_mode { 128 } else { 512 };
     let mut last_heartbeat = Instant::now();
     let mut remainder_offset = 0usize;
+    let snapshot_every = (total_steps / 200).max(1);
     let pb = create_bar(total_steps as u64, "PPO Training");
     while steps_done < total_steps {
         // Calculate LR
@@ -1564,7 +1575,7 @@ pub fn train_ppo(rng: &mut Rng, env_net: &EnvNet, config: &Config) -> ActorCriti
             "Updating ({} samples, {} epochs)...",
             collected, k_epochs
         ));
-        ppo.update(current_lr);
+        let update_loss = ppo.update(current_lr);
         steps_done += update_steps;
 
         if config.achf.cache_log_interval_steps > 0
@@ -1595,6 +1606,10 @@ pub fn train_ppo(rng: &mut Rng, env_net: &EnvNet, config: &Config) -> ActorCriti
         };
         pb.set_position(steps_done as u64);
         pb.set_message(format!("Avg R: {:.2} | LR: {:.6}", avg_r, current_lr));
+
+        if metrics.is_enabled() && steps_done % snapshot_every < update_steps {
+            metrics.emit_achf_snapshot(steps_done, update_loss, avg_r, ppo.policy.snapshot_achf());
+        }
     }
     pb.finish_with_message("PPO Training Complete.");
     ppo.policy.freeze_achf_for_inference();
@@ -1606,185 +1621,9 @@ pub fn train_ppo_with_metrics(
     rng: &mut Rng,
     env_net: &EnvNet,
     config: &Config,
-    metrics_tx: Option<std::sync::mpsc::Sender<crate::bench::StepSnapshot>>,
+    metrics_tx: Option<std::sync::mpsc::Sender<StepSnapshot>>,
 ) -> ActorCritic {
-    println!("\n[PPO] Initializing PPO Training (Actor-Critic)...");
-    let fast_mode = config.fast_init || config.ppo_mode == "fast";
-    let total_steps = if config.ppo_total_steps > 0 {
-        config.ppo_total_steps
-    } else if fast_mode {
-        4_000
-    } else {
-        20_000
-    };
-    let steps_per_update = if config.ppo_steps_per_update > 0 {
-        config.ppo_steps_per_update
-    } else if fast_mode {
-        256
-    } else {
-        1_024
-    };
-    let k_epochs = if config.ppo_k_epochs > 0 {
-        config.ppo_k_epochs
-    } else if fast_mode {
-        2
-    } else {
-        3
-    };
-    let batch_size = if config.ppo_batch_size > 0 {
-        config.ppo_batch_size
-    } else {
-        128
-    };
-    let context_len = if config.ppo_context_len > 0 {
-        config.ppo_context_len
-    } else if fast_mode {
-        6
-    } else {
-        8
-    };
-    let num_envs = if config.ppo_num_envs > 0 {
-        config.ppo_num_envs
-    } else {
-        1
-    };
-    let worker = GoodJobWorker::new_with_config(config).expect("Failed to build PPO worker pool");
-    let mut ppo = Ppo::new(rng.next_u64(), k_epochs, batch_size, config);
-    ppo.init_distillation(config);
-    let mut steps_done = 0;
-
-    let env_seeds: Vec<u64> = (0..num_envs).map(|_| rng.next_u64()).collect();
-    let mla_cfg = &ppo.policy.backbone.blocks[0].mla_layer.config;
-    let mut envs: Vec<PpoEnvState> = env_seeds
-        .into_iter()
-        .map(|seed| {
-            PpoEnvState::new(
-                seed,
-                env_net,
-                context_len,
-                mla_cfg.num_heads,
-                ppo.policy.backbone.blocks.len(),
-                mla_cfg.kv_lora_rank,
-                mla_cfg.v_head_dim,
-                mla_cfg.qk_rope_dim,
-                mla_cfg.max_seq_len,
-            )
-        })
-        .collect();
-
-    let mut recent_rewards: VecDeque<f64> = VecDeque::with_capacity(50);
-    let mut _episode_count = 0;
-    let initial_lr = 0.0003;
-    let heartbeat_every = if fast_mode { 128 } else { 512 };
-    let mut last_heartbeat = Instant::now();
-    let snapshot_every = (total_steps / 200).max(1);
-    let mut remainder_offset = 0usize;
-    let pb = create_bar(total_steps as u64, "PPO Training");
-
-    while steps_done < total_steps {
-        let progress = steps_done as f64 / total_steps as f64;
-        let current_lr = initial_lr * (1.0 - progress).max(0.1);
-
-        let remaining_steps = total_steps - steps_done;
-        let update_steps = steps_per_update.min(remaining_steps);
-        let rounds = update_steps / num_envs;
-        let remainder = update_steps % num_envs;
-        let mut collected = 0usize;
-        for _ in 0..rounds {
-            let step_results: Vec<PpoStepResult> = worker
-                .execute(|| {
-                    envs.par_iter_mut()
-                        .map(|env| env.step(&ppo.policy, env_net, config, context_len))
-                        .collect()
-                })
-                .unwrap_or_else(|msg| {
-                    log::error!("[PPO] Worker execution failed: {}", msg);
-                    vec![]
-                });
-            if step_results.is_empty() {
-                break;
-            }
-            for result in step_results {
-                ppo.store_raw(result.experience);
-                if let Some(done_reward) = result.finished_reward {
-                    _episode_count += 1;
-                    recent_rewards.push_back(done_reward);
-                    if recent_rewards.len() > 50 {
-                        recent_rewards.pop_front();
-                    }
-                }
-            }
-            collected += num_envs;
-            if collected.is_multiple_of(heartbeat_every)
-                && last_heartbeat.elapsed() >= Duration::from_millis(300)
-            {
-                let global_step = (steps_done + collected).min(total_steps);
-                let avg_env_reward =
-                    envs.iter().map(|e| e.episode_reward).sum::<f64>() / num_envs as f64;
-                pb.set_position(global_step as u64);
-                pb.set_message(format!(
-                    "Avg R: {:.2} | LR: {:.6}",
-                    avg_env_reward, current_lr
-                ));
-                last_heartbeat = Instant::now();
-            }
-        }
-        if remainder > 0 {
-            let start = remainder_offset % num_envs;
-            for i in 0..remainder {
-                let idx = (start + i) % num_envs;
-                let result = envs[idx].step(&ppo.policy, env_net, config, context_len);
-                ppo.store_raw(result.experience);
-                if let Some(done_reward) = result.finished_reward {
-                    _episode_count += 1;
-                    recent_rewards.push_back(done_reward);
-                    if recent_rewards.len() > 50 {
-                        recent_rewards.pop_front();
-                    }
-                }
-            }
-            remainder_offset = (remainder_offset + remainder) % num_envs;
-        }
-
-        pb.set_message(format!(
-            "Updating ({} samples, {} epochs)...",
-            collected, k_epochs
-        ));
-        let update_loss = ppo.update(current_lr);
-        steps_done += update_steps;
-
-        let avg_r = if recent_rewards.is_empty() {
-            0.0
-        } else {
-            recent_rewards.iter().sum::<f64>() / recent_rewards.len() as f64
-        };
-
-        if let Some(ref tx) = metrics_tx {
-            if steps_done % snapshot_every < update_steps {
-                let achf_snap = ppo.policy.snapshot_achf();
-                let snapshot = crate::bench::StepSnapshot {
-                    step: steps_done,
-                    gate_value: achf_snap.map_or(1.0, |s| s.gate),
-                    g_min: achf_snap.map_or(0.0, |s| s.g_min),
-                    grad_ema: achf_snap.map_or(0.0, |s| s.grad_ema),
-                    loss: update_loss,
-                    reward: avg_r,
-                    cache_hit_rate: achf_snap.map_or(0.0, |s| s.cache_hit_rate),
-                    sparse_ratio: achf_snap.map_or(0.0, |s| s.low_rank_ratio),
-                    ema_cached_ns: achf_snap.map_or(0.0, |s| s.ema_cached_ns),
-                    ema_sparse_ns: achf_snap.map_or(0.0, |s| s.ema_sparse_ns),
-                    adaptive_bias: achf_snap.map_or(1.0, |s| s.adaptive_bias),
-                };
-                let _ = tx.send(snapshot);
-            }
-        }
-
-        pb.set_position(steps_done as u64);
-        pb.set_message(format!("Avg R: {:.2} | LR: {:.6}", avg_r, current_lr));
-    }
-    pb.finish_with_message("PPO Training Complete.");
-    ppo.policy.freeze_achf_for_inference();
-    ppo.policy
+    train_ppo_impl(rng, env_net, config, TrainingMetricsSink::from(metrics_tx))
 }
 
 /// Incremental PPO trainer for online learning during interactive mode.
