@@ -1,13 +1,18 @@
 use crate::binary_codec;
+use crate::config::Config;
 use crate::env_net::EnvNet;
-use crate::neural::NeuralLuckOptimizer;
+use crate::neural::{NeuralLuckOptimizer, DIM};
 use log::info;
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
+const CACHE_MANIFEST_SCHEMA: u32 = 1;
+const FEATURE_SPEC_VERSION: u32 = 1;
 
 fn safe_parent_fallback(path: &str) -> Option<String> {
     let requested = Path::new(path);
@@ -56,6 +61,431 @@ fn read_file_bytes(path: &str) -> Result<Option<Vec<u8>>, String> {
     fs::read(path_ref).map(Some).map_err(|err| err.to_string())
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheProvenance {
+    #[default]
+    Unknown,
+    OfflineTrained,
+    OnlineBootstrap,
+    OnlineUpdated,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct CacheQualitySummary {
+    #[serde(default)]
+    pub provenance: CacheProvenance,
+    #[serde(default)]
+    pub training_steps: Option<usize>,
+    #[serde(default)]
+    pub final_loss: Option<f64>,
+    #[serde(default)]
+    pub final_reward: Option<f64>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+impl CacheQualitySummary {
+    pub fn training_steps(steps: usize) -> Self {
+        Self {
+            provenance: CacheProvenance::OfflineTrained,
+            training_steps: Some(steps),
+            ..Self::default()
+        }
+    }
+
+    pub fn note(note: impl Into<String>) -> Self {
+        Self {
+            note: Some(note.into()),
+            ..Self::default()
+        }
+    }
+
+    pub fn with_note(mut self, note: impl Into<String>) -> Self {
+        self.note = Some(note.into());
+        self
+    }
+
+    pub fn online_bootstrap(note: impl Into<String>) -> Self {
+        Self {
+            provenance: CacheProvenance::OnlineBootstrap,
+            note: Some(note.into()),
+            ..Self::default()
+        }
+    }
+
+    pub fn online_updated(note: impl Into<String>) -> Self {
+        Self {
+            provenance: CacheProvenance::OnlineUpdated,
+            note: Some(note.into()),
+            ..Self::default()
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CacheManifest {
+    pub schema_version: u32,
+    pub model_kind: String,
+    pub role: String,
+    pub config_fingerprint: String,
+    pub feature_spec_version: u32,
+    pub architecture: String,
+    pub source_hash: Option<String>,
+    pub artifact_hash: Option<String>,
+    pub quality: CacheQualitySummary,
+    pub created_unix_secs: u64,
+}
+
+impl CacheManifest {
+    pub fn expected(model_kind: &str, role: &str, config: &Config, architecture: String) -> Self {
+        Self {
+            schema_version: CACHE_MANIFEST_SCHEMA,
+            model_kind: model_kind.to_string(),
+            role: role.to_string(),
+            config_fingerprint: config_fingerprint(config),
+            feature_spec_version: FEATURE_SPEC_VERSION,
+            architecture,
+            source_hash: None,
+            artifact_hash: None,
+            quality: CacheQualitySummary::default(),
+            created_unix_secs: 0,
+        }
+    }
+
+    pub fn with_source_hash(mut self, source_hash: Option<String>) -> Self {
+        self.source_hash = source_hash;
+        self
+    }
+
+    pub fn with_quality(mut self, quality: CacheQualitySummary) -> Self {
+        self.quality = quality;
+        self
+    }
+
+    fn for_saved_artifact(mut self, artifact_hash: Option<String>) -> Self {
+        self.artifact_hash = artifact_hash;
+        self.created_unix_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self
+    }
+
+    fn compatibility_error(&self, expected: &CacheManifest) -> Option<String> {
+        if self.schema_version != expected.schema_version {
+            return Some(format!(
+                "schema {} != {}",
+                self.schema_version, expected.schema_version
+            ));
+        }
+        if self.model_kind != expected.model_kind {
+            return Some(format!(
+                "model_kind {} != {}",
+                self.model_kind, expected.model_kind
+            ));
+        }
+        if self.role != expected.role {
+            return Some(format!("role {} != {}", self.role, expected.role));
+        }
+        if self.config_fingerprint != expected.config_fingerprint {
+            return Some("config fingerprint mismatch".to_string());
+        }
+        if self.feature_spec_version != expected.feature_spec_version {
+            return Some(format!(
+                "feature spec {} != {}",
+                self.feature_spec_version, expected.feature_spec_version
+            ));
+        }
+        if self.architecture != expected.architecture {
+            return Some("architecture signature mismatch".to_string());
+        }
+        if self.role == "inference_bf16" && self.source_hash.is_none() {
+            return Some("inference manifest missing source artifact hash".to_string());
+        }
+        if expected.role == "inference_bf16" && expected.source_hash.is_none() {
+            return Some("expected inference source artifact hash unavailable".to_string());
+        }
+        if expected.source_hash.is_some() && self.source_hash != expected.source_hash {
+            return Some("source artifact hash mismatch".to_string());
+        }
+        if let Some(reason) = self.quality.compatibility_error(&expected.quality) {
+            return Some(reason);
+        }
+        None
+    }
+}
+
+impl CacheQualitySummary {
+    fn compatibility_error(&self, expected: &CacheQualitySummary) -> Option<String> {
+        match expected.provenance {
+            CacheProvenance::Unknown => {}
+            CacheProvenance::OfflineTrained => {
+                if self.provenance != CacheProvenance::OfflineTrained {
+                    return Some(format!(
+                        "quality provenance {:?} is not offline_trained",
+                        self.provenance
+                    ));
+                }
+            }
+            CacheProvenance::OnlineUpdated => {
+                if !matches!(
+                    self.provenance,
+                    CacheProvenance::OfflineTrained
+                        | CacheProvenance::OnlineBootstrap
+                        | CacheProvenance::OnlineUpdated
+                ) {
+                    return Some(format!(
+                        "quality provenance {:?} is not usable for online training",
+                        self.provenance
+                    ));
+                }
+            }
+            CacheProvenance::OnlineBootstrap => {
+                if self.provenance != CacheProvenance::OnlineBootstrap {
+                    return Some(format!(
+                        "quality provenance {:?} is not online_bootstrap",
+                        self.provenance
+                    ));
+                }
+            }
+        }
+
+        if let Some(min_steps) = expected.training_steps {
+            let actual_steps = self.training_steps.unwrap_or(0);
+            if actual_steps < min_steps {
+                return Some(format!(
+                    "training_steps {} < required {}",
+                    actual_steps, min_steps
+                ));
+            }
+        }
+        None
+    }
+}
+
+pub fn env_net_cache_manifest(config: &Config) -> CacheManifest {
+    CacheManifest::expected(
+        "env_net",
+        "master",
+        config,
+        "envnet:5_64_32_16_2".to_string(),
+    )
+}
+
+pub fn neural_cache_manifest(config: &Config) -> CacheManifest {
+    CacheManifest::expected(
+        "neural_luck_optimizer",
+        "master",
+        config,
+        format!("neural:v2:dim={DIM}:residual=2xdense_layernorm"),
+    )
+}
+
+pub fn dqn_master_cache_manifest(config: &Config, quality: CacheQualitySummary) -> CacheManifest {
+    CacheManifest::expected("dqn", "master", config, dqn_architecture(config)).with_quality(quality)
+}
+
+pub fn dqn_inference_cache_manifest(config: &Config, source_hash: Option<String>) -> CacheManifest {
+    CacheManifest::expected("dqn", "inference_bf16", config, dqn_architecture(config))
+        .with_source_hash(source_hash)
+}
+
+pub fn ppo_master_cache_manifest(config: &Config, quality: CacheQualitySummary) -> CacheManifest {
+    CacheManifest::expected("ppo", "master", config, ppo_architecture(config)).with_quality(quality)
+}
+
+pub fn ppo_inference_cache_manifest(config: &Config, source_hash: Option<String>) -> CacheManifest {
+    CacheManifest::expected("ppo", "inference_bf16", config, ppo_architecture(config))
+        .with_source_hash(source_hash)
+}
+
+fn dqn_architecture(config: &Config) -> String {
+    format!(
+        "dqn:v2:input={DIM}:hidden={}:actions={}:achf={}:achf_dqn={}:rank={}",
+        config.model_hidden_dim,
+        crate::utils::ACTION_SPACE,
+        config.achf.enabled,
+        config.achf.apply_dqn,
+        config.achf.rank
+    )
+}
+
+fn ppo_architecture(config: &Config) -> String {
+    format!(
+        "ppo:v2:input={DIM}:model_dim={}:hidden={}:layers={}:heads={}:kv_rank={}:rope={}:multi_stream={}:stream_factor={}:actions={}:achf={}:attn={}:ffn={}:rank={}",
+        config.model_dim,
+        config.model_hidden_dim,
+        config.model_num_layers,
+        config.model_num_heads,
+        config.model_kv_lora_rank,
+        config.model_qk_rope_dim,
+        config.use_multi_stream,
+        config.multi_stream_factor,
+        crate::utils::ACTION_SPACE,
+        config.achf.enabled,
+        config.achf.apply_attn,
+        config.achf.apply_ffn,
+        config.achf.rank
+    )
+}
+
+fn config_fingerprint(config: &Config) -> String {
+    let payload = format!(
+        "v1|p6={:.17}|p5={:.17}|p4={:.17}|up={:.17}|soft_start={}|soft_slope={:.17}|small={}|big={}|up_soft={}|five={}|always5={}|big_requires_not_up={}|fast={}|ppo_mode={}|ppo_steps={}|ppo_update={}|ppo_epochs={}|ppo_batch={}|ppo_ctx={}|ppo_envs={}|ppo_topk={}|distill={}|distill_decay={:.17}|distill_kl={:.17}|distill_warmup={}|model_dim={}|hidden={}|layers={}|heads={}|kv={}|rope={}|multi_stream={}|stream_factor={}|achf={:?}",
+        config.prob_6_base,
+        config.prob_5_base,
+        config.prob_4_base,
+        config.up_rate,
+        config.soft_pity_start,
+        config.soft_pity_slope,
+        config.small_pity_guarantee,
+        config.big_pity_cumulative,
+        config.up_pity_soft,
+        config.five_star_pity,
+        config.always_5_star,
+        config.big_pity_requires_not_up,
+        config.fast_init,
+        config.ppo_mode,
+        config.ppo_total_steps,
+        config.ppo_steps_per_update,
+        config.ppo_k_epochs,
+        config.ppo_batch_size,
+        config.ppo_context_len,
+        config.ppo_num_envs,
+        config.ppo_top_k,
+        config.distill_enabled,
+        config.distill_ema_decay,
+        config.distill_kl_coef,
+        config.distill_warmup_steps,
+        config.model_dim,
+        config.model_hidden_dim,
+        config.model_num_layers,
+        config.model_num_heads,
+        config.model_kv_lora_rank,
+        config.model_qk_rope_dim,
+        config.use_multi_stream,
+        config.multi_stream_factor,
+        config.achf
+    );
+    fnv1a_hex(payload.as_bytes())
+}
+
+fn fnv1a_hex(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+pub fn model_artifact_hash(path: &str) -> Option<String> {
+    let bin_path = format!("{}.bin", path);
+    artifact_hash_for_path(&bin_path)
+}
+
+pub fn serialized_model_hash<T: serde::Serialize>(model: &T) -> Option<String> {
+    match binary_codec::to_vec(model) {
+        Ok(bytes) => Some(fnv1a_hex(&bytes)),
+        Err(err) => {
+            log::warn!("[Cache] Failed to hash serialized model: {}", err);
+            None
+        }
+    }
+}
+
+fn artifact_hash_for_path(path: &str) -> Option<String> {
+    match read_file_bytes(path) {
+        Ok(Some(bytes)) => Some(fnv1a_hex(&bytes)),
+        Ok(None) => None,
+        Err(err) => {
+            log::warn!("[Cache] Failed to hash {}: {}", path, err);
+            None
+        }
+    }
+}
+
+pub fn cache_artifact_hash(path: &str) -> Option<String> {
+    read_cache_bytes(path).map(|bytes| fnv1a_hex(&bytes))
+}
+
+fn cache_manifest_path(path: &str) -> String {
+    format!("{}.manifest.json", path)
+}
+
+fn load_manifest(path: &str) -> Option<CacheManifest> {
+    let manifest_path = cache_manifest_path(path);
+    let bytes = read_cache_bytes(&manifest_path)?;
+    match serde_json::from_slice::<CacheManifest>(&bytes) {
+        Ok(manifest) => Some(manifest),
+        Err(err) => {
+            log::warn!(
+                "[Cache] Failed to parse manifest {}: {}",
+                manifest_path,
+                err
+            );
+            None
+        }
+    }
+}
+
+fn save_manifest(path: &str, manifest: &CacheManifest) -> bool {
+    let manifest_path = cache_manifest_path(path);
+    match serde_json::to_vec_pretty(manifest) {
+        Ok(bytes) => save_bytes_with_fallback(&manifest_path, &bytes, "Cache Manifest"),
+        Err(err) => {
+            log::warn!(
+                "[Cache] Failed to serialize manifest {}: {}",
+                manifest_path,
+                err
+            );
+            false
+        }
+    }
+}
+
+fn manifest_allows_load(path: &str, expected: &CacheManifest, artifact_path: Option<&str>) -> bool {
+    let Some(manifest) = load_manifest(path) else {
+        log::warn!("[Cache] Missing manifest for {}. Rebuilding.", path);
+        return false;
+    };
+    if let Some(reason) = manifest.compatibility_error(expected) {
+        log::warn!(
+            "[Cache] Manifest mismatch for {}: {}. Rebuilding.",
+            path,
+            reason
+        );
+        return false;
+    }
+    if let Some(artifact_path) = artifact_path {
+        let Some(expected_hash) = &manifest.artifact_hash else {
+            log::warn!(
+                "[Cache] Manifest for {} is missing artifact hash. Rebuilding.",
+                path
+            );
+            return false;
+        };
+        match cache_artifact_hash(artifact_path) {
+            Some(actual_hash) if &actual_hash == expected_hash => {}
+            Some(_) => {
+                log::warn!("[Cache] Artifact hash mismatch for {}. Rebuilding.", path);
+                return false;
+            }
+            None => {
+                log::warn!("[Cache] Missing artifact for {}. Rebuilding.", path);
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+fn cache_manifest_is_compatible(path: &str, expected: &CacheManifest) -> bool {
+    manifest_allows_load(path, expected, Some(path))
+}
+
 pub fn load_neural_cache(path: &str) -> Option<NeuralLuckOptimizer> {
     let bytes = read_cache_bytes(path)?;
     match NeuralLuckOptimizer::from_bytes(&bytes) {
@@ -75,20 +505,76 @@ pub fn save_neural_cache(path: &str, net: &NeuralLuckOptimizer) -> bool {
     save_bytes_with_fallback(path, &bytes, "Neural Core")
 }
 
-pub fn save_model<T: serde::Serialize>(model: &T, path: &str, label: &str) {
+pub fn load_neural_cache_with_manifest(
+    path: &str,
+    expected: &CacheManifest,
+) -> Option<NeuralLuckOptimizer> {
+    if !manifest_allows_load(path, expected, Some(path)) {
+        return None;
+    }
+    load_neural_cache(path)
+}
+
+pub fn save_neural_cache_with_manifest(
+    path: &str,
+    net: &NeuralLuckOptimizer,
+    manifest: CacheManifest,
+) -> bool {
+    let saved = save_neural_cache(path, net);
+    if saved {
+        let Some(artifact_hash) = cache_artifact_hash(path) else {
+            log::warn!(
+                "[Neural Core] Cache saved, but artifact hash is unavailable for {}",
+                path
+            );
+            return false;
+        };
+        let manifest = manifest.for_saved_artifact(Some(artifact_hash));
+        return save_manifest(path, &manifest);
+    }
+    saved
+}
+
+pub fn save_model<T: serde::Serialize>(model: &T, path: &str, label: &str) -> bool {
     let bin_path = format!("{}.bin", path);
-    match write_file_atomically(&bin_path, |writer| {
+    let saved = match write_file_atomically(&bin_path, |writer| {
         binary_codec::serialize_into(writer, model)
     }) {
-        Ok(()) => info!("[{}] Model saved to {} (Binary)", label, bin_path),
+        Ok(()) => {
+            info!("[{}] Model saved to {} (Binary)", label, bin_path);
+            true
+        }
         Err(err) => {
             log::warn!("[{}] Failed to save model to {}: {}", label, bin_path, err);
+            false
         }
     };
 
     // JSON debug dump disabled — binary format is authoritative and JSON serialization
     // of large neural network models (PPO/DQN with millions of f64 weights) takes
     // tens of seconds, causing the program to appear frozen after training.
+    saved
+}
+
+pub fn save_model_with_manifest<T: serde::Serialize>(
+    model: &T,
+    path: &str,
+    label: &str,
+    manifest: CacheManifest,
+) -> bool {
+    if !save_model(model, path, label) {
+        return false;
+    }
+    let Some(artifact_hash) = model_artifact_hash(path) else {
+        log::warn!(
+            "[{}] Model saved, but artifact hash is unavailable for {}",
+            label,
+            path
+        );
+        return false;
+    };
+    let manifest = manifest.for_saved_artifact(Some(artifact_hash));
+    save_manifest(path, &manifest)
 }
 
 pub fn load_env_net_cache(path: &str) -> Option<EnvNet> {
@@ -123,6 +609,33 @@ pub fn load_env_net_cache(path: &str) -> Option<EnvNet> {
 pub fn save_env_net_cache(path: &str, env_net: &EnvNet) -> bool {
     let json = env_net.to_json();
     save_bytes_with_fallback(path, json.as_bytes(), "EnvNet")
+}
+
+pub fn load_env_net_cache_with_manifest(path: &str, expected: &CacheManifest) -> Option<EnvNet> {
+    if !manifest_allows_load(path, expected, Some(path)) {
+        return None;
+    }
+    load_env_net_cache(path)
+}
+
+pub fn save_env_net_cache_with_manifest(
+    path: &str,
+    env_net: &EnvNet,
+    manifest: CacheManifest,
+) -> bool {
+    let saved = save_env_net_cache(path, env_net);
+    if saved {
+        let Some(artifact_hash) = cache_artifact_hash(path) else {
+            log::warn!(
+                "[EnvNet] Cache saved, but artifact hash is unavailable for {}",
+                path
+            );
+            return false;
+        };
+        let manifest = manifest.for_saved_artifact(Some(artifact_hash));
+        return save_manifest(path, &manifest);
+    }
+    saved
 }
 
 pub fn load_model<T: serde::de::DeserializeOwned>(path: &str, label: &str) -> Option<T> {
@@ -173,6 +686,18 @@ pub fn load_model<T: serde::de::DeserializeOwned>(path: &str, label: &str) -> Op
         }
     }
     None
+}
+
+pub fn load_model_with_manifest<T: serde::de::DeserializeOwned>(
+    path: &str,
+    label: &str,
+    expected: &CacheManifest,
+) -> Option<T> {
+    let bin_path = format!("{}.bin", path);
+    if !manifest_allows_load(path, expected, Some(&bin_path)) {
+        return None;
+    }
+    load_model(path, label)
 }
 
 fn save_bytes_with_fallback(path: &str, bytes: &[u8], label: &str) -> bool {
@@ -355,5 +880,142 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"original");
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn manifest_rejects_config_fingerprint_mismatch() {
+        let path = temp_stem("talos_model_io_manifest");
+        fs::write(&path, b"artifact").unwrap();
+
+        let config = crate::config::Config::default();
+        let manifest = env_net_cache_manifest(&config);
+        assert!(save_manifest(
+            &path,
+            &manifest.for_saved_artifact(Some(fnv1a_hex(b"artifact")))
+        ));
+        assert!(cache_manifest_is_compatible(
+            &path,
+            &env_net_cache_manifest(&config)
+        ));
+
+        let mut changed = config.clone();
+        changed.model_hidden_dim += 1;
+        assert!(!cache_manifest_is_compatible(
+            &path,
+            &env_net_cache_manifest(&changed)
+        ));
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(cache_manifest_path(&path));
+    }
+
+    #[test]
+    fn manifest_rejects_artifact_hash_mismatch() {
+        let path = temp_stem("talos_model_io_artifact_hash");
+        fs::write(&path, b"artifact").unwrap();
+
+        let config = crate::config::Config::default();
+        let manifest = env_net_cache_manifest(&config);
+        assert!(save_manifest(
+            &path,
+            &manifest.for_saved_artifact(Some(fnv1a_hex(b"different")))
+        ));
+
+        assert!(!cache_manifest_is_compatible(
+            &path,
+            &env_net_cache_manifest(&config)
+        ));
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(cache_manifest_path(&path));
+    }
+
+    #[test]
+    fn manifest_rejects_inference_without_source_hash() {
+        let path = temp_stem("talos_model_io_missing_source");
+        fs::write(&path, b"artifact").unwrap();
+
+        let config = crate::config::Config::default();
+        let manifest = dqn_inference_cache_manifest(&config, None);
+        assert!(save_manifest(
+            &path,
+            &manifest.for_saved_artifact(Some(fnv1a_hex(b"artifact")))
+        ));
+
+        assert!(!cache_manifest_is_compatible(
+            &path,
+            &dqn_inference_cache_manifest(&config, Some("master".to_string()))
+        ));
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(cache_manifest_path(&path));
+    }
+
+    #[test]
+    fn manifest_rejects_source_hash_mismatch() {
+        let path = temp_stem("talos_model_io_source_hash");
+        fs::write(&path, b"artifact").unwrap();
+
+        let config = crate::config::Config::default();
+        let manifest = dqn_inference_cache_manifest(&config, Some("old".to_string()));
+        assert!(save_manifest(
+            &path,
+            &manifest.for_saved_artifact(Some(fnv1a_hex(b"artifact")))
+        ));
+
+        assert!(!cache_manifest_is_compatible(
+            &path,
+            &dqn_inference_cache_manifest(&config, Some("new".to_string()))
+        ));
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(cache_manifest_path(&path));
+    }
+
+    #[test]
+    fn ppo_manifest_rejects_multi_stream_shape_change() {
+        let path = temp_stem("talos_model_io_ppo_shape");
+        fs::write(&path, b"artifact").unwrap();
+
+        let config = crate::config::Config::default();
+        let manifest = ppo_master_cache_manifest(&config, CacheQualitySummary::training_steps(1));
+        assert!(save_manifest(
+            &path,
+            &manifest.for_saved_artifact(Some(fnv1a_hex(b"artifact")))
+        ));
+
+        let mut changed = config.clone();
+        changed.multi_stream_factor += 1;
+        assert!(!cache_manifest_is_compatible(
+            &path,
+            &ppo_master_cache_manifest(&changed, CacheQualitySummary::training_steps(1))
+        ));
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(cache_manifest_path(&path));
+    }
+
+    #[test]
+    fn offline_manifest_rejects_online_bootstrap_quality() {
+        let path = temp_stem("talos_model_io_bootstrap_quality");
+        fs::write(&path, b"artifact").unwrap();
+
+        let config = crate::config::Config::default();
+        let manifest = dqn_master_cache_manifest(
+            &config,
+            CacheQualitySummary::online_bootstrap("random init"),
+        );
+        assert!(save_manifest(
+            &path,
+            &manifest.for_saved_artifact(Some(fnv1a_hex(b"artifact")))
+        ));
+
+        assert!(!cache_manifest_is_compatible(
+            &path,
+            &dqn_master_cache_manifest(&config, CacheQualitySummary::training_steps(1))
+        ));
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(cache_manifest_path(&path));
     }
 }

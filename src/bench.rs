@@ -3,33 +3,21 @@ use crate::chart::{self, ChartFormat};
 use crate::config::Config;
 use crate::dqn::{train_dqn_with_metrics, DuelingQNetwork};
 use crate::env_net::EnvNet;
-use crate::model_io::{load_env_net_cache, save_env_net_cache};
+use crate::model_io::{
+    env_net_cache_manifest, load_env_net_cache_with_manifest, save_env_net_cache_with_manifest,
+    CacheQualitySummary,
+};
 use crate::neural::NeuralLuckOptimizer;
 use crate::ppo::{train_ppo_with_metrics, ActorCritic};
 use crate::rng::Rng;
 use crate::sim::{simulate_fast, SimModelContext};
 use crate::trainer::{train_linear_regression, train_manifold_rl, train_neural_optimizer};
+use crate::training_metrics::StepSnapshot;
 use crate::worker::GoodJobWorker;
 use std::fs;
 use std::time::Instant;
 
 // ── Data structures ─────────────────────────────────────────────────────
-
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-pub struct StepSnapshot {
-    pub step: usize,
-    pub gate_value: f64,
-    pub g_min: f64,
-    pub grad_ema: f64,
-    pub loss: f64,
-    pub reward: f64,
-    pub cache_hit_rate: f64,
-    pub sparse_ratio: f64,
-    pub ema_cached_ns: f64,
-    pub ema_sparse_ns: f64,
-    pub adaptive_bias: f64,
-}
 
 #[derive(Clone, Debug)]
 pub struct BenchRunResult {
@@ -127,19 +115,27 @@ fn build_base_models_with_worker(
     rng: &mut Rng,
     worker: &GoodJobWorker,
 ) -> (EnvNet, NeuralLuckOptimizer) {
-    let mut env_net = if let Some(cached) = load_env_net_cache("env_net.cache") {
-        cached
-    } else {
-        let mut net = EnvNet::new(rng);
-        let (count, epochs) = if config.fast_init {
-            (256, 10)
+    let manifest = env_net_cache_manifest(config);
+    let mut env_net =
+        if let Some(cached) = load_env_net_cache_with_manifest("env_net.cache", &manifest) {
+            cached
         } else {
-            (1024, 50)
+            let mut net = EnvNet::new(rng);
+            let (count, epochs) = if config.fast_init {
+                (256, 10)
+            } else {
+                (1024, 50)
+            };
+            net.pretrain(rng, config, count, epochs);
+            let _ = save_env_net_cache_with_manifest(
+                "env_net.cache",
+                &net,
+                manifest.with_quality(CacheQualitySummary::note(format!(
+                    "{count}x{epochs} pretrain"
+                ))),
+            );
+            net
         };
-        net.pretrain(rng, config, count, epochs);
-        let _ = save_env_net_cache("env_net.cache", &net);
-        net
-    };
     env_net.set_train(false);
 
     let mut neural_opt = train_neural_optimizer(rng.next_u64(), &env_net, config, worker);
