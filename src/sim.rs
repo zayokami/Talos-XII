@@ -5,6 +5,7 @@ use crate::env_net::EnvNet;
 use crate::neural::{NeuralLuckOptimizer, Tensor, DIM};
 use crate::ppo::ActorCritic;
 use crate::rng::Rng;
+use crate::strategy::{decide, StrategyInputs};
 use crate::transformer::KVCache;
 use crate::worker::GoodJobWorker;
 use indicatif::ProgressBar;
@@ -73,13 +74,6 @@ pub struct PullOutcome {
     pub action: Option<usize>,
     pub ppo_log_prob: Option<f64>,
     pub ppo_value: Option<f64>,
-}
-
-struct PolicyDecision {
-    luck_factor: f64,
-    action: Option<usize>,
-    ppo_log_prob: Option<f64>,
-    ppo_value: Option<f64>,
 }
 
 struct PpoInputs {
@@ -277,123 +271,6 @@ impl PpoContext {
         if let Some(cache) = &mut self.kv_cache {
             policy.prune_cache(cache, self.context_len);
         }
-    }
-}
-
-struct PolicyInputs<'a> {
-    state: &'a PullState,
-    nn_total_pulls: usize,
-    config: &'a Config,
-    neural_opt: &'a NeuralLuckOptimizer,
-    dqn_policy: Option<&'a DuelingQNetwork>,
-    ppo_policy: Option<&'a ActorCritic>,
-    current_features: &'a Tensor,
-    ppo_state_seq: Option<&'a AutoTensor>,
-    ppo_pity_seq: Option<&'a [usize]>,
-    fast_inference: bool,
-    ppo_seq_data: Option<&'a [f64]>,
-    kv_cache: &'a mut Option<Vec<KVCache>>,
-    start_pos: usize,
-}
-
-fn decide_policy(inputs: PolicyInputs<'_>) -> PolicyDecision {
-    let PolicyInputs {
-        state,
-        nn_total_pulls,
-        config,
-        neural_opt,
-        dqn_policy,
-        ppo_policy,
-        current_features,
-        ppo_state_seq,
-        ppo_pity_seq,
-        fast_inference,
-        ppo_seq_data,
-        kv_cache,
-        start_pos,
-    } = inputs;
-    if config.luck_mode == LuckMode::Dqn {
-        if let Some(policy) = dqn_policy {
-            if fast_inference {
-                let features_f32: Vec<f32> = current_features.iter().map(|&v| v as f32).collect();
-                let (idx, modifier) = policy.predict_action_fast(&features_f32);
-                return PolicyDecision {
-                    luck_factor: modifier as f64,
-                    action: Some(idx),
-                    ppo_log_prob: None,
-                    ppo_value: None,
-                };
-            }
-            let tensor_x = AutoTensor::new(current_features.to_vec(), vec![DIM]);
-            let (idx, modifier) = policy.predict_action(&tensor_x);
-            return PolicyDecision {
-                luck_factor: modifier as f64,
-                action: Some(idx),
-                ppo_log_prob: None,
-                ppo_value: None,
-            };
-        }
-    } else if config.luck_mode == LuckMode::Ppo {
-        if let Some(policy) = ppo_policy {
-            if fast_inference {
-                if let Some(cache) = kv_cache {
-                    let features_f32: Vec<f32> =
-                        current_features.iter().map(|&v| v as f32).collect();
-                    let idx = policy.step_inference_cached(
-                        &features_f32,
-                        cache,
-                        start_pos,
-                        config.ppo_top_k,
-                    );
-                    return PolicyDecision {
-                        luck_factor: crate::utils::ACTIONS[idx],
-                        action: Some(idx),
-                        ppo_log_prob: None,
-                        ppo_value: None,
-                    };
-                }
-                if let Some(seq_data) = ppo_seq_data {
-                    let seq_f32: Vec<f32> = seq_data.iter().map(|&v| v as f32).collect();
-                    let idx = policy.step_inference(&seq_f32, config.ppo_top_k);
-                    return PolicyDecision {
-                        luck_factor: crate::utils::ACTIONS[idx],
-                        action: Some(idx),
-                        ppo_log_prob: None,
-                        ppo_value: None,
-                    };
-                }
-                return PolicyDecision {
-                    luck_factor: 0.0,
-                    action: None,
-                    ppo_log_prob: None,
-                    ppo_value: None,
-                };
-            }
-            let (idx, log_prob, value) =
-                if let (Some(seq), Some(pities)) = (ppo_state_seq, ppo_pity_seq) {
-                    policy.step(seq, pities, config.ppo_top_k)
-                } else {
-                    let tensor_x = AutoTensor::new(current_features.to_vec(), vec![DIM]);
-                    policy.step(&tensor_x, &[state.pity_6], config.ppo_top_k)
-                };
-            return PolicyDecision {
-                luck_factor: crate::utils::ACTIONS[idx],
-                action: Some(idx),
-                ppo_log_prob: Some(log_prob),
-                ppo_value: Some(value),
-            };
-        }
-    }
-
-    let dropout_seed = (state.pity_6 as u64)
-        .wrapping_add((nn_total_pulls as u64).wrapping_mul(31))
-        .wrapping_add((state.streak_4_star as u64).wrapping_mul(17));
-    let luck_factor = neural_opt.predict(current_features, dropout_seed);
-    PolicyDecision {
-        luck_factor,
-        action: None,
-        ppo_log_prob: None,
-        ppo_value: None,
     }
 }
 
@@ -638,7 +515,7 @@ pub fn roll_one(
             config,
         );
 
-        let decision = decide_policy(PolicyInputs {
+        let decision = decide(StrategyInputs {
             state,
             nn_total_pulls,
             config,
