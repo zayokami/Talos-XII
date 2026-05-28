@@ -131,6 +131,37 @@ __global__ void lerp_inplace_kernel(
     }
 }
 
+__global__ void per_store_transition_with_max_kernel(
+    float* __restrict__ states,
+    float* __restrict__ next_states,
+    int* __restrict__ actions,
+    float* __restrict__ rewards,
+    float* __restrict__ dones,
+    float* __restrict__ priorities,
+    const float* __restrict__ max_priority,
+    int idx,
+    const float* __restrict__ state,
+    const float* __restrict__ next_state,
+    int action,
+    float reward,
+    float done,
+    float alpha,
+    int dim
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < dim) {
+        states[idx * dim + tid] = state[tid];
+        next_states[idx * dim + tid] = next_state[tid];
+    }
+    if (tid == 0) {
+        actions[idx] = action;
+        rewards[idx] = reward;
+        dones[idx] = done;
+        float raw = fmaxf(max_priority[0], 1.0e-12f);
+        priorities[idx] = powf(raw, alpha);
+    }
+}
+
 template<typename T>
 __global__ void double_dqn_target_kernel(
     const T* __restrict__ q_next_eval,
@@ -172,6 +203,183 @@ __global__ void abs_diff_kernel(
         T diff = a[idx] - b[idx];
         out[idx] = diff < T(0.0) ? -diff : diff;
     }
+}
+
+__global__ void per_store_transition_kernel(
+    float* __restrict__ states,
+    float* __restrict__ next_states,
+    int* __restrict__ actions,
+    float* __restrict__ rewards,
+    float* __restrict__ dones,
+    float* __restrict__ priorities,
+    int idx,
+    const float* __restrict__ state,
+    const float* __restrict__ next_state,
+    int action,
+    float reward,
+    float done,
+    float priority,
+    int dim
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < dim) {
+        states[idx * dim + tid] = state[tid];
+        next_states[idx * dim + tid] = next_state[tid];
+    }
+    if (tid == 0) {
+        actions[idx] = action;
+        rewards[idx] = reward;
+        dones[idx] = done;
+        priorities[idx] = priority;
+    }
+}
+
+__global__ void per_sample_kernel(
+    const float* __restrict__ states,
+    const float* __restrict__ next_states,
+    const int* __restrict__ actions,
+    const float* __restrict__ rewards,
+    const float* __restrict__ dones,
+    const float* __restrict__ priorities,
+    const float* __restrict__ uniforms,
+    float* __restrict__ batch_states,
+    float* __restrict__ batch_next_states,
+    float* __restrict__ batch_action_mask,
+    float* __restrict__ batch_rewards,
+    float* __restrict__ batch_dones,
+    float* __restrict__ batch_weights,
+    int* __restrict__ batch_indices,
+    int size,
+    int dim,
+    int actions_count,
+    int batch,
+    float beta,
+    float total_priority_hint
+) {
+    int sample = blockIdx.x;
+    int tid = threadIdx.x;
+    if (sample >= batch || size <= 0) return;
+
+    __shared__ int selected_idx;
+    __shared__ float selected_priority;
+
+    if (tid == 0) {
+        float total = total_priority_hint;
+        if (!(total > 0.0f) || !isfinite(total)) {
+            total = 0.0f;
+            for (int i = 0; i < size; ++i) {
+                float pri = priorities[i];
+                if (pri > 0.0f && isfinite(pri)) {
+                    total += pri;
+                }
+            }
+        }
+        if (!(total > 0.0f) || !isfinite(total)) {
+            float u = uniforms[sample];
+            int idx = (int)(u * (float)size);
+            if (idx >= size) idx = size - 1;
+            if (idx < 0) idx = 0;
+            selected_idx = idx;
+            selected_priority = 1.0f;
+        } else {
+            float segment = total / (float)batch;
+            float u = uniforms[sample];
+            float value = segment * (float)sample + u * segment;
+            if (value >= total) value = nextafterf(total, 0.0f);
+            if (value < 0.0f) value = 0.0f;
+
+            float prefix = 0.0f;
+            int idx = size - 1;
+            float pri = priorities[idx];
+            for (int i = 0; i < size; ++i) {
+                pri = priorities[i];
+                if (pri < 0.0f || !isfinite(pri)) pri = 0.0f;
+                prefix += pri;
+                if (value <= prefix) {
+                    idx = i;
+                    break;
+                }
+            }
+            selected_idx = idx;
+            selected_priority = pri > 0.0f ? pri : 1.0e-12f;
+        }
+        batch_indices[sample] = selected_idx;
+        batch_rewards[sample] = rewards[selected_idx];
+        batch_dones[sample] = dones[selected_idx];
+
+        float prob = (total > 0.0f && isfinite(total))
+            ? fmaxf(selected_priority / total, 1.0e-12f)
+            : 1.0f / (float)size;
+        batch_weights[sample] = powf((float)size * prob, -beta);
+    }
+    __syncthreads();
+
+    int idx = selected_idx;
+    for (int d = tid; d < dim; d += blockDim.x) {
+        batch_states[sample * dim + d] = states[idx * dim + d];
+        batch_next_states[sample * dim + d] = next_states[idx * dim + d];
+    }
+    for (int a = tid; a < actions_count; a += blockDim.x) {
+        batch_action_mask[sample * actions_count + a] = (a == actions[idx]) ? 1.0f : 0.0f;
+    }
+}
+
+__global__ void per_normalize_weights_kernel(
+    float* __restrict__ weights,
+    int batch
+) {
+    __shared__ float partial[TENSOR_OP_BLOCK];
+    int tid = threadIdx.x;
+    float local = 0.0f;
+    for (int i = tid; i < batch; i += blockDim.x) {
+        float w = weights[i];
+        if (isfinite(w) && w > local) {
+            local = w;
+        }
+    }
+    partial[tid] = local;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride && partial[tid + stride] > partial[tid]) {
+            partial[tid] = partial[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    float max_weight = partial[0];
+    if (!(max_weight > 0.0f) || !isfinite(max_weight)) {
+        max_weight = 1.0f;
+    }
+    for (int i = tid; i < batch; i += blockDim.x) {
+        weights[i] /= max_weight;
+    }
+}
+
+__global__ void per_update_priorities_kernel(
+    float* __restrict__ priorities,
+    const int* __restrict__ indices,
+    const float* __restrict__ td_errors,
+    float* __restrict__ max_priority,
+    int batch,
+    int capacity,
+    float alpha,
+    float epsilon
+) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    float local_max = max_priority[0];
+    for (int i = 0; i < batch; ++i) {
+        int idx = indices[i];
+        if (idx < 0 || idx >= capacity) continue;
+        float td = td_errors[i];
+        float clipped = isfinite(td) ? fabsf(td) : 1.0f;
+        float raw = clipped + epsilon;
+        priorities[idx] = powf(raw, alpha);
+        if (raw > local_max) {
+            local_max = raw;
+        }
+    }
+    max_priority[0] = local_max;
 }
 
 template<typename T>
@@ -839,8 +1047,8 @@ extern "C" int double_dqn_target_f64(const double* h_eval, const double* h_targe
     const double* dev_rewards = (const double*)d_rewards;
     const double* dev_dones = (const double*)d_dones;
     double* dev_out = (double*)d_out;
-    dim3 block(TENSOR_OP_BLOCK);
-    dim3 grid((batch + TENSOR_OP_BLOCK - 1) / TENSOR_OP_BLOCK);
+    dim3 block(1);
+    dim3 grid(1);
     double_dqn_target_kernel<double><<<grid, block>>>(dev_eval, dev_target, dev_rewards, dev_dones, dev_out, batch, actions, gamma);
     return (int)cudaPeekAtLastError();
 }
@@ -874,6 +1082,159 @@ extern "C" int abs_diff_f32(const float* h_a, const float* h_b, float* h_out, in
     dim3 block(TENSOR_OP_BLOCK);
     dim3 grid((size + TENSOR_OP_BLOCK - 1) / TENSOR_OP_BLOCK);
     abs_diff_kernel<float><<<grid, block>>>(dev_a, dev_b, dev_out, size);
+    return (int)cudaPeekAtLastError();
+}
+
+extern "C" int per_store_transition_f32(
+    float* d_states,
+    float* d_next_states,
+    int* d_actions,
+    float* d_rewards,
+    float* d_dones,
+    float* d_priorities,
+    const float* d_state,
+    const float* d_next_state,
+    int idx,
+    int action,
+    float reward,
+    float done,
+    float priority,
+    int dim
+) {
+    dim3 block(TENSOR_OP_BLOCK);
+    dim3 grid((dim + TENSOR_OP_BLOCK - 1) / TENSOR_OP_BLOCK);
+    per_store_transition_kernel<<<grid, block>>>(
+        d_states,
+        d_next_states,
+        d_actions,
+        d_rewards,
+        d_dones,
+        d_priorities,
+        idx,
+        d_state,
+        d_next_state,
+        action,
+        reward,
+        done,
+        priority,
+        dim
+    );
+    return (int)cudaPeekAtLastError();
+}
+
+extern "C" int per_store_transition_with_max_f32(
+    float* d_states,
+    float* d_next_states,
+    int* d_actions,
+    float* d_rewards,
+    float* d_dones,
+    float* d_priorities,
+    const float* d_max_priority,
+    const float* d_state,
+    const float* d_next_state,
+    int idx,
+    int action,
+    float reward,
+    float done,
+    float alpha,
+    int dim
+) {
+    dim3 block(TENSOR_OP_BLOCK);
+    dim3 grid((dim + TENSOR_OP_BLOCK - 1) / TENSOR_OP_BLOCK);
+    per_store_transition_with_max_kernel<<<grid, block>>>(
+        d_states,
+        d_next_states,
+        d_actions,
+        d_rewards,
+        d_dones,
+        d_priorities,
+        d_max_priority,
+        idx,
+        d_state,
+        d_next_state,
+        action,
+        reward,
+        done,
+        alpha,
+        dim
+    );
+    return (int)cudaPeekAtLastError();
+}
+
+extern "C" int per_sample_f32(
+    const float* d_states,
+    const float* d_next_states,
+    const int* d_actions,
+    const float* d_rewards,
+    const float* d_dones,
+    const float* d_priorities,
+    const float* d_uniforms,
+    float* d_batch_states,
+    float* d_batch_next_states,
+    float* d_batch_action_mask,
+    float* d_batch_rewards,
+    float* d_batch_dones,
+    float* d_batch_weights,
+    int* d_batch_indices,
+    int size,
+    int dim,
+    int actions_count,
+    int batch,
+    float beta,
+    float total_priority
+) {
+    dim3 block(TENSOR_OP_BLOCK);
+    dim3 grid(batch);
+    per_sample_kernel<<<grid, block>>>(
+        d_states,
+        d_next_states,
+        d_actions,
+        d_rewards,
+        d_dones,
+        d_priorities,
+        d_uniforms,
+        d_batch_states,
+        d_batch_next_states,
+        d_batch_action_mask,
+        d_batch_rewards,
+        d_batch_dones,
+        d_batch_weights,
+        d_batch_indices,
+        size,
+        dim,
+        actions_count,
+        batch,
+        beta,
+        total_priority
+    );
+    cudaError_t err = cudaPeekAtLastError();
+    if (err != cudaSuccess) return (int)err;
+    per_normalize_weights_kernel<<<1, TENSOR_OP_BLOCK>>>(d_batch_weights, batch);
+    return (int)cudaPeekAtLastError();
+}
+
+extern "C" int per_update_priorities_f32(
+    float* d_priorities,
+    const int* d_indices,
+    const float* d_td_errors,
+    float* d_max_priority,
+    int batch,
+    int capacity,
+    float alpha,
+    float epsilon
+) {
+    dim3 block(TENSOR_OP_BLOCK);
+    dim3 grid((batch + TENSOR_OP_BLOCK - 1) / TENSOR_OP_BLOCK);
+    per_update_priorities_kernel<<<grid, block>>>(
+        d_priorities,
+        d_indices,
+        d_td_errors,
+        d_max_priority,
+        batch,
+        capacity,
+        alpha,
+        epsilon
+    );
     return (int)cudaPeekAtLastError();
 }
 

@@ -3413,6 +3413,383 @@ pub fn abs_diff_f32(
 }
 
 #[cfg(cuda)]
+#[allow(clippy::too_many_arguments)]
+pub fn per_store_transition_with_max_f32(
+    states: &DevicePtr<f32>,
+    next_states: &DevicePtr<f32>,
+    actions: &DevicePtr<i32>,
+    rewards: &DevicePtr<f32>,
+    dones: &DevicePtr<f32>,
+    priorities: &DevicePtr<f32>,
+    max_priority: &DevicePtr<f32>,
+    state: &DevicePtr<f32>,
+    next_state: &DevicePtr<f32>,
+    idx: usize,
+    action: usize,
+    reward: f32,
+    done: f32,
+    alpha: f32,
+    capacity: usize,
+    dim: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    validate_positive_dim(
+        "cuda::kernels::per_store_transition_with_max_f32(dim)",
+        "dim must be greater than zero",
+        dim,
+    )?;
+    if idx >= capacity {
+        return Err(CudaError::InvalidInput {
+            op: "cuda::kernels::per_store_transition_with_max_f32",
+            message: "idx out of bounds",
+        });
+    }
+    validate_len(
+        "cuda::kernels::per_store_transition_with_max_f32(states)",
+        states.len(),
+        checked_mul2(
+            "cuda::kernels::per_store_transition_with_max_f32(states)",
+            capacity,
+            dim,
+        )?,
+    )?;
+    validate_len(
+        "cuda::kernels::per_store_transition_with_max_f32(next_states)",
+        next_states.len(),
+        checked_mul2(
+            "cuda::kernels::per_store_transition_with_max_f32(next_states)",
+            capacity,
+            dim,
+        )?,
+    )?;
+    validate_len(
+        "cuda::kernels::per_store_transition_with_max_f32(actions)",
+        actions.len(),
+        capacity,
+    )?;
+    validate_len(
+        "cuda::kernels::per_store_transition_with_max_f32(rewards)",
+        rewards.len(),
+        capacity,
+    )?;
+    validate_len(
+        "cuda::kernels::per_store_transition_with_max_f32(dones)",
+        dones.len(),
+        capacity,
+    )?;
+    validate_len(
+        "cuda::kernels::per_store_transition_with_max_f32(priorities)",
+        priorities.len(),
+        capacity,
+    )?;
+    validate_len(
+        "cuda::kernels::per_store_transition_with_max_f32(max_priority)",
+        max_priority.len(),
+        1,
+    )?;
+    validate_len(
+        "cuda::kernels::per_store_transition_with_max_f32(state)",
+        state.len(),
+        dim,
+    )?;
+    validate_len(
+        "cuda::kernels::per_store_transition_with_max_f32(next_state)",
+        next_state.len(),
+        dim,
+    )?;
+    let idx_i32 = to_i32_len("cuda::kernels::per_store_transition_with_max_f32(idx)", idx)?;
+    let action_i32 = to_i32_len(
+        "cuda::kernels::per_store_transition_with_max_f32(action)",
+        action,
+    )?;
+    let dim_i32 = to_i32_len("cuda::kernels::per_store_transition_with_max_f32(dim)", dim)?;
+    let status = unsafe {
+        crate::cuda::bindings::cuda_per_store_transition_with_max_f32(
+            states.as_raw() as *mut f32,
+            next_states.as_raw() as *mut f32,
+            actions.as_raw() as *mut std::os::raw::c_int,
+            rewards.as_raw() as *mut f32,
+            dones.as_raw() as *mut f32,
+            priorities.as_raw() as *mut f32,
+            max_priority.as_raw() as *const f32,
+            state.as_raw() as *const f32,
+            next_state.as_raw() as *const f32,
+            idx_i32,
+            action_i32,
+            reward,
+            done,
+            alpha,
+            dim_i32,
+        )
+    };
+    if status == 0 {
+        let sync = unsafe { crate::cuda::bindings::cudaDeviceSynchronize() };
+        if sync == 0 {
+            Ok(())
+        } else {
+            Err(CudaError::Runtime {
+                op: "cuda::kernels::per_store_transition_with_max_f32(sync)",
+                code: sync as u32,
+            })
+        }
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::per_store_transition_with_max_f32",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+#[allow(clippy::too_many_arguments)]
+pub fn per_sample_f32(
+    states: &DevicePtr<f32>,
+    next_states: &DevicePtr<f32>,
+    actions: &DevicePtr<i32>,
+    rewards: &DevicePtr<f32>,
+    dones: &DevicePtr<f32>,
+    priorities: &DevicePtr<f32>,
+    uniforms: &DevicePtr<f32>,
+    batch_states: &DevicePtr<f32>,
+    batch_next_states: &DevicePtr<f32>,
+    batch_action_mask: &DevicePtr<f32>,
+    batch_rewards: &DevicePtr<f32>,
+    batch_dones: &DevicePtr<f32>,
+    batch_weights: &DevicePtr<f32>,
+    batch_indices: &DevicePtr<i32>,
+    size: usize,
+    capacity: usize,
+    dim: usize,
+    actions_count: usize,
+    batch: usize,
+    beta: f32,
+    total_priority_hint: f32,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    validate_positive_dim(
+        "cuda::kernels::per_sample_f32(size)",
+        "size must be greater than zero",
+        size,
+    )?;
+    validate_positive_dim(
+        "cuda::kernels::per_sample_f32(dim)",
+        "dim must be greater than zero",
+        dim,
+    )?;
+    validate_positive_dim(
+        "cuda::kernels::per_sample_f32(actions_count)",
+        "actions_count must be greater than zero",
+        actions_count,
+    )?;
+    validate_positive_dim(
+        "cuda::kernels::per_sample_f32(batch)",
+        "batch must be greater than zero",
+        batch,
+    )?;
+    if size > capacity {
+        return Err(CudaError::InvalidInput {
+            op: "cuda::kernels::per_sample_f32",
+            message: "size exceeds capacity",
+        });
+    }
+    validate_len(
+        "cuda::kernels::per_sample_f32(states)",
+        states.len(),
+        checked_mul2("cuda::kernels::per_sample_f32(states)", capacity, dim)?,
+    )?;
+    validate_len(
+        "cuda::kernels::per_sample_f32(next_states)",
+        next_states.len(),
+        checked_mul2("cuda::kernels::per_sample_f32(next_states)", capacity, dim)?,
+    )?;
+    validate_len(
+        "cuda::kernels::per_sample_f32(actions)",
+        actions.len(),
+        capacity,
+    )?;
+    validate_len(
+        "cuda::kernels::per_sample_f32(rewards)",
+        rewards.len(),
+        capacity,
+    )?;
+    validate_len(
+        "cuda::kernels::per_sample_f32(dones)",
+        dones.len(),
+        capacity,
+    )?;
+    validate_len(
+        "cuda::kernels::per_sample_f32(priorities)",
+        priorities.len(),
+        capacity,
+    )?;
+    validate_len(
+        "cuda::kernels::per_sample_f32(uniforms)",
+        uniforms.len(),
+        batch,
+    )?;
+    validate_len(
+        "cuda::kernels::per_sample_f32(batch_states)",
+        batch_states.len(),
+        checked_mul2("cuda::kernels::per_sample_f32(batch_states)", batch, dim)?,
+    )?;
+    validate_len(
+        "cuda::kernels::per_sample_f32(batch_next_states)",
+        batch_next_states.len(),
+        checked_mul2(
+            "cuda::kernels::per_sample_f32(batch_next_states)",
+            batch,
+            dim,
+        )?,
+    )?;
+    validate_len(
+        "cuda::kernels::per_sample_f32(batch_action_mask)",
+        batch_action_mask.len(),
+        checked_mul2(
+            "cuda::kernels::per_sample_f32(batch_action_mask)",
+            batch,
+            actions_count,
+        )?,
+    )?;
+    validate_len(
+        "cuda::kernels::per_sample_f32(batch_rewards)",
+        batch_rewards.len(),
+        batch,
+    )?;
+    validate_len(
+        "cuda::kernels::per_sample_f32(batch_dones)",
+        batch_dones.len(),
+        batch,
+    )?;
+    validate_len(
+        "cuda::kernels::per_sample_f32(batch_weights)",
+        batch_weights.len(),
+        batch,
+    )?;
+    validate_len(
+        "cuda::kernels::per_sample_f32(batch_indices)",
+        batch_indices.len(),
+        batch,
+    )?;
+    let size_i32 = to_i32_len("cuda::kernels::per_sample_f32(size)", size)?;
+    let dim_i32 = to_i32_len("cuda::kernels::per_sample_f32(dim)", dim)?;
+    let actions_i32 = to_i32_len(
+        "cuda::kernels::per_sample_f32(actions_count)",
+        actions_count,
+    )?;
+    let batch_i32 = to_i32_len("cuda::kernels::per_sample_f32(batch)", batch)?;
+    let status = unsafe {
+        crate::cuda::bindings::cuda_per_sample_f32(
+            states.as_raw() as *const f32,
+            next_states.as_raw() as *const f32,
+            actions.as_raw() as *const std::os::raw::c_int,
+            rewards.as_raw() as *const f32,
+            dones.as_raw() as *const f32,
+            priorities.as_raw() as *const f32,
+            uniforms.as_raw() as *const f32,
+            batch_states.as_raw() as *mut f32,
+            batch_next_states.as_raw() as *mut f32,
+            batch_action_mask.as_raw() as *mut f32,
+            batch_rewards.as_raw() as *mut f32,
+            batch_dones.as_raw() as *mut f32,
+            batch_weights.as_raw() as *mut f32,
+            batch_indices.as_raw() as *mut std::os::raw::c_int,
+            size_i32,
+            dim_i32,
+            actions_i32,
+            batch_i32,
+            beta,
+            total_priority_hint,
+        )
+    };
+    if status == 0 {
+        let sync = unsafe { crate::cuda::bindings::cudaDeviceSynchronize() };
+        if sync == 0 {
+            Ok(())
+        } else {
+            Err(CudaError::Runtime {
+                op: "cuda::kernels::per_sample_f32(sync)",
+                code: sync as u32,
+            })
+        }
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::per_sample_f32",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn per_update_priorities_f32(
+    priorities: &DevicePtr<f32>,
+    indices: &DevicePtr<i32>,
+    td_errors: &DevicePtr<f32>,
+    max_priority: &DevicePtr<f32>,
+    batch: usize,
+    capacity: usize,
+    alpha: f32,
+    epsilon: f32,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    validate_len(
+        "cuda::kernels::per_update_priorities_f32(priorities)",
+        priorities.len(),
+        capacity,
+    )?;
+    validate_len(
+        "cuda::kernels::per_update_priorities_f32(indices)",
+        indices.len(),
+        batch,
+    )?;
+    validate_len(
+        "cuda::kernels::per_update_priorities_f32(td_errors)",
+        td_errors.len(),
+        batch,
+    )?;
+    validate_len(
+        "cuda::kernels::per_update_priorities_f32(max_priority)",
+        max_priority.len(),
+        1,
+    )?;
+    let batch_i32 = to_i32_len("cuda::kernels::per_update_priorities_f32(batch)", batch)?;
+    let capacity_i32 = to_i32_len(
+        "cuda::kernels::per_update_priorities_f32(capacity)",
+        capacity,
+    )?;
+    if batch == 0 {
+        return Ok(());
+    }
+    let status = unsafe {
+        crate::cuda::bindings::cuda_per_update_priorities_f32(
+            priorities.as_raw() as *mut f32,
+            indices.as_raw() as *const std::os::raw::c_int,
+            td_errors.as_raw() as *const f32,
+            max_priority.as_raw() as *mut f32,
+            batch_i32,
+            capacity_i32,
+            alpha,
+            epsilon,
+        )
+    };
+    if status == 0 {
+        let sync = unsafe { crate::cuda::bindings::cudaDeviceSynchronize() };
+        if sync == 0 {
+            Ok(())
+        } else {
+            Err(CudaError::Runtime {
+                op: "cuda::kernels::per_update_priorities_f32(sync)",
+                code: sync as u32,
+            })
+        }
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::per_update_priorities_f32",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
 pub fn select_last_token_f32(
     input: &DevicePtr<f32>,
     out: &DevicePtr<f32>,

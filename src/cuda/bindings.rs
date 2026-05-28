@@ -57,6 +57,7 @@ pub const cudaMemcpyDeviceToDevice: c_int = 3;
 extern "C" {
     pub fn cudaSetDevice(device: c_int) -> c_int;
     pub fn cudaGetLastError() -> c_int;
+    pub fn cudaDeviceSynchronize() -> c_int;
     pub fn cudaMalloc(devPtr: *mut *mut std::ffi::c_void, size: usize) -> c_int;
     pub fn cudaFree(devPtr: *mut std::ffi::c_void) -> c_int;
     pub fn cudaMemcpy(
@@ -969,6 +970,75 @@ extern "C" {
         d_a: *mut c_int,
         d_b: *mut c_int,
         d_out: *mut c_int,
+    ) -> c_int;
+    #[link_name = "per_store_transition_f32"]
+    pub fn cuda_per_store_transition_f32(
+        d_states: *mut f32,
+        d_next_states: *mut f32,
+        d_actions: *mut c_int,
+        d_rewards: *mut f32,
+        d_dones: *mut f32,
+        d_priorities: *mut f32,
+        d_state: *const f32,
+        d_next_state: *const f32,
+        idx: c_int,
+        action: c_int,
+        reward: f32,
+        done: f32,
+        priority: f32,
+        dim: c_int,
+    ) -> c_int;
+    #[link_name = "per_store_transition_with_max_f32"]
+    pub fn cuda_per_store_transition_with_max_f32(
+        d_states: *mut f32,
+        d_next_states: *mut f32,
+        d_actions: *mut c_int,
+        d_rewards: *mut f32,
+        d_dones: *mut f32,
+        d_priorities: *mut f32,
+        d_max_priority: *const f32,
+        d_state: *const f32,
+        d_next_state: *const f32,
+        idx: c_int,
+        action: c_int,
+        reward: f32,
+        done: f32,
+        alpha: f32,
+        dim: c_int,
+    ) -> c_int;
+    #[link_name = "per_sample_f32"]
+    pub fn cuda_per_sample_f32(
+        d_states: *const f32,
+        d_next_states: *const f32,
+        d_actions: *const c_int,
+        d_rewards: *const f32,
+        d_dones: *const f32,
+        d_priorities: *const f32,
+        d_uniforms: *const f32,
+        d_batch_states: *mut f32,
+        d_batch_next_states: *mut f32,
+        d_batch_action_mask: *mut f32,
+        d_batch_rewards: *mut f32,
+        d_batch_dones: *mut f32,
+        d_batch_weights: *mut f32,
+        d_batch_indices: *mut c_int,
+        size: c_int,
+        dim: c_int,
+        actions_count: c_int,
+        batch: c_int,
+        beta: f32,
+        total_priority: f32,
+    ) -> c_int;
+    #[link_name = "per_update_priorities_f32"]
+    pub fn cuda_per_update_priorities_f32(
+        d_priorities: *mut f32,
+        d_indices: *const c_int,
+        d_td_errors: *const f32,
+        d_max_priority: *mut f32,
+        batch: c_int,
+        capacity: c_int,
+        alpha: f32,
+        epsilon: f32,
     ) -> c_int;
     #[link_name = "select_last_token_f64"]
     pub fn cuda_select_last_token(

@@ -1081,12 +1081,40 @@ struct PERSample {
     experiences: Vec<Experience>,
     indices: Vec<usize>,
     is_weights: Vec<f64>,
+    #[cfg(cuda)]
+    cuda_batch: Option<CudaPERSample>,
 }
 
 struct ReplayBuffer {
     tree: SumTree,
     alpha: f64,
     max_priority: f64,
+    #[cfg(cuda)]
+    cuda: Option<CudaReplayMirror>,
+}
+
+#[cfg(cuda)]
+struct CudaPERSample {
+    states: Tensor,
+    next_states: Tensor,
+    action_mask: Tensor,
+    rewards: Tensor,
+    dones: Tensor,
+    is_weights: Tensor,
+    indices: crate::cuda::memory::DevicePtr<i32>,
+}
+
+#[cfg(cuda)]
+struct CudaReplayMirror {
+    capacity: usize,
+    dim: usize,
+    states: crate::cuda::memory::DevicePtr<f32>,
+    next_states: crate::cuda::memory::DevicePtr<f32>,
+    actions: crate::cuda::memory::DevicePtr<i32>,
+    rewards: crate::cuda::memory::DevicePtr<f32>,
+    dones: crate::cuda::memory::DevicePtr<f32>,
+    priorities: crate::cuda::memory::DevicePtr<f32>,
+    max_priority: crate::cuda::memory::DevicePtr<f32>,
 }
 
 impl ReplayBuffer {
@@ -1095,11 +1123,21 @@ impl ReplayBuffer {
             tree: SumTree::new(capacity),
             alpha: PER_ALPHA,
             max_priority: 1.0,
+            #[cfg(cuda)]
+            cuda: CudaReplayMirror::new(capacity, DIM).ok(),
         }
     }
 
     fn push(&mut self, exp: Experience) {
         let priority = self.max_priority.powf(self.alpha);
+        #[cfg(cuda)]
+        let idx = self.tree.write_pos;
+        #[cfg(cuda)]
+        if let Some(cuda) = self.cuda.as_mut() {
+            if cuda.push(idx, &exp, self.alpha).is_err() {
+                self.cuda = None;
+            }
+        }
         self.tree.add(priority, exp);
     }
 
@@ -1108,6 +1146,20 @@ impl ReplayBuffer {
     fn sample(&self, rng: &mut Rng, batch_size: usize, beta: f64) -> PERSample {
         assert!(batch_size > 0, "batch_size must be > 0");
         assert!(self.tree.size > 0, "cannot sample from empty buffer");
+
+        #[cfg(cuda)]
+        if let Some(cuda_batch) = self
+            .cuda
+            .as_ref()
+            .and_then(|cuda| cuda.sample(rng, self.tree.size, batch_size, beta))
+        {
+            return PERSample {
+                experiences: Vec::new(),
+                indices: Vec::new(),
+                is_weights: Vec::new(),
+                cuda_batch: Some(cuda_batch),
+            };
+        }
 
         let total = self.tree.total_priority();
 
@@ -1127,6 +1179,8 @@ impl ReplayBuffer {
                 experiences,
                 indices,
                 is_weights,
+                #[cfg(cuda)]
+                cuda_batch: None,
             };
         }
 
@@ -1183,6 +1237,8 @@ impl ReplayBuffer {
             experiences,
             indices,
             is_weights,
+            #[cfg(cuda)]
+            cuda_batch: None,
         }
     }
 
@@ -1203,6 +1259,297 @@ impl ReplayBuffer {
 
     fn len(&self) -> usize {
         self.tree.size
+    }
+
+    #[cfg(cuda)]
+    fn update_priorities_cuda(
+        &mut self,
+        indices: &crate::cuda::memory::DevicePtr<i32>,
+        td_errors: &Tensor,
+        batch_size: usize,
+    ) -> bool {
+        self.cuda
+            .as_mut()
+            .is_some_and(|cuda| cuda.update_priorities(indices, td_errors, batch_size, self.alpha))
+    }
+}
+
+#[cfg(cuda)]
+impl CudaReplayMirror {
+    fn new(capacity: usize, dim: usize) -> crate::cuda::error::CudaResult<Self> {
+        use crate::cuda::memory::{alloc, copy_h2d};
+
+        let states = alloc::<f32>(capacity * dim)?;
+        let next_states = alloc::<f32>(capacity * dim)?;
+        let actions = alloc::<i32>(capacity)?;
+        let rewards = alloc::<f32>(capacity)?;
+        let dones = alloc::<f32>(capacity)?;
+        let priorities = alloc::<f32>(capacity)?;
+        let max_priority = alloc::<f32>(1)?;
+
+        let zeros = vec![0.0_f32; capacity * dim];
+        copy_h2d(&states, &zeros)?;
+        copy_h2d(&next_states, &zeros)?;
+        copy_h2d(&actions, &vec![0_i32; capacity])?;
+        copy_h2d(&rewards, &vec![0.0_f32; capacity])?;
+        copy_h2d(&dones, &vec![0.0_f32; capacity])?;
+        copy_h2d(&priorities, &vec![0.0_f32; capacity])?;
+        copy_h2d(&max_priority, &[1.0_f32])?;
+
+        Ok(Self {
+            capacity,
+            dim,
+            states,
+            next_states,
+            actions,
+            rewards,
+            dones,
+            priorities,
+            max_priority,
+        })
+    }
+
+    fn push(
+        &mut self,
+        idx: usize,
+        exp: &Experience,
+        alpha: f64,
+    ) -> crate::cuda::error::CudaResult<()> {
+        use crate::cuda::memory::{alloc, copy_h2d};
+
+        if idx >= self.capacity || exp.state.len() != self.dim || exp.next_state.len() != self.dim {
+            return Err(crate::cuda::error::CudaError::InvalidInput {
+                op: "CudaReplayMirror::push",
+                message: "transition shape/index mismatch",
+            });
+        }
+
+        let state = alloc::<f32>(self.dim)?;
+        let next_state = alloc::<f32>(self.dim)?;
+        let state_f32: Vec<f32> = exp.state.iter().map(|&v| v as f32).collect();
+        let next_state_f32: Vec<f32> = exp.next_state.iter().map(|&v| v as f32).collect();
+        copy_h2d(&state, &state_f32)?;
+        copy_h2d(&next_state, &next_state_f32)?;
+
+        crate::cuda::kernels::per_store_transition_with_max_f32(
+            &self.states,
+            &self.next_states,
+            &self.actions,
+            &self.rewards,
+            &self.dones,
+            &self.priorities,
+            &self.max_priority,
+            &state,
+            &next_state,
+            idx,
+            exp.action,
+            exp.reward as f32,
+            if exp.done { 1.0 } else { 0.0 },
+            alpha as f32,
+            self.capacity,
+            self.dim,
+        )
+    }
+
+    fn sample(
+        &self,
+        rng: &mut Rng,
+        size: usize,
+        batch_size: usize,
+        beta: f64,
+    ) -> Option<CudaPERSample> {
+        use crate::autograd::Device;
+        use crate::cuda::memory::{alloc, copy_h2d, CudaBuffer};
+        use crate::dtype::{Dtype, Storage};
+        use std::sync::{Arc, RwLock};
+
+        if size == 0 || size > self.capacity || batch_size == 0 {
+            return None;
+        }
+
+        let uniforms = alloc::<f32>(batch_size).ok()?;
+        let host_uniforms: Vec<f32> = (0..batch_size).map(|_| rng.next_f64() as f32).collect();
+        copy_h2d(&uniforms, &host_uniforms).ok()?;
+
+        let batch_states = alloc::<f32>(batch_size * self.dim).ok()?;
+        let batch_next_states = alloc::<f32>(batch_size * self.dim).ok()?;
+        let batch_action_mask = alloc::<f32>(batch_size * ACTION_SPACE).ok()?;
+        let batch_rewards = alloc::<f32>(batch_size).ok()?;
+        let batch_dones = alloc::<f32>(batch_size).ok()?;
+        let batch_weights = alloc::<f32>(batch_size).ok()?;
+        let batch_indices = alloc::<i32>(batch_size).ok()?;
+
+        crate::cuda::kernels::per_sample_f32(
+            &self.states,
+            &self.next_states,
+            &self.actions,
+            &self.rewards,
+            &self.dones,
+            &self.priorities,
+            &uniforms,
+            &batch_states,
+            &batch_next_states,
+            &batch_action_mask,
+            &batch_rewards,
+            &batch_dones,
+            &batch_weights,
+            &batch_indices,
+            size,
+            self.capacity,
+            self.dim,
+            ACTION_SPACE,
+            batch_size,
+            beta as f32,
+            0.0,
+        )
+        .ok()?;
+
+        fn tensor_from_f32_device(
+            device: crate::cuda::memory::DevicePtr<f32>,
+            shape: Vec<usize>,
+        ) -> Tensor {
+            let len = shape.iter().product();
+            let tensor = Tensor {
+                data: Storage::F32(Arc::new(RwLock::new(Vec::new()))),
+                grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F32)),
+                shape,
+                device: Device::Cuda,
+                dtype: Dtype::F32,
+                _ctx: None,
+            };
+            tensor.cuda_set_cached_buffer(Arc::new(CudaBuffer::F32(device)));
+            tensor
+        }
+
+        Some(CudaPERSample {
+            states: tensor_from_f32_device(batch_states, vec![batch_size, self.dim]),
+            next_states: tensor_from_f32_device(batch_next_states, vec![batch_size, self.dim]),
+            action_mask: tensor_from_f32_device(batch_action_mask, vec![batch_size, ACTION_SPACE]),
+            rewards: tensor_from_f32_device(batch_rewards, vec![batch_size, 1]),
+            dones: tensor_from_f32_device(batch_dones, vec![batch_size, 1]),
+            is_weights: tensor_from_f32_device(batch_weights, vec![batch_size, 1]),
+            indices: batch_indices,
+        })
+    }
+
+    fn update_priorities(
+        &mut self,
+        indices: &crate::cuda::memory::DevicePtr<i32>,
+        td_errors: &Tensor,
+        batch_size: usize,
+        alpha: f64,
+    ) -> bool {
+        use crate::autograd::Device;
+        use crate::cuda::memory::CudaBuffer;
+        use crate::dtype::Dtype;
+
+        if td_errors.device != Device::Cuda
+            || td_errors.dtype != Dtype::F32
+            || td_errors.numel() != batch_size
+        {
+            return false;
+        }
+        let Ok(td_buf) = td_errors.cuda_get_or_upload_buffer() else {
+            return false;
+        };
+        let CudaBuffer::F32(td) = &*td_buf else {
+            return false;
+        };
+        crate::cuda::kernels::per_update_priorities_f32(
+            &self.priorities,
+            indices,
+            td,
+            &self.max_priority,
+            batch_size,
+            self.capacity,
+            alpha as f32,
+            PER_EPSILON as f32,
+        )
+        .is_ok()
+    }
+}
+
+fn dqn_cpu_batch_tensors(
+    per_sample: &PERSample,
+    scratch: &mut DqnTrainerScratch,
+) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor) {
+    scratch.reset();
+
+    for exp in &per_sample.experiences {
+        scratch.states_vec.extend_from_slice(&exp.state);
+        scratch.next_states_vec.extend_from_slice(&exp.next_state);
+        let mask_start = scratch.actions_vec.len();
+        scratch.actions_vec.resize(mask_start + ACTION_SPACE, 0.0);
+        scratch.actions_vec[mask_start + exp.action] = 1.0;
+        scratch.rewards_vec.push(exp.reward);
+        scratch.dones_vec.push(if exp.done { 1.0 } else { 0.0 });
+    }
+
+    let batch_state = Tensor::new_f32(
+        std::mem::take(&mut scratch.states_vec),
+        vec![BATCH_SIZE, DIM],
+    );
+    let batch_next_state = Tensor::new_f32(
+        std::mem::take(&mut scratch.next_states_vec),
+        vec![BATCH_SIZE, DIM],
+    );
+    let batch_mask = Tensor::new_f32(
+        std::mem::take(&mut scratch.actions_vec),
+        vec![BATCH_SIZE, ACTION_SPACE],
+    );
+    let rewards_tensor = Tensor::new_f32(
+        std::mem::take(&mut scratch.rewards_vec),
+        vec![BATCH_SIZE, 1],
+    );
+    let dones_tensor = Tensor::new_f32(std::mem::take(&mut scratch.dones_vec), vec![BATCH_SIZE, 1]);
+    let is_weights_tensor = Tensor::new_f32(per_sample.is_weights.clone(), vec![BATCH_SIZE, 1]);
+
+    #[cfg(cuda)]
+    {
+        let batch_state = match batch_state.to_cuda() {
+            Ok(t) => t,
+            Err(_) => batch_state,
+        };
+        let batch_next_state = match batch_next_state.to_cuda() {
+            Ok(t) => t,
+            Err(_) => batch_next_state,
+        };
+        let batch_mask = match batch_mask.to_cuda() {
+            Ok(t) => t,
+            Err(_) => batch_mask,
+        };
+        let rewards_tensor = match rewards_tensor.to_cuda() {
+            Ok(t) => t,
+            Err(_) => rewards_tensor,
+        };
+        let dones_tensor = match dones_tensor.to_cuda() {
+            Ok(t) => t,
+            Err(_) => dones_tensor,
+        };
+        let is_weights_tensor = match is_weights_tensor.to_cuda() {
+            Ok(t) => t,
+            Err(_) => is_weights_tensor,
+        };
+        (
+            batch_state,
+            batch_next_state,
+            batch_mask,
+            rewards_tensor,
+            dones_tensor,
+            is_weights_tensor,
+        )
+    }
+
+    #[cfg(not(cuda))]
+    {
+        (
+            batch_state,
+            batch_next_state,
+            batch_mask,
+            rewards_tensor,
+            dones_tensor,
+            is_weights_tensor,
+        )
     }
 }
 
@@ -1272,6 +1619,7 @@ fn train_dqn_impl(
     let beta_anneal_steps = total_steps as f64;
     let snapshot_every = (total_steps / 200).max(1);
     let mut last_train_loss = 0.0_f64;
+    let mut pending_train_loss: Option<Tensor> = None;
 
     // Pre-allocated scratch buffers to avoid per-step heap allocations
     let mut scratch = DqnTrainerScratch::new();
@@ -1439,62 +1787,35 @@ fn train_dqn_impl(
 
             let start_forward = std::time::Instant::now();
             optimizer.zero_grad();
-            scratch.reset();
-
-            for exp in &per_sample.experiences {
-                scratch.states_vec.extend_from_slice(&exp.state);
-                scratch.next_states_vec.extend_from_slice(&exp.next_state);
-                // Build action mask: all zeros except exp.action which is 1.0
-                let mask_start = scratch.actions_vec.len();
-                scratch.actions_vec.resize(mask_start + ACTION_SPACE, 0.0);
-                scratch.actions_vec[mask_start + exp.action] = 1.0;
-                scratch.rewards_vec.push(exp.reward);
-                scratch.dones_vec.push(if exp.done { 1.0 } else { 0.0 });
-            }
-
-            let batch_state = Tensor::new_f32(
-                std::mem::take(&mut scratch.states_vec),
-                vec![BATCH_SIZE, DIM],
-            );
-            let batch_next_state = Tensor::new_f32(
-                std::mem::take(&mut scratch.next_states_vec),
-                vec![BATCH_SIZE, DIM],
-            );
-            let batch_mask = Tensor::new_f32(
-                std::mem::take(&mut scratch.actions_vec),
-                vec![BATCH_SIZE, ACTION_SPACE],
-            );
-            let rewards_tensor = Tensor::new_f32(
-                std::mem::take(&mut scratch.rewards_vec),
-                vec![BATCH_SIZE, 1],
-            );
-            let dones_tensor =
-                Tensor::new_f32(std::mem::take(&mut scratch.dones_vec), vec![BATCH_SIZE, 1]);
             #[cfg(cuda)]
-            let batch_state = match batch_state.to_cuda() {
-                Ok(t) => t,
-                Err(_) => batch_state,
+            let (
+                batch_state,
+                batch_next_state,
+                batch_mask,
+                rewards_tensor,
+                dones_tensor,
+                is_weights_tensor,
+            ) = if let Some(cuda_batch) = per_sample.cuda_batch.as_ref() {
+                (
+                    cuda_batch.states.clone(),
+                    cuda_batch.next_states.clone(),
+                    cuda_batch.action_mask.clone(),
+                    cuda_batch.rewards.clone(),
+                    cuda_batch.dones.clone(),
+                    cuda_batch.is_weights.clone(),
+                )
+            } else {
+                dqn_cpu_batch_tensors(&per_sample, &mut scratch)
             };
-            #[cfg(cuda)]
-            let batch_next_state = match batch_next_state.to_cuda() {
-                Ok(t) => t,
-                Err(_) => batch_next_state,
-            };
-            #[cfg(cuda)]
-            let batch_mask = match batch_mask.to_cuda() {
-                Ok(t) => t,
-                Err(_) => batch_mask,
-            };
-            #[cfg(cuda)]
-            let rewards_tensor = match rewards_tensor.to_cuda() {
-                Ok(t) => t,
-                Err(_) => rewards_tensor,
-            };
-            #[cfg(cuda)]
-            let dones_tensor = match dones_tensor.to_cuda() {
-                Ok(t) => t,
-                Err(_) => dones_tensor,
-            };
+            #[cfg(not(cuda))]
+            let (
+                batch_state,
+                batch_next_state,
+                batch_mask,
+                rewards_tensor,
+                dones_tensor,
+                is_weights_tensor,
+            ) = dqn_cpu_batch_tensors(&per_sample, &mut scratch);
 
             // 2. Policy Forward
             let q_values = policy_net.forward(&batch_state); // (B, 5)
@@ -1552,19 +1873,12 @@ fn train_dqn_impl(
             });
 
             // IS-weighted loss: w_i * (q - target)^2, normalized
-            let is_weights_tensor =
-                Tensor::new_f32(per_sample.is_weights.clone(), vec![BATCH_SIZE, 1]);
-            #[cfg(cuda)]
-            let is_weights_tensor = match is_weights_tensor.to_cuda() {
-                Ok(t) => t,
-                Err(_) => is_weights_tensor,
-            };
             let mut loss = q_actions.weighted_mse_loss(&target_tensor, &is_weights_tensor);
             if let Some(reg) = policy_net.achf_orthogonal_penalty() {
                 loss = loss + reg;
             }
 
-            last_train_loss = loss.data_as_f64_vec()[0];
+            pending_train_loss = Some(loss.detach());
             let forward_time = start_forward.elapsed();
 
             let start_backward = std::time::Instant::now();
@@ -1579,23 +1893,47 @@ fn train_dqn_impl(
             // Write back per-sample TD errors for priority update
             {
                 #[cfg(cuda)]
-                let td_tensor = abs_diff_cuda(&q_actions, &target_tensor);
+                {
+                    if let Some(cuda_batch) = per_sample.cuda_batch.as_ref() {
+                        let td_tensor = abs_diff_cuda(&q_actions, &target_tensor);
+                        if let Some(td_tensor) = td_tensor {
+                            let _ = replay_buffer.update_priorities_cuda(
+                                &cuda_batch.indices,
+                                &td_tensor,
+                                BATCH_SIZE,
+                            );
+                        }
+                    } else {
+                        let td_tensor = abs_diff_cuda(&q_actions, &target_tensor);
+                        let td_errors = if let Some(td_tensor) = td_tensor {
+                            td_tensor.data_as_f64_vec()
+                        } else {
+                            let q_data = q_actions.data_as_f64_vec();
+                            let t_data = target_tensor.data_as_f64_vec();
+                            q_data
+                                .iter()
+                                .zip(t_data.iter())
+                                .map(|(&q, &t)| (q - t).abs())
+                                .collect()
+                        };
+                        scratch.td_errors.clear();
+                        scratch.td_errors.extend(td_errors);
+                        replay_buffer.update_priorities(&per_sample.indices, &scratch.td_errors);
+                    }
+                }
                 #[cfg(not(cuda))]
-                let td_tensor: Option<Tensor> = None;
-                let td_errors = if let Some(td_tensor) = td_tensor {
-                    td_tensor.data_as_f64_vec()
-                } else {
+                {
                     let q_data = q_actions.data_as_f64_vec();
                     let t_data = target_tensor.data_as_f64_vec();
-                    q_data
+                    let td_errors: Vec<f64> = q_data
                         .iter()
                         .zip(t_data.iter())
                         .map(|(&q, &t)| (q - t).abs())
-                        .collect()
-                };
-                scratch.td_errors.clear();
-                scratch.td_errors.extend(td_errors);
-                replay_buffer.update_priorities(&per_sample.indices, &scratch.td_errors);
+                        .collect();
+                    scratch.td_errors.clear();
+                    scratch.td_errors.extend(td_errors);
+                    replay_buffer.update_priorities(&per_sample.indices, &scratch.td_errors);
+                }
             }
 
             // Soft Update Target Network
@@ -1651,6 +1989,9 @@ fn train_dqn_impl(
         }
 
         if metrics.is_enabled() && step % snapshot_every == 0 {
+            if let Some(loss) = pending_train_loss.take() {
+                last_train_loss = loss.item() as f64;
+            }
             let avg_r = if recent_rewards.is_empty() {
                 0.0
             } else {
@@ -1784,59 +2125,35 @@ impl OnlineDqnTrainer {
         let per_sample = self.replay_buffer.sample(rng, BATCH_SIZE, beta);
         self.optimizer.zero_grad();
 
-        self.scratch.reset();
-
-        for exp in &per_sample.experiences {
-            self.scratch.states_vec.extend_from_slice(&exp.state);
-            self.scratch
-                .next_states_vec
-                .extend_from_slice(&exp.next_state);
-            // Build action mask: all zeros except exp.action which is 1.0
-            let mask_start = self.scratch.actions_vec.len();
-            self.scratch
-                .actions_vec
-                .resize(mask_start + ACTION_SPACE, 0.0);
-            self.scratch.actions_vec[mask_start + exp.action] = 1.0;
-            self.scratch.rewards_vec.push(exp.reward);
-            self.scratch
-                .dones_vec
-                .push(if exp.done { 1.0 } else { 0.0 });
-        }
-
-        let batch_state = Tensor::new_f32(self.scratch.states_vec.clone(), vec![BATCH_SIZE, DIM]);
-        let batch_next_state =
-            Tensor::new_f32(self.scratch.next_states_vec.clone(), vec![BATCH_SIZE, DIM]);
-        let batch_mask = Tensor::new_f32(
-            self.scratch.actions_vec.clone(),
-            vec![BATCH_SIZE, ACTION_SPACE],
-        );
-        let rewards_tensor = Tensor::new_f32(self.scratch.rewards_vec.clone(), vec![BATCH_SIZE, 1]);
-        let dones_tensor = Tensor::new_f32(self.scratch.dones_vec.clone(), vec![BATCH_SIZE, 1]);
         #[cfg(cuda)]
-        let batch_state = match batch_state.to_cuda() {
-            Ok(t) => t,
-            Err(_) => batch_state,
+        let (
+            batch_state,
+            batch_next_state,
+            batch_mask,
+            rewards_tensor,
+            dones_tensor,
+            is_weights_tensor,
+        ) = if let Some(cuda_batch) = per_sample.cuda_batch.as_ref() {
+            (
+                cuda_batch.states.clone(),
+                cuda_batch.next_states.clone(),
+                cuda_batch.action_mask.clone(),
+                cuda_batch.rewards.clone(),
+                cuda_batch.dones.clone(),
+                cuda_batch.is_weights.clone(),
+            )
+        } else {
+            dqn_cpu_batch_tensors(&per_sample, &mut self.scratch)
         };
-        #[cfg(cuda)]
-        let batch_next_state = match batch_next_state.to_cuda() {
-            Ok(t) => t,
-            Err(_) => batch_next_state,
-        };
-        #[cfg(cuda)]
-        let batch_mask = match batch_mask.to_cuda() {
-            Ok(t) => t,
-            Err(_) => batch_mask,
-        };
-        #[cfg(cuda)]
-        let rewards_tensor = match rewards_tensor.to_cuda() {
-            Ok(t) => t,
-            Err(_) => rewards_tensor,
-        };
-        #[cfg(cuda)]
-        let dones_tensor = match dones_tensor.to_cuda() {
-            Ok(t) => t,
-            Err(_) => dones_tensor,
-        };
+        #[cfg(not(cuda))]
+        let (
+            batch_state,
+            batch_next_state,
+            batch_mask,
+            rewards_tensor,
+            dones_tensor,
+            is_weights_tensor,
+        ) = dqn_cpu_batch_tensors(&per_sample, &mut self.scratch);
 
         let q_values = self.policy.forward(&batch_state);
         let ones_5_1 = Tensor::new_f32(ONES_5_1_DATA.to_vec(), vec![5, 1]);
@@ -1886,12 +2203,6 @@ impl OnlineDqnTrainer {
             }
             Tensor::new_f32(self.scratch.target_vals.clone(), vec![BATCH_SIZE, 1])
         });
-        let is_weights_tensor = Tensor::new_f32(per_sample.is_weights.clone(), vec![BATCH_SIZE, 1]);
-        #[cfg(cuda)]
-        let is_weights_tensor = match is_weights_tensor.to_cuda() {
-            Ok(t) => t,
-            Err(_) => is_weights_tensor,
-        };
         let mut loss = q_actions.weighted_mse_loss(&target_tensor, &is_weights_tensor);
         if let Some(reg) = self.policy.achf_orthogonal_penalty() {
             loss = loss + reg;
@@ -1903,22 +2214,44 @@ impl OnlineDqnTrainer {
         // Write back per-sample TD errors for priority update
         {
             #[cfg(cuda)]
-            let td_tensor = abs_diff_cuda(&q_actions, &target_tensor);
+            {
+                if let Some(cuda_batch) = per_sample.cuda_batch.as_ref() {
+                    if let Some(td_tensor) = abs_diff_cuda(&q_actions, &target_tensor) {
+                        let _ = self.replay_buffer.update_priorities_cuda(
+                            &cuda_batch.indices,
+                            &td_tensor,
+                            BATCH_SIZE,
+                        );
+                    }
+                } else {
+                    let td_tensor = abs_diff_cuda(&q_actions, &target_tensor);
+                    let td_errors: Vec<f64> = if let Some(td_tensor) = td_tensor {
+                        td_tensor.data_as_f64_vec()
+                    } else {
+                        let q_data = q_actions.data_as_f64_vec();
+                        let t_data = target_tensor.data_as_f64_vec();
+                        q_data
+                            .iter()
+                            .zip(t_data.iter())
+                            .map(|(&q, &t)| (q - t).abs())
+                            .collect()
+                    };
+                    self.replay_buffer
+                        .update_priorities(&per_sample.indices, &td_errors);
+                }
+            }
             #[cfg(not(cuda))]
-            let td_tensor: Option<Tensor> = None;
-            let td_errors: Vec<f64> = if let Some(td_tensor) = td_tensor {
-                td_tensor.data_as_f64_vec()
-            } else {
+            {
                 let q_data = q_actions.data_as_f64_vec();
                 let t_data = target_tensor.data_as_f64_vec();
-                q_data
+                let td_errors: Vec<f64> = q_data
                     .iter()
                     .zip(t_data.iter())
                     .map(|(&q, &t)| (q - t).abs())
-                    .collect()
-            };
-            self.replay_buffer
-                .update_priorities(&per_sample.indices, &td_errors);
+                    .collect();
+                self.replay_buffer
+                    .update_priorities(&per_sample.indices, &td_errors);
+            }
         }
 
         self.target.soft_update(&self.policy, 0.005);

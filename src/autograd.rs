@@ -258,9 +258,13 @@ pub(crate) fn cuda_grad_out_buffer(
         }
     }
     if len == 0 {
-        return Some(Arc::new(CudaBuffer::F64(
-            crate::cuda::memory::DevicePtr::zero_sized(),
-        )));
+        let buffer = match grad_out.dtype() {
+            Dtype::F32 => CudaBuffer::F32(crate::cuda::memory::DevicePtr::zero_sized()),
+            Dtype::F64 => CudaBuffer::F64(crate::cuda::memory::DevicePtr::zero_sized()),
+            Dtype::BF16 => CudaBuffer::BF16(crate::cuda::memory::DevicePtr::zero_sized()),
+            Dtype::I8 => CudaBuffer::I8(crate::cuda::memory::DevicePtr::zero_sized()),
+        };
+        return Some(Arc::new(buffer));
     }
     match grad_out.dtype() {
         Dtype::F32 => {
@@ -1000,6 +1004,39 @@ impl Tensor {
     // Create a new leaf tensor with same data (copy)
     pub fn item(&self) -> f32 {
         assert_eq!(self.shape.iter().product::<usize>(), 1);
+        #[cfg(cuda)]
+        if self.device == Device::Cuda {
+            use crate::cuda::memory::CudaBuffer;
+            if let Some(buffer) = self.cuda_cached_buffer() {
+                match &*buffer {
+                    CudaBuffer::F32(b) if b.len() == 1 => {
+                        let mut host = [0.0_f32; 1];
+                        if crate::cuda::memory::copy_d2h(&mut host, b).is_ok() {
+                            return host[0];
+                        }
+                    }
+                    CudaBuffer::F64(b) if b.len() == 1 => {
+                        let mut host = [0.0_f64; 1];
+                        if crate::cuda::memory::copy_d2h(&mut host, b).is_ok() {
+                            return host[0] as f32;
+                        }
+                    }
+                    CudaBuffer::BF16(b) if b.len() == 1 => {
+                        let mut host = [crate::dtype::bf16::default(); 1];
+                        if crate::cuda::memory::copy_d2h(&mut host, b).is_ok() {
+                            return host[0].to_f32();
+                        }
+                    }
+                    CudaBuffer::I8(b) if b.len() == 1 => {
+                        let mut host = [0_i8; 1];
+                        if crate::cuda::memory::copy_d2h(&mut host, b).is_ok() {
+                            return host[0] as f32;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         self.data_to_f32_vec()[0]
     }
 
@@ -6055,9 +6092,13 @@ impl Tensor {
         }
 
         if len == 0 {
-            return Ok(Arc::new(CudaBuffer::F64(
-                crate::cuda::memory::DevicePtr::zero_sized(),
-            )));
+            let buffer = match self.dtype {
+                Dtype::BF16 => CudaBuffer::BF16(crate::cuda::memory::DevicePtr::zero_sized()),
+                Dtype::I8 => CudaBuffer::I8(crate::cuda::memory::DevicePtr::zero_sized()),
+                Dtype::F32 => CudaBuffer::F32(crate::cuda::memory::DevicePtr::zero_sized()),
+                Dtype::F64 => CudaBuffer::F64(crate::cuda::memory::DevicePtr::zero_sized()),
+            };
+            return Ok(Arc::new(buffer));
         }
         if host_len == 0 {
             return Err((

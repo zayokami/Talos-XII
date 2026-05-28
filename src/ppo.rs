@@ -998,7 +998,14 @@ impl Ppo {
             });
         }
 
-        let mut loss_sum = 0.0_f64;
+        let loss_sum_tensor = Tensor::zeros_f32(vec![1]);
+        #[cfg(cuda)]
+        let mut loss_sum_tensor = match loss_sum_tensor.to_cuda() {
+            Ok(t) => t,
+            Err(_) => loss_sum_tensor,
+        };
+        #[cfg(not(cuda))]
+        let mut loss_sum_tensor = loss_sum_tensor;
         let mut loss_count = 0usize;
         for _ in 0..self.k_epochs {
             indices.shuffle(&mut rand::rng());
@@ -1091,7 +1098,7 @@ impl Ppo {
                     let log_ratio = log_prob - old_log_prob_tensor;
                     let ratio = log_ratio.exp();
                     let approx_kl_term = (ratio.clone() - one_tensor.clone()) - log_ratio.clone();
-                    approx_kl_accum = approx_kl_accum + approx_kl_term;
+                    approx_kl_accum = approx_kl_accum.detach() + approx_kl_term.detach();
 
                     let adv_tensor = TRAINING_SCRATCH.with(|s| {
                         let mut scratch = s.borrow_mut();
@@ -1154,7 +1161,7 @@ impl Ppo {
                 if let Some(reg) = self.policy.achf_orthogonal_penalty() {
                     final_loss = final_loss + reg;
                 }
-                loss_sum += final_loss.item() as f64;
+                loss_sum_tensor = loss_sum_tensor.detach() + final_loss.detach();
                 loss_count += 1;
                 final_loss.backward();
                 self.policy.update_achf_after_backward();
@@ -1162,7 +1169,7 @@ impl Ppo {
                 // Update EMA teacher after each batch for self-distillation
                 self.update_ema_teacher();
 
-                let approx_kl = approx_kl_accum.item() as f64 / chunk.len() as f64;
+                let approx_kl = approx_kl_accum.detach().item() as f64 / chunk.len() as f64;
                 if approx_kl > target_kl * 1.5 {
                     early_stop = true;
                 }
@@ -1182,7 +1189,7 @@ impl Ppo {
             }
         }
         if loss_count > 0 {
-            loss_sum / loss_count as f64
+            loss_sum_tensor.item() as f64 / loss_count as f64
         } else {
             0.0
         }
