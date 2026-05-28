@@ -31,6 +31,43 @@ const PER_EPSILON: f64 = 1e-6;
 // Constant tensor data for reuse - avoids per-step allocation
 const ONES_5_1_DATA: [f64; 5] = [1.0; 5];
 
+fn double_dqn_target_cpu(
+    q_next_eval: &Tensor,
+    q_next_target: &Tensor,
+    rewards_tensor: &Tensor,
+    dones_tensor: &Tensor,
+    gamma: f64,
+    target_vals: &mut Vec<f64>,
+) -> Tensor {
+    target_vals.clear();
+
+    let guards = TensorReadGuard::new(&[q_next_eval, q_next_target]);
+    let q_next_eval_data = guards.get(0);
+    let q_next_target_data = guards.get(1);
+    let rewards = rewards_tensor.data_as_f64_vec();
+    let dones = dones_tensor.data_as_f64_vec();
+    let batch = q_next_eval.shape.first().copied().unwrap_or(BATCH_SIZE);
+    let actions = q_next_eval.shape.get(1).copied().unwrap_or(ACTION_SPACE);
+
+    for i in 0..batch {
+        let start = i * actions;
+        let end = start + actions;
+        let row_eval = &q_next_eval_data[start..end];
+        let mut max_idx = 0;
+        let mut max_val = f64::NEG_INFINITY;
+        for (k, &v) in row_eval.iter().enumerate() {
+            if v > max_val {
+                max_val = v;
+                max_idx = k;
+            }
+        }
+        let next_q_val = q_next_target_data[start + max_idx];
+        target_vals.push(rewards[i] + gamma * next_q_val * (1.0 - dones[i]));
+    }
+
+    Tensor::new_f32(std::mem::take(target_vals), vec![batch, 1])
+}
+
 #[cfg(cuda)]
 fn double_dqn_target_cuda(
     q_next_eval: &Tensor,
@@ -1833,44 +1870,34 @@ fn train_dqn_impl(
             let q_next_target = target_net.forward(&batch_next_state); // (B, 5)
 
             #[cfg(cuda)]
-            let target_tensor = double_dqn_target_cuda(
+            let target_tensor = {
+                double_dqn_target_cuda(
+                    &q_next_eval,
+                    &q_next_target,
+                    &rewards_tensor,
+                    &dones_tensor,
+                    GAMMA,
+                )
+                .unwrap_or_else(|| {
+                    double_dqn_target_cpu(
+                        &q_next_eval,
+                        &q_next_target,
+                        &rewards_tensor,
+                        &dones_tensor,
+                        GAMMA,
+                        &mut scratch.target_vals,
+                    )
+                })
+            };
+            #[cfg(not(cuda))]
+            let target_tensor = double_dqn_target_cpu(
                 &q_next_eval,
                 &q_next_target,
                 &rewards_tensor,
                 &dones_tensor,
                 GAMMA,
+                &mut scratch.target_vals,
             );
-            #[cfg(not(cuda))]
-            let target_tensor: Option<Tensor> = None;
-            let target_tensor = target_tensor.unwrap_or_else(|| {
-                let guards = TensorReadGuard::new(&[&q_next_eval, &q_next_target]);
-                let q_next_eval_data = guards.get(0);
-                let q_next_target_data = guards.get(1);
-                let rewards = rewards_tensor.data_as_f64_vec();
-                let dones = dones_tensor.data_as_f64_vec();
-
-                for i in 0..BATCH_SIZE {
-                    let start = i * ACTION_SPACE;
-                    let end = start + ACTION_SPACE;
-                    let row_eval = &q_next_eval_data[start..end];
-                    let mut max_idx = 0;
-                    let mut max_val = f64::NEG_INFINITY;
-                    for (k, &v) in row_eval.iter().enumerate() {
-                        if v > max_val {
-                            max_val = v;
-                            max_idx = k;
-                        }
-                    }
-                    let next_q_val = q_next_target_data[start + max_idx];
-                    scratch
-                        .target_vals
-                        .push(rewards[i] + GAMMA * next_q_val * (1.0 - dones[i]));
-                }
-                Tensor::new_f32(
-                    std::mem::take(&mut scratch.target_vals),
-                    vec![BATCH_SIZE, 1],
-                )
-            });
 
             // IS-weighted loss: w_i * (q - target)^2, normalized
             let mut loss = q_actions.weighted_mse_loss(&target_tensor, &is_weights_tensor);
@@ -2168,41 +2195,34 @@ impl OnlineDqnTrainer {
         let q_next_target = self.target.forward(&batch_next_state);
 
         #[cfg(cuda)]
-        let target_tensor = double_dqn_target_cuda(
+        let target_tensor = {
+            double_dqn_target_cuda(
+                &q_next_eval,
+                &q_next_target,
+                &rewards_tensor,
+                &dones_tensor,
+                GAMMA,
+            )
+            .unwrap_or_else(|| {
+                double_dqn_target_cpu(
+                    &q_next_eval,
+                    &q_next_target,
+                    &rewards_tensor,
+                    &dones_tensor,
+                    GAMMA,
+                    &mut self.scratch.target_vals,
+                )
+            })
+        };
+        #[cfg(not(cuda))]
+        let target_tensor = double_dqn_target_cpu(
             &q_next_eval,
             &q_next_target,
             &rewards_tensor,
             &dones_tensor,
             GAMMA,
+            &mut self.scratch.target_vals,
         );
-        #[cfg(not(cuda))]
-        let target_tensor: Option<Tensor> = None;
-        let target_tensor = target_tensor.unwrap_or_else(|| {
-            let guards = TensorReadGuard::new(&[&q_next_eval, &q_next_target]);
-            let q_next_eval_data = guards.get(0);
-            let q_next_target_data = guards.get(1);
-            let rewards = rewards_tensor.data_as_f64_vec();
-            let dones = dones_tensor.data_as_f64_vec();
-
-            for i in 0..BATCH_SIZE {
-                let start = i * ACTION_SPACE;
-                let end = start + ACTION_SPACE;
-                let row_eval = &q_next_eval_data[start..end];
-                let mut max_idx = 0;
-                let mut max_val = f64::NEG_INFINITY;
-                for (k, &v) in row_eval.iter().enumerate() {
-                    if v > max_val {
-                        max_val = v;
-                        max_idx = k;
-                    }
-                }
-                let next_q_val = q_next_target_data[start + max_idx];
-                self.scratch
-                    .target_vals
-                    .push(rewards[i] + GAMMA * next_q_val * (1.0 - dones[i]));
-            }
-            Tensor::new_f32(self.scratch.target_vals.clone(), vec![BATCH_SIZE, 1])
-        });
         let mut loss = q_actions.weighted_mse_loss(&target_tensor, &is_weights_tensor);
         if let Some(reg) = self.policy.achf_orthogonal_penalty() {
             loss = loss + reg;
