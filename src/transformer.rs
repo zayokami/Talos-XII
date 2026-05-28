@@ -1970,7 +1970,7 @@ impl MultiHeadLatentAttention {
                                         CudaBuffer::F32(kg),
                                         Dtype::F32,
                                     ) => crate::cuda::kernels::batched_qk_scores_backward_f32(
-                                        gt, qb, kb, qg, kg, b, seq, dim,
+                                        &gt, &qb, &kb, &qg, &kg, b, seq, dim,
                                     )
                                     .is_ok(),
                                     (
@@ -1981,7 +1981,7 @@ impl MultiHeadLatentAttention {
                                         CudaBuffer::F64(kg),
                                         Dtype::F64,
                                     ) => crate::cuda::kernels::batched_qk_scores_backward(
-                                        gt, qb, kb, qg, kg, b, seq, dim,
+                                        &gt, &qb, &kb, &qg, &kg, b, seq, dim,
                                     )
                                     .is_ok(),
                                     _ => false,
@@ -2224,7 +2224,7 @@ impl MultiHeadLatentAttention {
                                     CudaBuffer::F32(vg),
                                     Dtype::F32,
                                 ) => crate::cuda::kernels::attention_weighted_sum_backward_f32(
-                                    gt, p, vb, pg, vg, b, seq, dim_v,
+                                    &gt, &p, &vb, &pg, &vg, b, seq, dim_v,
                                 )
                                 .is_ok(),
                                 (
@@ -2235,7 +2235,7 @@ impl MultiHeadLatentAttention {
                                     CudaBuffer::F64(vg),
                                     Dtype::F64,
                                 ) => crate::cuda::kernels::attention_weighted_sum_backward(
-                                    gt, p, vb, pg, vg, b, seq, dim_v,
+                                    &gt, &p, &vb, &pg, &vg, b, seq, dim_v,
                                 )
                                 .is_ok(),
                                 _ => false,
