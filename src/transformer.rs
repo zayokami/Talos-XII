@@ -531,6 +531,10 @@ impl LuckTransformer {
     pub fn last_token(&self, x: &Tensor) -> Tensor {
         // x: [Batch, Seq, Dim]
         // Return [Batch, Dim] (last token)
+        #[cfg(cuda)]
+        if let Some(out) = x.select_last_token_cuda() {
+            return out;
+        }
         let shape = &x.shape;
         let batch_size = shape[0];
         let seq_len = shape[1];
@@ -555,10 +559,18 @@ impl LuckTransformer {
         }
     }
 
-    pub fn freeze_achf_for_inference(&self) {
-        for block in &self.blocks {
-            if let Some(achf) = &block.achf_ffn {
+    pub fn freeze_achf_for_inference(&mut self) {
+        for block in &mut self.blocks {
+            if let Some(achf) = &mut block.achf_ffn {
                 achf.freeze_for_inference();
+            }
+        }
+    }
+
+    pub fn prune_achf(&mut self, threshold: f64) {
+        for block in &mut self.blocks {
+            if let Some(achf) = &mut block.achf_ffn {
+                achf.prune(threshold);
             }
         }
     }

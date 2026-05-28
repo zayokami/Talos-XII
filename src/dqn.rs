@@ -31,6 +31,178 @@ const PER_EPSILON: f64 = 1e-6;
 // Constant tensor data for reuse - avoids per-step allocation
 const ONES_5_1_DATA: [f64; 5] = [1.0; 5];
 
+#[cfg(cuda)]
+fn double_dqn_target_cuda(
+    q_next_eval: &Tensor,
+    q_next_target: &Tensor,
+    rewards: &Tensor,
+    dones: &Tensor,
+    gamma: f64,
+) -> Option<Tensor> {
+    use crate::autograd::Device;
+    use crate::cuda::memory::{alloc, CudaBuffer};
+    use crate::dtype::{Dtype, Storage};
+
+    if q_next_eval.device != Device::Cuda
+        || q_next_target.device != Device::Cuda
+        || rewards.device != Device::Cuda
+        || dones.device != Device::Cuda
+        || q_next_eval.dtype != q_next_target.dtype
+        || q_next_eval.dtype != rewards.dtype
+        || q_next_eval.dtype != dones.dtype
+        || !matches!(q_next_eval.dtype, Dtype::F32 | Dtype::F64)
+        || q_next_eval.shape.len() != 2
+        || q_next_eval.shape != q_next_target.shape
+    {
+        return None;
+    }
+    let batch = q_next_eval.shape[0];
+    let actions = q_next_eval.shape[1];
+    if actions == 0 || rewards.numel() != batch || dones.numel() != batch {
+        return None;
+    }
+
+    let d_eval = q_next_eval.cuda_get_or_upload_buffer().ok()?;
+    let d_target = q_next_target.cuda_get_or_upload_buffer().ok()?;
+    let d_rewards = rewards.cuda_get_or_upload_buffer().ok()?;
+    let d_dones = dones.cuda_get_or_upload_buffer().ok()?;
+    let d_out = match q_next_eval.dtype {
+        Dtype::F32 => CudaBuffer::F32(alloc::<f32>(batch).ok()?),
+        Dtype::F64 => CudaBuffer::F64(alloc::<f64>(batch).ok()?),
+        _ => return None,
+    };
+    let d_out = std::sync::Arc::new(d_out);
+    let ok = match (
+        &*d_eval,
+        &*d_target,
+        &*d_rewards,
+        &*d_dones,
+        &*d_out,
+        q_next_eval.dtype,
+    ) {
+        (
+            CudaBuffer::F32(eval),
+            CudaBuffer::F32(target),
+            CudaBuffer::F32(rewards),
+            CudaBuffer::F32(dones),
+            CudaBuffer::F32(out),
+            Dtype::F32,
+        ) => crate::cuda::kernels::double_dqn_target_f32(
+            eval,
+            target,
+            rewards,
+            dones,
+            out,
+            batch,
+            actions,
+            gamma as f32,
+        )
+        .is_ok(),
+        (
+            CudaBuffer::F64(eval),
+            CudaBuffer::F64(target),
+            CudaBuffer::F64(rewards),
+            CudaBuffer::F64(dones),
+            CudaBuffer::F64(out),
+            Dtype::F64,
+        ) => crate::cuda::kernels::double_dqn_target(
+            eval, target, rewards, dones, out, batch, actions, gamma,
+        )
+        .is_ok(),
+        _ => false,
+    };
+    if !ok {
+        return None;
+    }
+
+    let out = Tensor {
+        data: Tensor::empty_storage(q_next_eval.dtype),
+        grad: Storage::zeros(batch, Tensor::grad_dtype_for(q_next_eval.dtype)),
+        shape: vec![batch, 1],
+        device: Device::Cuda,
+        dtype: q_next_eval.dtype,
+        _ctx: None,
+    };
+    out.cuda_set_cached_buffer(d_out);
+    Some(out)
+}
+
+#[cfg(cuda)]
+fn abs_diff_cuda(a: &Tensor, b: &Tensor) -> Option<Tensor> {
+    use crate::autograd::Device;
+    use crate::cuda::memory::{alloc, CudaBuffer};
+    use crate::dtype::{Dtype, Storage};
+
+    if a.device != Device::Cuda
+        || b.device != Device::Cuda
+        || a.dtype != b.dtype
+        || a.numel() != b.numel()
+        || !matches!(a.dtype, Dtype::F32 | Dtype::F64)
+    {
+        return None;
+    }
+    let len = a.numel();
+    let d_a = a.cuda_get_or_upload_buffer().ok()?;
+    let d_b = b.cuda_get_or_upload_buffer().ok()?;
+    let d_out = match a.dtype {
+        Dtype::F32 => CudaBuffer::F32(alloc::<f32>(len).ok()?),
+        Dtype::F64 => CudaBuffer::F64(alloc::<f64>(len).ok()?),
+        _ => return None,
+    };
+    let d_out = std::sync::Arc::new(d_out);
+    let ok = match (&*d_a, &*d_b, &*d_out, a.dtype) {
+        (CudaBuffer::F32(lhs), CudaBuffer::F32(rhs), CudaBuffer::F32(out), Dtype::F32) => {
+            crate::cuda::kernels::abs_diff_f32(lhs, rhs, out, len).is_ok()
+        }
+        (CudaBuffer::F64(lhs), CudaBuffer::F64(rhs), CudaBuffer::F64(out), Dtype::F64) => {
+            crate::cuda::kernels::abs_diff(lhs, rhs, out, len).is_ok()
+        }
+        _ => false,
+    };
+    if !ok {
+        return None;
+    }
+
+    let out = Tensor {
+        data: Tensor::empty_storage(a.dtype),
+        grad: Storage::zeros(len, Tensor::grad_dtype_for(a.dtype)),
+        shape: a.shape.clone(),
+        device: Device::Cuda,
+        dtype: a.dtype,
+        _ctx: None,
+    };
+    out.cuda_set_cached_buffer(d_out);
+    Some(out)
+}
+
+#[cfg(cuda)]
+fn argmax_cuda_index(values: &Tensor) -> Option<usize> {
+    use crate::autograd::Device;
+    use crate::cuda::memory::{alloc, copy_d2h, CudaBuffer};
+    use crate::dtype::Dtype;
+
+    if values.device != Device::Cuda || values.numel() == 0 {
+        return None;
+    }
+    let d_values = values.cuda_get_or_upload_buffer().ok()?;
+    let d_idx = alloc::<i32>(1).ok()?;
+    let ok = match (&*d_values, values.dtype) {
+        (CudaBuffer::F32(v), Dtype::F32) => {
+            crate::cuda::kernels::argmax_f32(v, &d_idx, values.numel()).is_ok()
+        }
+        (CudaBuffer::F64(v), Dtype::F64) => {
+            crate::cuda::kernels::argmax(v, &d_idx, values.numel()).is_ok()
+        }
+        _ => false,
+    };
+    if !ok {
+        return None;
+    }
+    let mut host = [0_i32; 1];
+    copy_d2h(&mut host, &d_idx).ok()?;
+    usize::try_from(host[0]).ok()
+}
+
 // --- Layers ---
 // Linear layer is now imported from crate::nn
 
@@ -141,18 +313,30 @@ impl DuelingQNetwork {
 
         // Q(s, a) = V(s) + (A(s, a) - mean(A(s, a')))
 
-        if state.shape.len() == 2 && state.shape[0] > 1 {
+        if state.shape.len() == 2 {
             // Batch Mode
 
             // val is (B, 1). Expand to (B, 5).
             // Multiply by ones(1, 5) -> (B, 5)
             // MatMul: (B, 1) x (1, 5) -> (B, 5)
             let ones_1_5 = Tensor::new_f32(vec![1.0; 5], vec![1, 5]);
+            #[cfg(cuda)]
+            let ones_1_5 = if state.device == crate::autograd::Device::Cuda {
+                ones_1_5.to_cuda().unwrap_or(ones_1_5)
+            } else {
+                ones_1_5
+            };
             let val_expanded = val.matmul(&ones_1_5);
 
             // Mean Adv: (B, 5) -> (B, 1)
             // Multiply by ones(5, 1) / 5.0
             let ones_5_1 = Tensor::new_f32(vec![0.2; 5], vec![5, 1]); // 1/5 = 0.2
+            #[cfg(cuda)]
+            let ones_5_1 = if state.device == crate::autograd::Device::Cuda {
+                ones_5_1.to_cuda().unwrap_or(ones_5_1)
+            } else {
+                ones_5_1
+            };
             let mean_adv = adv.matmul(&ones_5_1); // (B, 1)
             let mean_adv_expanded = mean_adv.matmul(&ones_1_5); // (B, 5)
 
@@ -197,9 +381,15 @@ impl DuelingQNetwork {
         }
     }
 
-    pub fn freeze_achf_for_inference(&self) {
-        if let Some(achf) = &self.achf {
+    pub fn freeze_achf_for_inference(&mut self) {
+        if let Some(achf) = &mut self.achf {
             achf.freeze_for_inference();
+        }
+    }
+
+    pub fn prune_achf(&mut self, threshold: f64) {
+        if let Some(achf) = &mut self.achf {
+            achf.prune(threshold);
         }
     }
 
@@ -292,6 +482,11 @@ impl DuelingQNetwork {
 
     pub fn soft_update(&mut self, source: &Self, tau: f64) {
         fn interpolate(target: &mut Tensor, source: &Tensor, tau: f64) {
+            #[cfg(cuda)]
+            if target.cuda_lerp_in_place_from(source, tau) {
+                return;
+            }
+
             let tau_f32 = tau as f32;
             match (target.dtype, source.dtype) {
                 (crate::dtype::Dtype::F32, crate::dtype::Dtype::F32) => {
@@ -361,6 +556,10 @@ impl DuelingQNetwork {
 
     pub fn predict_action(&self, state: &Tensor) -> (usize, f32) {
         let q_values = self.forward(state);
+        #[cfg(cuda)]
+        if let Some(max_idx) = argmax_cuda_index(&q_values) {
+            return (max_idx, ACTIONS[max_idx] as f32);
+        }
         let mut max_val = f32::NEG_INFINITY;
         let mut max_idx = 0;
         let q_data = q_values.data_to_f32_vec();
@@ -683,19 +882,10 @@ impl GpuAdam {
         use crate::cuda::memory::CudaBuffer;
         self.t += 1;
         crate::cuda::record_optimizer_attempt();
-        let mut total_norm = 0.0;
-        for param in &self.params {
-            let grad = param.grad_to_f64_vec();
-            for &g in grad.iter() {
-                total_norm += g * g;
-            }
+        if !crate::autograd::cuda_clip_gradients_in_place(&self.params, 1.0, 1e-6) {
+            crate::cuda::record_optimizer_fallback();
+            return;
         }
-        total_norm = total_norm.sqrt();
-        let clip_coef = if total_norm > 1.0 {
-            1.0 / total_norm
-        } else {
-            1.0
-        };
 
         let bias_correction1 = 1.0 - self.beta1.powi(self.t as i32);
         let bias_correction2 = 1.0 - self.beta2.powi(self.t as i32);
@@ -745,7 +935,7 @@ impl GpuAdam {
                     self.weight_decay as f32,
                     bias_correction1 as f32,
                     bias_correction2 as f32,
-                    clip_coef as f32,
+                    1.0,
                 )
                 .is_ok(),
                 (
@@ -767,7 +957,7 @@ impl GpuAdam {
                     self.weight_decay,
                     bias_correction1,
                     bias_correction2,
-                    clip_coef,
+                    1.0,
                 )
                 .is_ok(),
                 _ => false,
@@ -1043,16 +1233,12 @@ fn train_dqn_impl(
 ) -> DuelingQNetwork {
     println!("\n[DQN] Initializing Double Dueling DQN Training...");
 
-    let policy_net = DuelingQNetwork::new_with_config(config, rng.next_u64());
+    let mut policy_net = DuelingQNetwork::new_with_config(config, rng.next_u64());
     let mut target_net = DuelingQNetwork::new_with_config(config, rng.next_u64());
     target_net.load_state_dict(&policy_net); // Sync weights
 
     #[cfg(cuda)]
-    let policy_net = {
-        let mut p = policy_net;
-        p.to_cuda();
-        p
-    };
+    policy_net.to_cuda();
     #[cfg(cuda)]
     {
         target_net.to_cuda();
@@ -1114,23 +1300,46 @@ fn train_dqn_impl(
         )
         .to_vec();
 
-        let current_state_tensor = Tensor::new_f32(current_state_raw.clone(), vec![DIM]);
+        let current_state_tensor = Tensor::new_f32(current_state_raw.clone(), vec![1, DIM]);
+        #[cfg(cuda)]
+        let current_state_tensor = match current_state_tensor.to_cuda() {
+            Ok(t) => t,
+            Err(_) => current_state_tensor,
+        };
 
         // 2. Select Action
         let action = if rng.next_f64() < epsilon {
             rng.next_u64_bounded(ACTION_SPACE as u64) as usize
         } else {
             let q_values = policy_net.forward(&current_state_tensor);
-            let mut max_val = f64::NEG_INFINITY;
-            let mut max_idx = 0;
-            let q_data = q_values.data_as_f64_vec();
-            for (i, &val) in q_data.iter().enumerate() {
-                if val > max_val {
-                    max_val = val;
-                    max_idx = i;
+            #[cfg(cuda)]
+            if let Some(max_idx) = argmax_cuda_index(&q_values) {
+                max_idx
+            } else {
+                let mut max_val = f64::NEG_INFINITY;
+                let mut max_idx = 0;
+                let q_data = q_values.data_as_f64_vec();
+                for (i, &val) in q_data.iter().enumerate() {
+                    if val > max_val {
+                        max_val = val;
+                        max_idx = i;
+                    }
                 }
+                max_idx
             }
-            max_idx
+            #[cfg(not(cuda))]
+            {
+                let mut max_val = f64::NEG_INFINITY;
+                let mut max_idx = 0;
+                let q_data = q_values.data_as_f64_vec();
+                for (i, &val) in q_data.iter().enumerate() {
+                    if val > max_val {
+                        max_val = val;
+                        max_idx = i;
+                    }
+                }
+                max_idx
+            }
         };
 
         // 3. Step Environment
@@ -1255,6 +1464,12 @@ fn train_dqn_impl(
                 std::mem::take(&mut scratch.actions_vec),
                 vec![BATCH_SIZE, ACTION_SPACE],
             );
+            let rewards_tensor = Tensor::new_f32(
+                std::mem::take(&mut scratch.rewards_vec),
+                vec![BATCH_SIZE, 1],
+            );
+            let dones_tensor =
+                Tensor::new_f32(std::mem::take(&mut scratch.dones_vec), vec![BATCH_SIZE, 1]);
             #[cfg(cuda)]
             let batch_state = match batch_state.to_cuda() {
                 Ok(t) => t,
@@ -1269,6 +1484,16 @@ fn train_dqn_impl(
             let batch_mask = match batch_mask.to_cuda() {
                 Ok(t) => t,
                 Err(_) => batch_mask,
+            };
+            #[cfg(cuda)]
+            let rewards_tensor = match rewards_tensor.to_cuda() {
+                Ok(t) => t,
+                Err(_) => rewards_tensor,
+            };
+            #[cfg(cuda)]
+            let dones_tensor = match dones_tensor.to_cuda() {
+                Ok(t) => t,
+                Err(_) => dones_tensor,
             };
 
             // 2. Policy Forward
@@ -1286,49 +1511,49 @@ fn train_dqn_impl(
             // Evaluate value using Target Net
             let q_next_target = target_net.forward(&batch_next_state); // (B, 5)
 
-            // Use batch lock for better performance
-            let guards = TensorReadGuard::new(&[&q_next_eval, &q_next_target]);
-            let q_next_eval_data = guards.get(0);
-            let q_next_target_data = guards.get(1);
-
-            for i in 0..BATCH_SIZE {
-                let start = i * ACTION_SPACE;
-                let end = start + ACTION_SPACE;
-
-                // Argmax from Policy Net
-                let row_eval = &q_next_eval_data[start..end];
-                let mut max_idx = 0;
-                let mut max_val = f64::NEG_INFINITY;
-                for (k, &v) in row_eval.iter().enumerate() {
-                    if v > max_val {
-                        max_val = v;
-                        max_idx = k;
-                    }
-                }
-
-                // Value from Target Net
-                let next_q_val = q_next_target_data[start + max_idx];
-
-                let r = scratch.rewards_vec[i];
-                let d = scratch.dones_vec[i];
-                // if done (d=1.0), target = r. else r + gamma * next_q_val
-                let target = r + GAMMA * next_q_val * (1.0 - d);
-                scratch.target_vals.push(target);
-            }
-
-            let target_tensor = Tensor::new_f32(
-                std::mem::take(&mut scratch.target_vals),
-                vec![BATCH_SIZE, 1],
+            #[cfg(cuda)]
+            let target_tensor = double_dqn_target_cuda(
+                &q_next_eval,
+                &q_next_target,
+                &rewards_tensor,
+                &dones_tensor,
+                GAMMA,
             );
+            #[cfg(not(cuda))]
+            let target_tensor: Option<Tensor> = None;
+            let target_tensor = target_tensor.unwrap_or_else(|| {
+                let guards = TensorReadGuard::new(&[&q_next_eval, &q_next_target]);
+                let q_next_eval_data = guards.get(0);
+                let q_next_target_data = guards.get(1);
+                let rewards = rewards_tensor.data_as_f64_vec();
+                let dones = dones_tensor.data_as_f64_vec();
+
+                for i in 0..BATCH_SIZE {
+                    let start = i * ACTION_SPACE;
+                    let end = start + ACTION_SPACE;
+                    let row_eval = &q_next_eval_data[start..end];
+                    let mut max_idx = 0;
+                    let mut max_val = f64::NEG_INFINITY;
+                    for (k, &v) in row_eval.iter().enumerate() {
+                        if v > max_val {
+                            max_val = v;
+                            max_idx = k;
+                        }
+                    }
+                    let next_q_val = q_next_target_data[start + max_idx];
+                    scratch
+                        .target_vals
+                        .push(rewards[i] + GAMMA * next_q_val * (1.0 - dones[i]));
+                }
+                Tensor::new_f32(
+                    std::mem::take(&mut scratch.target_vals),
+                    vec![BATCH_SIZE, 1],
+                )
+            });
 
             // IS-weighted loss: w_i * (q - target)^2, normalized
             let is_weights_tensor =
                 Tensor::new_f32(per_sample.is_weights.clone(), vec![BATCH_SIZE, 1]);
-            #[cfg(cuda)]
-            let target_tensor = match target_tensor.to_cuda() {
-                Ok(t) => t,
-                Err(_) => target_tensor,
-            };
             #[cfg(cuda)]
             let is_weights_tensor = match is_weights_tensor.to_cuda() {
                 Ok(t) => t,
@@ -1353,15 +1578,23 @@ fn train_dqn_impl(
 
             // Write back per-sample TD errors for priority update
             {
-                let q_data = q_actions.data_as_f64_vec();
-                let t_data = target_tensor.data_as_f64_vec();
-                scratch.td_errors.clear();
-                scratch.td_errors.extend(
+                #[cfg(cuda)]
+                let td_tensor = abs_diff_cuda(&q_actions, &target_tensor);
+                #[cfg(not(cuda))]
+                let td_tensor: Option<Tensor> = None;
+                let td_errors = if let Some(td_tensor) = td_tensor {
+                    td_tensor.data_as_f64_vec()
+                } else {
+                    let q_data = q_actions.data_as_f64_vec();
+                    let t_data = target_tensor.data_as_f64_vec();
                     q_data
                         .iter()
                         .zip(t_data.iter())
-                        .map(|(&q, &t)| (q - t).abs()),
-                );
+                        .map(|(&q, &t)| (q - t).abs())
+                        .collect()
+                };
+                scratch.td_errors.clear();
+                scratch.td_errors.extend(td_errors);
                 replay_buffer.update_priorities(&per_sample.indices, &scratch.td_errors);
             }
 
@@ -1437,6 +1670,7 @@ fn train_dqn_impl(
         }
     }
     pb.finish_with_message("DQN Training Complete.");
+    policy_net.prune_achf(config.achf.prune_threshold);
     policy_net.freeze_achf_for_inference();
     policy_net
 }
@@ -1576,6 +1810,8 @@ impl OnlineDqnTrainer {
             self.scratch.actions_vec.clone(),
             vec![BATCH_SIZE, ACTION_SPACE],
         );
+        let rewards_tensor = Tensor::new_f32(self.scratch.rewards_vec.clone(), vec![BATCH_SIZE, 1]);
+        let dones_tensor = Tensor::new_f32(self.scratch.dones_vec.clone(), vec![BATCH_SIZE, 1]);
         #[cfg(cuda)]
         let batch_state = match batch_state.to_cuda() {
             Ok(t) => t,
@@ -1591,6 +1827,16 @@ impl OnlineDqnTrainer {
             Ok(t) => t,
             Err(_) => batch_mask,
         };
+        #[cfg(cuda)]
+        let rewards_tensor = match rewards_tensor.to_cuda() {
+            Ok(t) => t,
+            Err(_) => rewards_tensor,
+        };
+        #[cfg(cuda)]
+        let dones_tensor = match dones_tensor.to_cuda() {
+            Ok(t) => t,
+            Err(_) => dones_tensor,
+        };
 
         let q_values = self.policy.forward(&batch_state);
         let ones_5_1 = Tensor::new_f32(ONES_5_1_DATA.to_vec(), vec![5, 1]);
@@ -1604,36 +1850,43 @@ impl OnlineDqnTrainer {
         let q_next_eval = self.policy.forward(&batch_next_state);
         let q_next_target = self.target.forward(&batch_next_state);
 
-        // Use batch lock for better performance
-        let guards = TensorReadGuard::new(&[&q_next_eval, &q_next_target]);
-        let q_next_eval_data = guards.get(0);
-        let q_next_target_data = guards.get(1);
-
-        for i in 0..BATCH_SIZE {
-            let start = i * ACTION_SPACE;
-            let end = start + ACTION_SPACE;
-            let row_eval = &q_next_eval_data[start..end];
-            let mut max_idx = 0;
-            let mut max_val = f64::NEG_INFINITY;
-            for (k, &v) in row_eval.iter().enumerate() {
-                if v > max_val {
-                    max_val = v;
-                    max_idx = k;
-                }
-            }
-            let next_q_val = q_next_target_data[start + max_idx];
-            let r = self.scratch.rewards_vec[i];
-            let d = self.scratch.dones_vec[i];
-            let target = r + GAMMA * next_q_val * (1.0 - d);
-            self.scratch.target_vals.push(target);
-        }
-        let target_tensor = Tensor::new_f32(self.scratch.target_vals.clone(), vec![BATCH_SIZE, 1]);
-        let is_weights_tensor = Tensor::new_f32(per_sample.is_weights.clone(), vec![BATCH_SIZE, 1]);
         #[cfg(cuda)]
-        let target_tensor = match target_tensor.to_cuda() {
-            Ok(t) => t,
-            Err(_) => target_tensor,
-        };
+        let target_tensor = double_dqn_target_cuda(
+            &q_next_eval,
+            &q_next_target,
+            &rewards_tensor,
+            &dones_tensor,
+            GAMMA,
+        );
+        #[cfg(not(cuda))]
+        let target_tensor: Option<Tensor> = None;
+        let target_tensor = target_tensor.unwrap_or_else(|| {
+            let guards = TensorReadGuard::new(&[&q_next_eval, &q_next_target]);
+            let q_next_eval_data = guards.get(0);
+            let q_next_target_data = guards.get(1);
+            let rewards = rewards_tensor.data_as_f64_vec();
+            let dones = dones_tensor.data_as_f64_vec();
+
+            for i in 0..BATCH_SIZE {
+                let start = i * ACTION_SPACE;
+                let end = start + ACTION_SPACE;
+                let row_eval = &q_next_eval_data[start..end];
+                let mut max_idx = 0;
+                let mut max_val = f64::NEG_INFINITY;
+                for (k, &v) in row_eval.iter().enumerate() {
+                    if v > max_val {
+                        max_val = v;
+                        max_idx = k;
+                    }
+                }
+                let next_q_val = q_next_target_data[start + max_idx];
+                self.scratch
+                    .target_vals
+                    .push(rewards[i] + GAMMA * next_q_val * (1.0 - dones[i]));
+            }
+            Tensor::new_f32(self.scratch.target_vals.clone(), vec![BATCH_SIZE, 1])
+        });
+        let is_weights_tensor = Tensor::new_f32(per_sample.is_weights.clone(), vec![BATCH_SIZE, 1]);
         #[cfg(cuda)]
         let is_weights_tensor = match is_weights_tensor.to_cuda() {
             Ok(t) => t,
@@ -1649,13 +1902,21 @@ impl OnlineDqnTrainer {
 
         // Write back per-sample TD errors for priority update
         {
-            let q_data = q_actions.data_as_f64_vec();
-            let t_data = target_tensor.data_as_f64_vec();
-            let td_errors: Vec<f64> = q_data
-                .iter()
-                .zip(t_data.iter())
-                .map(|(&q, &t)| (q - t).abs())
-                .collect();
+            #[cfg(cuda)]
+            let td_tensor = abs_diff_cuda(&q_actions, &target_tensor);
+            #[cfg(not(cuda))]
+            let td_tensor: Option<Tensor> = None;
+            let td_errors: Vec<f64> = if let Some(td_tensor) = td_tensor {
+                td_tensor.data_as_f64_vec()
+            } else {
+                let q_data = q_actions.data_as_f64_vec();
+                let t_data = target_tensor.data_as_f64_vec();
+                q_data
+                    .iter()
+                    .zip(t_data.iter())
+                    .map(|(&q, &t)| (q - t).abs())
+                    .collect()
+            };
             self.replay_buffer
                 .update_priorities(&per_sample.indices, &td_errors);
         }

@@ -324,11 +324,12 @@ fn build_dqn_master(
     let trained_dqn_manifest = dqn_master_cache_manifest(config, dqn_training_quality(config))
         .with_source_hash(neural_hash);
     if !options.force {
-        if let Some(cached) = load_model_with_manifest::<DuelingQNetwork>(
+        if let Some(mut cached) = load_model_with_manifest::<DuelingQNetwork>(
             DQN_MASTER_CACHE_PATH,
             "DQN",
             &dqn_master_manifest,
         ) {
+            cached.prune_achf(config.achf.prune_threshold);
             cached.freeze_achf_for_inference();
             info!("[DQN] Cached model loaded.");
             return cached;
@@ -414,18 +415,20 @@ fn prepare_dqn_inference_cache(
 ) -> DuelingQNetwork {
     let expected_manifest = dqn_inference_cache_manifest(config, master_hash);
     if !force_refresh {
-        if let Some(cached) = load_model_with_manifest::<DuelingQNetwork>(
+        if let Some(mut cached) = load_model_with_manifest::<DuelingQNetwork>(
             DQN_INFERENCE_CACHE_PATH,
             "DQN BF16",
             &expected_manifest,
         ) {
+            cached.prune_achf(config.achf.prune_threshold);
             cached.freeze_achf_for_inference();
             info!("[DQN] BF16 inference cache loaded.");
             return cached;
         }
     }
 
-    let bf16 = master.to_inference_bf16();
+    let mut bf16 = master.to_inference_bf16();
+    bf16.prune_achf(config.achf.prune_threshold);
     bf16.freeze_achf_for_inference();
     let _ = save_model_with_manifest(
         &bf16,
@@ -446,11 +449,12 @@ fn build_ppo_master(
     let ppo_master_manifest = ppo_master_cache_manifest(config, ppo_training_quality(config))
         .with_source_hash(env_net_hash);
     if !force {
-        if let Some(cached) = load_model_with_manifest::<ActorCritic>(
+        if let Some(mut cached) = load_model_with_manifest::<ActorCritic>(
             PPO_MASTER_CACHE_PATH,
             "PPO",
             &ppo_master_manifest,
         ) {
+            cached.prune_achf(config.achf.prune_threshold);
             cached.freeze_achf_for_inference();
             info!("[PPO] Cached model loaded.");
             return cached;
@@ -515,18 +519,20 @@ fn prepare_ppo_inference_cache(
 ) -> ActorCritic {
     let expected_manifest = ppo_inference_cache_manifest(config, master_hash);
     if !force_refresh {
-        if let Some(cached) = load_model_with_manifest::<ActorCritic>(
+        if let Some(mut cached) = load_model_with_manifest::<ActorCritic>(
             PPO_INFERENCE_CACHE_PATH,
             "PPO BF16",
             &expected_manifest,
         ) {
+            cached.prune_achf(config.achf.prune_threshold);
             cached.freeze_achf_for_inference();
             info!("[PPO] BF16 inference cache loaded.");
             return cached;
         }
     }
 
-    let bf16 = master.to_inference_bf16();
+    let mut bf16 = master.to_inference_bf16();
+    bf16.prune_achf(config.achf.prune_threshold);
     bf16.freeze_achf_for_inference();
     let _ = save_model_with_manifest(
         &bf16,

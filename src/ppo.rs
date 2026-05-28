@@ -253,8 +253,12 @@ impl ActorCritic {
         self.backbone.update_achf_after_backward();
     }
 
-    pub fn freeze_achf_for_inference(&self) {
+    pub fn freeze_achf_for_inference(&mut self) {
         self.backbone.freeze_achf_for_inference();
+    }
+
+    pub fn prune_achf(&mut self, threshold: f64) {
+        self.backbone.prune_achf(threshold);
     }
 
     pub fn achf_orthogonal_penalty(&self) -> Option<Tensor> {
@@ -586,19 +590,10 @@ impl GpuAdam {
         use crate::cuda::memory::CudaBuffer;
         self.t += 1;
         crate::cuda::record_optimizer_attempt();
-
-        // Compute global gradient norm on CPU (copy grads from GPU)
-        let mut total_norm = 0.0;
-        for param in &self.params {
-            let grad = param.grad_to_f64_vec();
-            total_norm += crate::simd::dot_product(&grad, &grad);
+        if !crate::autograd::cuda_clip_gradients_in_place(&self.params, 1.0, 1e-6) {
+            crate::cuda::record_optimizer_fallback();
+            return;
         }
-        total_norm = total_norm.sqrt();
-        let clip_coef = if total_norm > 1.0 {
-            1.0 / total_norm
-        } else {
-            1.0
-        };
 
         let bias_correction1 = 1.0 - self.beta1.powi(self.t as i32);
         let bias_correction2 = 1.0 - self.beta2.powi(self.t as i32);
@@ -648,7 +643,7 @@ impl GpuAdam {
                     self.weight_decay as f32,
                     bias_correction1 as f32,
                     bias_correction2 as f32,
-                    clip_coef as f32,
+                    1.0,
                 )
                 .is_ok(),
                 (
@@ -670,7 +665,7 @@ impl GpuAdam {
                     self.weight_decay,
                     bias_correction1,
                     bias_correction2,
-                    clip_coef,
+                    1.0,
                 )
                 .is_ok(),
                 _ => false,
@@ -843,6 +838,11 @@ impl Ppo {
         let ema_params = ema.parameters();
 
         for (ema_p, stud_p) in ema_params.iter().zip(student_params.iter()) {
+            #[cfg(cuda)]
+            if ema_p.cuda_lerp_in_place_from(stud_p, inv) {
+                continue;
+            }
+
             if ema_p.dtype == crate::dtype::Dtype::F64 {
                 let mut ema_data = ema_p.data_write_f64();
                 let stud_data = stud_p.data_f64();
@@ -901,11 +901,7 @@ impl Ppo {
         let rewards = std::mem::take(&mut self.memory.rewards);
         let is_terminals = std::mem::take(&mut self.memory.is_terminals);
         let values = std::mem::take(&mut self.memory.values);
-        let states: Vec<Tensor> = states_raw
-            .into_iter()
-            .zip(state_lens)
-            .map(|(data, seq_len)| Tensor::new_f32(data, vec![seq_len, DIM]))
-            .collect();
+        let states: Vec<(Vec<f64>, usize)> = states_raw.into_iter().zip(state_lens).collect();
         let mut advantages = vec![0.0; len];
         let mut returns = vec![0.0; len];
 
@@ -951,6 +947,10 @@ impl Ppo {
         let mut indices: Vec<usize> = (0..len).collect();
         let value_coef_tensor = Tensor::new_f32(vec![VALUE_COEF], vec![1]);
         let entropy_coef_tensor = Tensor::new_f32(vec![ENTROPY_COEF], vec![1]);
+        let clip_low_tensor = Tensor::new_f32(vec![1.0 - CLIP_EPSILON], vec![1]);
+        let clip_high_tensor = Tensor::new_f32(vec![1.0 + CLIP_EPSILON], vec![1]);
+        let one_tensor = Tensor::new_f32(vec![1.0], vec![1]);
+        let approx_kl_zero_tensor = Tensor::zeros_f32(vec![1]);
         #[cfg(cuda)]
         let value_coef_tensor = match value_coef_tensor.to_cuda() {
             Ok(t) => t,
@@ -960,6 +960,26 @@ impl Ppo {
         let entropy_coef_tensor = match entropy_coef_tensor.to_cuda() {
             Ok(t) => t,
             Err(_) => entropy_coef_tensor,
+        };
+        #[cfg(cuda)]
+        let clip_low_tensor = match clip_low_tensor.to_cuda() {
+            Ok(t) => t,
+            Err(_) => clip_low_tensor,
+        };
+        #[cfg(cuda)]
+        let clip_high_tensor = match clip_high_tensor.to_cuda() {
+            Ok(t) => t,
+            Err(_) => clip_high_tensor,
+        };
+        #[cfg(cuda)]
+        let one_tensor = match one_tensor.to_cuda() {
+            Ok(t) => t,
+            Err(_) => one_tensor,
+        };
+        #[cfg(cuda)]
+        let approx_kl_zero_tensor = match approx_kl_zero_tensor.to_cuda() {
+            Ok(t) => t,
+            Err(_) => approx_kl_zero_tensor,
         };
 
         #[cfg(cuda)]
@@ -982,8 +1002,6 @@ impl Ppo {
         let mut loss_count = 0usize;
         for _ in 0..self.k_epochs {
             indices.shuffle(&mut rand::rng());
-            let mut approx_kl = 0.0;
-            let mut batch_count = 0.0;
             let mut early_stop = false;
 
             for chunk in indices.chunks(self.batch_size) {
@@ -993,12 +1011,11 @@ impl Ppo {
                 let inv_batch = 1.0 / batch_len as f64;
 
                 // Batched forward: pad states to max seq_len and stack
-                let max_seq_len = chunk.iter().map(|&i| states[i].shape[0]).max().unwrap_or(1);
+                let max_seq_len = chunk.iter().map(|&i| states[i].1).max().unwrap_or(1);
                 let mut batch_data = Vec::with_capacity(batch_len * max_seq_len * DIM);
                 for &i in chunk {
-                    let state_data = states[i].data_as_f64_vec();
-                    let seq_len = states[i].shape[0];
-                    batch_data.extend_from_slice(&state_data);
+                    let (state_data, seq_len) = (&states[i].0, states[i].1);
+                    batch_data.extend_from_slice(state_data);
                     if seq_len < max_seq_len {
                         batch_data.resize(batch_data.len() + (max_seq_len - seq_len) * DIM, 0.0);
                     }
@@ -1037,6 +1054,7 @@ impl Ppo {
 
                 let mut loss_accum = Tensor::zeros_f32(vec![1]);
                 let mut distill_accum = Tensor::zeros_f32(vec![1]);
+                let mut approx_kl_accum = approx_kl_zero_tensor.clone();
                 #[cfg(cuda)]
                 {
                     loss_accum = match loss_accum.to_cuda() {
@@ -1046,6 +1064,10 @@ impl Ppo {
                     distill_accum = match distill_accum.to_cuda() {
                         Ok(t) => t,
                         Err(_) => distill_accum,
+                    };
+                    approx_kl_accum = match approx_kl_accum.to_cuda() {
+                        Ok(t) => t,
+                        Err(_) => approx_kl_accum,
                     };
                 }
 
@@ -1060,12 +1082,6 @@ impl Ppo {
                     let value = batch_values.index_select(chunk_idx);
                     let entropy = batch_entropy.index_select(chunk_idx);
 
-                    let log_prob_val = log_prob.data_as_f64_vec()[0];
-                    let log_ratio_val = log_prob_val - old_log_prob;
-                    let ratio_val = log_ratio_val.exp();
-                    approx_kl += (ratio_val - 1.0) - log_ratio_val;
-                    batch_count += 1.0;
-
                     // Use scratch tensors to avoid per-sample heap allocations
                     let old_log_prob_tensor = TRAINING_SCRATCH.with(|s| {
                         let mut scratch = s.borrow_mut();
@@ -1074,6 +1090,8 @@ impl Ppo {
                     });
                     let log_ratio = log_prob - old_log_prob_tensor;
                     let ratio = log_ratio.exp();
+                    let approx_kl_term = (ratio.clone() - one_tensor.clone()) - log_ratio.clone();
+                    approx_kl_accum = approx_kl_accum + approx_kl_term;
 
                     let adv_tensor = TRAINING_SCRATCH.with(|s| {
                         let mut scratch = s.borrow_mut();
@@ -1081,12 +1099,15 @@ impl Ppo {
                         scratch.advantage.clone()
                     });
                     let surr1 = ratio.clone() * adv_tensor.clone();
-                    let ratio_clipped = ratio.clip(1.0 - CLIP_EPSILON, 1.0 + CLIP_EPSILON);
+                    let ratio_clipped = {
+                        let lo = clip_low_tensor.clone();
+                        let hi = clip_high_tensor.clone();
+                        let clipped_low = lo.clone() + (ratio.clone() - lo.clone()).relu();
+                        clipped_low.clone() - (clipped_low - hi.clone()).relu()
+                    };
                     let surr2 = ratio_clipped * adv_tensor;
 
-                    let s1_val = surr1.data_as_f64_vec()[0];
-                    let s2_val = surr2.data_as_f64_vec()[0];
-                    let policy_loss = if s1_val < s2_val { surr1 } else { surr2 };
+                    let policy_loss = surr1.clone() - (surr1 - surr2).relu();
 
                     let ret_tensor = TRAINING_SCRATCH.with(|s| {
                         let mut scratch = s.borrow_mut();
@@ -1133,7 +1154,7 @@ impl Ppo {
                 if let Some(reg) = self.policy.achf_orthogonal_penalty() {
                     final_loss = final_loss + reg;
                 }
-                loss_sum += final_loss.data_as_f64_vec()[0];
+                loss_sum += final_loss.item() as f64;
                 loss_count += 1;
                 final_loss.backward();
                 self.policy.update_achf_after_backward();
@@ -1141,7 +1162,8 @@ impl Ppo {
                 // Update EMA teacher after each batch for self-distillation
                 self.update_ema_teacher();
 
-                if batch_count > 0.0 && (approx_kl / batch_count) > target_kl * 1.5 {
+                let approx_kl = approx_kl_accum.item() as f64 / chunk.len() as f64;
+                if approx_kl > target_kl * 1.5 {
                     early_stop = true;
                 }
 
@@ -1155,11 +1177,8 @@ impl Ppo {
             }
 
             // Early Stopping check
-            if batch_count > 0.0 {
-                approx_kl /= batch_count;
-                if approx_kl > target_kl * 1.5 {
-                    break;
-                }
+            if early_stop {
+                break;
             }
         }
         if loss_count > 0 {
@@ -1612,6 +1631,7 @@ fn train_ppo_impl(
         }
     }
     pb.finish_with_message("PPO Training Complete.");
+    ppo.policy.prune_achf(config.achf.prune_threshold);
     ppo.policy.freeze_achf_for_inference();
     ppo.policy
 }
@@ -2068,5 +2088,36 @@ mod tests {
         let policy = ActorCritic::new(7, &crate::config::AchfConfig::default(), 64, 2);
         let ppo = Ppo::from_policy(policy, 1, 0);
         assert_eq!(ppo.batch_size, 1);
+    }
+
+    #[test]
+    fn actor_critic_freeze_prunes_backbone_achf_for_cache_hits() {
+        let achf = crate::config::AchfConfig {
+            enabled: true,
+            cache_cost_bias: 0.0,
+            infer_gate: "one".to_string(),
+            prune_threshold: 0.01,
+            proj_freq: 0,
+            ..Default::default()
+        };
+        let mut policy = ActorCritic::new(7, &achf, 16, 1);
+        assert!(policy.backbone.blocks[0]
+            .achf_ffn
+            .as_ref()
+            .is_some_and(|achf| achf.sparse_weight.is_none()));
+
+        policy.freeze_achf_for_inference();
+        assert!(policy.backbone.blocks[0]
+            .achf_ffn
+            .as_ref()
+            .is_some_and(|achf| achf.sparse_weight.is_some()));
+
+        let state = vec![0.1; DIM];
+        let _ = policy.step_inference(&state, 0);
+        let stats = policy.achf_cache_stats_aggregate();
+        assert_eq!(stats.calls, 1);
+        assert_eq!(stats.cache_hits, 1);
+        assert_eq!(stats.dense_paths, 0);
+        assert_eq!(stats.sparse_paths, 0);
     }
 }

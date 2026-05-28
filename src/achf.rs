@@ -885,7 +885,7 @@ impl AchfLayer {
         }
     }
 
-    pub fn freeze_for_inference(&self) {
+    pub fn freeze_for_inference(&mut self) {
         if !self.config.enabled {
             return;
         }
@@ -897,6 +897,7 @@ impl AchfLayer {
         if !already_bf16 {
             self.project_weight();
         }
+        self.prune(self.config.prune_threshold);
         self.prepare_inference_cache();
         let mut state = self.state.write().unwrap();
         state.freeze_projection = true;
@@ -1828,7 +1829,7 @@ mod tests {
             proj_mode: "rowcol".to_string(),
             ..Default::default()
         };
-        let layer = AchfLayer::new_square(4, cfg, 11);
+        let mut layer = AchfLayer::new_square(4, cfg, 11);
         let x = Tensor::rand(vec![1, 4], -0.1, 0.1, 12);
         let _ = layer.forward_residual(&x);
         layer.freeze_for_inference();
@@ -1856,6 +1857,32 @@ mod tests {
         let g = layer.last_gate();
         let g_min = layer.last_g_min();
         assert!(g >= g_min);
+    }
+
+    #[test]
+    fn achf_freeze_prunes_and_prepares_cache_without_explicit_prune() {
+        let cfg = AchfConfig {
+            enabled: true,
+            cache_cost_bias: 0.0,
+            infer_gate: "one".to_string(),
+            prune_threshold: 0.01,
+            proj_freq: 0,
+            ..Default::default()
+        };
+        let mut layer = AchfLayer::new(3, 2, true, cfg, 30);
+        assert!(layer.sparse_weight.is_none());
+
+        layer.freeze_for_inference();
+        assert!(layer.sparse_weight.is_some());
+        assert!(layer.sparse_mask.is_some());
+
+        let x = vec![1.0, -2.0, 0.5];
+        let _ = layer.forward_inference_residual(&x);
+        let stats = layer.cache_stats();
+        assert_eq!(stats.calls, 1);
+        assert_eq!(stats.cache_hits, 1);
+        assert_eq!(stats.dense_paths, 0);
+        assert_eq!(stats.sparse_paths, 0);
     }
 
     #[test]
