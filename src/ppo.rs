@@ -65,12 +65,7 @@ thread_local! {
 // Returns (action_index, log_prob_of_action).
 // If top_k > 0, only the top_k logits are kept (others set to -inf).
 #[inline]
-fn softmax_sample(logits: &[f32], top_k: usize) -> (usize, f32) {
-    if logits.len() != ACTION_SPACE {
-        let fallback_prob = 1.0 / ACTION_SPACE as f32;
-        return (0, fallback_prob.ln());
-    }
-
+fn softmax_probs(logits: &[f32], top_k: usize) -> [f32; ACTION_SPACE] {
     // Find max for numerical stability
     let mut max_l = f32::NEG_INFINITY;
     for &v in logits {
@@ -116,6 +111,18 @@ fn softmax_sample(logits: &[f32], top_k: usize) -> (usize, f32) {
             *prob /= sum_exp;
         }
     }
+
+    probs
+}
+
+#[inline]
+fn softmax_sample(logits: &[f32], top_k: usize) -> (usize, f32) {
+    if logits.len() != ACTION_SPACE {
+        let fallback_prob = 1.0 / ACTION_SPACE as f32;
+        return (0, fallback_prob.ln());
+    }
+
+    let probs = softmax_probs(logits, top_k);
 
     // Categorical sampling
     let mut r = rand::random::<f32>();
@@ -2008,62 +2015,19 @@ mod tests {
     #[test]
     fn softmax_sample_top_k_zero_like_full_softmax() {
         // top_k=0 should behave identically to full softmax (no truncation)
-        // Compare empirical distributions over many samples
-        let logits = [1.0, 2.0, 3.0, 4.0, 5.0];
-        let trials = 1000;
-
-        let mut counts_0 = [0usize; ACTION_SPACE];
-        let mut counts_full = [0usize; ACTION_SPACE];
-
-        for _ in 0..trials {
-            let (a0, _) = softmax_sample(&logits, 0);
-            let (af, _) = softmax_sample(&logits, ACTION_SPACE);
-            counts_0[a0] += 1;
-            counts_full[af] += 1;
-        }
-
-        // Distributions should be identical (normalized counts should match)
-        for i in 0..ACTION_SPACE {
-            let p0 = counts_0[i] as f64 / trials as f64;
-            let pf = counts_full[i] as f64 / trials as f64;
-            assert!(
-                (p0 - pf).abs() < 0.05,
-                "Distribution mismatch at index {}: top_k=0 has {:.3}, full softmax has {:.3}",
-                i,
-                p0,
-                pf
-            );
-        }
+        let logits: Vec<f32> = (0..ACTION_SPACE).map(|i| (i + 1) as f32).collect();
+        let probs_0 = softmax_probs(&logits, 0);
+        let probs_full = softmax_probs(&logits, ACTION_SPACE);
+        assert_eq!(probs_0, probs_full);
     }
 
     #[test]
     fn softmax_sample_top_k_gte_action_space_like_full_softmax() {
         // top_k >= ACTION_SPACE should behave identically to full softmax
-        let logits = [1.0, 2.0, 3.0, 4.0, 5.0];
-        let trials = 1000;
-
-        let mut counts_large = [0usize; ACTION_SPACE];
-        let mut counts_full = [0usize; ACTION_SPACE];
-
-        for _ in 0..trials {
-            let (al, _) = softmax_sample(&logits, ACTION_SPACE + 10);
-            let (af, _) = softmax_sample(&logits, ACTION_SPACE);
-            counts_large[al] += 1;
-            counts_full[af] += 1;
-        }
-
-        // Distributions should be identical
-        for i in 0..ACTION_SPACE {
-            let pl = counts_large[i] as f64 / trials as f64;
-            let pf = counts_full[i] as f64 / trials as f64;
-            assert!(
-                (pl - pf).abs() < 0.05,
-                "Distribution mismatch at index {}: top_k large has {:.3}, full softmax has {:.3}",
-                i,
-                pl,
-                pf
-            );
-        }
+        let logits: Vec<f32> = (0..ACTION_SPACE).map(|i| (i + 1) as f32).collect();
+        let probs_large = softmax_probs(&logits, ACTION_SPACE + 10);
+        let probs_full = softmax_probs(&logits, ACTION_SPACE);
+        assert_eq!(probs_large, probs_full);
     }
 
     #[test]
@@ -2074,20 +2038,16 @@ mod tests {
         // [5.0, 4.0, 4.0, 3.0, 2.0] with top_k=3
         // Sorted: [5.0, 4.0, 4.0, 3.0, 2.0], threshold = 4.0
         // Correct behavior with <: indices 0,1,2 survive and 3,4 are masked.
-        let logits = [5.0, 4.0, 4.0, 3.0, 2.0];
+        let logits = vec![5.0, 4.0, 4.0, 3.0, 2.0];
         let top_k = 3;
 
-        let mut counts = [0usize; ACTION_SPACE];
-        for _ in 0..1000 {
-            let (action, _) = softmax_sample(&logits, top_k);
-            counts[action] += 1;
-        }
+        let probs = softmax_probs(&logits, top_k);
 
-        assert!(counts[0] > 0, "Index 0 (5.0) should be sampled");
-        assert!(counts[1] > 0, "Index 1 (4.0) should be sampled");
-        assert!(counts[2] > 0, "Index 2 (4.0) should be sampled");
-        assert_eq!(counts[3], 0, "Index 3 (3.0) should be masked");
-        assert_eq!(counts[4], 0, "Index 4 (2.0) should be masked");
+        assert!(probs[0] > 0.0, "Index 0 (5.0) should survive");
+        assert!(probs[1] > 0.0, "Index 1 (4.0) should survive");
+        assert!(probs[2] > 0.0, "Index 2 (4.0) should survive");
+        assert_eq!(probs[3], 0.0, "Index 3 (3.0) should be masked");
+        assert_eq!(probs[4], 0.0, "Index 4 (2.0) should be masked");
     }
 
     #[test]
