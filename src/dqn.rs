@@ -2017,7 +2017,7 @@ fn train_dqn_impl(
             // Select Action Q-Values: (B, 5) * (B, 5) -> (B, 5) [one non-zero per row]
             // Sum across dim 1 to get (B, 1)
             // MatMul by ones(5, 1) -> (B, 1)
-            let q_actions = (q_values * batch_mask).matmul(&ones_5_1); // (B, 1)
+            let q_actions = (&q_values * &batch_mask).matmul(&ones_5_1); // (B, 1)
 
             // 3. Compute Targets (Double DQN)
             #[cfg(cuda)]
@@ -2357,7 +2357,7 @@ impl OnlineDqnTrainer {
             Ok(t) => t,
             Err(_) => ones_5_1,
         };
-        let q_actions = (q_values * batch_mask).matmul(&ones_5_1);
+        let q_actions = (&q_values * &batch_mask).matmul(&ones_5_1);
 
         #[cfg(cuda)]
         let target_tensor = if batch_next_state.device == crate::autograd::Device::Cuda
