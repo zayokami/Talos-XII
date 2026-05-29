@@ -17,6 +17,16 @@ use crate::worker::GoodJobWorker;
 use std::fs;
 use std::time::Instant;
 
+const BENCH_EXPERIMENTS: &[&str] = &[
+    "ablation",
+    "mode",
+    "path",
+    "gate",
+    "scale",
+    "apply",
+    "convergence",
+];
+
 // ── Data structures ─────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -156,6 +166,29 @@ fn build_base_models(
     (env_net, neural_opt, worker)
 }
 
+fn bench_sized_config(base_config: &Config) -> Config {
+    let mut cfg = base_config.clone();
+    cfg.fast_init = true;
+    cfg.model_dim = crate::neural::DIM;
+    cfg.model_hidden_dim = cfg.model_hidden_dim.clamp(32, 64);
+    cfg.model_num_layers = cfg.model_num_layers.clamp(1, 2);
+    cfg.model_num_heads = cfg.model_num_heads.clamp(1, 4).min(cfg.model_hidden_dim);
+    while !cfg.model_hidden_dim.is_multiple_of(cfg.model_num_heads) {
+        cfg.model_num_heads -= 1;
+    }
+    cfg.model_kv_lora_rank = cfg
+        .model_kv_lora_rank
+        .clamp(1, cfg.model_hidden_dim.min(16));
+    cfg.model_qk_rope_dim = cfg
+        .model_qk_rope_dim
+        .clamp(2, (cfg.model_hidden_dim / cfg.model_num_heads).clamp(2, 4));
+    if !cfg.model_qk_rope_dim.is_multiple_of(2) {
+        cfg.model_qk_rope_dim -= 1;
+    }
+    cfg.multi_stream_factor = cfg.multi_stream_factor.clamp(1, 2);
+    cfg
+}
+
 struct ThroughputParams<'a> {
     neural_opt: &'a NeuralLuckOptimizer,
     dqn: Option<&'a DuelingQNetwork>,
@@ -206,8 +239,56 @@ fn measure_inference_throughput(rng: &mut Rng, params: &ThroughputParams<'_>) ->
 fn should_run(bench_cfg: &BenchConfig, name: &str) -> bool {
     match &bench_cfg.only {
         None => true,
-        Some(list) => list.iter().any(|s| s == name),
+        Some(list) => list.iter().any(|s| s.eq_ignore_ascii_case(name)),
     }
+}
+
+pub fn parse_chart_format(value: &str) -> Result<ChartFormat, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "svg" => Ok(ChartFormat::Svg),
+        "png" => Ok(ChartFormat::Png),
+        other => Err(format!(
+            "unsupported benchmark chart format '{other}', expected svg or png"
+        )),
+    }
+}
+
+pub fn parse_only_filter(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+pub fn validate_bench_config(bench_cfg: &BenchConfig) -> Result<(), String> {
+    if bench_cfg.num_trials == 0 {
+        return Err("benchmark trials must be at least 1".to_string());
+    }
+    validate_only_filter(bench_cfg.only.as_deref())
+}
+
+fn validate_only_filter(only: Option<&[String]>) -> Result<(), String> {
+    let Some(only) = only else {
+        return Ok(());
+    };
+    let unknown: Vec<&str> = only
+        .iter()
+        .map(String::as_str)
+        .filter(|name| {
+            !BENCH_EXPERIMENTS
+                .iter()
+                .any(|known| name.eq_ignore_ascii_case(known))
+        })
+        .collect();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "unknown benchmark experiment(s): {}. Expected one or more of: {}",
+            unknown.join(", "),
+            BENCH_EXPERIMENTS.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 fn ext(fmt: &ChartFormat) -> &'static str {
@@ -220,6 +301,8 @@ fn ext(fmt: &ChartFormat) -> &'static str {
 // ── Main entry point ────────────────────────────────────────────────────
 
 pub fn run_achf_benchmarks(base_config: &Config, seed: u64, bench_cfg: &BenchConfig) {
+    validate_bench_config(bench_cfg).unwrap_or_else(|err| panic!("{err}"));
+
     let dir = &bench_cfg.output_dir;
     let nt = bench_cfg.num_trials;
     fs::create_dir_all(dir).expect("Failed to create output directory");
@@ -334,9 +417,8 @@ fn run_ablation(base_config: &Config, seed: u64, nt: usize) -> Vec<AggregatedRes
     let mut agg = Vec::new();
     for (label, enabled) in [("ACHF Enabled", true), ("ACHF Disabled", false)] {
         println!("  [{}]", label);
-        let mut cfg = base_config.clone();
+        let mut cfg = bench_sized_config(base_config);
         cfg.achf.enabled = enabled;
-        cfg.fast_init = true;
         let runs = run_multi_trial(label, &cfg, seed, nt);
         agg.push(aggregate_trials(&runs));
     }
@@ -348,10 +430,9 @@ fn run_mode_comparison(base_config: &Config, seed: u64, nt: usize) -> Vec<Aggreg
     let mut agg = Vec::new();
     for (label, mode) in [("Lite", "lite"), ("Full", "full")] {
         println!("  [{}]", label);
-        let mut cfg = base_config.clone();
+        let mut cfg = bench_sized_config(base_config);
         cfg.achf.enabled = true;
         cfg.achf.mode = mode.to_string();
-        cfg.fast_init = true;
         let runs = run_multi_trial(label, &cfg, seed, nt);
         agg.push(aggregate_trials(&runs));
     }
@@ -361,9 +442,8 @@ fn run_mode_comparison(base_config: &Config, seed: u64, nt: usize) -> Vec<Aggreg
 fn run_path_comparison(base_config: &Config, seed: u64) -> Vec<(String, Vec<f64>)> {
     println!("[Bench] Running Path Comparison (Cached/Sparse/Dense)...");
     let mut rng = Rng::from_seed(seed);
-    let mut cfg = base_config.clone();
+    let mut cfg = bench_sized_config(base_config);
     cfg.achf.enabled = true;
-    cfg.fast_init = true;
     cfg.ppo_total_steps = cfg.ppo_total_steps.min(2000);
     cfg.ppo_steps_per_update = cfg.ppo_steps_per_update.min(256);
     cfg.ppo_k_epochs = cfg.ppo_k_epochs.min(2);
@@ -401,9 +481,8 @@ fn run_path_comparison(base_config: &Config, seed: u64) -> Vec<(String, Vec<f64>
 fn run_gate_curve(base_config: &Config, seed: u64) -> BenchRunResult {
     println!("[Bench] Running Gate Curve Experiment...");
     let mut rng = Rng::from_seed(seed);
-    let mut cfg = base_config.clone();
+    let mut cfg = bench_sized_config(base_config);
     cfg.achf.enabled = true;
-    cfg.fast_init = true;
     cfg.ppo_total_steps = cfg.ppo_total_steps.min(4000);
     cfg.ppo_steps_per_update = cfg.ppo_steps_per_update.min(256);
     cfg.ppo_k_epochs = cfg.ppo_k_epochs.min(2);
@@ -437,19 +516,17 @@ fn run_scale_test(base_config: &Config, seed: u64, nt: usize) -> Vec<AggregatedR
     {
         let label = "No ACHF";
         println!("  [{}]", label);
-        let mut cfg = base_config.clone();
+        let mut cfg = bench_sized_config(base_config);
         cfg.achf.enabled = false;
-        cfg.fast_init = true;
         let runs = run_multi_trial(label, &cfg, seed, nt);
         agg.push(aggregate_trials(&runs));
     }
     for rank in [16, 32, 64, 128, 256] {
         let label = format!("rank={}", rank);
         println!("  [{}]", label);
-        let mut cfg = base_config.clone();
+        let mut cfg = bench_sized_config(base_config);
         cfg.achf.enabled = true;
         cfg.achf.rank = rank;
-        cfg.fast_init = true;
         let runs = run_multi_trial(&label, &cfg, seed, nt);
         agg.push(aggregate_trials(&runs));
     }
@@ -469,12 +546,11 @@ fn run_apply_combination(base_config: &Config, seed: u64, nt: usize) -> Vec<Aggr
     let mut agg = Vec::new();
     for (label, attn, ffn, dqn_flag) in combos {
         println!("  [{}]", label);
-        let mut cfg = base_config.clone();
+        let mut cfg = bench_sized_config(base_config);
         cfg.achf.enabled = attn || ffn || dqn_flag;
         cfg.achf.apply_attn = attn;
         cfg.achf.apply_ffn = ffn;
         cfg.achf.apply_dqn = dqn_flag;
-        cfg.fast_init = true;
         let runs = run_multi_trial(label, &cfg, seed, nt);
         agg.push(aggregate_trials(&runs));
     }
@@ -490,9 +566,8 @@ fn run_convergence(base_config: &Config, seed: u64, nt: usize) -> Vec<Aggregated
         for t in 0..nt {
             let trial_seed = seed.wrapping_add(t as u64 * 1337);
             let mut rng = Rng::from_seed(trial_seed);
-            let mut cfg = base_config.clone();
+            let mut cfg = bench_sized_config(base_config);
             cfg.achf.enabled = enabled;
-            cfg.fast_init = true;
             cfg.ppo_total_steps = cfg.ppo_total_steps.min(4000);
             cfg.ppo_steps_per_update = cfg.ppo_steps_per_update.min(256);
             cfg.ppo_k_epochs = cfg.ppo_k_epochs.min(2);
@@ -601,38 +676,36 @@ fn agg_bars_with_error(agg: &[AggregatedResult]) -> Vec<(&str, f64, f64)> {
 fn chart_ablation(agg: &[AggregatedResult], dir: &str, ext: &str) {
     let bars = agg_bars_with_error(agg);
     let path = format!("{}/ablation_throughput.{}", dir, ext);
-    if chart::draw_bar_chart_with_error(
+    write_chart(
         &path,
-        "Ablation: Throughput (mean +/- std)",
-        "Configuration",
-        "Sims/sec",
-        &bars,
-        800,
-        500,
-    )
-    .is_ok()
-    {
-        println!("  -> {}", path);
-    }
+        chart::draw_bar_chart_with_error(
+            &path,
+            "Ablation: Throughput (mean +/- std)",
+            "Configuration",
+            "Sims/sec",
+            &bars,
+            800,
+            500,
+        ),
+    );
     chart_agg_reward_curve(agg, dir, ext, "ablation_reward", "Ablation: Reward Curve");
 }
 
 fn chart_mode(agg: &[AggregatedResult], dir: &str, ext: &str) {
     let bars = agg_bars_with_error(agg);
     let path = format!("{}/mode_comparison.{}", dir, ext);
-    if chart::draw_bar_chart_with_error(
+    write_chart(
         &path,
-        "Mode: Throughput (lite vs full, mean +/- std)",
-        "Mode",
-        "Sims/sec",
-        &bars,
-        800,
-        500,
-    )
-    .is_ok()
-    {
-        println!("  -> {}", path);
-    }
+        chart::draw_bar_chart_with_error(
+            &path,
+            "Mode: Throughput (lite vs full, mean +/- std)",
+            "Mode",
+            "Sims/sec",
+            &bars,
+            800,
+            500,
+        ),
+    );
 }
 
 fn chart_path_latency(latencies: &[(String, Vec<f64>)], dir: &str, ext: &str) {
@@ -654,19 +727,18 @@ fn chart_path_latency(latencies: &[(String, Vec<f64>)], dir: &str, ext: &str) {
         })
         .collect();
     let path = format!("{}/path_latency_boxplot.{}", dir, ext);
-    if chart::draw_box_plot(
+    write_chart(
         &path,
-        "Inference Path Latency",
-        "Path",
-        "Latency (ns)",
-        &stats,
-        800,
-        500,
-    )
-    .is_ok()
-    {
-        println!("  -> {}", path);
-    }
+        chart::draw_box_plot(
+            &path,
+            "Inference Path Latency",
+            "Path",
+            "Latency (ns)",
+            &stats,
+            800,
+            500,
+        ),
+    );
 }
 
 fn chart_gate_curve(result: &BenchRunResult, dir: &str, ext: &str) {
@@ -713,55 +785,52 @@ fn chart_gate_curve(result: &BenchRunResult, dir: &str, ext: &str) {
         ("Adaptive Bias", &abias),
     ];
     let path = format!("{}/gate_curve.{}", dir, ext);
-    if chart::draw_line_chart(
+    write_chart(
         &path,
-        "Gate Dynamics During Training",
-        "Training Step",
-        "Value",
-        &series,
-        1000,
-        600,
-    )
-    .is_ok()
-    {
-        println!("  -> {}", path);
-    }
+        chart::draw_line_chart(
+            &path,
+            "Gate Dynamics During Training",
+            "Training Step",
+            "Value",
+            &series,
+            1000,
+            600,
+        ),
+    );
 }
 
 fn chart_scale(agg: &[AggregatedResult], dir: &str, ext: &str) {
     let bars = agg_bars_with_error(agg);
     let path = format!("{}/scale_test.{}", dir, ext);
-    if chart::draw_bar_chart_with_error(
+    write_chart(
         &path,
-        "Scalability: Throughput by Rank (mean +/- std)",
-        "Configuration",
-        "Sims/sec",
-        &bars,
-        900,
-        500,
-    )
-    .is_ok()
-    {
-        println!("  -> {}", path);
-    }
+        chart::draw_bar_chart_with_error(
+            &path,
+            "Scalability: Throughput by Rank (mean +/- std)",
+            "Configuration",
+            "Sims/sec",
+            &bars,
+            900,
+            500,
+        ),
+    );
 }
 
 fn chart_apply(agg: &[AggregatedResult], dir: &str, ext: &str) {
     let bars = agg_bars_with_error(agg);
     let path = format!("{}/apply_combination.{}", dir, ext);
-    if chart::draw_bar_chart_with_error(
+    write_chart(
         &path,
-        "Apply Combination: Throughput (mean +/- std)",
-        "Configuration",
-        "Sims/sec",
-        &bars,
-        1000,
-        500,
-    )
-    .is_ok()
-    {
-        println!("  -> {}", path);
-    }
+        chart::draw_bar_chart_with_error(
+            &path,
+            "Apply Combination: Throughput (mean +/- std)",
+            "Configuration",
+            "Sims/sec",
+            &bars,
+            1000,
+            500,
+        ),
+    );
 }
 
 fn chart_convergence(agg: &[AggregatedResult], dir: &str, ext: &str) {
@@ -781,20 +850,23 @@ fn chart_convergence(agg: &[AggregatedResult], dir: &str, ext: &str) {
         .iter()
         .map(|(l, d)| (l.as_str(), d.as_slice()))
         .collect();
-    let path = format!("{}/convergence_loss.{}", dir, ext);
-    if chart::draw_line_chart(
-        &path,
-        "Convergence: Loss Curve",
-        "Training Step",
-        "Loss",
-        &loss_ref,
-        900,
-        500,
-    )
-    .is_ok()
-    {
-        println!("  -> {}", path);
+    if loss_ref.is_empty() {
+        eprintln!("[Bench] Skipping convergence_loss chart: no loss snapshots collected");
+        return;
     }
+    let path = format!("{}/convergence_loss.{}", dir, ext);
+    write_chart(
+        &path,
+        chart::draw_line_chart(
+            &path,
+            "Convergence: Loss Curve",
+            "Training Step",
+            "Loss",
+            &loss_ref,
+            900,
+            500,
+        ),
+    );
 
     chart_agg_reward_curve(
         agg,
@@ -828,20 +900,23 @@ fn chart_agg_reward_curve(
         .iter()
         .map(|(l, d)| (l.as_str(), d.as_slice()))
         .collect();
-    let path = format!("{}/{}.{}", dir, filename, ext);
-    if chart::draw_line_chart(
-        &path,
-        title,
-        "Training Step",
-        "Avg Reward",
-        &series_ref,
-        900,
-        500,
-    )
-    .is_ok()
-    {
-        println!("  -> {}", path);
+    if series_ref.is_empty() {
+        eprintln!("[Bench] Skipping {filename} chart: no reward snapshots collected");
+        return;
     }
+    let path = format!("{}/{}.{}", dir, filename, ext);
+    write_chart(
+        &path,
+        chart::draw_line_chart(
+            &path,
+            title,
+            "Training Step",
+            "Avg Reward",
+            &series_ref,
+            900,
+            500,
+        ),
+    );
 }
 
 // ── Output: summary, JSON, CSV ──────────────────────────────────────────
@@ -893,39 +968,36 @@ fn write_summary_txt(all: &[(&str, Vec<AggregatedResult>)], dir: &str) {
         lines.push(String::new());
     }
     let path = format!("{}/summary.txt", dir);
-    fs::write(&path, lines.join("\n")).ok();
+    write_text_file(&path, &lines.join("\n"));
     println!("[Bench] Summary -> {}", path);
 }
 
 fn write_summary_json(all: &[(&str, Vec<AggregatedResult>)], dir: &str) {
-    let mut json = String::from("{\n");
-    for (i, (name, agg)) in all.iter().enumerate() {
-        json.push_str(&format!("  \"{}\": [\n", name));
-        for (j, a) in agg.iter().enumerate() {
-            json.push_str(&format!(
-                "    {{\"label\":\"{}\",\"throughput_mean\":{:.2},\"throughput_std\":{:.2},\"reward_mean\":{:.4},\"reward_std\":{:.4},\"loss_mean\":{:.4},\"loss_std\":{:.4},\"param_count\":{},\"throughput_ci\":[{:.2},{:.2}],\"reward_ci\":[{:.4},{:.4}]}}",
-                a.label,
-                a.throughput.mean, a.throughput.std_dev,
-                a.reward.mean, a.reward.std_dev,
-                a.loss.mean, a.loss.std_dev,
-                a.param_count,
-                a.throughput.ci_low, a.throughput.ci_high,
-                a.reward.ci_low, a.reward.ci_high
-            ));
-            if j + 1 < agg.len() {
-                json.push(',');
-            }
-            json.push('\n');
-        }
-        json.push_str("  ]");
-        if i + 1 < all.len() {
-            json.push(',');
-        }
-        json.push('\n');
+    let mut root = serde_json::Map::new();
+    for (name, agg) in all {
+        let entries: Vec<serde_json::Value> = agg
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "label": a.label.as_str(),
+                    "throughput_mean": a.throughput.mean,
+                    "throughput_std": a.throughput.std_dev,
+                    "reward_mean": a.reward.mean,
+                    "reward_std": a.reward.std_dev,
+                    "loss_mean": a.loss.mean,
+                    "loss_std": a.loss.std_dev,
+                    "param_count": a.param_count,
+                    "throughput_ci": [a.throughput.ci_low, a.throughput.ci_high],
+                    "reward_ci": [a.reward.ci_low, a.reward.ci_high],
+                })
+            })
+            .collect();
+        root.insert((*name).to_string(), serde_json::Value::Array(entries));
     }
-    json.push('}');
+    let json = serde_json::to_string_pretty(&serde_json::Value::Object(root))
+        .expect("benchmark summary JSON should be serializable");
     let path = format!("{}/summary.json", dir);
-    fs::write(&path, &json).ok();
+    write_text_file(&path, &json);
     println!("[Bench] JSON  -> {}", path);
 }
 
@@ -959,9 +1031,25 @@ fn write_csvs(all: &[(&str, Vec<AggregatedResult>)], dir: &str) {
             }
         }
         let path = format!("{}/{}.csv", dir, name);
-        fs::write(&path, &csv).ok();
+        write_text_file(&path, &csv);
         println!("[Bench] CSV   -> {}", path);
     }
+}
+
+fn write_chart(path: &str, result: Result<(), Box<dyn std::error::Error>>) {
+    match result {
+        Ok(()) => println!("  -> {}", path),
+        Err(err) => panic!("failed to write benchmark chart {path}: {err}"),
+    }
+}
+
+fn write_text_file(path: &str, content: &str) {
+    try_write_text_file(path, content)
+        .unwrap_or_else(|err| panic!("failed to write benchmark output {path}: {err}"));
+}
+
+fn try_write_text_file(path: &str, content: &str) -> std::io::Result<()> {
+    fs::write(path, content)
 }
 
 fn percentile(data: &[f64], pct: usize) -> f64 {
@@ -972,4 +1060,151 @@ fn percentile(data: &[f64], pct: usize) -> f64 {
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let idx = (pct * sorted.len() / 100).min(sorted.len() - 1);
     sorted[idx]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bench_config_with_only(only: Option<Vec<String>>) -> BenchConfig {
+        BenchConfig {
+            output_dir: "unused".to_string(),
+            format: ChartFormat::Svg,
+            only,
+            num_trials: 1,
+        }
+    }
+
+    #[test]
+    fn parse_only_filter_normalizes_and_drops_empty_entries() {
+        assert_eq!(
+            parse_only_filter(" path, Gate ,,CONVERGENCE "),
+            vec![
+                "path".to_string(),
+                "gate".to_string(),
+                "convergence".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn validate_only_filter_accepts_known_experiments_case_insensitively() {
+        let cfg = bench_config_with_only(Some(vec!["Path".to_string(), "GATE".to_string()]));
+        validate_bench_config(&cfg).unwrap();
+        assert!(should_run(&cfg, "path"));
+        assert!(should_run(&cfg, "gate"));
+        assert!(!should_run(&cfg, "scale"));
+    }
+
+    #[test]
+    fn validate_only_filter_rejects_unknown_experiments() {
+        let cfg = bench_config_with_only(Some(vec!["path".to_string(), "missing".to_string()]));
+        let message = validate_bench_config(&cfg).unwrap_err();
+        assert!(message.contains("unknown benchmark experiment(s): missing"));
+    }
+
+    #[test]
+    fn validate_bench_config_rejects_zero_trials() {
+        let cfg = BenchConfig {
+            output_dir: "unused".to_string(),
+            format: ChartFormat::Svg,
+            only: None,
+            num_trials: 0,
+        };
+        assert_eq!(
+            validate_bench_config(&cfg).unwrap_err(),
+            "benchmark trials must be at least 1"
+        );
+    }
+
+    #[test]
+    fn parse_chart_format_rejects_unknown_formats() {
+        assert!(matches!(
+            parse_chart_format("svg").unwrap(),
+            ChartFormat::Svg
+        ));
+        assert!(matches!(
+            parse_chart_format("PNG").unwrap(),
+            ChartFormat::Png
+        ));
+        assert!(parse_chart_format("jpg").is_err());
+    }
+
+    #[test]
+    fn bench_sized_config_clamps_large_model_for_smoke_benchmarks() {
+        let mut cfg = Config::default();
+        cfg.model_dim = 2048;
+        cfg.model_hidden_dim = 8192;
+        cfg.model_num_layers = 24;
+        cfg.model_num_heads = 32;
+        cfg.model_kv_lora_rank = 1024;
+        cfg.model_qk_rope_dim = 256;
+        cfg.multi_stream_factor = 4;
+
+        let bench_cfg = bench_sized_config(&cfg);
+
+        assert!(bench_cfg.fast_init);
+        assert_eq!(bench_cfg.model_dim, crate::neural::DIM);
+        assert_eq!(bench_cfg.model_hidden_dim, 64);
+        assert_eq!(bench_cfg.model_num_layers, 2);
+        assert!(bench_cfg.model_num_heads <= 4);
+        assert_eq!(bench_cfg.model_hidden_dim % bench_cfg.model_num_heads, 0);
+        assert!(bench_cfg.model_kv_lora_rank <= 16);
+        assert!(bench_cfg.model_qk_rope_dim <= 4);
+        assert_eq!(bench_cfg.model_qk_rope_dim % 2, 0);
+        assert!(bench_cfg.multi_stream_factor <= 2);
+    }
+
+    #[test]
+    fn write_text_file_reports_io_errors() {
+        let dir = std::env::temp_dir().join(format!(
+            "talos_xii_bench_write_error_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.to_string_lossy().to_string();
+
+        let result = try_write_text_file(&path, "content");
+        std::fs::remove_dir(&dir).unwrap();
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn write_summary_json_escapes_labels() {
+        let dir = std::env::temp_dir().join(format!(
+            "talos_xii_bench_json_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let output_dir = dir.to_string_lossy().to_string();
+        let result = AggregatedResult {
+            label: "label,with\"quote".to_string(),
+            throughput: TrialStats::from_values(&[10.0]),
+            reward: TrialStats::from_values(&[0.5]),
+            loss: TrialStats::from_values(&[0.25]),
+            time_ms: TrialStats::from_values(&[12.0]),
+            param_count: 42,
+            best_snapshots: Vec::new(),
+            cache_stats: None,
+        };
+
+        write_summary_json(&[("exp", vec![result])], &output_dir);
+
+        let json_path = dir.join("summary.json");
+        let json = std::fs::read_to_string(&json_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["exp"][0]["label"], "label,with\"quote");
+
+        std::fs::remove_file(json_path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 }

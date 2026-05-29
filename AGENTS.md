@@ -31,8 +31,8 @@ See `README.md` for full details. Quick reference:
 | Task | Command |
 |---|---|
 | Build (dev) | `cargo build` |
-| Test (default features, 158 tests) | `cargo test` |
-| Test (all features, 179 tests) | `cargo test --all-features` |
+| Test (default features, 169 tests) | `cargo test` |
+| Test (all features, 190 tests) | `cargo test --all-features` |
 | Lint (format) | `cargo fmt -- --check` |
 | Lint (clippy) | `cargo clippy -- -D warnings` |
 | Lint (all features) | `cargo clippy --all-features -- -D warnings` |

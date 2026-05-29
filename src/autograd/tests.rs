@@ -572,6 +572,18 @@ fn test_f32_relu_softmax_sum() {
 }
 
 #[test]
+fn test_f32_index_select_forward_backward() {
+    let a = Tensor::with_dtype(vec![1.0, 2.0, 3.0], vec![3], Dtype::F32);
+    let selected = a.index_select(1);
+    assert_eq!(selected.dtype, Dtype::F32);
+    assert_eq!(selected.data_as_f64_vec(), vec![2.0]);
+
+    selected.backward();
+
+    assert_eq!(a.grad_to_f64_vec(), vec![0.0, 1.0, 0.0]);
+}
+
+#[test]
 fn test_f32_reshape_broadcast_transpose() {
     let a = Tensor::with_dtype(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], Dtype::F32);
 

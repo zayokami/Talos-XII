@@ -11,13 +11,13 @@ impl Tensor {
         if let Some(out) = self.index_select_cuda(idx) {
             return out;
         }
-        let self_data = self.data_f64();
+        let self_data = self.data_as_f64_vec();
         let val = self_data[idx];
         let parents = vec![self.clone()];
 
         Tensor {
-            data: Storage::F64(Arc::new(RwLock::new(vec![val]))),
-            grad: Storage::zeros(1, Tensor::grad_dtype_for(Dtype::F64)),
+            data: Storage::from_f64_vec(vec![val], self.dtype),
+            grad: Storage::zeros(1, Tensor::grad_dtype_for(self.dtype)),
             shape: vec![1],
             device: self.device,
             dtype: self.dtype,

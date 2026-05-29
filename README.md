@@ -193,7 +193,7 @@ cargo run -- train                # calibrate models with collected data
 cargo run --release -- benchmark
 ```
 
-Runs built-in benchmarks: 10,000 fast simulations (200 pulls each) and 300 detailed simulations (120 pulls each).
+Runs the quick built-in benchmark: 500 fast simulations and 100 detailed simulations, each with 100 pulls.
 
 ### Paper-Grade ACHF Benchmark
 
@@ -519,7 +519,7 @@ cargo run -- train                # 用采集数据校准模型
 cargo run --release -- benchmark
 ```
 
-运行内置基准：10,000 次快速模拟（每次 200 抽）和 300 次详细模拟（每次 120 抽）。
+运行快速内置基准：500 次快速模拟和 100 次详细模拟，每次 100 抽。
 
 ### ACHF 论文级 Benchmark
 

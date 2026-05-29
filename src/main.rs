@@ -134,6 +134,7 @@ enum Commands {
 #[derive(Subcommand, Clone)]
 enum BenchAction {
     /// Run full ACHF benchmark suite
+    #[command(name = "paper", visible_alias = "achf", alias = "p")]
     Achf {
         /// Run only specific experiments (comma-separated: ablation,mode,path,gate,scale,apply,convergence)
         #[arg(long)]
@@ -531,6 +532,36 @@ fn benchmark_simulation(
     );
 }
 
+fn build_bench_config(
+    output_dir: String,
+    format: &str,
+    only: Option<Vec<String>>,
+    trials: usize,
+) -> Result<bench::BenchConfig, String> {
+    let cfg = bench::BenchConfig {
+        output_dir,
+        format: bench::parse_chart_format(format)?,
+        only,
+        num_trials: trials,
+    };
+    bench::validate_bench_config(&cfg)?;
+    Ok(cfg)
+}
+
+fn validate_bench_action(action: &Option<BenchAction>) -> Result<(), String> {
+    if let Some(BenchAction::Achf {
+        only,
+        output_dir: _,
+        format,
+        trials,
+    }) = action
+    {
+        let only = only.as_deref().map(bench::parse_only_filter);
+        build_bench_config(String::new(), format, only, *trials)?;
+    }
+    Ok(())
+}
+
 fn main() {
     panic_guard::install();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -619,6 +650,39 @@ fn main() {
             }
             _ => unreachable!(),
         }
+        return;
+    }
+
+    if let Some(Commands::Benchmark { action }) = &args.command {
+        if let Err(err) = validate_bench_action(action) {
+            eprintln!("\x1b[1;31m[Benchmark Error]\x1b[0m {}", err);
+            std::process::exit(2);
+        }
+    }
+
+    if let Some(Commands::Benchmark {
+        action:
+            Some(BenchAction::Achf {
+                only,
+                output_dir,
+                format,
+                trials,
+            }),
+    }) = args.command.clone()
+    {
+        let bench_cfg = build_bench_config(
+            output_dir,
+            &format,
+            only.map(|s| bench::parse_only_filter(&s)),
+            trials,
+        )
+        .unwrap_or_else(|err| {
+            eprintln!("\x1b[1;31m[Benchmark Error]\x1b[0m {}", err);
+            std::process::exit(2);
+        });
+        let config = Config::load(&args.config);
+        let seed = args.seed.unwrap_or(42);
+        bench::run_achf_benchmarks(&config, seed, &bench_cfg);
         return;
     }
 
@@ -715,16 +779,16 @@ fn main() {
                 format,
                 trials,
             }) => {
-                let chart_fmt = match format.as_str() {
-                    "png" => chart::ChartFormat::Png,
-                    _ => chart::ChartFormat::Svg,
-                };
-                let bench_cfg = bench::BenchConfig {
+                let bench_cfg = build_bench_config(
                     output_dir,
-                    format: chart_fmt,
-                    only: only.map(|s| s.split(',').map(|x| x.trim().to_string()).collect()),
-                    num_trials: trials.max(1),
-                };
+                    &format,
+                    only.map(|s| bench::parse_only_filter(&s)),
+                    trials,
+                )
+                .unwrap_or_else(|err| {
+                    eprintln!("\x1b[1;31m[Benchmark Error]\x1b[0m {}", err);
+                    std::process::exit(2);
+                });
                 let seed = args.seed.unwrap_or(42);
                 bench::run_achf_benchmarks(&config, seed, &bench_cfg);
             }
@@ -1359,14 +1423,12 @@ fn run_interactive(args: RunInteractiveArgs) {
                         match arg {
                             "--only" | "-o" => {
                                 if let Some(val) = parts.next() {
-                                    only_filter = Some(
-                                        val.split(',').map(|s| s.trim().to_string()).collect(),
-                                    );
+                                    only_filter = Some(bench::parse_only_filter(val));
                                 }
                             }
                             "--trials" | "-t" => {
                                 if let Some(val) = parts.next() {
-                                    trials = val.parse().unwrap_or(3).max(1);
+                                    trials = val.parse().unwrap_or(0);
                                 }
                             }
                             "--format" | "-f" => {
@@ -1382,16 +1444,14 @@ fn run_interactive(args: RunInteractiveArgs) {
                             _ => {}
                         }
                     }
-                    let chart_fmt = match format_str.as_str() {
-                        "png" => chart::ChartFormat::Png,
-                        _ => chart::ChartFormat::Svg,
-                    };
-                    let bench_cfg = bench::BenchConfig {
-                        output_dir,
-                        format: chart_fmt,
-                        only: only_filter,
-                        num_trials: trials,
-                    };
+                    let bench_cfg =
+                        match build_bench_config(output_dir, &format_str, only_filter, trials) {
+                            Ok(cfg) => cfg,
+                            Err(err) => {
+                                println!("\x1b[1;31m[Benchmark Error]\x1b[0m {}", err);
+                                continue;
+                            }
+                        };
                     let seed = rng.next_u64();
                     bench::run_achf_benchmarks(&config, seed, &bench_cfg);
                 }
@@ -1413,12 +1473,17 @@ fn run_interactive(args: RunInteractiveArgs) {
                 }
                 _ => {
                     // Treat as a shortcut: bench <experiment_name>
-                    let chart_fmt = chart::ChartFormat::Svg;
-                    let bench_cfg = bench::BenchConfig {
-                        output_dir: "bench_output".to_string(),
-                        format: chart_fmt,
-                        only: Some(vec![sub_lower]),
-                        num_trials: 3,
+                    let bench_cfg = match build_bench_config(
+                        "bench_output".to_string(),
+                        "svg",
+                        Some(vec![sub_lower]),
+                        3,
+                    ) {
+                        Ok(cfg) => cfg,
+                        Err(err) => {
+                            println!("\x1b[1;31m[Benchmark Error]\x1b[0m {}", err);
+                            continue;
+                        }
                     };
                     let seed = rng.next_u64();
                     bench::run_achf_benchmarks(&config, seed, &bench_cfg);
@@ -2059,6 +2124,63 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_paper_alias_parses_as_achf_suite() {
+        let args = Args::try_parse_from([
+            "talos_xii",
+            "benchmark",
+            "paper",
+            "--only",
+            "path,gate",
+            "--trials",
+            "2",
+            "--format",
+            "png",
+            "--output-dir",
+            "out",
+        ])
+        .unwrap();
+
+        match args.command {
+            Some(Commands::Benchmark {
+                action:
+                    Some(BenchAction::Achf {
+                        only,
+                        output_dir,
+                        format,
+                        trials,
+                    }),
+            }) => {
+                assert_eq!(only.as_deref(), Some("path,gate"));
+                assert_eq!(output_dir, "out");
+                assert_eq!(format, "png");
+                assert_eq!(trials, 2);
+            }
+            _ => panic!("expected benchmark paper to parse as ACHF suite"),
+        }
+
+        let achf_alias = Args::try_parse_from(["talos_xii", "benchmark", "achf"]).unwrap();
+        assert!(matches!(
+            achf_alias.command,
+            Some(Commands::Benchmark {
+                action: Some(BenchAction::Achf { .. })
+            })
+        ));
+    }
+
+    #[test]
+    fn benchmark_config_rejects_invalid_values() {
+        assert!(build_bench_config("out".to_string(), "jpg", None, 1).is_err());
+        assert!(build_bench_config("out".to_string(), "svg", None, 0).is_err());
+        assert!(build_bench_config(
+            "out".to_string(),
+            "svg",
+            Some(vec!["missing".to_string()]),
+            1
+        )
+        .is_err());
+    }
+
+    #[test]
     fn simulate_fast_costs_and_free_pulls_match() {
         let (config, env_net, neural_opt) = build_context();
         let mut rng = Rng::from_seed(1);
@@ -2247,30 +2369,41 @@ mod tests {
     fn benchmark_dqn_predict_action_fast() {
         let dqn = DuelingQNetwork::new(42, &crate::config::AchfConfig::default());
         let features = [0.5_f32; DIM];
-        let iterations = 10_000;
+        let fast_iterations = 20_000;
+        let tensor_iterations = 16;
 
         // Warmup
         for _ in 0..100 {
-            let _ = dqn.predict_action_fast(&features);
+            std::hint::black_box(dqn.predict_action_fast(std::hint::black_box(&features)));
+        }
+        for _ in 0..2 {
+            let tensor_x = AutoTensor::new(features.iter().map(|&v| v as f64).collect(), vec![DIM]);
+            std::hint::black_box(dqn.predict_action(std::hint::black_box(&tensor_x)));
         }
 
         let start = std::time::Instant::now();
-        for _ in 0..iterations {
-            let _ = dqn.predict_action_fast(&features);
+        for _ in 0..fast_iterations {
+            std::hint::black_box(dqn.predict_action_fast(std::hint::black_box(&features)));
         }
         let fast_elapsed = start.elapsed();
 
         let start2 = std::time::Instant::now();
-        for _ in 0..iterations {
+        for _ in 0..tensor_iterations {
             let tensor_x = AutoTensor::new(features.iter().map(|&v| v as f64).collect(), vec![DIM]);
-            let _ = dqn.predict_action(&tensor_x);
+            std::hint::black_box(dqn.predict_action(std::hint::black_box(&tensor_x)));
         }
         let tensor_elapsed = start2.elapsed();
 
-        let speedup = tensor_elapsed.as_secs_f64() / fast_elapsed.as_secs_f64();
+        let fast_avg = fast_elapsed.as_secs_f64() / fast_iterations as f64;
+        let tensor_avg = tensor_elapsed.as_secs_f64() / tensor_iterations as f64;
+        let speedup = tensor_avg / fast_avg;
         println!(
-            "\n[PERF] DQN predict: fast={:.2?} vs tensor={:.2?} (speedup: {:.2}x)",
-            fast_elapsed, tensor_elapsed, speedup
+            "\n[PERF] DQN predict: fast={:.3}us/call over {} calls vs tensor={:.3}ms/call over {} calls (speedup: {:.2}x)",
+            fast_avg * 1_000_000.0,
+            fast_iterations,
+            tensor_avg * 1_000.0,
+            tensor_iterations,
+            speedup
         );
         assert!(
             speedup > 0.95,
