@@ -23,6 +23,8 @@ mod neural;
 mod nn;
 mod panic_guard;
 mod ppo;
+#[cfg(feature = "python")]
+mod python_bridge;
 mod rng;
 mod sim;
 mod simd;
@@ -54,6 +56,7 @@ use neural::{NeuralLuckOptimizer, DIM};
 use ppo::{ActorCritic, OnlinePpoTrainer};
 use rng::Rng;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
@@ -115,6 +118,17 @@ enum Commands {
     },
     /// Train/calibrate model using collected player data
     Train,
+    /// Run a custom Python script with the embedded PyO3 interpreter
+    Python {
+        /// Python script to execute
+        script: PathBuf,
+        /// Working directory for the script. Defaults to the current directory.
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Arguments passed to the script. Use `--` before script arguments.
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -522,6 +536,34 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
 
+    if let Some(Commands::Python {
+        script,
+        cwd,
+        args: script_args,
+    }) = args.command.clone()
+    {
+        #[cfg(feature = "python")]
+        {
+            let exit_code = match python_bridge::run_script(&script, cwd.as_deref(), &script_args) {
+                Ok(code) => code,
+                Err(err) => {
+                    eprintln!("\x1b[1;31m[Python Error]\x1b[0m {}", err);
+                    1
+                }
+            };
+            std::process::exit(exit_code);
+        }
+
+        #[cfg(not(feature = "python"))]
+        {
+            let _ = (script, cwd, script_args);
+            eprintln!(
+                "\x1b[1;31m[Python Error]\x1b[0m Python scripting support is disabled. Rebuild with `--features python`."
+            );
+            std::process::exit(2);
+        }
+    }
+
     if matches!(
         args.command,
         Some(Commands::Collect { .. }) | Some(Commands::Train)
@@ -711,7 +753,7 @@ fn main() {
             };
             run_f2p_analysis(&f2p_ctx, &mut rng);
         }
-        Commands::Collect { .. } | Commands::Train => unreachable!(),
+        Commands::Collect { .. } | Commands::Train | Commands::Python { .. } => unreachable!(),
     }
 }
 

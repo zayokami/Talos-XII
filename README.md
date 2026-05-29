@@ -160,6 +160,24 @@ Simulates massive free-resource scenarios (1M in release mode), outputting:
 
 If "Avg Extra Jade Cost" is N/A, all simulations cleared UP within the free pull budget.
 
+### Python Scripting (Optional)
+
+Enable the optional PyO3 bridge to run a Python script inside the Talos-XII process:
+
+```bash
+cargo run --features python -- python <script.py> -- <args>
+```
+
+Example:
+
+```bash
+cargo run --features python -- python examples/python/autograd_minimal.py -- 1.0
+```
+
+The final `--` separates arguments passed to the script; inside Python they are available through `sys.argv[1:]`. The embedded interpreter exposes a built-in `talos_xii` module with `Tensor`, `tensor`, `zeros`, `ones`, `rand`, `randn`, dtype constants, and autograd operations such as `matmul`, `mse_loss`, `backward`, and `grad`.
+
+No NumPy or PyTorch installation is required for Talos-XII tensor/autograd scripts. The optional bridge links against a local Python runtime supported by PyO3. Scripts are arbitrary Python code and are not sandboxed, so run only scripts you trust.
+
 ### Data Collection & Model Calibration
 
 ```bash
@@ -467,6 +485,24 @@ cargo run --release -- f2p
 - **额外嵌晶玉成本** — 免费资源不够时，平均还需多少额外投入
 
 "Avg Extra Jade Cost" 显示 N/A 表示所有模拟都在免费抽内出了 UP，无需额外付费。
+
+### Python 脚本支持（可选）
+
+启用可选 PyO3 桥接后，可在 Talos-XII 进程内执行 Python 脚本：
+
+```bash
+cargo run --features python -- python <script.py> -- <args>
+```
+
+示例：
+
+```bash
+cargo run --features python -- python examples/python/autograd_minimal.py -- 1.0
+```
+
+最后一个 `--` 用于分隔传给脚本的参数；在 Python 中可通过 `sys.argv[1:]` 读取。嵌入式解释器会提供内置 `talos_xii` 模块，包含 `Tensor`、`tensor`、`zeros`、`ones`、`rand`、`randn`、dtype 常量，以及 `matmul`、`mse_loss`、`backward`、`grad` 等 autograd 操作。
+
+编写 Talos-XII 张量/autograd 脚本不需要安装 NumPy 或 PyTorch。这个可选桥接会链接本机 PyO3 支持的 Python 运行时。脚本是任意 Python 代码，且不提供沙箱隔离，请只运行可信脚本。
 
 ### 数据采集与模型校准
 

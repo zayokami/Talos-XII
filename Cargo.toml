@@ -22,10 +22,12 @@ plotters = { version = "0.3", default-features = false, features = [
     "line_series", "errorbar", "full_palette",
     "ttf", "ab_glyph",
 ] }
+pyo3 = { version = "0.28.3", optional = true, features = ["auto-initialize"] }
 
 [features]
 default = []
 cuda = []
+python = ["dep:pyo3"]
 
 [profile.release]
 lto = true        # Link Time Optimization (smaller binary, faster code)
