@@ -625,6 +625,51 @@ fn test_f32_gelu_exp_log() {
 }
 
 #[test]
+fn test_f32_more_unary_math_ops() {
+    let a = Tensor::with_dtype(vec![-1.0, 0.0, 2.0], vec![3], Dtype::F32);
+    let tanh = a.tanh();
+    assert_eq!(tanh.dtype, Dtype::F32);
+    let tanh_data = tanh.data_as_f64_vec();
+    for (actual, expected) in
+        tanh_data
+            .iter()
+            .zip([(-1.0_f64).tanh(), 0.0_f64.tanh(), 2.0_f64.tanh()])
+    {
+        assert!((actual - expected).abs() < 1e-5);
+    }
+    tanh.sum().backward();
+    let a_grad = a.grad_to_f64_vec();
+    for (actual, y) in a_grad.iter().zip(tanh_data.iter()) {
+        assert!((actual - (1.0 - y * y)).abs() < 1e-5);
+    }
+
+    let b = Tensor::with_dtype(vec![-1.0, 0.0, 2.0], vec![3], Dtype::F32);
+    let sigmoid = b.sigmoid();
+    assert_eq!(sigmoid.dtype, Dtype::F32);
+    let sigmoid_data = sigmoid.data_as_f64_vec();
+    for (actual, x) in sigmoid_data.iter().zip([-1.0_f64, 0.0, 2.0]) {
+        let expected = 1.0 / (1.0 + (-x).exp());
+        assert!((actual - expected).abs() < 1e-5);
+    }
+    sigmoid.sum().backward();
+    let b_grad = b.grad_to_f64_vec();
+    for (actual, y) in b_grad.iter().zip(sigmoid_data.iter()) {
+        assert!((actual - y * (1.0 - y)).abs() < 1e-5);
+    }
+
+    let c = Tensor::with_dtype(vec![-2.0, 0.0, 0.5, 3.0], vec![4], Dtype::F32);
+    let clamped = c.clamp(-0.5, 1.0);
+    assert_eq!(clamped.dtype, Dtype::F32);
+    assert_eq!(clamped.data_as_f64_vec(), vec![-0.5, 0.0, 0.5, 1.0]);
+    clamped.sum().backward();
+    assert_eq!(c.grad_to_f64_vec(), vec![0.0, 1.0, 1.0, 0.0]);
+
+    let d = Tensor::with_dtype(vec![1.0, 4.0, 9.0], vec![3], Dtype::F32);
+    assert_eq!(d.sqrt().data_as_f64_vec(), vec![1.0, 2.0, 3.0]);
+    assert_eq!(d.pow(2.0).data_as_f64_vec(), vec![1.0, 16.0, 81.0]);
+}
+
+#[test]
 fn test_f32_backward_elementwise() {
     let a = Tensor::with_dtype(vec![2.0, 3.0], vec![2], Dtype::F32);
     let b = Tensor::with_dtype(vec![4.0, 5.0], vec![2], Dtype::F32);

@@ -1,7 +1,29 @@
 use crate::autograd::{Context, Device, Tensor, PAR_THRESHOLD};
 use crate::dtype::{Dtype, Storage};
 use rayon::prelude::*;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+#[inline]
+fn sigmoid_f64(x: f64) -> f64 {
+    if x >= 0.0 {
+        let z = (-x).exp();
+        1.0 / (1.0 + z)
+    } else {
+        let z = x.exp();
+        z / (1.0 + z)
+    }
+}
+
+#[inline]
+fn sigmoid_f32(x: f32) -> f32 {
+    if x >= 0.0 {
+        let z = (-x).exp();
+        1.0 / (1.0 + z)
+    } else {
+        let z = x.exp();
+        z / (1.0 + z)
+    }
+}
 
 impl Tensor {
     pub fn log(&self) -> Tensor {
@@ -600,35 +622,201 @@ impl Tensor {
         }
     }
 
+    pub fn tanh(&self) -> Tensor {
+        if self.dtype == Dtype::F64 {
+            let self_data = self.data_as_f64_vec();
+            let len = self_data.len();
+            let data: Vec<f64> = if len >= PAR_THRESHOLD {
+                self_data.par_iter().map(|&x| x.tanh()).collect()
+            } else {
+                self_data.iter().map(|&x| x.tanh()).collect()
+            };
+            let out_cache = Arc::new(data.clone());
+            let parents = vec![self.clone()];
+            return Tensor {
+                data: Storage::f64(data),
+                grad: Storage::zeros(len, Dtype::F64),
+                shape: self.shape.clone(),
+                device: Device::Cpu,
+                dtype: Dtype::F64,
+                _ctx: Some(Arc::new(Context {
+                    parents,
+                    backward_op: Box::new(move |grad_out, _parents| {
+                        let grad_out_f64 = grad_out.to_f64_vec();
+                        let mut inp_grad = _parents[0].grad_write_compat();
+                        if inp_grad.len() >= PAR_THRESHOLD {
+                            inp_grad
+                                .par_iter_mut()
+                                .zip(grad_out_f64.par_iter())
+                                .zip(out_cache.par_iter())
+                                .for_each(|((ig, &g), &y)| {
+                                    *ig += g * (1.0 - y * y);
+                                });
+                        } else {
+                            for i in 0..inp_grad.len() {
+                                let y = out_cache[i];
+                                inp_grad[i] += grad_out_f64[i] * (1.0 - y * y);
+                            }
+                        }
+                    }),
+                })),
+            };
+        }
+
+        let self_data = self.data_to_f32_vec();
+        let len = self_data.len();
+        let data: Vec<f32> = if len >= PAR_THRESHOLD {
+            self_data.par_iter().map(|&x| x.tanh()).collect()
+        } else {
+            self_data.iter().map(|&x| x.tanh()).collect()
+        };
+        let out_cache: Arc<Vec<f64>> = Arc::new(data.iter().map(|&v| v as f64).collect());
+        let parents = vec![self.clone()];
+
+        Tensor {
+            data: Storage::from_f32_vec(data, self.dtype),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(self.dtype)),
+            shape: self.shape.clone(),
+            device: Device::Cpu,
+            dtype: self.dtype,
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, _parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = _parents[0].grad_write_compat();
+                    if inp_grad.len() >= PAR_THRESHOLD {
+                        inp_grad
+                            .par_iter_mut()
+                            .zip(grad_out_f64.par_iter())
+                            .zip(out_cache.par_iter())
+                            .for_each(|((ig, &g), &y)| {
+                                *ig += g * (1.0 - y * y);
+                            });
+                    } else {
+                        for i in 0..inp_grad.len() {
+                            let y = out_cache[i];
+                            inp_grad[i] += grad_out_f64[i] * (1.0 - y * y);
+                        }
+                    }
+                }),
+            })),
+        }
+    }
+
+    pub fn sigmoid(&self) -> Tensor {
+        if self.dtype == Dtype::F64 {
+            let self_data = self.data_as_f64_vec();
+            let len = self_data.len();
+            let data: Vec<f64> = if len >= PAR_THRESHOLD {
+                self_data.par_iter().map(|&x| sigmoid_f64(x)).collect()
+            } else {
+                self_data.iter().map(|&x| sigmoid_f64(x)).collect()
+            };
+            let out_cache = Arc::new(data.clone());
+            let parents = vec![self.clone()];
+            return Tensor {
+                data: Storage::f64(data),
+                grad: Storage::zeros(len, Dtype::F64),
+                shape: self.shape.clone(),
+                device: Device::Cpu,
+                dtype: Dtype::F64,
+                _ctx: Some(Arc::new(Context {
+                    parents,
+                    backward_op: Box::new(move |grad_out, _parents| {
+                        let grad_out_f64 = grad_out.to_f64_vec();
+                        let mut inp_grad = _parents[0].grad_write_compat();
+                        if inp_grad.len() >= PAR_THRESHOLD {
+                            inp_grad
+                                .par_iter_mut()
+                                .zip(grad_out_f64.par_iter())
+                                .zip(out_cache.par_iter())
+                                .for_each(|((ig, &g), &y)| {
+                                    *ig += g * y * (1.0 - y);
+                                });
+                        } else {
+                            for i in 0..inp_grad.len() {
+                                let y = out_cache[i];
+                                inp_grad[i] += grad_out_f64[i] * y * (1.0 - y);
+                            }
+                        }
+                    }),
+                })),
+            };
+        }
+
+        let self_data = self.data_to_f32_vec();
+        let len = self_data.len();
+        let data: Vec<f32> = if len >= PAR_THRESHOLD {
+            self_data.par_iter().map(|&x| sigmoid_f32(x)).collect()
+        } else {
+            self_data.iter().map(|&x| sigmoid_f32(x)).collect()
+        };
+        let out_cache: Arc<Vec<f64>> = Arc::new(data.iter().map(|&v| v as f64).collect());
+        let parents = vec![self.clone()];
+
+        Tensor {
+            data: Storage::from_f32_vec(data, self.dtype),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(self.dtype)),
+            shape: self.shape.clone(),
+            device: Device::Cpu,
+            dtype: self.dtype,
+            _ctx: Some(Arc::new(Context {
+                parents,
+                backward_op: Box::new(move |grad_out, _parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = _parents[0].grad_write_compat();
+                    if inp_grad.len() >= PAR_THRESHOLD {
+                        inp_grad
+                            .par_iter_mut()
+                            .zip(grad_out_f64.par_iter())
+                            .zip(out_cache.par_iter())
+                            .for_each(|((ig, &g), &y)| {
+                                *ig += g * y * (1.0 - y);
+                            });
+                    } else {
+                        for i in 0..inp_grad.len() {
+                            let y = out_cache[i];
+                            inp_grad[i] += grad_out_f64[i] * y * (1.0 - y);
+                        }
+                    }
+                }),
+            })),
+        }
+    }
+
+    pub fn clamp(&self, min: f64, max: f64) -> Tensor {
+        self.clip(min, max)
+    }
+
     pub fn clip(&self, min: f64, max: f64) -> Tensor {
-        let self_data = self.data_f64();
+        let self_data = self.data_as_f64_vec();
         let len = self_data.len();
         let data: Vec<f64> = if len >= PAR_THRESHOLD {
             self_data.par_iter().map(|&x| x.max(min).min(max)).collect()
         } else {
             self_data.iter().map(|&x| x.max(min).min(max)).collect()
         };
+        let input_cache = Arc::new(self_data);
         let parents = vec![self.clone()];
 
         Tensor {
-            data: Storage::F64(Arc::new(RwLock::new(data))),
-            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
+            data: Storage::from_f64_vec(data, self.dtype),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(self.dtype)),
             shape: self.shape.clone(),
-            device: self.device,
+            device: Device::Cpu,
             dtype: self.dtype,
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
                     let grad_out_f64 = grad_out.to_f64_vec();
                     let input = &parents[0];
-                    let input_data = input.data_f64();
                     let mut inp_grad = input.grad_write_compat();
                     let len = inp_grad.len();
                     if len >= PAR_THRESHOLD {
                         inp_grad
                             .par_iter_mut()
                             .zip(grad_out_f64.par_iter())
-                            .zip(input_data.par_iter())
+                            .zip(input_cache.par_iter())
                             .for_each(|((ig, &g), &id)| {
                                 if id >= min && id <= max {
                                     *ig += g;
@@ -636,7 +824,7 @@ impl Tensor {
                             });
                     } else {
                         for i in 0..len {
-                            if input_data[i] >= min && input_data[i] <= max {
+                            if input_cache[i] >= min && input_cache[i] <= max {
                                 inp_grad[i] += grad_out_f64[i];
                             }
                         }

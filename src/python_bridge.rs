@@ -242,6 +242,42 @@ impl PyTensor {
         wrap_tensor_op(|| self.inner.exp())
     }
 
+    fn abs(&self) -> PyResult<Self> {
+        wrap_tensor_op(|| self.inner.abs())
+    }
+
+    fn pow(&self, exponent: f64) -> PyResult<Self> {
+        wrap_tensor_op(|| self.inner.pow(exponent))
+    }
+
+    fn sin(&self) -> PyResult<Self> {
+        wrap_tensor_op(|| self.inner.sin())
+    }
+
+    fn cos(&self) -> PyResult<Self> {
+        wrap_tensor_op(|| self.inner.cos())
+    }
+
+    fn sqrt(&self) -> PyResult<Self> {
+        wrap_tensor_op(|| self.inner.sqrt())
+    }
+
+    fn tanh(&self) -> PyResult<Self> {
+        wrap_tensor_op(|| self.inner.tanh())
+    }
+
+    fn sigmoid(&self) -> PyResult<Self> {
+        wrap_tensor_op(|| self.inner.sigmoid())
+    }
+
+    fn clamp(&self, min: f64, max: f64) -> PyResult<Self> {
+        wrap_tensor_op(|| self.inner.clamp(min, max))
+    }
+
+    fn clip(&self, min: f64, max: f64) -> PyResult<Self> {
+        wrap_tensor_op(|| self.inner.clip(min, max))
+    }
+
     fn reshape(&self, shape: Vec<usize>) -> PyResult<Self> {
         wrap_tensor_op(|| self.inner.reshape(shape))
     }
@@ -500,7 +536,13 @@ mod tests {
     fn run_script_smoke_executes_basic_tensor_ops() {
         let script_path = temp_script_path("talos_xii_python_bridge_smoke");
         let script = r#"
+import math
 import talos_xii as tx
+
+def assert_close_list(got, expected, tol=1e-5):
+    assert len(got) == len(expected), (got, expected)
+    for g, e in zip(got, expected):
+        assert abs(g - e) <= tol, (got, expected)
 
 x = tx.tensor([1.0, 2.0, 3.0, 4.0], [2, 2])
 assert x.shape == [2, 2]
@@ -517,6 +559,17 @@ w = tx.tensor([2.0, 0.0, 1.0, 2.0], [2, 2])
 m = x.matmul(w)
 assert m.shape == [2, 2]
 assert m.to_list() == [4.0, 4.0, 10.0, 8.0]
+
+u = tx.tensor([-1.0, 0.0, 2.0, 4.0], [4])
+assert_close_list(u.abs().to_list(), [1.0, 0.0, 2.0, 4.0])
+assert_close_list(u.pow(2.0).to_list(), [1.0, 0.0, 4.0, 16.0])
+assert_close_list(u.sin().to_list(), [math.sin(v) for v in [-1.0, 0.0, 2.0, 4.0]])
+assert_close_list(u.cos().to_list(), [math.cos(v) for v in [-1.0, 0.0, 2.0, 4.0]])
+assert_close_list(u.tanh().to_list(), [math.tanh(v) for v in [-1.0, 0.0, 2.0, 4.0]])
+assert_close_list(u.sigmoid().to_list(), [1.0 / (1.0 + math.exp(-v)) for v in [-1.0, 0.0, 2.0, 4.0]])
+assert_close_list(u.clamp(-0.5, 1.0).to_list(), [-0.5, 0.0, 1.0, 1.0])
+assert_close_list(u.clip(-0.25, 2.5).to_list(), [-0.25, 0.0, 2.0, 2.5])
+assert_close_list(tx.tensor([1.0, 4.0, 9.0, 16.0], [4]).sqrt().to_list(), [1.0, 2.0, 3.0, 4.0])
 "#;
 
         std::fs::write(&script_path, script).unwrap();
