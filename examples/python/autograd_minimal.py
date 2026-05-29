@@ -10,7 +10,7 @@ def main():
     w = tx.tensor([0.25, -0.5], [2, 1])
     target = tx.tensor([target_value], [1, 1])
 
-    prediction = x.matmul(w)
+    prediction = x.matmul(w) + 0.1
     loss = prediction.mse_loss(target)
     loss.backward()
 

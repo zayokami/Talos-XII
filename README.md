@@ -174,7 +174,35 @@ Example:
 cargo run --features python -- python examples/python/autograd_minimal.py -- 1.0
 ```
 
-The final `--` separates arguments passed to the script; inside Python they are available through `sys.argv[1:]`. The embedded interpreter exposes a built-in `talos_xii` module with `Tensor`, `tensor`, `zeros`, `ones`, `rand`, `randn`, dtype constants, and autograd operations such as `matmul`, `mse_loss`, `backward`, and `grad`.
+The final `--` separates arguments passed to the script; inside Python they are available through `sys.argv[1:]`. The embedded interpreter exposes a built-in `talos_xii` module with `Tensor`, `tensor`, `full`, `zeros`, `ones`, `arange`, `eye`, `rand`, `randn`, dtype constants, scalar/Tensor arithmetic, and autograd operations such as `matmul`, `mse_loss`, `backward`, and `grad`.
+
+To write your own script, create a normal `.py` file, import `talos_xii`, build tensors, compute a scalar loss, then call `backward()`:
+
+```python
+# scripts/my_train.py
+import sys
+import talos_xii as tx
+
+target = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
+
+x = tx.tensor([1.0, 2.0], [1, 2])
+w = tx.tensor([0.25, -0.5], [2, 1])
+y = x.matmul(w) + 0.1
+loss = y.mse_loss(tx.tensor([target], [1, 1]))
+loss.backward()
+
+print("prediction:", y.item())
+print("loss:", loss.item())
+print("grad_w:", w.grad())
+```
+
+Run it from the project root:
+
+```bash
+cargo run --features python -- python scripts/my_train.py -- 1.0
+```
+
+Think of `talos_xii` as the small tensor/autograd module provided by this binary. Use `tx.tensor(...)` for your data, `tx.zeros/full/arange/eye/randn(...)` for common inputs, and normal Python operators like `x + 1.0`, `2.0 * x`, `x ** 2.0`, and `abs(x)` for math.
 
 No NumPy or PyTorch installation is required for Talos-XII tensor/autograd scripts. The optional bridge links against a local Python runtime supported by PyO3. Scripts are arbitrary Python code and are not sandboxed, so run only scripts you trust.
 
@@ -500,7 +528,35 @@ cargo run --features python -- python <script.py> -- <args>
 cargo run --features python -- python examples/python/autograd_minimal.py -- 1.0
 ```
 
-最后一个 `--` 用于分隔传给脚本的参数；在 Python 中可通过 `sys.argv[1:]` 读取。嵌入式解释器会提供内置 `talos_xii` 模块，包含 `Tensor`、`tensor`、`zeros`、`ones`、`rand`、`randn`、dtype 常量，以及 `matmul`、`mse_loss`、`backward`、`grad` 等 autograd 操作。
+最后一个 `--` 用于分隔传给脚本的参数；在 Python 中可通过 `sys.argv[1:]` 读取。嵌入式解释器会提供内置 `talos_xii` 模块，包含 `Tensor`、`tensor`、`full`、`zeros`、`ones`、`arange`、`eye`、`rand`、`randn`、dtype 常量、标量/Tensor 混合运算，以及 `matmul`、`mse_loss`、`backward`、`grad` 等 autograd 操作。
+
+自定义脚本就是普通 `.py` 文件。先 `import talos_xii as tx`，再创建 Tensor，算出一个标量 loss，最后调用 `backward()`：
+
+```python
+# scripts/my_train.py
+import sys
+import talos_xii as tx
+
+target = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
+
+x = tx.tensor([1.0, 2.0], [1, 2])
+w = tx.tensor([0.25, -0.5], [2, 1])
+y = x.matmul(w) + 0.1
+loss = y.mse_loss(tx.tensor([target], [1, 1]))
+loss.backward()
+
+print("prediction:", y.item())
+print("loss:", loss.item())
+print("grad_w:", w.grad())
+```
+
+在项目根目录运行：
+
+```bash
+cargo run --features python -- python scripts/my_train.py -- 1.0
+```
+
+可以把 `talos_xii` 理解成这个二进制自带的小型张量/autograd 模块。用 `tx.tensor(...)` 放入数据，用 `tx.zeros/full/arange/eye/randn(...)` 创建常见输入，也可以直接写 `x + 1.0`、`2.0 * x`、`x ** 2.0`、`abs(x)` 这类普通 Python 数学表达式。
 
 编写 Talos-XII 张量/autograd 脚本不需要安装 NumPy 或 PyTorch。这个可选桥接会链接本机 PyO3 支持的 Python 运行时。脚本是任意 Python 代码，且不提供沙箱隔离，请只运行可信脚本。
 
