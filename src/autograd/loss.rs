@@ -1,6 +1,8 @@
 #[cfg(cuda)]
 use crate::autograd::cuda_grad_out_buffer;
 use crate::autograd::{Context, Device, Tensor};
+#[cfg(cuda)]
+use crate::dtype::Dtype;
 use crate::dtype::Storage;
 use std::sync::Arc;
 
