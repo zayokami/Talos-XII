@@ -96,6 +96,19 @@ pub struct AggregatedResult {
     pub cache_stats: Option<AchfCacheStats>,
 }
 
+#[derive(Clone, Debug)]
+struct PathLatencyStats {
+    label: String,
+    samples: usize,
+    mean_ns: f64,
+    min_ns: f64,
+    p50_ns: f64,
+    p90_ns: f64,
+    p95_ns: f64,
+    p99_ns: f64,
+    max_ns: f64,
+}
+
 fn aggregate_trials(runs: &[BenchRunResult]) -> AggregatedResult {
     let label = runs[0].label.clone();
     let tputs: Vec<f64> = runs.iter().map(|r| r.throughput_sims_per_sec).collect();
@@ -313,6 +326,8 @@ pub fn run_achf_benchmarks(base_config: &Config, seed: u64, bench_cfg: &BenchCon
     println!("========================================\n");
 
     let mut all_agg: Vec<(&str, Vec<AggregatedResult>)> = Vec::new();
+    let mut path_latencies: Option<Vec<(String, Vec<f64>)>> = None;
+    let mut gate_curve: Option<BenchRunResult> = None;
 
     if should_run(bench_cfg, "ablation") {
         let agg = run_ablation(base_config, seed, nt);
@@ -333,12 +348,16 @@ pub fn run_achf_benchmarks(base_config: &Config, seed: u64, bench_cfg: &BenchCon
     if should_run(bench_cfg, "path") {
         let latencies = run_path_comparison(base_config, seed);
         println!("[Bench] Path Comparison complete.");
-        for (name, vals) in &latencies {
-            let avg = vals.iter().sum::<f64>() / vals.len() as f64;
-            println!("  {}: avg {:.1} ns ({} samples)", name, avg, vals.len());
+        for stats in path_latency_stats(&latencies) {
+            println!(
+                "  {}: avg {:.1} ns ({} samples)",
+                stats.label, stats.mean_ns, stats.samples
+            );
         }
         let e = ext(&bench_cfg.format);
         chart_path_latency(&latencies, dir, e);
+        write_path_latency_outputs(&latencies, dir);
+        path_latencies = Some(latencies);
     }
 
     if should_run(bench_cfg, "gate") {
@@ -350,6 +369,8 @@ pub fn run_achf_benchmarks(base_config: &Config, seed: u64, bench_cfg: &BenchCon
         );
         let e = ext(&bench_cfg.format);
         chart_gate_curve(&result, dir, e);
+        write_gate_curve_outputs(&result, dir);
+        gate_curve = Some(result);
     }
 
     if should_run(bench_cfg, "scale") {
@@ -376,8 +397,18 @@ pub fn run_achf_benchmarks(base_config: &Config, seed: u64, bench_cfg: &BenchCon
         all_agg.push(("convergence", agg));
     }
 
-    write_summary_txt(&all_agg, dir);
-    write_summary_json(&all_agg, dir);
+    write_summary_txt(
+        &all_agg,
+        path_latencies.as_deref(),
+        gate_curve.as_ref(),
+        dir,
+    );
+    write_summary_json(
+        &all_agg,
+        path_latencies.as_deref(),
+        gate_curve.as_ref(),
+        dir,
+    );
     write_csvs(&all_agg, dir);
 
     println!("\n========================================");
@@ -453,12 +484,17 @@ fn run_path_comparison(base_config: &Config, seed: u64) -> Vec<(String, Vec<f64>
 
     let input_dim = crate::neural::DIM;
     let sample_input: Vec<f32> = (0..input_dim).map(|i| (i as f32) * 0.1 + 0.05).collect();
+    let warmup_iterations = 100;
     let iterations = 2000;
 
     let mut all_latencies: Vec<(String, Vec<f64>)> = Vec::new();
 
     // 0 = Cached, 1 = Sparse, 2 = Dense
     for (path_name, path_id) in [("Cached", 0u8), ("Sparse", 1), ("Dense", 2)] {
+        for _ in 0..warmup_iterations {
+            let _ = ppo.forward_inference_forced_path(&sample_input, path_id);
+        }
+
         let mut latencies = Vec::with_capacity(iterations);
         for _ in 0..iterations {
             let start = Instant::now();
@@ -935,7 +971,12 @@ fn print_agg_summary(name: &str, agg: &[AggregatedResult]) {
     }
 }
 
-fn write_summary_txt(all: &[(&str, Vec<AggregatedResult>)], dir: &str) {
+fn write_summary_txt(
+    all: &[(&str, Vec<AggregatedResult>)],
+    path_latencies: Option<&[(String, Vec<f64>)]>,
+    gate_curve: Option<&BenchRunResult>,
+    dir: &str,
+) {
     let mut lines = Vec::new();
     for (name, agg) in all {
         lines.push(format!("=== {} ===", name));
@@ -967,12 +1008,74 @@ fn write_summary_txt(all: &[(&str, Vec<AggregatedResult>)], dir: &str) {
         }
         lines.push(String::new());
     }
+    if let Some(latencies) = path_latencies {
+        lines.push("=== path_latency ===".to_string());
+        for stats in path_latency_stats(latencies) {
+            lines.push(format!(
+                "  {:20} | samples={} | mean={:.1}ns | p50={:.1}ns | p95={:.1}ns | p99={:.1}ns",
+                stats.label, stats.samples, stats.mean_ns, stats.p50_ns, stats.p95_ns, stats.p99_ns
+            ));
+        }
+        lines.push(String::new());
+    }
+    if let Some(result) = gate_curve {
+        lines.push("=== gate_curve ===".to_string());
+        lines.push(format!(
+            "  {:20} | snapshots={} | reward={:.4} | loss={:.4} | params={} | time_ms={:.1}",
+            result.label,
+            result.snapshots.len(),
+            result.final_avg_reward,
+            result.final_loss,
+            result.param_count,
+            result.total_time_ms
+        ));
+        if let Some(last) = result.snapshots.last() {
+            lines.push(format!(
+                "    final: step={} gate={:.4} g_min={:.4} hit={:.1}% sparse={:.1}% bias={:.3}",
+                last.step,
+                last.gate_value,
+                last.g_min,
+                last.cache_hit_rate * 100.0,
+                last.sparse_ratio * 100.0,
+                last.adaptive_bias
+            ));
+        }
+        if let Some(stats) = result.cache_stats {
+            let calls = stats.calls as f64;
+            let path_total = (stats.sparse_paths + stats.dense_paths) as f64;
+            let hit_pct = if calls > 0.0 {
+                stats.cache_hits as f64 / calls * 100.0
+            } else {
+                0.0
+            };
+            let sparse_pct = if path_total > 0.0 {
+                stats.sparse_paths as f64 / path_total * 100.0
+            } else {
+                0.0
+            };
+            let dense_pct = if path_total > 0.0 {
+                stats.dense_paths as f64 / path_total * 100.0
+            } else {
+                0.0
+            };
+            lines.push(format!(
+                "    ACHF: calls={} hit={:.1}% sparse={:.1}% dense={:.1}% decision_ns={:.1}",
+                stats.calls, hit_pct, sparse_pct, dense_pct, stats.decision_ema_ns
+            ));
+        }
+        lines.push(String::new());
+    }
     let path = format!("{}/summary.txt", dir);
     write_text_file(&path, &lines.join("\n"));
     println!("[Bench] Summary -> {}", path);
 }
 
-fn write_summary_json(all: &[(&str, Vec<AggregatedResult>)], dir: &str) {
+fn write_summary_json(
+    all: &[(&str, Vec<AggregatedResult>)],
+    path_latencies: Option<&[(String, Vec<f64>)]>,
+    gate_curve: Option<&BenchRunResult>,
+    dir: &str,
+) {
     let mut root = serde_json::Map::new();
     for (name, agg) in all {
         let entries: Vec<serde_json::Value> = agg
@@ -994,6 +1097,15 @@ fn write_summary_json(all: &[(&str, Vec<AggregatedResult>)], dir: &str) {
             .collect();
         root.insert((*name).to_string(), serde_json::Value::Array(entries));
     }
+    if let Some(latencies) = path_latencies {
+        root.insert(
+            "path_latency".to_string(),
+            serde_json::Value::Array(path_latency_stats_json(latencies)),
+        );
+    }
+    if let Some(result) = gate_curve {
+        root.insert("gate_curve".to_string(), gate_curve_summary_json(result));
+    }
     let json = serde_json::to_string_pretty(&serde_json::Value::Object(root))
         .expect("benchmark summary JSON should be serializable");
     let path = format!("{}/summary.json", dir);
@@ -1005,6 +1117,7 @@ fn write_csvs(all: &[(&str, Vec<AggregatedResult>)], dir: &str) {
     for (name, agg) in all {
         let mut csv = String::from("label,trial,throughput,reward,loss,time_ms,param_count\n");
         for a in agg {
+            let label = csv_escape(&a.label);
             for (t, ((&tput, &rew), &loss)) in a
                 .throughput
                 .values
@@ -1020,7 +1133,7 @@ fn write_csvs(all: &[(&str, Vec<AggregatedResult>)], dir: &str) {
                 };
                 csv.push_str(&format!(
                     "{},{},{:.2},{:.4},{:.4},{:.1},{}\n",
-                    a.label,
+                    label,
                     t + 1,
                     tput,
                     rew,
@@ -1033,6 +1146,166 @@ fn write_csvs(all: &[(&str, Vec<AggregatedResult>)], dir: &str) {
         let path = format!("{}/{}.csv", dir, name);
         write_text_file(&path, &csv);
         println!("[Bench] CSV   -> {}", path);
+    }
+}
+
+fn write_path_latency_outputs(latencies: &[(String, Vec<f64>)], dir: &str) {
+    let mut csv = String::from("label,sample,latency_ns\n");
+    for (label, values) in latencies {
+        let label = csv_escape(label);
+        for (idx, latency_ns) in values.iter().enumerate() {
+            csv.push_str(&format!("{},{},{:.3}\n", label, idx + 1, latency_ns));
+        }
+    }
+    let csv_path = format!("{}/path_latency.csv", dir);
+    write_text_file(&csv_path, &csv);
+    println!("[Bench] CSV   -> {}", csv_path);
+
+    let json = serde_json::to_string_pretty(&serde_json::Value::Array(path_latency_stats_json(
+        latencies,
+    )))
+    .expect("path latency summary JSON should be serializable");
+    let json_path = format!("{}/path_latency_summary.json", dir);
+    write_text_file(&json_path, &json);
+    println!("[Bench] JSON  -> {}", json_path);
+}
+
+fn write_gate_curve_outputs(result: &BenchRunResult, dir: &str) {
+    let mut csv = String::from(
+        "step,gate_value,g_min,grad_ema,loss,reward,cache_hit_rate,sparse_ratio,ema_cached_ns,ema_sparse_ns,adaptive_bias\n",
+    );
+    for snapshot in &result.snapshots {
+        csv.push_str(&format!(
+            "{},{:.8},{:.8},{:.8},{:.8},{:.8},{:.8},{:.8},{:.3},{:.3},{:.8}\n",
+            snapshot.step,
+            snapshot.gate_value,
+            snapshot.g_min,
+            snapshot.grad_ema,
+            snapshot.loss,
+            snapshot.reward,
+            snapshot.cache_hit_rate,
+            snapshot.sparse_ratio,
+            snapshot.ema_cached_ns,
+            snapshot.ema_sparse_ns,
+            snapshot.adaptive_bias
+        ));
+    }
+    let csv_path = format!("{}/gate_curve.csv", dir);
+    write_text_file(&csv_path, &csv);
+    println!("[Bench] CSV   -> {}", csv_path);
+
+    let json = serde_json::to_string_pretty(&gate_curve_summary_json(result))
+        .expect("gate curve summary JSON should be serializable");
+    let json_path = format!("{}/gate_curve_summary.json", dir);
+    write_text_file(&json_path, &json);
+    println!("[Bench] JSON  -> {}", json_path);
+}
+
+fn path_latency_stats(latencies: &[(String, Vec<f64>)]) -> Vec<PathLatencyStats> {
+    latencies
+        .iter()
+        .filter(|(_, values)| !values.is_empty())
+        .map(|(label, values)| {
+            let mut sorted = values.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let samples = sorted.len();
+            let mean_ns = sorted.iter().sum::<f64>() / samples as f64;
+            PathLatencyStats {
+                label: label.clone(),
+                samples,
+                mean_ns,
+                min_ns: sorted[0],
+                p50_ns: percentile_sorted(&sorted, 50),
+                p90_ns: percentile_sorted(&sorted, 90),
+                p95_ns: percentile_sorted(&sorted, 95),
+                p99_ns: percentile_sorted(&sorted, 99),
+                max_ns: sorted[samples - 1],
+            }
+        })
+        .collect()
+}
+
+fn path_latency_stats_json(latencies: &[(String, Vec<f64>)]) -> Vec<serde_json::Value> {
+    path_latency_stats(latencies)
+        .into_iter()
+        .map(|stats| {
+            serde_json::json!({
+                "label": stats.label,
+                "samples": stats.samples,
+                "mean_ns": stats.mean_ns,
+                "min_ns": stats.min_ns,
+                "p50_ns": stats.p50_ns,
+                "p90_ns": stats.p90_ns,
+                "p95_ns": stats.p95_ns,
+                "p99_ns": stats.p99_ns,
+                "max_ns": stats.max_ns,
+            })
+        })
+        .collect()
+}
+
+fn gate_curve_summary_json(result: &BenchRunResult) -> serde_json::Value {
+    let final_step = result.snapshots.last().map_or(0, |s| s.step);
+    serde_json::json!({
+        "label": result.label.as_str(),
+        "total_time_ms": result.total_time_ms,
+        "throughput_sims_per_sec": result.throughput_sims_per_sec,
+        "final_avg_reward": result.final_avg_reward,
+        "final_loss": result.final_loss,
+        "param_count": result.param_count,
+        "snapshot_count": result.snapshots.len(),
+        "final_step": final_step,
+        "final_snapshot": result.snapshots.last().map(step_snapshot_json),
+        "cache_stats": result.cache_stats.map(cache_stats_json),
+    })
+}
+
+fn step_snapshot_json(snapshot: &StepSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "step": snapshot.step,
+        "gate_value": snapshot.gate_value,
+        "g_min": snapshot.g_min,
+        "grad_ema": snapshot.grad_ema,
+        "loss": snapshot.loss,
+        "reward": snapshot.reward,
+        "cache_hit_rate": snapshot.cache_hit_rate,
+        "sparse_ratio": snapshot.sparse_ratio,
+        "ema_cached_ns": snapshot.ema_cached_ns,
+        "ema_sparse_ns": snapshot.ema_sparse_ns,
+        "adaptive_bias": snapshot.adaptive_bias,
+    })
+}
+
+fn cache_stats_json(stats: AchfCacheStats) -> serde_json::Value {
+    let calls = stats.calls as f64;
+    let path_total = (stats.sparse_paths + stats.dense_paths) as f64;
+    serde_json::json!({
+        "calls": stats.calls,
+        "cache_hits": stats.cache_hits,
+        "cache_misses": stats.cache_misses,
+        "cache_skips": stats.cache_skips,
+        "sparse_paths": stats.sparse_paths,
+        "dense_paths": stats.dense_paths,
+        "hit_rate": if calls > 0.0 { stats.cache_hits as f64 / calls } else { 0.0 },
+        "sparse_path_rate": if path_total > 0.0 { stats.sparse_paths as f64 / path_total } else { 0.0 },
+        "dense_path_rate": if path_total > 0.0 { stats.dense_paths as f64 / path_total } else { 0.0 },
+        "ema_cached_ns": stats.ema_cached_ns,
+        "ema_cached_long_ns": stats.ema_cached_long_ns,
+        "ema_sparse_ns": stats.ema_sparse_ns,
+        "ema_sparse_long_ns": stats.ema_sparse_long_ns,
+        "decision_ema_ns": stats.decision_ema_ns,
+        "decision_ema_long_ns": stats.decision_ema_long_ns,
+        "adaptive_bias": stats.adaptive_bias,
+        "latency_samples": stats.latency_samples,
+        "decision_samples": stats.decision_samples,
+    })
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
     }
 }
 
@@ -1058,6 +1331,13 @@ fn percentile(data: &[f64], pct: usize) -> f64 {
     }
     let mut sorted = data.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    percentile_sorted(&sorted, pct)
+}
+
+fn percentile_sorted(sorted: &[f64], pct: usize) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
     let idx = (pct * sorted.len() / 100).min(sorted.len() - 1);
     sorted[idx]
 }
@@ -1065,6 +1345,20 @@ fn percentile(data: &[f64], pct: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "talos_xii_bench_{}_{}_{}",
+            prefix,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
 
     fn bench_config_with_only(only: Option<Vec<String>>) -> BenchConfig {
         BenchConfig {
@@ -1132,14 +1426,16 @@ mod tests {
 
     #[test]
     fn bench_sized_config_clamps_large_model_for_smoke_benchmarks() {
-        let mut cfg = Config::default();
-        cfg.model_dim = 2048;
-        cfg.model_hidden_dim = 8192;
-        cfg.model_num_layers = 24;
-        cfg.model_num_heads = 32;
-        cfg.model_kv_lora_rank = 1024;
-        cfg.model_qk_rope_dim = 256;
-        cfg.multi_stream_factor = 4;
+        let cfg = Config {
+            model_dim: 2048,
+            model_hidden_dim: 8192,
+            model_num_layers: 24,
+            model_num_heads: 32,
+            model_kv_lora_rank: 1024,
+            model_qk_rope_dim: 256,
+            multi_stream_factor: 4,
+            ..Config::default()
+        };
 
         let bench_cfg = bench_sized_config(&cfg);
 
@@ -1157,15 +1453,7 @@ mod tests {
 
     #[test]
     fn write_text_file_reports_io_errors() {
-        let dir = std::env::temp_dir().join(format!(
-            "talos_xii_bench_write_error_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&dir).unwrap();
+        let dir = unique_temp_dir("write_error");
         let path = dir.to_string_lossy().to_string();
 
         let result = try_write_text_file(&path, "content");
@@ -1176,15 +1464,7 @@ mod tests {
 
     #[test]
     fn write_summary_json_escapes_labels() {
-        let dir = std::env::temp_dir().join(format!(
-            "talos_xii_bench_json_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&dir).unwrap();
+        let dir = unique_temp_dir("json");
         let output_dir = dir.to_string_lossy().to_string();
         let result = AggregatedResult {
             label: "label,with\"quote".to_string(),
@@ -1197,7 +1477,7 @@ mod tests {
             cache_stats: None,
         };
 
-        write_summary_json(&[("exp", vec![result])], &output_dir);
+        write_summary_json(&[("exp", vec![result])], None, None, &output_dir);
 
         let json_path = dir.join("summary.json");
         let json = std::fs::read_to_string(&json_path).unwrap();
@@ -1206,5 +1486,112 @@ mod tests {
 
         std::fs::remove_file(json_path).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn csv_escape_quotes_commas_quotes_and_newlines() {
+        assert_eq!(csv_escape("plain"), "plain");
+        assert_eq!(csv_escape("a,b\"c"), "\"a,b\"\"c\"");
+        assert_eq!(csv_escape("line\nbreak"), "\"line\nbreak\"");
+    }
+
+    #[test]
+    fn path_latency_outputs_include_stats_in_csv_json_and_summary() {
+        let dir = unique_temp_dir("path_latency");
+        let output_dir = dir.to_string_lossy().to_string();
+        let latencies = vec![
+            ("Dense,path".to_string(), vec![30.0, 10.0, 20.0, 40.0]),
+            ("Empty".to_string(), Vec::new()),
+        ];
+
+        let stats = path_latency_stats(&latencies);
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].label, "Dense,path");
+        assert_eq!(stats[0].samples, 4);
+        assert_eq!(stats[0].mean_ns, 25.0);
+        assert_eq!(stats[0].min_ns, 10.0);
+        assert_eq!(stats[0].p50_ns, 30.0);
+        assert_eq!(stats[0].p95_ns, 40.0);
+
+        write_path_latency_outputs(&latencies, &output_dir);
+        write_summary_json(&[], Some(&latencies), None, &output_dir);
+
+        let csv = std::fs::read_to_string(dir.join("path_latency.csv")).unwrap();
+        assert!(csv.contains("\"Dense,path\",1,30.000"));
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("summary.json")).unwrap())
+                .unwrap();
+        assert_eq!(json["path_latency"][0]["label"], "Dense,path");
+        assert_eq!(json["path_latency"][0]["p99_ns"], 40.0);
+        let summary: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("path_latency_summary.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(summary[0]["samples"], 4);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn gate_curve_outputs_include_snapshot_and_cache_summary() {
+        let dir = unique_temp_dir("gate_curve");
+        let output_dir = dir.to_string_lossy().to_string();
+        let result = BenchRunResult {
+            label: "Gate Curve".to_string(),
+            total_time_ms: 12.5,
+            throughput_sims_per_sec: 0.0,
+            final_avg_reward: 1.25,
+            final_loss: 0.125,
+            param_count: 7,
+            snapshots: vec![StepSnapshot {
+                step: 10,
+                gate_value: 0.8,
+                g_min: 0.2,
+                grad_ema: 0.3,
+                loss: 0.125,
+                reward: 1.25,
+                cache_hit_rate: 0.5,
+                sparse_ratio: 0.75,
+                ema_cached_ns: 11.0,
+                ema_sparse_ns: 22.0,
+                adaptive_bias: 1.1,
+            }],
+            cache_stats: Some(AchfCacheStats {
+                calls: 8,
+                cache_hits: 2,
+                cache_misses: 1,
+                cache_skips: 1,
+                sparse_paths: 3,
+                dense_paths: 1,
+                ema_cached_ns: 11.0,
+                ema_cached_long_ns: 12.0,
+                ema_sparse_ns: 22.0,
+                ema_sparse_long_ns: 23.0,
+                decision_ema_ns: 4.0,
+                decision_ema_long_ns: 5.0,
+                adaptive_bias: 1.1,
+                latency_samples: 6,
+                decision_samples: 4,
+            }),
+        };
+
+        write_gate_curve_outputs(&result, &output_dir);
+        write_summary_json(&[], None, Some(&result), &output_dir);
+
+        let csv = std::fs::read_to_string(dir.join("gate_curve.csv")).unwrap();
+        assert!(csv.contains("10,0.80000000,0.20000000,0.30000000"));
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("summary.json")).unwrap())
+                .unwrap();
+        assert_eq!(json["gate_curve"]["snapshot_count"], 1);
+        assert_eq!(json["gate_curve"]["final_snapshot"]["step"], 10);
+        assert_eq!(json["gate_curve"]["cache_stats"]["hit_rate"], 0.25);
+        let summary: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("gate_curve_summary.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(summary["final_step"], 10);
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
