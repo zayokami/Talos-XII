@@ -93,7 +93,7 @@ cargo build --release
 ./target/release/talos_xii
 ```
 
-On first launch, the program trains EnvNet, NeuralLuckOptimizer, DQN (50k steps), and PPO (20k steps by default), taking ~30–45 seconds. Models are cached to `env_net.cache`, `neural.cache`, `dqn.cache.bin`, and `ppo.cache.bin`; BF16 inference caches are written to `dqn.cache.bf16.bin` and `ppo.cache.bf16.bin`. Subsequent launches complete in under 1 second.
+On first launch, the program trains EnvNet, NeuralLuckOptimizer, DQN (50k steps), and PPO (20k steps by default), taking ~30–45 seconds. Models are cached beside the running executable as `env_net.cache`, `neural.cache`, `dqn.cache.bin`, and `ppo.cache.bin`; BF16 inference caches are written to `dqn.cache.bf16.bin` and `ppo.cache.bf16.bin`. Subsequent launches complete in under 1 second.
 
 ### CUDA Support (Optional)
 
@@ -351,7 +351,7 @@ Training EnvNet, NeuralLuckOptimizer, DQN, and PPO models takes ~30–45 seconds
 All simulations obtained UP within the free pull budget — no paid spending was required. This means free resources are sufficient under current pool conditions.
 
 **Can I delete the cache files?**
-Yes. Deleting `env_net.cache`, `neural.cache`, `dqn.cache.bin`, or `ppo.cache.bin` triggers retraining for the corresponding model on next run. Deleting `dqn.cache.bf16.bin` or `ppo.cache.bf16.bin` only rebuilds the BF16 inference cache from the master model. Usually only needed when pity/probability mechanics, model architecture, feature construction, or training configuration changes.
+Yes. These files are stored beside the executable by default. Deleting `env_net.cache`, `neural.cache`, `dqn.cache.bin`, or `ppo.cache.bin` triggers retraining for the corresponding model on next run. Deleting `dqn.cache.bf16.bin` or `ppo.cache.bf16.bin` only rebuilds the BF16 inference cache from the master model. Usually only needed when pity/probability mechanics, model architecture, feature construction, or training configuration changes.
 
 ---
 
@@ -447,7 +447,7 @@ cargo build --release
 ./target/release/talos_xii
 ```
 
-首次启动会训练 EnvNet、NeuralLuckOptimizer、DQN（50k 步）和 PPO（默认 20k 步），约 30～45 秒。模型缓存至 `env_net.cache`、`neural.cache`、`dqn.cache.bin`、`ppo.cache.bin`；BF16 推理缓存写入 `dqn.cache.bf16.bin` 和 `ppo.cache.bf16.bin`，之后启动不到 1 秒。
+首次启动会训练 EnvNet、NeuralLuckOptimizer、DQN（50k 步）和 PPO（默认 20k 步），约 30～45 秒。模型默认缓存到运行中的 exe 所在目录，文件名为 `env_net.cache`、`neural.cache`、`dqn.cache.bin`、`ppo.cache.bin`；BF16 推理缓存写入 `dqn.cache.bf16.bin` 和 `ppo.cache.bf16.bin`，之后启动不到 1 秒。
 
 ### CUDA 支持（可选）
 
@@ -703,7 +703,7 @@ cargo test
 所有模拟都在免费抽数内出了 UP，没有产生需要额外付费的样本，说明当前卡池条件下免费资源够用。
 
 **可以删除缓存文件吗？**
-可以。删除 `env_net.cache`、`neural.cache`、`dqn.cache.bin` 或 `ppo.cache.bin` 后，下次运行会重训对应模型。删除 `dqn.cache.bf16.bin` 或 `ppo.cache.bf16.bin` 只会从主模型重建 BF16 推理缓存。一般只在保底/概率机制、模型结构、特征构造或训练配置变化时才需要清缓存。
+可以。缓存文件默认在 exe 所在目录。删除 `env_net.cache`、`neural.cache`、`dqn.cache.bin` 或 `ppo.cache.bin` 后，下次运行会重训对应模型。删除 `dqn.cache.bf16.bin` 或 `ppo.cache.bf16.bin` 只会从主模型重建 BF16 推理缓存。一般只在保底/概率机制、模型结构、特征构造或训练配置变化时才需要清缓存。
 
 ---
 

@@ -14,39 +14,86 @@ static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const CACHE_MANIFEST_SCHEMA: u32 = 1;
 const FEATURE_SPEC_VERSION: u32 = 1;
 
-fn safe_parent_fallback(path: &str) -> Option<String> {
+fn executable_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+}
+
+fn is_cache_relative_path(path: &Path) -> bool {
+    !path.is_absolute()
+        && !path
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+}
+
+fn cache_primary_path(path: &str) -> PathBuf {
     let requested = Path::new(path);
-    if requested.is_absolute() || requested.components().any(|c| c == Component::ParentDir) {
+    if requested.as_os_str().is_empty() {
+        return requested.to_path_buf();
+    }
+    if is_cache_relative_path(requested) {
+        if let Some(base) = executable_dir() {
+            return base.join(requested);
+        }
+    }
+    requested.to_path_buf()
+}
+
+fn legacy_parent_fallback(path: &str) -> Option<PathBuf> {
+    let requested = Path::new(path);
+    if !is_cache_relative_path(requested) {
         return None;
     }
-    Some(
-        Path::new("..")
-            .join("..")
-            .join(requested)
-            .to_string_lossy()
-            .into_owned(),
-    )
+    Some(Path::new("..").join("..").join(requested))
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+fn cache_read_candidates(path: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::with_capacity(3);
+    push_unique_path(&mut paths, cache_primary_path(path));
+
+    let requested = PathBuf::from(path);
+    if !requested.is_absolute() {
+        push_unique_path(&mut paths, requested);
+    }
+    if let Some(fallback) = legacy_parent_fallback(path) {
+        push_unique_path(&mut paths, fallback);
+    }
+    paths
+}
+
+fn cache_write_candidates(path: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::with_capacity(3);
+    push_unique_path(&mut paths, cache_primary_path(path));
+
+    let requested = PathBuf::from(path);
+    if !requested.is_absolute() {
+        push_unique_path(&mut paths, requested);
+    }
+    if let Some(fallback) = legacy_parent_fallback(path) {
+        push_unique_path(&mut paths, fallback);
+    }
+    paths
 }
 
 pub fn read_cache_bytes(path: &str) -> Option<Vec<u8>> {
-    match read_file_bytes(path) {
-        Ok(Some(bytes)) => return Some(bytes),
-        Ok(None) => {}
-        Err(err) => log::warn!("[Cache] Failed to read {}: {}", path, err),
-    }
-    let alt = safe_parent_fallback(path)?;
-    match read_file_bytes(&alt) {
-        Ok(Some(bytes)) => Some(bytes),
-        Ok(None) => None,
-        Err(err) => {
-            log::warn!("[Cache] Failed to read fallback {}: {}", alt, err);
-            None
+    for candidate in cache_read_candidates(path) {
+        match read_file_bytes(&candidate) {
+            Ok(Some(bytes)) => return Some(bytes),
+            Ok(None) => {}
+            Err(err) => log::warn!("[Cache] Failed to read {}: {}", candidate.display(), err),
         }
     }
+    None
 }
 
-fn read_file_bytes(path: &str) -> Result<Option<Vec<u8>>, String> {
-    let path_ref = Path::new(path);
+fn read_file_bytes(path_ref: &Path) -> Result<Option<Vec<u8>>, String> {
     let metadata = match fs::metadata(path_ref) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -396,14 +443,7 @@ pub fn serialized_model_hash<T: serde::Serialize>(model: &T) -> Option<String> {
 }
 
 fn artifact_hash_for_path(path: &str) -> Option<String> {
-    match read_file_bytes(path) {
-        Ok(Some(bytes)) => Some(fnv1a_hex(&bytes)),
-        Ok(None) => None,
-        Err(err) => {
-            log::warn!("[Cache] Failed to hash {}: {}", path, err);
-            None
-        }
-    }
+    read_cache_bytes(path).map(|bytes| fnv1a_hex(&bytes))
 }
 
 pub fn cache_artifact_hash(path: &str) -> Option<String> {
@@ -537,15 +577,25 @@ pub fn save_neural_cache_with_manifest(
 
 pub fn save_model<T: serde::Serialize>(model: &T, path: &str, label: &str) -> bool {
     let bin_path = format!("{}.bin", path);
+    let display_path = cache_primary_path(&bin_path);
     let saved = match write_file_atomically(&bin_path, |writer| {
         binary_codec::serialize_into(writer, model)
     }) {
         Ok(()) => {
-            info!("[{}] Model saved to {} (Binary)", label, bin_path);
+            info!(
+                "[{}] Model saved to {} (Binary)",
+                label,
+                display_path.display()
+            );
             true
         }
         Err(err) => {
-            log::warn!("[{}] Failed to save model to {}: {}", label, bin_path, err);
+            log::warn!(
+                "[{}] Failed to save model to {}: {}",
+                label,
+                display_path.display(),
+                err
+            );
             false
         }
     };
@@ -640,49 +690,65 @@ pub fn save_env_net_cache_with_manifest(
 
 pub fn load_model<T: serde::de::DeserializeOwned>(path: &str, label: &str) -> Option<T> {
     let bin_path = format!("{}.bin", path);
-    match std::fs::File::open(&bin_path) {
-        Ok(file) => {
-            let reader = std::io::BufReader::new(file);
-            match binary_codec::deserialize_from(reader) {
-                Ok(model) => {
-                    info!("[{}] Loaded model from {} (Binary)", label, bin_path);
-                    return Some(model);
-                }
-                Err(e) => {
-                    log::warn!(
-                        "[{}] Failed to deserialize model from {}: {}",
-                        label,
-                        bin_path,
-                        e
-                    );
-                }
+    if let Some((file, actual_path)) = open_cache_file(&bin_path, label) {
+        let reader = std::io::BufReader::new(file);
+        match binary_codec::deserialize_from(reader) {
+            Ok(model) => {
+                info!(
+                    "[{}] Loaded model from {} (Binary)",
+                    label,
+                    actual_path.display()
+                );
+                return Some(model);
             }
-        }
-        Err(e) => {
-            log::warn!("[{}] Failed to open {}: {}", label, bin_path, e);
-        }
+            Err(e) => {
+                log::warn!(
+                    "[{}] Failed to deserialize model from {}: {}",
+                    label,
+                    actual_path.display(),
+                    e
+                );
+            }
+        };
     }
 
-    match std::fs::File::open(path) {
-        Ok(file) => {
-            let reader = std::io::BufReader::new(file);
-            match serde_json::from_reader(reader) {
-                Ok(model) => {
-                    info!("[{}] Loaded model from {} (JSON)", label, path);
-                    return Some(model);
-                }
-                Err(e) => {
-                    log::warn!(
-                        "[{}] Failed to deserialize model from {}: {}",
-                        label,
-                        path,
-                        e
-                    );
-                }
+    if let Some((file, actual_path)) = open_cache_file(path, label) {
+        let reader = std::io::BufReader::new(file);
+        match serde_json::from_reader(reader) {
+            Ok(model) => {
+                info!(
+                    "[{}] Loaded model from {} (JSON)",
+                    label,
+                    actual_path.display()
+                );
+                return Some(model);
             }
-        }
-        Err(e) => {
-            log::warn!("[{}] Failed to open {}: {}", label, path, e);
+            Err(e) => {
+                log::warn!(
+                    "[{}] Failed to deserialize model from {}: {}",
+                    label,
+                    actual_path.display(),
+                    e
+                );
+            }
+        };
+    }
+    None
+}
+
+fn open_cache_file(path: &str, label: &str) -> Option<(File, PathBuf)> {
+    for candidate in cache_read_candidates(path) {
+        match File::open(&candidate) {
+            Ok(file) => return Some((file, candidate)),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                log::warn!(
+                    "[{}] Failed to open {}: {}",
+                    label,
+                    candidate.display(),
+                    err
+                );
+            }
         }
     }
     None
@@ -701,25 +767,29 @@ pub fn load_model_with_manifest<T: serde::de::DeserializeOwned>(
 }
 
 fn save_bytes_with_fallback(path: &str, bytes: &[u8], label: &str) -> bool {
-    match write_bytes_atomically(path, bytes) {
-        Ok(()) => return true,
-        Err(err) => log::warn!("[{}] Failed to save {}: {}", label, path, err),
-    }
-
-    let Some(alt) = safe_parent_fallback(path) else {
-        return false;
-    };
-    match write_bytes_atomically(&alt, bytes) {
-        Ok(()) => true,
-        Err(err) => {
-            log::warn!("[{}] Failed to save fallback cache {}: {}", label, alt, err);
-            false
+    let mut last_error = None;
+    for candidate in cache_write_candidates(path) {
+        match write_bytes_atomically_at(&candidate, bytes) {
+            Ok(()) => return true,
+            Err(err) => {
+                log::warn!(
+                    "[{}] Failed to save {}: {}",
+                    label,
+                    candidate.display(),
+                    err
+                );
+                last_error = Some(err);
+            }
         }
     }
+    if last_error.is_none() {
+        log::warn!("[{}] Failed to save {}: no candidate path", label, path);
+    }
+    false
 }
 
-fn write_bytes_atomically(path: &str, bytes: &[u8]) -> Result<(), String> {
-    write_file_atomically(path, |writer| writer.write_all(bytes))
+fn write_bytes_atomically_at(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    write_file_atomically_at(path, |writer| writer.write_all(bytes))
 }
 
 fn write_file_atomically<E, F>(path: &str, write_fn: F) -> Result<(), String>
@@ -727,7 +797,15 @@ where
     E: std::fmt::Display,
     F: FnOnce(&mut BufWriter<File>) -> Result<(), E>,
 {
-    let target = Path::new(path);
+    let target = cache_primary_path(path);
+    write_file_atomically_at(&target, write_fn)
+}
+
+fn write_file_atomically_at<E, F>(target: &Path, write_fn: F) -> Result<(), String>
+where
+    E: std::fmt::Display,
+    F: FnOnce(&mut BufWriter<File>) -> Result<(), E>,
+{
     if target.as_os_str().is_empty() {
         return Err("target path is empty".to_string());
     }
@@ -833,6 +911,53 @@ mod tests {
             .join(format!("{}_{}_{}", prefix, std::process::id(), now))
             .to_string_lossy()
             .into_owned()
+    }
+
+    fn unique_relative_name(prefix: &str) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("{}_{}_{}", prefix, std::process::id(), now)
+    }
+
+    #[test]
+    fn relative_cache_names_default_to_executable_dir() {
+        let name = unique_relative_name("talos_model_io_relative_bytes.cache");
+        let primary = cache_primary_path(&name);
+        let exe_dir = executable_dir().expect("test executable path should be available");
+        assert_eq!(primary, exe_dir.join(&name));
+
+        let cwd_path = PathBuf::from(&name);
+        let _ = fs::remove_file(&primary);
+        let _ = fs::remove_file(&cwd_path);
+
+        assert!(save_bytes_with_fallback(&name, b"cached", "Test Cache"));
+        assert_eq!(fs::read(&primary).unwrap(), b"cached");
+        assert_eq!(read_cache_bytes(&name).unwrap(), b"cached");
+
+        let _ = fs::remove_file(primary);
+        let _ = fs::remove_file(cwd_path);
+    }
+
+    #[test]
+    fn relative_model_cache_loads_from_executable_dir() {
+        let path = unique_relative_name("talos_model_io_relative_model");
+        let bin_path = cache_primary_path(&format!("{}.bin", path));
+        let cwd_bin_path = PathBuf::from(format!("{}.bin", path));
+        let _ = fs::remove_file(&bin_path);
+        let _ = fs::remove_file(&cwd_bin_path);
+
+        let model = TestModel {
+            value: 7,
+            name: "relative".to_string(),
+        };
+        assert!(save_model(&model, &path, "Test"));
+        assert!(bin_path.exists());
+        assert_eq!(load_model::<TestModel>(&path, "Test"), Some(model));
+
+        let _ = fs::remove_file(bin_path);
+        let _ = fs::remove_file(cwd_bin_path);
     }
 
     #[test]

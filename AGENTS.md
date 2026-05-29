@@ -55,7 +55,7 @@ See `README.md` for full details. Quick reference:
 ### Non-obvious caveats
 
 - **First run trains neural models**: The first model-using `cargo run` invocation takes ~30-45s because it trains or loads EnvNet, NeuralLuckOptimizer, DQN (50k steps), and PPO (20k steps by default). Subsequent runs load cache files and start in <1s.
-- **Cache files are generated in CWD**: Running model commands creates cache artifacts such as `env_net.cache`, `neural.cache`, `dqn.cache.bin`, `ppo.cache.bin`, `dqn.cache.bf16.bin`, and `ppo.cache.bf16.bin`. These are gitignored.
+- **Cache files live beside the executable by default**: Running model commands creates cache artifacts such as `env_net.cache`, `neural.cache`, `dqn.cache.bin`, `ppo.cache.bin`, `dqn.cache.bf16.bin`, and `ppo.cache.bf16.bin` in the directory containing the running binary. Legacy CWD cache locations are still read for compatibility.
 - **Config warnings are benign**: `[Config Warning] Unknown field: _comment*` messages at startup are expected — they come from documentation comment fields in `data/config.json`.
 - **Dev profile uses opt-level 3**: The `[profile.dev]` in `Cargo.toml` enables full optimizations even in debug mode (needed for neural network perf). This means dev builds are slower to compile but run at near-release speed.
 - **`interactive` subcommand reads stdin**: Avoid using `cargo run -- interactive` in non-TTY contexts as it blocks waiting for user input.
