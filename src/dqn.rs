@@ -1,5 +1,7 @@
 use crate::achf::AchfLayer;
-use crate::autograd::{Tensor, TensorReadGuard};
+use crate::autograd::Tensor;
+#[cfg(test)]
+use crate::autograd::TensorReadGuard;
 use crate::config::{AchfConfig, Config};
 use crate::env_net::EnvNet;
 use crate::neural::{NeuralLuckOptimizer, DIM};
@@ -31,6 +33,7 @@ const PER_EPSILON: f64 = 1e-6;
 // Constant tensor data for reuse - avoids per-step allocation
 const ONES_5_1_DATA: [f64; 5] = [1.0; 5];
 
+#[cfg(test)]
 fn double_dqn_target_cpu(
     q_next_eval: &Tensor,
     q_next_target: &Tensor,
@@ -66,6 +69,72 @@ fn double_dqn_target_cpu(
     }
 
     Tensor::new_f32(std::mem::take(target_vals), vec![batch, 1])
+}
+
+fn double_dqn_target_from_q_values_cpu(
+    q_next_eval_data: &[f32],
+    q_next_target_data: &[f32],
+    rewards: &[f32],
+    dones: &[f32],
+    gamma: f64,
+    target_vals: &mut Vec<f64>,
+) -> Tensor {
+    assert_eq!(rewards.len(), dones.len());
+    let batch = rewards.len();
+    assert_eq!(q_next_eval_data.len(), batch * ACTION_SPACE);
+    assert_eq!(q_next_target_data.len(), batch * ACTION_SPACE);
+
+    target_vals.clear();
+    target_vals.reserve(batch);
+
+    for i in 0..batch {
+        let start = i * ACTION_SPACE;
+        let end = start + ACTION_SPACE;
+        let row_eval = &q_next_eval_data[start..end];
+        let mut max_idx = 0;
+        let mut max_val = f32::NEG_INFINITY;
+        for (k, &v) in row_eval.iter().enumerate() {
+            if v > max_val {
+                max_val = v;
+                max_idx = k;
+            }
+        }
+        let next_q_val = q_next_target_data[start + max_idx] as f64;
+        target_vals.push(rewards[i] as f64 + gamma * next_q_val * (1.0 - dones[i] as f64));
+    }
+
+    Tensor::new_f32(std::mem::take(target_vals), vec![batch, 1])
+}
+
+fn double_dqn_target_inference_cpu(
+    policy_net: &DuelingQNetwork,
+    target_net: &DuelingQNetwork,
+    batch_next_state: &Tensor,
+    rewards_tensor: &Tensor,
+    dones_tensor: &Tensor,
+    gamma: f64,
+    target_vals: &mut Vec<f64>,
+) -> Tensor {
+    let next_states = batch_next_state.data_to_f32_vec();
+    assert!(
+        next_states.len().is_multiple_of(DIM),
+        "DQN next-state batch length {} is not divisible by feature dim {}",
+        next_states.len(),
+        DIM
+    );
+    let q_next_eval = policy_net.forward_inference_batch_values(&next_states);
+    let q_next_target = target_net.forward_inference_batch_values(&next_states);
+    let rewards = rewards_tensor.data_to_f32_vec();
+    let dones = dones_tensor.data_to_f32_vec();
+
+    double_dqn_target_from_q_values_cpu(
+        &q_next_eval,
+        &q_next_target,
+        &rewards,
+        &dones,
+        gamma,
+        target_vals,
+    )
 }
 
 #[cfg(cuda)]
@@ -460,6 +529,83 @@ impl DuelingQNetwork {
         out.adv_head = self.adv_head.to_inference_bf16();
         out.achf = self.achf.as_ref().map(AchfLayer::to_inference_bf16);
         out
+    }
+
+    fn forward_inference_batch_values(&self, states: &[f32]) -> Vec<f32> {
+        if states.is_empty() {
+            return Vec::new();
+        }
+        assert!(
+            states.len().is_multiple_of(DIM),
+            "DQN batch inference input length {} is not divisible by feature dim {}",
+            states.len(),
+            DIM
+        );
+        let batch = states.len() / DIM;
+        let mut h1 = vec![0.0f32; batch * self.l1.out_features];
+        let mut h2 = vec![0.0f32; batch * self.l2.out_features];
+        let mut h3 = vec![0.0f32; batch * self.l3.out_features];
+        let mut val = vec![0.0f32; batch * self.val_head.out_features];
+        let mut adv = vec![0.0f32; batch * self.adv_head.out_features];
+
+        self.l1.forward_inference_into(states, &mut h1);
+        for v in &mut h1 {
+            if *v < 0.0 {
+                *v = 0.0;
+            }
+        }
+
+        self.l2.forward_inference_into(&h1, &mut h2);
+        for v in &mut h2 {
+            if *v < 0.0 {
+                *v = 0.0;
+            }
+        }
+
+        if let Some(achf) = &self.achf {
+            let out = achf.forward_inference_residual(&h2);
+            h3.resize(out.len(), 0.0);
+            h3.copy_from_slice(&out);
+        } else {
+            h3.resize(h2.len(), 0.0);
+            self.l3.forward_inference_into(&h2, &mut h3);
+        }
+        for v in &mut h3 {
+            if *v < 0.0 {
+                *v = 0.0;
+            }
+        }
+
+        self.val_head.forward_inference_into(&h3, &mut val);
+        self.adv_head.forward_inference_into(&h3, &mut adv);
+
+        let mut q_values = vec![0.0f32; batch * ACTION_SPACE];
+        for b in 0..batch {
+            let val_b = val[b];
+            let adv_row = &adv[b * ACTION_SPACE..(b + 1) * ACTION_SPACE];
+            let mean_adv = adv_row.iter().sum::<f32>() / ACTION_SPACE as f32;
+            for (i, &a) in adv_row.iter().enumerate() {
+                q_values[b * ACTION_SPACE + i] = val_b + a - mean_adv;
+            }
+        }
+        q_values
+    }
+
+    #[cfg(test)]
+    pub fn forward_inference_batch(&self, state: &Tensor) -> Tensor {
+        let states = state.data_to_f32_vec();
+        let q_values = self.forward_inference_batch_values(&states);
+        let batch = if state.shape.len() == 2 {
+            state.shape[0]
+        } else {
+            1
+        };
+        let shape = if batch == 1 {
+            vec![ACTION_SPACE]
+        } else {
+            vec![batch, ACTION_SPACE]
+        };
+        Tensor::new_f32(q_values.into_iter().map(|v| v as f64).collect(), shape)
     }
 
     // Copy weights
@@ -1863,14 +2009,13 @@ fn train_dqn_impl(
             let q_actions = (q_values * batch_mask).matmul(&ones_5_1); // (B, 1)
 
             // 3. Compute Targets (Double DQN)
-            // Select action using Policy Net
-            let q_next_eval = policy_net.forward(&batch_next_state); // (B, 5)
-
-            // Evaluate value using Target Net
-            let q_next_target = target_net.forward(&batch_next_state); // (B, 5)
-
             #[cfg(cuda)]
-            let target_tensor = {
+            let target_tensor = if batch_next_state.device == crate::autograd::Device::Cuda
+                && q_values.device == crate::autograd::Device::Cuda
+                && crate::cuda::is_available()
+            {
+                let q_next_eval = policy_net.forward(&batch_next_state).detach(); // (B, 5)
+                let q_next_target = target_net.forward(&batch_next_state).detach(); // (B, 5)
                 double_dqn_target_cuda(
                     &q_next_eval,
                     &q_next_target,
@@ -1879,20 +2024,32 @@ fn train_dqn_impl(
                     GAMMA,
                 )
                 .unwrap_or_else(|| {
-                    double_dqn_target_cpu(
-                        &q_next_eval,
-                        &q_next_target,
+                    double_dqn_target_inference_cpu(
+                        &policy_net,
+                        &target_net,
+                        &batch_next_state,
                         &rewards_tensor,
                         &dones_tensor,
                         GAMMA,
                         &mut scratch.target_vals,
                     )
                 })
+            } else {
+                double_dqn_target_inference_cpu(
+                    &policy_net,
+                    &target_net,
+                    &batch_next_state,
+                    &rewards_tensor,
+                    &dones_tensor,
+                    GAMMA,
+                    &mut scratch.target_vals,
+                )
             };
             #[cfg(not(cuda))]
-            let target_tensor = double_dqn_target_cpu(
-                &q_next_eval,
-                &q_next_target,
+            let target_tensor = double_dqn_target_inference_cpu(
+                &policy_net,
+                &target_net,
+                &batch_next_state,
                 &rewards_tensor,
                 &dones_tensor,
                 GAMMA,
@@ -2191,11 +2348,13 @@ impl OnlineDqnTrainer {
         };
         let q_actions = (q_values * batch_mask).matmul(&ones_5_1);
 
-        let q_next_eval = self.policy.forward(&batch_next_state);
-        let q_next_target = self.target.forward(&batch_next_state);
-
         #[cfg(cuda)]
-        let target_tensor = {
+        let target_tensor = if batch_next_state.device == crate::autograd::Device::Cuda
+            && q_values.device == crate::autograd::Device::Cuda
+            && crate::cuda::is_available()
+        {
+            let q_next_eval = self.policy.forward(&batch_next_state).detach();
+            let q_next_target = self.target.forward(&batch_next_state).detach();
             double_dqn_target_cuda(
                 &q_next_eval,
                 &q_next_target,
@@ -2204,20 +2363,32 @@ impl OnlineDqnTrainer {
                 GAMMA,
             )
             .unwrap_or_else(|| {
-                double_dqn_target_cpu(
-                    &q_next_eval,
-                    &q_next_target,
+                double_dqn_target_inference_cpu(
+                    &self.policy,
+                    &self.target,
+                    &batch_next_state,
                     &rewards_tensor,
                     &dones_tensor,
                     GAMMA,
                     &mut self.scratch.target_vals,
                 )
             })
+        } else {
+            double_dqn_target_inference_cpu(
+                &self.policy,
+                &self.target,
+                &batch_next_state,
+                &rewards_tensor,
+                &dones_tensor,
+                GAMMA,
+                &mut self.scratch.target_vals,
+            )
         };
         #[cfg(not(cuda))]
-        let target_tensor = double_dqn_target_cpu(
-            &q_next_eval,
-            &q_next_target,
+        let target_tensor = double_dqn_target_inference_cpu(
+            &self.policy,
+            &self.target,
+            &batch_next_state,
             &rewards_tensor,
             &dones_tensor,
             GAMMA,
@@ -2302,5 +2473,95 @@ impl OnlineDqnTrainer {
 
     pub fn buffer_len(&self) -> usize {
         self.replay_buffer.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn small_dqn_config() -> Config {
+        Config {
+            model_hidden_dim: 16,
+            model_num_layers: 1,
+            achf: AchfConfig {
+                enabled: false,
+                ..AchfConfig::default()
+            },
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn dqn_batch_inference_matches_autograd_forward_without_graph() {
+        let config = small_dqn_config();
+        let dqn = DuelingQNetwork::new_with_config(&config, 123);
+        let values: Vec<f64> = (0..2 * DIM)
+            .map(|i| i as f64 / (2 * DIM) as f64 - 0.25)
+            .collect();
+        let states = Tensor::new_f32(values, vec![2, DIM]);
+
+        let fast = dqn.forward_inference_batch(&states);
+        let slow = dqn.forward(&states).detach();
+
+        assert!(fast._ctx.is_none());
+        assert_eq!(fast.shape, vec![2, ACTION_SPACE]);
+        let fast_data = fast.data_to_f32_vec();
+        let slow_data = slow.data_to_f32_vec();
+        assert_eq!(fast_data.len(), slow_data.len());
+        for (idx, (&actual, &expected)) in fast_data.iter().zip(slow_data.iter()).enumerate() {
+            assert!(
+                (actual - expected).abs() < 1e-4,
+                "idx {idx}: inference={actual}, autograd={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn double_dqn_target_inference_matches_tensor_target_without_graph() {
+        let config = small_dqn_config();
+        let policy = DuelingQNetwork::new_with_config(&config, 7);
+        let target = DuelingQNetwork::new_with_config(&config, 11);
+        let batch = 3;
+        let values: Vec<f64> = (0..batch * DIM)
+            .map(|i| ((i % DIM) as f64 - 8.0) / 32.0)
+            .collect();
+        let next_states = Tensor::new_f32(values, vec![batch, DIM]);
+        let rewards = Tensor::new_f32(vec![1.0, -0.5, 0.25], vec![batch, 1]);
+        let dones = Tensor::new_f32(vec![0.0, 1.0, 0.0], vec![batch, 1]);
+
+        let q_next_eval = policy.forward(&next_states).detach();
+        let q_next_target = target.forward(&next_states).detach();
+        let mut expected_vals = Vec::new();
+        let expected = double_dqn_target_cpu(
+            &q_next_eval,
+            &q_next_target,
+            &rewards,
+            &dones,
+            GAMMA,
+            &mut expected_vals,
+        );
+
+        let mut actual_vals = Vec::new();
+        let actual = double_dqn_target_inference_cpu(
+            &policy,
+            &target,
+            &next_states,
+            &rewards,
+            &dones,
+            GAMMA,
+            &mut actual_vals,
+        );
+
+        assert!(actual._ctx.is_none());
+        let actual_data = actual.data_to_f32_vec();
+        let expected_data = expected.data_to_f32_vec();
+        for (idx, (&actual, &expected)) in actual_data.iter().zip(expected_data.iter()).enumerate()
+        {
+            assert!(
+                (actual - expected).abs() < 1e-4,
+                "idx {idx}: inference_target={actual}, tensor_target={expected}"
+            );
+        }
     }
 }

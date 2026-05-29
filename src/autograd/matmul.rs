@@ -254,8 +254,52 @@ impl Tensor {
             vec![m, n]
         };
 
-        let lhs_cache: Arc<Vec<f64>> = Arc::new(lhs_f32.iter().map(|&v| v as f64).collect());
-        let rhs_cache: Arc<Vec<f64>> = Arc::new(rhs_f32.iter().map(|&v| v as f64).collect());
+        if out_dtype == Dtype::F64 {
+            let lhs_cache: Arc<Vec<f64>> = Arc::new(lhs_f32.iter().map(|&v| v as f64).collect());
+            let rhs_cache: Arc<Vec<f64>> = Arc::new(rhs_f32.iter().map(|&v| v as f64).collect());
+
+            return Tensor {
+                data: Storage::from_f32_vec(out_data, out_dtype),
+                grad: Storage::zeros(m * n, Tensor::grad_dtype_for(out_dtype)),
+                shape: out_shape,
+                device: Device::Cpu,
+                dtype: out_dtype,
+                _ctx: Some(Arc::new(Context {
+                    parents: vec![self.clone(), other.clone()],
+                    backward_op: Box::new(move |grad_out, _parents| {
+                        let grad_out_f64 = grad_out.to_f64_vec();
+                        {
+                            let mut lhs_grad = _parents[0].grad_write_compat();
+                            for r in 0..m {
+                                for i in 0..k {
+                                    let mut sum = 0.0f64;
+                                    for j in 0..n {
+                                        sum += grad_out_f64[r * n + j] * rhs_cache[i * n + j];
+                                    }
+                                    lhs_grad[r * k + i] += sum;
+                                }
+                            }
+                        }
+
+                        {
+                            let mut rhs_grad = _parents[1].grad_write_compat();
+                            for i in 0..k {
+                                for j in 0..n {
+                                    let mut sum = 0.0f64;
+                                    for r in 0..m {
+                                        sum += lhs_cache[r * k + i] * grad_out_f64[r * n + j];
+                                    }
+                                    rhs_grad[i * n + j] += sum;
+                                }
+                            }
+                        }
+                    }),
+                })),
+            };
+        }
+
+        let lhs_cache: Arc<Vec<f32>> = Arc::new(lhs_f32);
+        let rhs_cache: Arc<Vec<f32>> = Arc::new(rhs_f32);
 
         Tensor {
             data: Storage::from_f32_vec(out_data, out_dtype),
@@ -266,26 +310,32 @@ impl Tensor {
             _ctx: Some(Arc::new(Context {
                 parents: vec![self.clone(), other.clone()],
                 backward_op: Box::new(move |grad_out, _parents| {
-                    let grad_out_f64 = grad_out.to_f64_vec();
-                    let mut lhs_grad = _parents[0].grad_write_compat();
-                    for r in 0..m {
-                        for i in 0..k {
-                            let mut sum = 0.0f64;
-                            for j in 0..n {
-                                sum += grad_out_f64[r * n + j] * rhs_cache[i * n + j];
+                    let grad_out_f32 = grad_out.to_f32_vec();
+                    {
+                        let mut lhs_grad = _parents[0].grad_write_f32();
+                        for r in 0..m {
+                            for i in 0..k {
+                                let mut sum = 0.0f64;
+                                for j in 0..n {
+                                    sum += grad_out_f32[r * n + j] as f64
+                                        * rhs_cache[i * n + j] as f64;
+                                }
+                                lhs_grad[r * k + i] += sum as f32;
                             }
-                            lhs_grad[r * k + i] += sum;
                         }
                     }
 
-                    let mut rhs_grad = _parents[1].grad_write_compat();
-                    for i in 0..k {
-                        for j in 0..n {
-                            let mut sum = 0.0f64;
-                            for r in 0..m {
-                                sum += lhs_cache[r * k + i] * grad_out_f64[r * n + j];
+                    {
+                        let mut rhs_grad = _parents[1].grad_write_f32();
+                        for i in 0..k {
+                            for j in 0..n {
+                                let mut sum = 0.0f64;
+                                for r in 0..m {
+                                    sum += lhs_cache[r * k + i] as f64
+                                        * grad_out_f32[r * n + j] as f64;
+                                }
+                                rhs_grad[i * n + j] += sum as f32;
                             }
-                            rhs_grad[i * n + j] += sum;
                         }
                     }
                 }),
