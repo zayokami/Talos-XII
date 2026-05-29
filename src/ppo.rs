@@ -165,7 +165,7 @@ impl ActorCritic {
     }
 
     /// Test-friendly constructor with configurable size.
-    /// Defaults (2048, 4) match production; tests should pass smaller values.
+    /// Production now uses a compact default; tests can still override size explicitly.
     #[allow(dead_code)]
     pub fn new(seed: u64, achf: &AchfConfig, hidden_dim: usize, num_layers: usize) -> Self {
         let backbone = LuckTransformer::new_compat(DIM, hidden_dim, true, num_layers, seed, achf);

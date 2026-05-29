@@ -2022,9 +2022,9 @@ mod tests {
 
     fn build_context() -> (Config, EnvNet, NeuralLuckOptimizer) {
         let mut config = Config::load("data/config.json");
-        // Force small model dims in tests to avoid OOM with large defaults
+        // Keep test model dimensions compact so allocations stay modest.
         config.model_dim = 32;
-        config.model_hidden_dim = 2048;
+        config.model_hidden_dim = 1024;
         config.model_num_layers = 4;
         config.model_num_heads = 8;
         config.model_kv_lora_rank = 128;

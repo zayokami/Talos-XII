@@ -404,7 +404,7 @@ impl Default for AchfConfig {
             cache_latency_sample_every: 1,
             cache_log_interval_steps: 0,
             cache_log_per_layer: false,
-            rank: 256,
+            rank: 128,
             prune_threshold: 0.01,
             apply_attn: true,
             apply_ffn: true,
@@ -560,14 +560,14 @@ impl Default for Config {
             train_interval_ms: 50,
             max_train_steps_per_tick: 1,
             language: None,
-            model_dim: 512,
-            model_hidden_dim: 8192,
-            model_num_layers: 24,
-            model_num_heads: 32,
-            model_kv_lora_rank: 1024,
-            model_qk_rope_dim: 256,
+            model_dim: 32,
+            model_hidden_dim: 1024,
+            model_num_layers: 4,
+            model_num_heads: 8,
+            model_kv_lora_rank: 128,
+            model_qk_rope_dim: 64,
             use_multi_stream: true,
-            multi_stream_factor: 4,
+            multi_stream_factor: 2,
             achf: AchfConfig::default(),
         }
     }
@@ -797,28 +797,28 @@ impl Config {
                 config.language = v.as_str().map(|s| s.to_string());
             }
             if let Some(v) = map.get("model_dim") {
-                config.model_dim = v.as_f64().unwrap_or(512.0).round() as usize;
+                config.model_dim = v.as_f64().unwrap_or(32.0).round() as usize;
             }
             if let Some(v) = map.get("model_hidden_dim") {
-                config.model_hidden_dim = v.as_f64().unwrap_or(8192.0).round() as usize;
+                config.model_hidden_dim = v.as_f64().unwrap_or(1024.0).round() as usize;
             }
             if let Some(v) = map.get("model_num_layers") {
-                config.model_num_layers = v.as_f64().unwrap_or(12.0).round() as usize;
+                config.model_num_layers = v.as_f64().unwrap_or(4.0).round() as usize;
             }
             if let Some(v) = map.get("model_num_heads") {
-                config.model_num_heads = v.as_f64().unwrap_or(32.0).round() as usize;
+                config.model_num_heads = v.as_f64().unwrap_or(8.0).round() as usize;
             }
             if let Some(v) = map.get("model_kv_lora_rank") {
-                config.model_kv_lora_rank = v.as_f64().unwrap_or(1024.0).round() as usize;
+                config.model_kv_lora_rank = v.as_f64().unwrap_or(128.0).round() as usize;
             }
             if let Some(v) = map.get("model_qk_rope_dim") {
-                config.model_qk_rope_dim = v.as_f64().unwrap_or(256.0).round() as usize;
+                config.model_qk_rope_dim = v.as_f64().unwrap_or(64.0).round() as usize;
             }
             if let Some(v) = map.get("use_multi_stream") {
                 config.use_multi_stream = v.as_bool().unwrap_or(true);
             }
             if let Some(v) = map.get("multi_stream_factor") {
-                config.multi_stream_factor = v.as_f64().unwrap_or(4.0).round() as usize;
+                config.multi_stream_factor = v.as_f64().unwrap_or(2.0).round() as usize;
             }
             if let Some(v) = map.get("use_calibrated") {
                 config.use_calibrated = v.as_bool().unwrap_or(true);
@@ -927,8 +927,8 @@ impl Config {
                     config.achf.cache_log_per_layer = v.as_bool().unwrap_or(false);
                 }
                 if let Some(v) = achf_map.get("rank") {
-                    let r = v.as_f64().unwrap_or(256.0).round() as usize;
-                    config.achf.rank = if r == 0 { 256 } else { r };
+                    let r = v.as_f64().unwrap_or(128.0).round() as usize;
+                    config.achf.rank = if r == 0 { 128 } else { r };
                 }
                 if let Some(v) = achf_map.get("prune_threshold") {
                     config.achf.prune_threshold = v.as_f64().unwrap_or(0.01);
@@ -958,20 +958,20 @@ impl Config {
 
         // Sanitize model dimension settings
         if config.model_dim == 0 {
-            eprintln!("[Config Warning] model_dim is 0, fallback to 512");
-            config.model_dim = 512;
+            eprintln!("[Config Warning] model_dim is 0, fallback to 32");
+            config.model_dim = 32;
         }
         if config.model_hidden_dim == 0 {
-            eprintln!("[Config Warning] model_hidden_dim is 0, fallback to 8192");
-            config.model_hidden_dim = 8192;
+            eprintln!("[Config Warning] model_hidden_dim is 0, fallback to 1024");
+            config.model_hidden_dim = 1024;
         }
         if config.model_num_layers == 0 {
-            eprintln!("[Config Warning] model_num_layers is 0, fallback to 12");
-            config.model_num_layers = 12;
+            eprintln!("[Config Warning] model_num_layers is 0, fallback to 4");
+            config.model_num_layers = 4;
         }
         if config.model_num_heads == 0 {
-            eprintln!("[Config Warning] model_num_heads is 0, fallback to 32");
-            config.model_num_heads = 32;
+            eprintln!("[Config Warning] model_num_heads is 0, fallback to 8");
+            config.model_num_heads = 8;
         }
         if config.model_dim % config.model_num_heads != 0 {
             eprintln!(
@@ -984,7 +984,7 @@ impl Config {
             }
         }
         if config.multi_stream_factor == 0 {
-            config.multi_stream_factor = 4;
+            config.multi_stream_factor = 2;
         }
 
         if !config.pools.is_empty() {
@@ -1315,6 +1315,20 @@ mod tests {
         } else {
             panic!("Expected string");
         }
+    }
+
+    #[test]
+    fn default_model_uses_compact_dimensions() {
+        let config = Config::default();
+
+        assert_eq!(config.model_dim, 32);
+        assert_eq!(config.model_hidden_dim, 1024);
+        assert_eq!(config.model_num_layers, 4);
+        assert_eq!(config.model_num_heads, 8);
+        assert_eq!(config.model_kv_lora_rank, 128);
+        assert_eq!(config.model_qk_rope_dim, 64);
+        assert_eq!(config.multi_stream_factor, 2);
+        assert_eq!(config.achf.rank, 128);
     }
 
     #[test]

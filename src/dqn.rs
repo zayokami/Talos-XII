@@ -22,6 +22,7 @@ const EPSILON_DECAY: usize = 50000;
 const LEARNING_RATE: f64 = 0.001;
 const TRAIN_FREQ: usize = 10;
 const LOG_FREQ: usize = 100;
+const DEFAULT_DQN_HIDDEN: usize = 1024;
 use crate::utils::{create_bar, ACTIONS, ACTION_SPACE, EPISODE_MAX_PULLS};
 
 // PER Hyperparameters (Schaul et al. 2016)
@@ -375,17 +376,27 @@ impl DuelingQNetwork {
         }
     }
 
-    /// Backward-compatible constructor using hard-coded defaults.
+    /// Convenience constructor using compact hard-coded defaults.
     pub fn new(seed: u64, achf: &AchfConfig) -> Self {
-        let l1 = Linear::new(DIM, 2048, true, seed);
-        let l2 = Linear::new(2048, 2048, true, seed.wrapping_add(1));
-        let l3 = Linear::new(2048, 2048, true, seed.wrapping_add(2));
-        let val_head = Linear::new(2048, 1, true, seed.wrapping_add(3));
-        let adv_head = Linear::new(2048, ACTION_SPACE, true, seed.wrapping_add(4));
+        let l1 = Linear::new(DIM, DEFAULT_DQN_HIDDEN, true, seed);
+        let l2 = Linear::new(
+            DEFAULT_DQN_HIDDEN,
+            DEFAULT_DQN_HIDDEN,
+            true,
+            seed.wrapping_add(1),
+        );
+        let l3 = Linear::new(
+            DEFAULT_DQN_HIDDEN,
+            DEFAULT_DQN_HIDDEN,
+            true,
+            seed.wrapping_add(2),
+        );
+        let val_head = Linear::new(DEFAULT_DQN_HIDDEN, 1, true, seed.wrapping_add(3));
+        let adv_head = Linear::new(DEFAULT_DQN_HIDDEN, ACTION_SPACE, true, seed.wrapping_add(4));
         let achf_layer = if achf.enabled && achf.apply_dqn {
             Some(AchfLayer::new(
-                2048,
-                2048,
+                DEFAULT_DQN_HIDDEN,
+                DEFAULT_DQN_HIDDEN,
                 true,
                 achf.clone(),
                 seed.wrapping_add(500),
