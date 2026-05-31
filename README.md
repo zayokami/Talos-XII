@@ -371,8 +371,7 @@ This project has no affiliation with Arknights: Endfield or Hypergryph Co., Ltd.
 
 **Copyright 2026 zayoka.** MIT licensed.
 
-Contact: yuokai1@163.com
-
+Contact: into@zayoka.com
 ---
 
 ## 系统要求
@@ -721,4 +720,4 @@ cargo test
 
 ---
 
-联系方式：yuokai1@163.com
+联系方式：into@zayoka.com
