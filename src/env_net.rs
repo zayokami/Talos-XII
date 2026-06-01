@@ -1260,7 +1260,6 @@ impl EnvNet {
                             }
                         } else {
                             state.pity_6 += 1;
-                            state.total_pulls_in_pool += 1;
                             let force_5 = config.always_5_star
                                 || (config.five_star_pity > 0
                                     && state.streak_4_star >= config.five_star_pity - 1);
@@ -1270,6 +1269,7 @@ impl EnvNet {
                                 state.streak_4_star += 1;
                             }
                         }
+                        state.total_pulls_in_pool += 1;
                     }
 
                     let observed_bias = if signed_deviations.is_empty() {
