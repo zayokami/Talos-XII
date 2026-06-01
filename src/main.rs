@@ -201,8 +201,9 @@ fn prompt_yes_no(prompt: &str, default_yes: bool) -> bool {
 
 use model_io::{
     cache_artifact_hash, dqn_inference_cache_manifest, dqn_master_cache_manifest,
-    load_model_with_manifest, ppo_inference_cache_manifest, ppo_master_cache_manifest,
-    save_model_with_manifest, serialized_model_hash, CacheQualitySummary,
+    load_model_with_manifest_allow_source_mismatch, ppo_inference_cache_manifest,
+    ppo_master_cache_manifest, save_model_with_manifest, serialized_model_hash,
+    CacheQualitySummary,
 };
 use utils::{
     INPUT_CAP, MAX_DRAIN_PER_TICK, ONLINE_REPORT_INTERVAL_SECS, PPO_ONLINE_LR, PULL_DISPLAY_LIMIT,
@@ -848,20 +849,6 @@ fn run_interactive(args: RunInteractiveArgs) {
     let dqn_shared = Arc::new(RwLock::new(dqn_policy.clone()));
     let neural_shared = Arc::new(RwLock::new(trained_neural_opt.clone()));
     let ppo_shared = Arc::new(RwLock::new(ppo_policy.clone()));
-    let dqn_manifest = dqn_master_cache_manifest(&config, dqn_training_quality(&config))
-        .with_source_hash(cache_artifact_hash(NEURAL_CACHE_PATH));
-    let ppo_manifest = ppo_master_cache_manifest(&config, ppo_training_quality(&config))
-        .with_source_hash(cache_artifact_hash(ENV_NET_CACHE_PATH));
-    let dqn_train_master =
-        load_model_with_manifest::<DuelingQNetwork>(DQN_MASTER_CACHE_PATH, "DQN", &dqn_manifest)
-            .unwrap_or_else(|| {
-                let mut master = DuelingQNetwork::new_with_config(&config, rng.next_u64());
-                master.load_state_dict(&dqn_policy);
-                master
-            });
-    let ppo_train_master =
-        load_model_with_manifest::<ActorCritic>(PPO_MASTER_CACHE_PATH, "PPO", &ppo_manifest)
-            .unwrap_or_else(|| ActorCritic::new_with_config(&config, rng.next_u64()));
     let stop_flag = Arc::new(AtomicBool::new(false));
     let mut online_handles: Vec<thread::JoinHandle<()>> = Vec::new();
     let mut dqn_sender: Option<mpsc::Sender<Experience>> = None;
@@ -876,6 +863,18 @@ fn run_interactive(args: RunInteractiveArgs) {
         let interval_ms = config.train_interval_ms.max(1) as u64;
         let max_steps = config.max_train_steps_per_tick;
         let trainer_seed = rng.next_u64();
+        let dqn_manifest = dqn_master_cache_manifest(&config, dqn_training_quality(&config))
+            .with_source_hash(cache_artifact_hash(NEURAL_CACHE_PATH));
+        let dqn_train_master = load_model_with_manifest_allow_source_mismatch::<DuelingQNetwork>(
+            DQN_MASTER_CACHE_PATH,
+            "DQN",
+            &dqn_manifest,
+        )
+        .unwrap_or_else(|| {
+            let mut master = DuelingQNetwork::new_with_config(&config, rng.next_u64());
+            master.load_state_dict(&dqn_policy);
+            master
+        });
         let mut trainer = OnlineDqnTrainer::from_policy(dqn_train_master, trainer_seed);
         let dqn_manifest = dqn_manifest
             .clone()
@@ -980,6 +979,14 @@ fn run_interactive(args: RunInteractiveArgs) {
         let interval_ms = (config.train_interval_ms.max(1) as u64).max(5);
         let max_steps = config.max_train_steps_per_tick;
         let (k_epochs, batch_size) = resolve_ppo_online_train_params(&config);
+        let ppo_manifest = ppo_master_cache_manifest(&config, ppo_training_quality(&config))
+            .with_source_hash(cache_artifact_hash(ENV_NET_CACHE_PATH));
+        let ppo_train_master = load_model_with_manifest_allow_source_mismatch::<ActorCritic>(
+            PPO_MASTER_CACHE_PATH,
+            "PPO",
+            &ppo_manifest,
+        )
+        .unwrap_or_else(|| ActorCritic::new_with_config(&config, rng.next_u64()));
         let mut trainer = OnlinePpoTrainer::from_policy(ppo_train_master, k_epochs, batch_size);
         let ppo_manifest = ppo_manifest
             .clone()
@@ -2017,6 +2024,7 @@ fn run_interactive(args: RunInteractiveArgs) {
 mod tests {
     use super::*;
     use crate::config::PoolConfig;
+    use crate::model_io::load_model_with_manifest;
     use crate::nn::Module;
     use sim::{simulate_core, simulate_fast, simulate_one, SimControl, SimModelContext};
 

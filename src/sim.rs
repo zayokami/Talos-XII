@@ -980,7 +980,7 @@ pub fn simulate_one(
         nn_total_pulls_one_based: false,
         collect_details: true,
         big_pity_requires_not_up: ctx.config.big_pity_requires_not_up,
-        fast_inference: false,
+        fast_inference: ctx.ppo_sender.is_none(),
     };
     let (stats, pulls_opt) = simulate_core(&control, rng, available_free_pulls, ctx);
     let pulls = pulls_opt.unwrap_or_default();
@@ -1438,6 +1438,39 @@ mod tests {
             "Probability mismatch too large: {}",
             diff_sum
         );
+    }
+
+    #[test]
+    fn simulate_one_ppo_without_online_trainer_uses_fast_inference() {
+        let (mut config, env_net, neural_opt) = build_context();
+        config.luck_mode = LuckMode::Ppo;
+        config.achf.enabled = false;
+        config.model_hidden_dim = 64;
+        config.model_num_layers = 1;
+        config.model_num_heads = 4;
+        config.model_kv_lora_rank = 16;
+        config.model_qk_rope_dim = 8;
+        config.ppo_context_len = 4;
+        let policy = crate::ppo::ActorCritic::new_with_config(&config, 12345);
+        let mut rng = Rng::from_seed(11);
+        let ctx = SimModelContext {
+            neural_opt: &neural_opt,
+            dqn_policy: None,
+            ppo_policy: Some(&policy),
+            env_net: &env_net,
+            config: &config,
+            exp_sender: None,
+            neural_sender: None,
+            ppo_sender: None,
+        };
+
+        let result = simulate_one(4, &mut rng, 0, &ctx);
+
+        assert_eq!(result.pulls.len(), 4);
+        assert!(result
+            .pulls
+            .iter()
+            .all(|pull| (4..=6).contains(&pull.rarity)));
     }
 
     #[allow(dead_code)]

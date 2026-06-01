@@ -5,7 +5,7 @@ use crate::neural::{NeuralLuckOptimizer, DIM};
 use log::info;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -420,11 +420,28 @@ fn config_fingerprint(config: &Config) -> String {
 
 fn fnv1a_hex(bytes: &[u8]) -> String {
     let mut hash = 0xcbf29ce484222325u64;
-    for byte in bytes {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
+    fnv1a_update(&mut hash, bytes);
     format!("{hash:016x}")
+}
+
+fn fnv1a_update(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= *byte as u64;
+        *hash = hash.wrapping_mul(0x100000001b3);
+    }
+}
+
+fn fnv1a_reader_hex<R: Read>(mut reader: R) -> std::io::Result<String> {
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        fnv1a_update(&mut hash, &buf[..read]);
+    }
+    Ok(format!("{hash:016x}"))
 }
 
 pub fn model_artifact_hash(path: &str) -> Option<String> {
@@ -443,11 +460,29 @@ pub fn serialized_model_hash<T: serde::Serialize>(model: &T) -> Option<String> {
 }
 
 fn artifact_hash_for_path(path: &str) -> Option<String> {
-    read_cache_bytes(path).map(|bytes| fnv1a_hex(&bytes))
+    for candidate in cache_read_candidates(path) {
+        match File::open(&candidate) {
+            Ok(file) => match fnv1a_reader_hex(BufReader::new(file)) {
+                Ok(hash) => return Some(hash),
+                Err(err) => {
+                    log::warn!("[Cache] Failed to hash {}: {}", candidate.display(), err);
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                log::warn!(
+                    "[Cache] Failed to open {} for hashing: {}",
+                    candidate.display(),
+                    err
+                );
+            }
+        }
+    }
+    None
 }
 
 pub fn cache_artifact_hash(path: &str) -> Option<String> {
-    read_cache_bytes(path).map(|bytes| fnv1a_hex(&bytes))
+    artifact_hash_for_path(path)
 }
 
 fn cache_manifest_path(path: &str) -> String {
@@ -762,6 +797,37 @@ pub fn load_model_with_manifest<T: serde::de::DeserializeOwned>(
     let bin_path = format!("{}.bin", path);
     if !manifest_allows_load(path, expected, Some(&bin_path)) {
         return None;
+    }
+    load_model(path, label)
+}
+
+pub fn load_model_with_manifest_allow_source_mismatch<T: serde::de::DeserializeOwned>(
+    path: &str,
+    label: &str,
+    expected: &CacheManifest,
+) -> Option<T> {
+    let Some(manifest) = load_manifest(path) else {
+        log::warn!("[Cache] Missing manifest for {}. Rebuilding.", path);
+        return None;
+    };
+    let mut relaxed_expected = expected.clone();
+    relaxed_expected.source_hash = manifest.source_hash.clone();
+    let bin_path = format!("{}.bin", path);
+    if !manifest_allows_load(path, &relaxed_expected, Some(&bin_path)) {
+        return None;
+    }
+    if expected.source_hash.is_some() && manifest.source_hash != expected.source_hash {
+        log::warn!(
+            "[Cache] Source artifact hash mismatch for {}. Using cached {} because config and architecture still match; use force retrain to rebuild it.",
+            path,
+            label
+        );
+    } else if expected.source_hash.is_none() && manifest.source_hash.is_some() {
+        log::warn!(
+            "[Cache] Source artifact hash for {} was not recomputed during startup. Using cached {} after artifact/config validation.",
+            path,
+            label
+        );
     }
     load_model(path, label)
 }
@@ -1094,6 +1160,62 @@ mod tests {
         ));
 
         let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(cache_manifest_path(&path));
+    }
+
+    #[test]
+    fn relaxed_model_load_allows_only_source_hash_mismatch() {
+        let path = temp_stem("talos_model_io_relaxed_source_hash");
+        let model = TestModel {
+            value: 42,
+            name: "cached".to_string(),
+        };
+
+        let config = crate::config::Config::default();
+        let saved_manifest =
+            dqn_master_cache_manifest(&config, CacheQualitySummary::training_steps(1))
+                .with_source_hash(Some("old-source".to_string()));
+        assert!(save_model_with_manifest(
+            &model,
+            &path,
+            "Test",
+            saved_manifest
+        ));
+
+        let expected_manifest =
+            dqn_master_cache_manifest(&config, CacheQualitySummary::training_steps(1))
+                .with_source_hash(Some("new-source".to_string()));
+        assert_eq!(
+            load_model_with_manifest::<TestModel>(&path, "Test", &expected_manifest),
+            None
+        );
+        assert_eq!(
+            load_model_with_manifest_allow_source_mismatch::<TestModel>(
+                &path,
+                "Test",
+                &expected_manifest
+            ),
+            Some(TestModel {
+                value: 42,
+                name: "cached".to_string(),
+            })
+        );
+
+        let mut changed = config.clone();
+        changed.model_hidden_dim += 1;
+        let incompatible_manifest =
+            dqn_master_cache_manifest(&changed, CacheQualitySummary::training_steps(1))
+                .with_source_hash(Some("new-source".to_string()));
+        assert_eq!(
+            load_model_with_manifest_allow_source_mismatch::<TestModel>(
+                &path,
+                "Test",
+                &incompatible_manifest
+            ),
+            None
+        );
+
+        let _ = fs::remove_file(format!("{}.bin", path));
         let _ = fs::remove_file(cache_manifest_path(&path));
     }
 

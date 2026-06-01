@@ -4,9 +4,10 @@ use crate::env_net::EnvNet;
 use crate::model_io::{
     cache_artifact_hash, dqn_inference_cache_manifest, dqn_master_cache_manifest,
     env_net_cache_manifest, load_env_net_cache_with_manifest, load_model_with_manifest,
-    load_neural_cache_with_manifest, neural_cache_manifest, ppo_inference_cache_manifest,
+    load_model_with_manifest_allow_source_mismatch, load_neural_cache_with_manifest,
+    model_artifact_hash, neural_cache_manifest, ppo_inference_cache_manifest,
     ppo_master_cache_manifest, save_env_net_cache_with_manifest, save_model_with_manifest,
-    save_neural_cache_with_manifest, serialized_model_hash, CacheQualitySummary,
+    save_neural_cache_with_manifest, CacheQualitySummary,
 };
 use crate::neural::NeuralLuckOptimizer;
 use crate::ppo::{train_ppo, ActorCritic};
@@ -66,7 +67,7 @@ pub fn initialize_system(
         env_net_hash.clone(),
     );
     let neural_hash = required_source_hash(cache_artifact_hash(NEURAL_CACHE_PATH));
-    let dqn_master = build_dqn_master(
+    let (dqn_master, dqn_master_rebuilt) = build_dqn_master(
         &mut rng,
         &env_net,
         &trained_neural_opt,
@@ -74,22 +75,19 @@ pub fn initialize_system(
         options,
         neural_hash,
     );
-    let dqn_master_hash = serialized_model_hash(&dqn_master);
     let dqn_policy = prepare_dqn_gpu_policy(
         &dqn_master,
-        options.force,
+        options.force || dqn_master_rebuilt,
         config.device,
         &config,
-        dqn_master_hash,
     );
-    let ppo_master = build_ppo_master(&mut rng, &env_net, &config, options.force, env_net_hash);
-    let ppo_master_hash = serialized_model_hash(&ppo_master);
+    let (ppo_master, ppo_master_rebuilt) =
+        build_ppo_master(&mut rng, &env_net, &config, options.force, env_net_hash);
     let ppo_policy = prepare_ppo_gpu_policy(
         &ppo_master,
-        options.force,
+        options.force || ppo_master_rebuilt,
         config.device,
         &config,
-        ppo_master_hash,
     );
 
     (
@@ -273,11 +271,10 @@ fn build_trained_neural_opt(
     let mut trained_neural_opt = if !force {
         if let Some(cached) = load_neural_cache_with_manifest(NEURAL_CACHE_PATH, &neural_manifest) {
             info!("[Neural Core] Cache detected. Cached weights loaded.");
-            cached
-        } else {
-            info!("[Neural Core] Cache not found. Training new weights...");
-            train_neural_optimizer(rng.next_u64(), env_net, config, worker)
+            return cached;
         }
+        info!("[Neural Core] Cache not found. Training new weights...");
+        train_neural_optimizer(rng.next_u64(), env_net, config, worker)
     } else {
         info!("[Neural Core] Force training new weights...");
         train_neural_optimizer(rng.next_u64(), env_net, config, worker)
@@ -311,7 +308,7 @@ fn build_dqn_master(
     config: &Config,
     options: ModelInitOptions,
     neural_hash: Option<String>,
-) -> DuelingQNetwork {
+) -> (DuelingQNetwork, bool) {
     let online_dqn_allowed =
         options.allow_online_bootstrap && config.online_train && config.online_train_dqn;
     let load_quality = if online_dqn_allowed {
@@ -324,7 +321,7 @@ fn build_dqn_master(
     let trained_dqn_manifest = dqn_master_cache_manifest(config, dqn_training_quality(config))
         .with_source_hash(neural_hash);
     if !options.force {
-        if let Some(mut cached) = load_model_with_manifest::<DuelingQNetwork>(
+        if let Some(mut cached) = load_model_with_manifest_allow_source_mismatch::<DuelingQNetwork>(
             DQN_MASTER_CACHE_PATH,
             "DQN",
             &dqn_master_manifest,
@@ -332,7 +329,7 @@ fn build_dqn_master(
             cached.prune_achf(config.achf.prune_threshold);
             cached.freeze_achf_for_inference();
             info!("[DQN] Cached model loaded.");
-            return cached;
+            return (cached, false);
         }
 
         if online_dqn_allowed {
@@ -346,7 +343,7 @@ fn build_dqn_master(
                     "online training initialized from random weights",
                 )),
             );
-            return d;
+            return (d, true);
         }
 
         info!("[DQN] Training new model...");
@@ -357,7 +354,7 @@ fn build_dqn_master(
             "DQN",
             trained_dqn_manifest.clone(),
         );
-        return d;
+        return (d, true);
     }
 
     if online_dqn_allowed {
@@ -371,13 +368,13 @@ fn build_dqn_master(
                 "online training initialized from random weights",
             )),
         );
-        return d;
+        return (d, true);
     }
 
     info!("[DQN] Force training new model...");
     let d = train_dqn(trained_neural_opt, rng, env_net, config);
     let _ = save_model_with_manifest(&d, DQN_MASTER_CACHE_PATH, "DQN", trained_dqn_manifest);
-    d
+    (d, true)
 }
 
 #[cfg(cuda)]
@@ -386,9 +383,8 @@ fn prepare_dqn_gpu_policy(
     force_refresh: bool,
     device: ComputeDevice,
     config: &Config,
-    master_hash: Option<String>,
 ) -> DuelingQNetwork {
-    let mut policy = prepare_dqn_inference_cache(master, force_refresh, config, master_hash);
+    let mut policy = prepare_dqn_inference_cache(master, force_refresh, config);
     if device == ComputeDevice::Cuda {
         policy.to_cuda();
         info!("[DQN] BF16 inference cache moved to CUDA for Tensor Core matmul.");
@@ -402,18 +398,19 @@ fn prepare_dqn_gpu_policy(
     force_refresh: bool,
     _device: ComputeDevice,
     config: &Config,
-    master_hash: Option<String>,
 ) -> DuelingQNetwork {
-    prepare_dqn_inference_cache(master, force_refresh, config, master_hash)
+    prepare_dqn_inference_cache(master, force_refresh, config)
 }
 
 fn prepare_dqn_inference_cache(
     master: &DuelingQNetwork,
     force_refresh: bool,
     config: &Config,
-    master_hash: Option<String>,
 ) -> DuelingQNetwork {
-    let expected_manifest = dqn_inference_cache_manifest(config, master_hash);
+    let expected_manifest = dqn_inference_cache_manifest(
+        config,
+        required_source_hash(model_artifact_hash(DQN_MASTER_CACHE_PATH)),
+    );
     if !force_refresh {
         if let Some(mut cached) = load_model_with_manifest::<DuelingQNetwork>(
             DQN_INFERENCE_CACHE_PATH,
@@ -445,11 +442,11 @@ fn build_ppo_master(
     config: &Config,
     force: bool,
     env_net_hash: Option<String>,
-) -> ActorCritic {
+) -> (ActorCritic, bool) {
     let ppo_master_manifest = ppo_master_cache_manifest(config, ppo_training_quality(config))
         .with_source_hash(env_net_hash);
     if !force {
-        if let Some(mut cached) = load_model_with_manifest::<ActorCritic>(
+        if let Some(mut cached) = load_model_with_manifest_allow_source_mismatch::<ActorCritic>(
             PPO_MASTER_CACHE_PATH,
             "PPO",
             &ppo_master_manifest,
@@ -457,7 +454,7 @@ fn build_ppo_master(
             cached.prune_achf(config.achf.prune_threshold);
             cached.freeze_achf_for_inference();
             info!("[PPO] Cached model loaded.");
-            return cached;
+            return (cached, false);
         }
 
         info!("[PPO] Training new model...");
@@ -469,7 +466,7 @@ fn build_ppo_master(
             "PPO",
             ppo_master_manifest.clone(),
         );
-        return p;
+        return (p, true);
     }
 
     info!("[PPO] Force training new model...");
@@ -481,7 +478,7 @@ fn build_ppo_master(
         "PPO",
         ppo_master_manifest.clone(),
     );
-    p
+    (p, true)
 }
 
 #[cfg(cuda)]
@@ -490,9 +487,8 @@ fn prepare_ppo_gpu_policy(
     force_refresh: bool,
     device: ComputeDevice,
     config: &Config,
-    master_hash: Option<String>,
 ) -> ActorCritic {
-    let mut policy = prepare_ppo_inference_cache(master, force_refresh, config, master_hash);
+    let mut policy = prepare_ppo_inference_cache(master, force_refresh, config);
     if device == ComputeDevice::Cuda {
         policy.to_cuda();
         info!("[PPO] BF16 inference cache moved to CUDA for Tensor Core matmul.");
@@ -506,18 +502,19 @@ fn prepare_ppo_gpu_policy(
     force_refresh: bool,
     _device: ComputeDevice,
     config: &Config,
-    master_hash: Option<String>,
 ) -> ActorCritic {
-    prepare_ppo_inference_cache(master, force_refresh, config, master_hash)
+    prepare_ppo_inference_cache(master, force_refresh, config)
 }
 
 fn prepare_ppo_inference_cache(
     master: &ActorCritic,
     force_refresh: bool,
     config: &Config,
-    master_hash: Option<String>,
 ) -> ActorCritic {
-    let expected_manifest = ppo_inference_cache_manifest(config, master_hash);
+    let expected_manifest = ppo_inference_cache_manifest(
+        config,
+        required_source_hash(model_artifact_hash(PPO_MASTER_CACHE_PATH)),
+    );
     if !force_refresh {
         if let Some(mut cached) = load_model_with_manifest::<ActorCritic>(
             PPO_INFERENCE_CACHE_PATH,
