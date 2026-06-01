@@ -7,6 +7,7 @@ use crate::env_net::EnvNet;
 use crate::gacha_env::{step_pull, GachaAction};
 use crate::neural::{NeuralLuckOptimizer, DIM};
 use crate::nn::{Linear, Module};
+use crate::policy_eval::{evaluate_dqn_policy, format_policy_eval};
 use crate::rng::Rng;
 use crate::sim::{build_features_with_luck_budget, env_net_env, PullState};
 use crate::training_metrics::{StepSnapshot, TrainingMetrics, TrainingMetricsSink};
@@ -24,9 +25,7 @@ const LEARNING_RATE: f64 = 0.001;
 const TRAIN_FREQ: usize = 10;
 const LOG_FREQ: usize = 100;
 const DEFAULT_DQN_HIDDEN: usize = 1024;
-use crate::utils::{
-    create_bar, format_policy_eval, PolicyEvalStats, ACTIONS, ACTION_SPACE, EPISODE_MAX_PULLS,
-};
+use crate::utils::{create_bar, ACTIONS, ACTION_SPACE, EPISODE_MAX_PULLS};
 
 // PER Hyperparameters (Schaul et al. 2016)
 const PER_ALPHA: f64 = 0.6;
@@ -1768,85 +1767,6 @@ pub fn train_dqn(
     )
 }
 
-fn evaluate_dqn_policy(
-    policy: &DuelingQNetwork,
-    env_net: &EnvNet,
-    config: &Config,
-    episodes: usize,
-    seed: u64,
-) -> PolicyEvalStats {
-    let episodes = episodes.max(1);
-    let mut total_reward = 0.0;
-    let mut total_pulls = 0usize;
-    let mut up_hits = 0usize;
-    let mut action_counts = [0usize; ACTION_SPACE];
-
-    for episode in 0..episodes {
-        let mut rng = Rng::from_seed(seed.wrapping_add((episode as u64).wrapping_mul(0x9E37_79B9)));
-        let mut state_struct = PullState::new(config);
-        let (env_noise, env_bias) = env_net_env(env_net, &mut rng, 0, 0, 0, 0);
-        let mut pulls_done = 0usize;
-        let mut episode_reward = 0.0;
-
-        loop {
-            let current_state_raw = build_features_with_luck_budget(
-                state_struct.pity_6,
-                pulls_done,
-                env_noise,
-                state_struct.streak_4_star,
-                env_bias,
-                state_struct.loss_streak,
-                state_struct.luck_budget,
-                config,
-            )
-            .to_vec();
-            let current_state_tensor = Tensor::new_f32(current_state_raw, vec![1, DIM]);
-            #[cfg(cuda)]
-            let current_state_tensor = match current_state_tensor.to_cuda() {
-                Ok(t) => t,
-                Err(_) => current_state_tensor,
-            };
-            let (action, requested_luck_modifier) = policy.predict_action(&current_state_tensor);
-            if let Some(count) = action_counts.get_mut(action) {
-                *count += 1;
-            }
-
-            let outcome = step_pull(
-                &mut state_struct,
-                &mut rng,
-                config,
-                config.big_pity_requires_not_up,
-                GachaAction::policy(action, requested_luck_modifier as f64),
-            );
-            pulls_done += 1;
-
-            episode_reward += crate::utils::compute_reward_dqn(
-                outcome.rarity == 6,
-                outcome.is_up,
-                state_struct.loss_streak,
-                outcome.luck_modifier,
-                config.luck_action_cost,
-            );
-
-            if outcome.is_up || pulls_done >= EPISODE_MAX_PULLS {
-                if outcome.is_up {
-                    up_hits += 1;
-                }
-                total_pulls += pulls_done;
-                total_reward += episode_reward;
-                break;
-            }
-        }
-    }
-
-    PolicyEvalStats {
-        episodes,
-        avg_reward: total_reward / episodes as f64,
-        up_rate: up_hits as f64 / episodes as f64,
-        avg_pulls: total_pulls as f64 / episodes as f64,
-        action_counts,
-    }
-}
 fn train_dqn_impl(
     _initial_model: &NeuralLuckOptimizer,
     rng: &mut Rng,

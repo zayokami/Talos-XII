@@ -23,6 +23,7 @@ mod model_io;
 mod neural;
 mod nn;
 mod panic_guard;
+mod policy_eval;
 mod ppo;
 #[cfg(feature = "python")]
 mod python_bridge;

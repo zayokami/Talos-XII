@@ -49,45 +49,6 @@ pub const DEFAULT_PPO_CONTEXT_LEN: usize = 8;
 pub const ACTION_SPACE: usize = 5;
 pub const ACTIONS: [f64; ACTION_SPACE] = [0.0, 0.005, 0.015, -0.005, -0.015];
 
-#[derive(Clone, Debug, Default)]
-pub struct PolicyEvalStats {
-    pub episodes: usize,
-    pub avg_reward: f64,
-    pub up_rate: f64,
-    pub avg_pulls: f64,
-    pub action_counts: [usize; ACTION_SPACE],
-}
-
-impl PolicyEvalStats {
-    pub fn action_distribution(&self) -> [f64; ACTION_SPACE] {
-        let total = self.action_counts.iter().sum::<usize>() as f64;
-        if total <= 0.0 {
-            return [0.0; ACTION_SPACE];
-        }
-        let mut out = [0.0; ACTION_SPACE];
-        for (dst, &count) in out.iter_mut().zip(self.action_counts.iter()) {
-            *dst = count as f64 / total;
-        }
-        out
-    }
-}
-
-pub fn format_policy_eval(label: &str, step: usize, stats: &PolicyEvalStats) -> String {
-    let dist = stats.action_distribution();
-    format!(
-        "[Eval:{label}] Step {step}: episodes={} AvgR={:.3} UP={:.1}% AvgPulls={:.1} Actions=[0:{:.1}%, +.005:{:.1}%, +.015:{:.1}%, -.005:{:.1}%, -.015:{:.1}%]",
-        stats.episodes,
-        stats.avg_reward,
-        stats.up_rate * 100.0,
-        stats.avg_pulls,
-        dist[0] * 100.0,
-        dist[1] * 100.0,
-        dist[2] * 100.0,
-        dist[3] * 100.0,
-        dist[4] * 100.0
-    )
-}
-
 /// Cost applied to policy-controlled luck interventions.
 pub fn luck_action_penalty(luck_modifier: f64, action_cost: f64) -> f64 {
     if !luck_modifier.is_finite()

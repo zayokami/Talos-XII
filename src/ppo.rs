@@ -4,13 +4,13 @@ use crate::env_net::EnvNet;
 use crate::gacha_env::{step_pull, GachaAction};
 use crate::neural::DIM;
 use crate::nn::{Linear, Module};
+use crate::policy_eval::{evaluate_ppo_policy, format_policy_eval};
 use crate::rng::Rng;
 use crate::sim::{build_features_with_luck_budget, env_net_env, PpoExperience, PullState};
 use crate::training_metrics::{StepSnapshot, TrainingMetrics, TrainingMetricsSink};
 use crate::transformer::{KVCache, LuckTransformer};
 use crate::utils::{
-    create_bar, format_policy_eval, normalize_slice, sum_f64, sum_sq_diff, PolicyEvalStats,
-    ACTIONS, ACTION_SPACE, EPISODE_MAX_PULLS,
+    create_bar, normalize_slice, sum_f64, sum_sq_diff, ACTIONS, ACTION_SPACE, EPISODE_MAX_PULLS,
 };
 use crate::worker::GoodJobWorker;
 use rand::seq::SliceRandom;
@@ -27,8 +27,8 @@ const GAMMA: f64 = 0.99;
 const GAE_LAMBDA: f64 = 0.95;
 const VALUE_COEF: f64 = 0.5;
 const ENTROPY_COEF: f64 = 0.01;
-const EARLY_UP_BONUS_THRESHOLD_1: usize = 80;
-const EARLY_UP_BONUS_THRESHOLD_2: usize = 50;
+pub(crate) const EARLY_UP_BONUS_THRESHOLD_1: usize = 80;
+pub(crate) const EARLY_UP_BONUS_THRESHOLD_2: usize = 50;
 
 #[derive(Default)]
 struct CachedStepScratch {
@@ -349,7 +349,7 @@ impl ActorCritic {
         })
     }
 
-    fn step_inference_cached_greedy(
+    pub(crate) fn step_inference_cached_greedy(
         &self,
         state: &[f32],
         kv_cache: &mut [KVCache],
@@ -1418,118 +1418,6 @@ struct PpoStepResult {
 /// Train a PPO agent with multi-environment rollouts.
 pub fn train_ppo(rng: &mut Rng, env_net: &EnvNet, config: &Config) -> ActorCritic {
     train_ppo_impl(rng, env_net, config, TrainingMetricsSink::noop())
-}
-
-fn evaluate_ppo_policy(
-    policy: &ActorCritic,
-    env_net: &EnvNet,
-    config: &Config,
-    context_len: usize,
-    episodes: usize,
-    seed: u64,
-) -> PolicyEvalStats {
-    let episodes = episodes.max(1);
-    let context_len = context_len.max(1);
-    let mut total_reward = 0.0;
-    let mut total_pulls = 0usize;
-    let mut up_hits = 0usize;
-    let mut action_counts = [0usize; ACTION_SPACE];
-    let mla_cfg = &policy.backbone.blocks[0].mla_layer.config;
-    let num_layers = policy.backbone.blocks.len();
-
-    for episode in 0..episodes {
-        let mut rng = Rng::from_seed(seed.wrapping_add((episode as u64).wrapping_mul(0x9E37_79B9)));
-        let mut state_struct = PullState::new(config);
-        let (env_noise, env_bias) = env_net_env(env_net, &mut rng, 0, 0, 0, 0);
-        let mut pulls_done = 0usize;
-        let mut episode_reward = 0.0;
-        let mut history_buffer: VecDeque<Vec<f64>> = VecDeque::with_capacity(context_len);
-        let mut kv_cache: Vec<_> = (0..num_layers)
-            .map(|_| KVCache::new(mla_cfg.num_heads))
-            .collect();
-        for cache in &mut kv_cache {
-            cache.preallocate(
-                mla_cfg.num_heads,
-                mla_cfg.kv_lora_rank,
-                mla_cfg.v_head_dim,
-                mla_cfg.qk_rope_dim,
-                mla_cfg.max_seq_len,
-            );
-        }
-
-        loop {
-            let current_state_raw = build_features_with_luck_budget(
-                state_struct.pity_6,
-                pulls_done,
-                env_noise,
-                state_struct.streak_4_star,
-                env_bias,
-                state_struct.loss_streak,
-                state_struct.luck_budget,
-                config,
-            )
-            .to_vec();
-            history_buffer.push_back(current_state_raw);
-            if history_buffer.len() > context_len {
-                history_buffer.pop_front();
-                policy.prune_cache(&mut kv_cache, context_len);
-            }
-
-            let seq_len = history_buffer.len();
-            let token = history_buffer
-                .back()
-                .expect("history_buffer should not be empty after push");
-            let token_f32: Vec<f32> = token.iter().map(|&v| v as f32).collect();
-            let action_idx =
-                policy.step_inference_cached_greedy(&token_f32, &mut kv_cache, seq_len - 1);
-            if let Some(count) = action_counts.get_mut(action_idx) {
-                *count += 1;
-            }
-
-            let outcome = step_pull(
-                &mut state_struct,
-                &mut rng,
-                config,
-                config.big_pity_requires_not_up,
-                GachaAction::policy(action_idx, ACTIONS[action_idx]),
-            );
-            pulls_done += 1;
-
-            let mut reward = crate::utils::compute_reward_ppo(
-                outcome.rarity == 6,
-                outcome.is_up,
-                state_struct.loss_streak,
-                outcome.luck_modifier,
-                config.luck_action_cost,
-            );
-            if outcome.rarity == 6 && outcome.is_up {
-                if pulls_done < EARLY_UP_BONUS_THRESHOLD_1 {
-                    reward += 5.0;
-                }
-                if pulls_done < EARLY_UP_BONUS_THRESHOLD_2 {
-                    reward += 5.0;
-                }
-            }
-            episode_reward += reward;
-
-            if outcome.is_up || pulls_done >= EPISODE_MAX_PULLS {
-                if outcome.is_up {
-                    up_hits += 1;
-                }
-                total_pulls += pulls_done;
-                total_reward += episode_reward;
-                break;
-            }
-        }
-    }
-
-    PolicyEvalStats {
-        episodes,
-        avg_reward: total_reward / episodes as f64,
-        up_rate: up_hits as f64 / episodes as f64,
-        avg_pulls: total_pulls as f64 / episodes as f64,
-        action_counts,
-    }
 }
 
 fn train_ppo_impl(
