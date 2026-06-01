@@ -49,6 +49,67 @@ pub const DEFAULT_PPO_CONTEXT_LEN: usize = 8;
 pub const ACTION_SPACE: usize = 5;
 pub const ACTIONS: [f64; ACTION_SPACE] = [0.0, 0.005, 0.015, -0.005, -0.015];
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct RewardBreakdown {
+    pub base: f64,
+    pub hit: f64,
+    pub streak: f64,
+    pub luck: f64,
+    pub early: f64,
+}
+
+impl RewardBreakdown {
+    pub fn total(self) -> f64 {
+        self.base + self.hit + self.streak + self.luck + self.early
+    }
+
+    pub fn add_assign(&mut self, other: Self) {
+        self.base += other.base;
+        self.hit += other.hit;
+        self.streak += other.streak;
+        self.luck += other.luck;
+        self.early += other.early;
+    }
+
+    pub fn add_early_bonus(&mut self, bonus: f64) {
+        self.early += bonus;
+    }
+
+    pub fn averaged(self, count: usize) -> Self {
+        if count == 0 {
+            return Self::default();
+        }
+        let denom = count as f64;
+        Self {
+            base: self.base / denom,
+            hit: self.hit / denom,
+            streak: self.streak / denom,
+            luck: self.luck / denom,
+            early: self.early / denom,
+        }
+    }
+
+    pub fn average<I>(items: I) -> Self
+    where
+        I: IntoIterator<Item = Self>,
+    {
+        let mut total = Self::default();
+        let mut count = 0usize;
+        for item in items {
+            total.add_assign(item);
+            count += 1;
+        }
+        total.averaged(count)
+    }
+
+    pub fn format_compact(self) -> String {
+        format!(
+            "R[base={:+.2} hit={:+.2} streak={:+.2} luck={:+.2} early={:+.2}]",
+            self.base, self.hit, self.streak, self.luck, self.early
+        )
+    }
+}
+
 /// Cost applied to policy-controlled luck interventions.
 pub fn luck_action_penalty(luck_modifier: f64, action_cost: f64) -> f64 {
     if !luck_modifier.is_finite()
@@ -105,6 +166,59 @@ pub fn apply_luck_budget(requested_modifier: f64, budget: &mut f64, config: &Con
     actual
 }
 
+fn compute_reward_breakdown(
+    is_six: bool,
+    is_up: bool,
+    loss_streak: usize,
+    luck_modifier: f64,
+    luck_action_cost: f64,
+    up_reward: f64,
+    non_up_reward: f64,
+    streak_penalty: f64,
+) -> RewardBreakdown {
+    let hit = if is_six {
+        if is_up {
+            up_reward
+        } else {
+            non_up_reward
+        }
+    } else {
+        0.0
+    };
+    let streak = if is_six && !is_up && loss_streak >= STREAK_PENALTY_THRESHOLD {
+        -(loss_streak as f64) * streak_penalty
+    } else {
+        0.0
+    };
+    let luck = -luck_action_penalty(luck_modifier, luck_action_cost);
+    RewardBreakdown {
+        base: REWARD_BASE,
+        hit,
+        streak,
+        luck,
+        early: 0.0,
+    }
+}
+
+pub fn compute_reward_dqn_breakdown(
+    is_six: bool,
+    is_up: bool,
+    loss_streak: usize,
+    luck_modifier: f64,
+    luck_action_cost: f64,
+) -> RewardBreakdown {
+    compute_reward_breakdown(
+        is_six,
+        is_up,
+        loss_streak,
+        luck_modifier,
+        luck_action_cost,
+        REWARD_SIX_UP_DQN,
+        REWARD_SIX_NON_UP_DQN,
+        STREAK_PENALTY_DQN,
+    )
+}
+
 /// Compute DQN-style reward for experience replay.
 pub fn compute_reward_dqn(
     is_six: bool,
@@ -113,35 +227,49 @@ pub fn compute_reward_dqn(
     luck_modifier: f64,
     luck_action_cost: f64,
 ) -> f64 {
-    let mut reward = REWARD_BASE;
-    if is_six {
-        if is_up {
-            reward += REWARD_SIX_UP_DQN;
-        } else {
-            reward += REWARD_SIX_NON_UP_DQN;
-        }
-    }
-    if loss_streak >= STREAK_PENALTY_THRESHOLD {
-        reward -= (loss_streak as f64) * STREAK_PENALTY_DQN;
-    }
-    reward -= luck_action_penalty(luck_modifier, luck_action_cost);
-    reward
+    compute_reward_dqn_breakdown(is_six, is_up, loss_streak, luck_modifier, luck_action_cost)
+        .total()
+}
+
+pub fn compute_reward_neural_breakdown(
+    is_six: bool,
+    is_up: bool,
+    loss_streak: usize,
+) -> RewardBreakdown {
+    compute_reward_breakdown(
+        is_six,
+        is_up,
+        loss_streak,
+        0.0,
+        0.0,
+        REWARD_SIX_UP_NEURAL,
+        REWARD_SIX_NON_UP_NEURAL,
+        STREAK_PENALTY_NEURAL,
+    )
 }
 
 /// Compute Neural-style reward for online neural training.
 pub fn compute_reward_neural(is_six: bool, is_up: bool, loss_streak: usize) -> f64 {
-    let mut reward = REWARD_BASE;
-    if is_six {
-        if is_up {
-            reward += REWARD_SIX_UP_NEURAL;
-        } else {
-            reward += REWARD_SIX_NON_UP_NEURAL;
-        }
-    }
-    if loss_streak >= STREAK_PENALTY_THRESHOLD {
-        reward -= (loss_streak as f64) * STREAK_PENALTY_NEURAL;
-    }
-    reward
+    compute_reward_neural_breakdown(is_six, is_up, loss_streak).total()
+}
+
+pub fn compute_reward_ppo_breakdown(
+    is_six: bool,
+    is_up: bool,
+    loss_streak: usize,
+    luck_modifier: f64,
+    luck_action_cost: f64,
+) -> RewardBreakdown {
+    compute_reward_breakdown(
+        is_six,
+        is_up,
+        loss_streak,
+        luck_modifier,
+        luck_action_cost,
+        REWARD_SIX_UP_PPO,
+        REWARD_SIX_NON_UP_PPO,
+        STREAK_PENALTY_PPO,
+    )
 }
 
 /// Compute PPO-style reward for PPO experience replay.
@@ -152,19 +280,8 @@ pub fn compute_reward_ppo(
     luck_modifier: f64,
     luck_action_cost: f64,
 ) -> f64 {
-    let mut reward = REWARD_BASE;
-    if is_six {
-        if is_up {
-            reward += REWARD_SIX_UP_PPO;
-        } else {
-            reward += REWARD_SIX_NON_UP_PPO;
-        }
-    }
-    if loss_streak >= STREAK_PENALTY_THRESHOLD {
-        reward -= (loss_streak as f64) * STREAK_PENALTY_PPO;
-    }
-    reward -= luck_action_penalty(luck_modifier, luck_action_cost);
-    reward
+    compute_reward_ppo_breakdown(is_six, is_up, loss_streak, luck_modifier, luck_action_cost)
+        .total()
 }
 
 /// Format ACHF cache statistics into a human-readable summary string.
@@ -362,6 +479,48 @@ mod tests {
         let free = compute_reward_dqn(false, false, 0, 0.0, 8.0);
         let boosted = compute_reward_dqn(false, false, 0, 0.015, 8.0);
         assert!((free - boosted - 0.12).abs() < 1e-12);
+    }
+
+    #[test]
+    fn reward_breakdown_totals_match_scalar_helpers() {
+        let dqn = compute_reward_dqn_breakdown(true, false, 3, 0.015, 8.0);
+        let neural = compute_reward_neural_breakdown(true, false, 3);
+        let ppo = compute_reward_ppo_breakdown(true, true, 0, 0.0, 8.0);
+
+        assert!((dqn.total() - compute_reward_dqn(true, false, 3, 0.015, 8.0)).abs() < 1e-12);
+        assert!((neural.total() - compute_reward_neural(true, false, 3)).abs() < 1e-12);
+        assert!((ppo.total() - compute_reward_ppo(true, true, 0, 0.0, 8.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn policy_reward_does_not_repeat_loss_streak_penalty_on_non_six_pulls() {
+        assert!((compute_reward_dqn(false, false, 3, 0.0, 8.0) - REWARD_BASE).abs() < 1e-12);
+        assert!((compute_reward_neural(false, false, 3) - REWARD_BASE).abs() < 1e-12);
+        assert!((compute_reward_ppo(false, false, 3, 0.0, 8.0) - REWARD_BASE).abs() < 1e-12);
+    }
+
+    #[test]
+    fn policy_reward_applies_loss_streak_penalty_to_non_up_six() {
+        let loss_streak = 3;
+        assert!(
+            (compute_reward_dqn(true, false, loss_streak, 0.0, 8.0)
+                - (REWARD_BASE + REWARD_SIX_NON_UP_DQN - loss_streak as f64 * STREAK_PENALTY_DQN))
+                .abs()
+                < 1e-12
+        );
+        assert!(
+            (compute_reward_neural(true, false, loss_streak)
+                - (REWARD_BASE + REWARD_SIX_NON_UP_NEURAL
+                    - loss_streak as f64 * STREAK_PENALTY_NEURAL))
+                .abs()
+                < 1e-12
+        );
+        assert!(
+            (compute_reward_ppo(true, false, loss_streak, 0.0, 8.0)
+                - (REWARD_BASE + REWARD_SIX_NON_UP_PPO - loss_streak as f64 * STREAK_PENALTY_PPO))
+                .abs()
+                < 1e-12
+        );
     }
 
     #[test]

@@ -9,7 +9,8 @@ use crate::rng::Rng;
 use crate::sim::{build_features_with_luck_budget, env_net_env, PullState};
 use crate::transformer::{KVCache, MLAConfig};
 use crate::utils::{
-    compute_reward_dqn, compute_reward_ppo, ACTIONS, ACTION_SPACE, EPISODE_MAX_PULLS,
+    compute_reward_dqn_breakdown, compute_reward_ppo_breakdown, RewardBreakdown, ACTIONS,
+    ACTION_SPACE, EPISODE_MAX_PULLS,
 };
 use std::collections::VecDeque;
 
@@ -24,6 +25,7 @@ pub struct PolicyEvalStats {
     pub avg_effective_luck: f64,
     pub avg_abs_effective_luck: f64,
     pub avg_terminal_luck_budget: f64,
+    pub avg_reward_breakdown: RewardBreakdown,
     pub action_counts: [usize; ACTION_SPACE],
 }
 
@@ -64,9 +66,10 @@ impl PolicyEvalStats {
 pub fn format_policy_eval(label: &str, step: usize, stats: &PolicyEvalStats) -> String {
     let dist = stats.action_distribution();
     format!(
-        "[Eval:{label}] Step {step}: episodes={} AvgR={:.3} UP={:.1}% ForcedUP={:.1}% AvgPulls={:.1} EffLuck={:+.5}/{:.5} EndBudget={:.4} Pos/Neg={:.1}%/{:.1}% Actions=[0:{:.1}%, +.005:{:.1}%, +.015:{:.1}%, -.005:{:.1}%, -.015:{:.1}%]",
+        "[Eval:{label}] Step {step}: episodes={} AvgRet={:.3} {} UP={:.1}% ForcedUP={:.1}% AvgPulls={:.1} EffLuck={:+.5}/{:.5} EndBudget={:.4} Pos/Neg={:.1}%/{:.1}% Actions=[0:{:.1}%, +.005:{:.1}%, +.015:{:.1}%, -.005:{:.1}%, -.015:{:.1}%]",
         stats.episodes,
         stats.avg_reward,
+        stats.avg_reward_breakdown.format_compact(),
         stats.up_rate * 100.0,
         stats.forced_up_rate * 100.0,
         stats.avg_pulls,
@@ -98,7 +101,7 @@ pub fn evaluate_dqn_policy(
         seed,
         &mut selector,
         |outcome, state, _, config| {
-            compute_reward_dqn(
+            compute_reward_dqn_breakdown(
                 outcome.rarity == 6,
                 outcome.is_up,
                 state.loss_streak,
@@ -125,7 +128,7 @@ pub fn evaluate_ppo_policy(
         seed,
         &mut selector,
         |outcome, state, pulls_done, config| {
-            let mut reward = compute_reward_ppo(
+            let mut reward = compute_reward_ppo_breakdown(
                 outcome.rarity == 6,
                 outcome.is_up,
                 state.loss_streak,
@@ -134,10 +137,10 @@ pub fn evaluate_ppo_policy(
             );
             if outcome.rarity == 6 && outcome.is_up {
                 if pulls_done < EARLY_UP_BONUS_THRESHOLD_1 {
-                    reward += 5.0;
+                    reward.add_early_bonus(5.0);
                 }
                 if pulls_done < EARLY_UP_BONUS_THRESHOLD_2 {
-                    reward += 5.0;
+                    reward.add_early_bonus(5.0);
                 }
             }
             reward
@@ -256,7 +259,7 @@ fn evaluate_policy<S, R>(
 ) -> PolicyEvalStats
 where
     S: EvalActionSelector,
-    R: FnMut(&GachaStep, &PullState, usize, &Config) -> f64,
+    R: FnMut(&GachaStep, &PullState, usize, &Config) -> RewardBreakdown,
 {
     let episodes = episodes.max(1);
     let mut accumulator = PolicyEvalAccumulator::default();
@@ -268,6 +271,7 @@ where
         let (env_noise, env_bias) = env_net_env(env_net, &mut rng, 0, 0, 0, 0);
         let mut pulls_done = 0usize;
         let mut episode_reward = 0.0;
+        let mut episode_breakdown = RewardBreakdown::default();
         selector.reset_episode();
 
         loop {
@@ -292,11 +296,18 @@ where
             pulls_done += 1;
 
             let reward = reward_fn(&outcome, &state, pulls_done, config);
-            episode_reward += reward;
+            episode_reward += reward.total();
+            episode_breakdown.add_assign(reward);
             accumulator.record_step(action, &outcome);
 
             if outcome.is_up || pulls_done >= EPISODE_MAX_PULLS {
-                accumulator.finish_episode(&state, pulls_done, episode_reward, &outcome);
+                accumulator.finish_episode(
+                    &state,
+                    pulls_done,
+                    episode_reward,
+                    episode_breakdown,
+                    &outcome,
+                );
                 break;
             }
         }
@@ -314,6 +325,7 @@ struct PolicyEvalAccumulator {
     total_effective_luck: f64,
     total_abs_effective_luck: f64,
     total_terminal_luck_budget: f64,
+    total_reward_breakdown: RewardBreakdown,
     action_counts: [usize; ACTION_SPACE],
 }
 
@@ -331,6 +343,7 @@ impl PolicyEvalAccumulator {
         state: &PullState,
         pulls_done: usize,
         episode_reward: f64,
+        episode_breakdown: RewardBreakdown,
         outcome: &GachaStep,
     ) {
         if outcome.is_up {
@@ -342,6 +355,7 @@ impl PolicyEvalAccumulator {
         self.total_pulls += pulls_done;
         self.total_reward += episode_reward;
         self.total_terminal_luck_budget += state.luck_budget;
+        self.total_reward_breakdown.add_assign(episode_breakdown);
     }
 
     fn finish(self, episodes: usize) -> PolicyEvalStats {
@@ -355,6 +369,7 @@ impl PolicyEvalAccumulator {
             avg_effective_luck: self.total_effective_luck / total_actions,
             avg_abs_effective_luck: self.total_abs_effective_luck / total_actions,
             avg_terminal_luck_budget: self.total_terminal_luck_budget / episodes as f64,
+            avg_reward_breakdown: self.total_reward_breakdown.averaged(episodes),
             action_counts: self.action_counts,
         }
     }
@@ -405,12 +420,21 @@ mod tests {
             avg_effective_luck: 0.001,
             avg_abs_effective_luck: 0.002,
             avg_terminal_luck_budget: 0.01,
+            avg_reward_breakdown: RewardBreakdown {
+                base: -7.2,
+                hit: 10.0,
+                streak: -1.0,
+                luck: -0.55,
+                early: 0.0,
+            },
             action_counts: [1, 1, 1, 1, 0],
         };
 
         let line = format_policy_eval("DQN", 100, &stats);
 
         assert!(line.contains("[Eval:DQN] Step 100"));
+        assert!(line.contains("AvgRet=1.250"));
+        assert!(line.contains("R[base=-7.20 hit=+10.00 streak=-1.00 luck=-0.55 early=+0.00]"));
         assert!(line.contains("ForcedUP=25.0%"));
         assert!(line.contains("EffLuck=+0.00100/0.00200"));
         assert!(line.contains("Pos/Neg=50.0%/25.0%"));

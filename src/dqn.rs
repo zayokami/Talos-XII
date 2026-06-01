@@ -25,7 +25,10 @@ const LEARNING_RATE: f64 = 0.001;
 const TRAIN_FREQ: usize = 10;
 const LOG_FREQ: usize = 100;
 const DEFAULT_DQN_HIDDEN: usize = 1024;
-use crate::utils::{create_bar, ACTIONS, ACTION_SPACE, EPISODE_MAX_PULLS};
+use crate::utils::{
+    compute_reward_dqn_breakdown, create_bar, RewardBreakdown, ACTIONS, ACTION_SPACE,
+    EPISODE_MAX_PULLS,
+};
 
 // PER Hyperparameters (Schaul et al. 2016)
 const PER_ALPHA: f64 = 0.6;
@@ -1803,8 +1806,10 @@ fn train_dqn_impl(
     let mut pulls_done = 0;
 
     let mut episode_reward = 0.0;
+    let mut episode_breakdown = RewardBreakdown::default();
     let mut episode_count = 0;
     let mut recent_rewards: VecDeque<f64> = VecDeque::with_capacity(51);
+    let mut recent_reward_breakdowns: VecDeque<RewardBreakdown> = VecDeque::with_capacity(51);
 
     let beta_anneal_steps = total_steps as f64;
     let snapshot_every = (total_steps / 200).max(1);
@@ -1891,15 +1896,17 @@ fn train_dqn_impl(
         );
         pulls_done += 1;
 
-        let reward = crate::utils::compute_reward_dqn(
+        let reward_breakdown = compute_reward_dqn_breakdown(
             outcome.rarity == 6,
             outcome.is_up,
             state_struct.loss_streak,
             outcome.luck_modifier,
             config.luck_action_cost,
         );
+        let reward = reward_breakdown.total();
 
         episode_reward += reward;
+        episode_breakdown.add_assign(reward_breakdown);
 
         let next_state_raw = build_features_with_luck_budget(
             state_struct.pity_6,
@@ -2104,8 +2111,12 @@ fn train_dqn_impl(
         if done {
             episode_count += 1;
             recent_rewards.push_back(episode_reward);
+            recent_reward_breakdowns.push_back(episode_breakdown);
             if recent_rewards.len() > 50 {
                 recent_rewards.pop_front();
+            }
+            if recent_reward_breakdowns.len() > 50 {
+                recent_reward_breakdowns.pop_front();
             }
 
             state_struct = PullState::new(config);
@@ -2114,6 +2125,7 @@ fn train_dqn_impl(
             env_bias = new_env.1;
             pulls_done = 0;
             episode_reward = 0.0;
+            episode_breakdown = RewardBreakdown::default();
         }
 
         if step % LOG_FREQ == 0 {
@@ -2122,10 +2134,14 @@ fn train_dqn_impl(
             } else {
                 recent_rewards.iter().sum::<f64>() / recent_rewards.len() as f64
             };
+            let avg_breakdown = RewardBreakdown::average(recent_reward_breakdowns.iter().copied());
             pb.set_position(step as u64);
             pb.set_message(format!(
-                "Ep: {} | Avg R: {:.2} | Eps: {:.3}",
-                episode_count, avg_r, epsilon
+                "Ep: {} | AvgRet: {:.2} | {} | Eps: {:.3}",
+                episode_count,
+                avg_r,
+                avg_breakdown.format_compact(),
+                epsilon
             ));
         }
 

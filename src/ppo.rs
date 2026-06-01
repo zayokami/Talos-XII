@@ -10,7 +10,8 @@ use crate::sim::{build_features_with_luck_budget, env_net_env, PpoExperience, Pu
 use crate::training_metrics::{StepSnapshot, TrainingMetrics, TrainingMetricsSink};
 use crate::transformer::{KVCache, LuckTransformer};
 use crate::utils::{
-    create_bar, normalize_slice, sum_f64, sum_sq_diff, ACTIONS, ACTION_SPACE, EPISODE_MAX_PULLS,
+    compute_reward_ppo_breakdown, create_bar, normalize_slice, sum_f64, sum_sq_diff,
+    RewardBreakdown, ACTIONS, ACTION_SPACE, EPISODE_MAX_PULLS,
 };
 use crate::worker::GoodJobWorker;
 use rand::seq::SliceRandom;
@@ -1249,6 +1250,7 @@ struct PpoEnvState {
     pity_vec: Vec<usize>,
     kv_cache: Vec<KVCache>,
     episode_reward: f64,
+    episode_breakdown: RewardBreakdown,
     rng: Rng,
 }
 
@@ -1289,6 +1291,7 @@ impl PpoEnvState {
             pity_vec: Vec::with_capacity(context_len),
             kv_cache: caches,
             episode_reward: 0.0,
+            episode_breakdown: RewardBreakdown::default(),
             rng,
         }
     }
@@ -1305,6 +1308,7 @@ impl PpoEnvState {
         self.env_bias = env_bias;
         self.pulls_done = 0;
         self.episode_reward = 0.0;
+        self.episode_breakdown = RewardBreakdown::default();
     }
 
     fn step(
@@ -1365,7 +1369,7 @@ impl PpoEnvState {
         );
         self.pulls_done += 1;
 
-        let mut reward = crate::utils::compute_reward_ppo(
+        let mut reward_breakdown = compute_reward_ppo_breakdown(
             outcome.rarity == 6,
             outcome.is_up,
             self.state_struct.loss_streak,
@@ -1374,13 +1378,15 @@ impl PpoEnvState {
         );
         if outcome.rarity == 6 && outcome.is_up {
             if self.pulls_done < EARLY_UP_BONUS_THRESHOLD_1 {
-                reward += 5.0;
+                reward_breakdown.add_early_bonus(5.0);
             }
             if self.pulls_done < EARLY_UP_BONUS_THRESHOLD_2 {
-                reward += 5.0;
+                reward_breakdown.add_early_bonus(5.0);
             }
         }
+        let reward = reward_breakdown.total();
         self.episode_reward += reward;
+        self.episode_breakdown.add_assign(reward_breakdown);
 
         let done = outcome.is_up || self.pulls_done >= EPISODE_MAX_PULLS;
 
@@ -1396,16 +1402,23 @@ impl PpoEnvState {
         };
 
         let finished_reward = if done {
-            let r = self.episode_reward;
-            self.reset(env_net, config);
-            Some(r)
+            Some(self.episode_reward)
         } else {
             None
         };
+        let finished_breakdown = if done {
+            Some(self.episode_breakdown)
+        } else {
+            None
+        };
+        if done {
+            self.reset(env_net, config);
+        }
 
         PpoStepResult {
             experience,
             finished_reward,
+            finished_breakdown,
         }
     }
 }
@@ -1413,6 +1426,7 @@ impl PpoEnvState {
 struct PpoStepResult {
     experience: PpoStoreRawInput,
     finished_reward: Option<f64>,
+    finished_breakdown: Option<RewardBreakdown>,
 }
 
 /// Train a PPO agent with multi-environment rollouts.
@@ -1492,6 +1506,7 @@ fn train_ppo_impl(
         .collect();
 
     let mut recent_rewards: VecDeque<f64> = VecDeque::with_capacity(50);
+    let mut recent_reward_breakdowns: VecDeque<RewardBreakdown> = VecDeque::with_capacity(50);
     let mut _episode_count = 0;
 
     // Linear LR decay
@@ -1535,6 +1550,12 @@ fn train_ppo_impl(
                         recent_rewards.pop_front();
                     }
                 }
+                if let Some(done_breakdown) = result.finished_breakdown {
+                    recent_reward_breakdowns.push_back(done_breakdown);
+                    if recent_reward_breakdowns.len() > 50 {
+                        recent_reward_breakdowns.pop_front();
+                    }
+                }
             }
             collected += num_envs;
             if collected.is_multiple_of(heartbeat_every)
@@ -1543,10 +1564,14 @@ fn train_ppo_impl(
                 let global_step = (steps_done + collected).min(total_steps);
                 let avg_env_reward =
                     envs.iter().map(|e| e.episode_reward).sum::<f64>() / num_envs as f64;
+                let cur_breakdown =
+                    RewardBreakdown::average(envs.iter().map(|env| env.episode_breakdown));
                 pb.set_position(global_step as u64);
                 pb.set_message(format!(
-                    "Avg R: {:.2} | LR: {:.6}",
-                    avg_env_reward, current_lr
+                    "CurRet: {:.2} | {} | LR: {:.6}",
+                    avg_env_reward,
+                    cur_breakdown.format_compact(),
+                    current_lr
                 ));
                 last_heartbeat = Instant::now();
             }
@@ -1564,15 +1589,24 @@ fn train_ppo_impl(
                         recent_rewards.pop_front();
                     }
                 }
+                if let Some(done_breakdown) = result.finished_breakdown {
+                    recent_reward_breakdowns.push_back(done_breakdown);
+                    if recent_reward_breakdowns.len() > 50 {
+                        recent_reward_breakdowns.pop_front();
+                    }
+                }
                 collected += 1;
                 if collected.is_multiple_of(heartbeat_every)
                     && last_heartbeat.elapsed() >= Duration::from_millis(300)
                 {
                     let global_step = (steps_done + collected).min(total_steps);
+                    let cur_breakdown = envs[idx].episode_breakdown;
                     pb.set_position(global_step as u64);
                     pb.set_message(format!(
-                        "Avg R: {:.2} | LR: {:.6}",
-                        envs[idx].episode_reward, current_lr
+                        "CurRet: {:.2} | {} | LR: {:.6}",
+                        envs[idx].episode_reward,
+                        cur_breakdown.format_compact(),
+                        current_lr
                     ));
                     last_heartbeat = Instant::now();
                 }
@@ -1613,8 +1647,14 @@ fn train_ppo_impl(
         } else {
             recent_rewards.iter().sum::<f64>() / recent_rewards.len() as f64
         };
+        let avg_breakdown = RewardBreakdown::average(recent_reward_breakdowns.iter().copied());
         pb.set_position(steps_done as u64);
-        pb.set_message(format!("Avg R: {:.2} | LR: {:.6}", avg_r, current_lr));
+        pb.set_message(format!(
+            "AvgRet: {:.2} | {} | LR: {:.6}",
+            avg_r,
+            avg_breakdown.format_compact(),
+            current_lr
+        ));
 
         if config.policy_eval_interval > 0
             && steps_done % config.policy_eval_interval < update_steps
