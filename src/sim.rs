@@ -506,9 +506,6 @@ pub fn roll_one(
     kv_cache: &mut Option<Vec<KVCache>>,
     start_pos: usize,
 ) -> PullOutcome {
-    state.pity_6 += 1;
-    state.total_pulls_in_pool += 1;
-
     let mut big_pity_used = false;
     let mut is_up = false;
     let mut action_used = None;
@@ -517,6 +514,7 @@ pub fn roll_one(
     let mut ppo_value = None;
     let rarity: u8;
 
+    let current_total_pulls = state.total_pulls_in_pool + 1;
     let big_pity_gate = if big_pity_requires_not_up {
         !state.has_obtained_up
     } else {
@@ -526,8 +524,7 @@ pub fn roll_one(
     // semantically distinct pity thresholds that happen to share the same outcome.
     // Merging them would obscure game-mechanical intent.
     #[allow(clippy::if_same_then_else)]
-    if config.up_pity_soft > 0 && state.total_pulls_in_pool == config.up_pity_soft && big_pity_gate
-    {
+    if config.up_pity_soft > 0 && current_total_pulls == config.up_pity_soft && big_pity_gate {
         rarity = 6;
         is_up = true;
         big_pity_used = true;
@@ -536,7 +533,7 @@ pub fn roll_one(
         state.loss_streak = 0;
         let _ = apply_luck_budget(0.0, &mut state.luck_budget, config);
     } else if config.big_pity_cumulative > 0
-        && state.total_pulls_in_pool == config.big_pity_cumulative
+        && current_total_pulls == config.big_pity_cumulative
         && big_pity_gate
     {
         rarity = 6;
@@ -598,6 +595,7 @@ pub fn roll_one(
                 }
             }
         } else {
+            state.pity_6 += 1;
             let force_5_star = config.always_5_star
                 || (config.five_star_pity > 0 && state.streak_4_star >= config.five_star_pity - 1);
             if force_5_star || r < (final_prob_6 + config.prob_5_base).min(1.0) {
@@ -609,6 +607,8 @@ pub fn roll_one(
             }
         }
     }
+
+    state.total_pulls_in_pool = current_total_pulls;
 
     if is_up {
         state.has_obtained_up = true;

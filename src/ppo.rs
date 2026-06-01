@@ -1355,12 +1355,11 @@ impl PpoEnvState {
             config.ppo_top_k,
         );
 
+        let current_pity = self.state_struct.pity_6;
+        let current_total_pulls = self.state_struct.total_pulls_in_pool + 1;
         let mut luck_modifier = 0.0;
         let mut is_six = false;
         let mut is_up = false;
-
-        self.state_struct.pity_6 += 1;
-        self.state_struct.total_pulls_in_pool += 1;
 
         let big_pity_gate = if config.big_pity_requires_not_up {
             !self.state_struct.has_obtained_up
@@ -1371,10 +1370,7 @@ impl PpoEnvState {
         // semantically distinct pity thresholds that happen to share the same outcome.
         // Merging them would obscure game-mechanical intent.
         #[allow(clippy::if_same_then_else)]
-        if config.up_pity_soft > 0
-            && self.state_struct.total_pulls_in_pool == config.up_pity_soft
-            && big_pity_gate
-        {
+        if config.up_pity_soft > 0 && current_total_pulls == config.up_pity_soft && big_pity_gate {
             is_six = true;
             is_up = true;
             self.state_struct.pity_6 = 0;
@@ -1383,7 +1379,7 @@ impl PpoEnvState {
             self.state_struct.has_obtained_up = true;
             let _ = apply_luck_budget(0.0, &mut self.state_struct.luck_budget, config);
         } else if config.big_pity_cumulative > 0
-            && self.state_struct.total_pulls_in_pool == config.big_pity_cumulative
+            && current_total_pulls == config.big_pity_cumulative
             && big_pity_gate
         {
             is_six = true;
@@ -1399,7 +1395,7 @@ impl PpoEnvState {
                 &mut self.state_struct.luck_budget,
                 config,
             );
-            let base_prob_6 = prob_6(self.state_struct.pity_6, config);
+            let base_prob_6 = prob_6(current_pity, config);
             let final_prob_6 = (base_prob_6 + luck_modifier).clamp(0.0, 1.0);
             let r = self.rng.next_f64();
             if r < final_prob_6 {
@@ -1420,11 +1416,14 @@ impl PpoEnvState {
                     && self.state_struct.streak_4_star >= config.five_star_pity - 1)
                 || r < (final_prob_6 + config.prob_5_base).min(1.0)
             {
+                self.state_struct.pity_6 = current_pity + 1;
                 self.state_struct.streak_4_star = 0;
             } else {
+                self.state_struct.pity_6 = current_pity + 1;
                 self.state_struct.streak_4_star += 1;
             }
         }
+        self.state_struct.total_pulls_in_pool = current_total_pulls;
         self.pulls_done += 1;
 
         let mut reward = crate::utils::compute_reward_ppo(
@@ -1548,12 +1547,12 @@ fn evaluate_ppo_policy(
                 *count += 1;
             }
 
+            let current_pity = state_struct.pity_6;
+            let current_total_pulls = state_struct.total_pulls_in_pool + 1;
             let mut luck_modifier = 0.0;
             let mut is_six = false;
             let mut is_up = false;
 
-            state_struct.pity_6 += 1;
-            state_struct.total_pulls_in_pool += 1;
             let big_pity_gate = if config.big_pity_requires_not_up {
                 !state_struct.has_obtained_up
             } else {
@@ -1562,7 +1561,7 @@ fn evaluate_ppo_policy(
 
             #[allow(clippy::if_same_then_else)]
             if config.up_pity_soft > 0
-                && state_struct.total_pulls_in_pool == config.up_pity_soft
+                && current_total_pulls == config.up_pity_soft
                 && big_pity_gate
             {
                 is_six = true;
@@ -1573,7 +1572,7 @@ fn evaluate_ppo_policy(
                 state_struct.has_obtained_up = true;
                 let _ = apply_luck_budget(0.0, &mut state_struct.luck_budget, config);
             } else if config.big_pity_cumulative > 0
-                && state_struct.total_pulls_in_pool == config.big_pity_cumulative
+                && current_total_pulls == config.big_pity_cumulative
                 && big_pity_gate
             {
                 is_six = true;
@@ -1586,7 +1585,7 @@ fn evaluate_ppo_policy(
             } else {
                 luck_modifier =
                     apply_luck_budget(ACTIONS[action_idx], &mut state_struct.luck_budget, config);
-                let base_prob_6 = prob_6(state_struct.pity_6, config);
+                let base_prob_6 = prob_6(current_pity, config);
                 let final_prob_6 = (base_prob_6 + luck_modifier).clamp(0.0, 1.0);
                 let r = rng.next_f64();
                 if r < final_prob_6 {
@@ -1607,11 +1606,14 @@ fn evaluate_ppo_policy(
                         && state_struct.streak_4_star >= config.five_star_pity - 1)
                     || r < (final_prob_6 + config.prob_5_base).min(1.0)
                 {
+                    state_struct.pity_6 = current_pity + 1;
                     state_struct.streak_4_star = 0;
                 } else {
+                    state_struct.pity_6 = current_pity + 1;
                     state_struct.streak_4_star += 1;
                 }
             }
+            state_struct.total_pulls_in_pool = current_total_pulls;
             pulls_done += 1;
 
             let mut reward = crate::utils::compute_reward_ppo(
