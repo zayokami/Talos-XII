@@ -14,6 +14,7 @@ mod dbn;
 mod dqn;
 mod dtype;
 mod env_net;
+mod gacha_env;
 #[cfg(test)]
 mod grad_check;
 mod i18n;

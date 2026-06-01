@@ -4,10 +4,11 @@ use crate::autograd::Tensor;
 use crate::autograd::TensorReadGuard;
 use crate::config::{AchfConfig, Config};
 use crate::env_net::EnvNet;
+use crate::gacha_env::{step_pull, GachaAction};
 use crate::neural::{NeuralLuckOptimizer, DIM};
 use crate::nn::{Linear, Module};
 use crate::rng::Rng;
-use crate::sim::{build_features_with_luck_budget, env_net_env, prob_6, PullState};
+use crate::sim::{build_features_with_luck_budget, env_net_env, PullState};
 use crate::training_metrics::{StepSnapshot, TrainingMetrics, TrainingMetricsSink};
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -24,8 +25,7 @@ const TRAIN_FREQ: usize = 10;
 const LOG_FREQ: usize = 100;
 const DEFAULT_DQN_HIDDEN: usize = 1024;
 use crate::utils::{
-    apply_luck_budget, create_bar, format_policy_eval, PolicyEvalStats, ACTIONS, ACTION_SPACE,
-    EPISODE_MAX_PULLS,
+    create_bar, format_policy_eval, PolicyEvalStats, ACTIONS, ACTION_SPACE, EPISODE_MAX_PULLS,
 };
 
 // PER Hyperparameters (Schaul et al. 2016)
@@ -1811,88 +1811,25 @@ fn evaluate_dqn_policy(
                 *count += 1;
             }
 
-            let current_pity = state_struct.pity_6;
-            let current_total_pulls = state_struct.total_pulls_in_pool + 1;
-            let mut luck_modifier = 0.0;
-            let mut is_six = false;
-            let mut is_up = false;
-
-            let big_pity_gate = if config.big_pity_requires_not_up {
-                !state_struct.has_obtained_up
-            } else {
-                true
-            };
-
-            #[allow(clippy::if_same_then_else)]
-            if config.up_pity_soft > 0
-                && current_total_pulls == config.up_pity_soft
-                && big_pity_gate
-            {
-                is_six = true;
-                is_up = true;
-                state_struct.pity_6 = 0;
-                state_struct.streak_4_star = 0;
-                state_struct.loss_streak = 0;
-                state_struct.has_obtained_up = true;
-                let _ = apply_luck_budget(0.0, &mut state_struct.luck_budget, config);
-            } else if config.big_pity_cumulative > 0
-                && current_total_pulls == config.big_pity_cumulative
-                && big_pity_gate
-            {
-                is_six = true;
-                is_up = true;
-                state_struct.pity_6 = 0;
-                state_struct.streak_4_star = 0;
-                state_struct.loss_streak = 0;
-                state_struct.has_obtained_up = true;
-                let _ = apply_luck_budget(0.0, &mut state_struct.luck_budget, config);
-            } else {
-                luck_modifier = apply_luck_budget(
-                    requested_luck_modifier as f64,
-                    &mut state_struct.luck_budget,
-                    config,
-                );
-                let base_prob_6 = prob_6(current_pity, config);
-                let final_prob_6 = (base_prob_6 + luck_modifier).clamp(0.0, 1.0);
-                let r = rng.next_f64();
-                if r < final_prob_6 {
-                    is_six = true;
-                    state_struct.pity_6 = 0;
-                    state_struct.streak_4_star = 0;
-                    if config.up_rate > 0.0 && !config.up_six.is_empty() {
-                        if rng.next_f64() < config.up_rate {
-                            is_up = true;
-                            state_struct.loss_streak = 0;
-                            state_struct.has_obtained_up = true;
-                        } else {
-                            state_struct.loss_streak += 1;
-                        }
-                    }
-                } else if config.always_5_star
-                    || (config.five_star_pity > 0
-                        && state_struct.streak_4_star >= config.five_star_pity - 1)
-                    || r < (final_prob_6 + config.prob_5_base).min(1.0)
-                {
-                    state_struct.pity_6 = current_pity + 1;
-                    state_struct.streak_4_star = 0;
-                } else {
-                    state_struct.pity_6 = current_pity + 1;
-                    state_struct.streak_4_star += 1;
-                }
-            }
-            state_struct.total_pulls_in_pool = current_total_pulls;
+            let outcome = step_pull(
+                &mut state_struct,
+                &mut rng,
+                config,
+                config.big_pity_requires_not_up,
+                GachaAction::policy(action, requested_luck_modifier as f64),
+            );
             pulls_done += 1;
 
             episode_reward += crate::utils::compute_reward_dqn(
-                is_six,
-                is_up,
+                outcome.rarity == 6,
+                outcome.is_up,
                 state_struct.loss_streak,
-                luck_modifier,
+                outcome.luck_modifier,
                 config.luck_action_cost,
             );
 
-            if is_up || pulls_done >= EPISODE_MAX_PULLS {
-                if is_up {
+            if outcome.is_up || pulls_done >= EPISODE_MAX_PULLS {
+                if outcome.is_up {
                     up_hits += 1;
                 }
                 total_pulls += pulls_done;
@@ -2025,76 +1962,20 @@ fn train_dqn_impl(
         };
 
         // 3. Step Environment
-        let current_pity = state_struct.pity_6;
-        let current_total_pulls = state_struct.total_pulls_in_pool + 1;
-        let mut luck_modifier = 0.0;
-        let mut is_six = false;
-        let mut is_up = false;
-
-        let big_pity_gate = if config.big_pity_requires_not_up {
-            !state_struct.has_obtained_up
-        } else {
-            true
-        };
-        #[allow(clippy::if_same_then_else)]
-        if config.up_pity_soft > 0 && current_total_pulls == config.up_pity_soft && big_pity_gate {
-            is_six = true;
-            is_up = true;
-            state_struct.pity_6 = 0;
-            state_struct.streak_4_star = 0;
-            state_struct.loss_streak = 0;
-            state_struct.has_obtained_up = true;
-            let _ = apply_luck_budget(0.0, &mut state_struct.luck_budget, config);
-        } else if config.big_pity_cumulative > 0
-            && current_total_pulls == config.big_pity_cumulative
-            && big_pity_gate
-        {
-            is_six = true;
-            is_up = true;
-            state_struct.pity_6 = 0;
-            state_struct.streak_4_star = 0;
-            state_struct.loss_streak = 0;
-            state_struct.has_obtained_up = true;
-            let _ = apply_luck_budget(0.0, &mut state_struct.luck_budget, config);
-        } else {
-            luck_modifier =
-                apply_luck_budget(ACTIONS[action], &mut state_struct.luck_budget, config);
-            let base_prob_6 = prob_6(current_pity, config);
-            let final_prob_6 = (base_prob_6 + luck_modifier).clamp(0.0, 1.0);
-            let r = rng.next_f64();
-            if r < final_prob_6 {
-                is_six = true;
-                state_struct.pity_6 = 0;
-                state_struct.streak_4_star = 0;
-                if config.up_rate > 0.0 && !config.up_six.is_empty() {
-                    if rng.next_f64() < config.up_rate {
-                        is_up = true;
-                        state_struct.loss_streak = 0;
-                        state_struct.has_obtained_up = true;
-                    } else {
-                        state_struct.loss_streak += 1;
-                    }
-                }
-            } else if config.always_5_star
-                || (config.five_star_pity > 0
-                    && state_struct.streak_4_star >= config.five_star_pity - 1)
-                || r < (final_prob_6 + config.prob_5_base).min(1.0)
-            {
-                state_struct.pity_6 = current_pity + 1;
-                state_struct.streak_4_star = 0;
-            } else {
-                state_struct.pity_6 = current_pity + 1;
-                state_struct.streak_4_star += 1;
-            }
-        }
-        state_struct.total_pulls_in_pool = current_total_pulls;
+        let outcome = step_pull(
+            &mut state_struct,
+            rng,
+            config,
+            config.big_pity_requires_not_up,
+            GachaAction::policy(action, ACTIONS[action]),
+        );
         pulls_done += 1;
 
         let reward = crate::utils::compute_reward_dqn(
-            is_six,
-            is_up,
+            outcome.rarity == 6,
+            outcome.is_up,
             state_struct.loss_streak,
-            luck_modifier,
+            outcome.luck_modifier,
             config.luck_action_cost,
         );
 
@@ -2112,7 +1993,7 @@ fn train_dqn_impl(
         )
         .to_vec();
 
-        let done = is_up || pulls_done >= EPISODE_MAX_PULLS;
+        let done = outcome.is_up || pulls_done >= EPISODE_MAX_PULLS;
 
         replay_buffer.push(Experience {
             state: current_state_raw,

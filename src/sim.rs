@@ -2,6 +2,7 @@ use crate::autograd::Tensor as AutoTensor;
 use crate::config::{Config, LuckMode};
 use crate::dqn::{DuelingQNetwork, Experience};
 use crate::env_net::EnvNet;
+use crate::gacha_env::{force_up_pity_triggered, step_pull, GachaAction};
 use crate::neural::{NeuralLuckOptimizer, Tensor, DIM};
 use crate::ppo::ActorCritic;
 use crate::rng::Rng;
@@ -20,8 +21,8 @@ pub const COST_PER_PULL: u32 = 500;
 /// Number of free pulls available to F2P players per banner cycle.
 pub const FREE_PULLS_WELFARE: u32 = 135;
 use crate::utils::{
-    apply_luck_budget, compute_reward_dqn, compute_reward_neural, compute_reward_ppo,
-    initial_luck_budget, luck_budget_ratio, DEFAULT_PPO_CONTEXT_LEN, EPISODE_MAX_PULLS,
+    compute_reward_dqn, compute_reward_neural, compute_reward_ppo, initial_luck_budget,
+    luck_budget_ratio, DEFAULT_PPO_CONTEXT_LEN, EPISODE_MAX_PULLS,
 };
 
 #[derive(Clone, Debug)]
@@ -506,46 +507,9 @@ pub fn roll_one(
     kv_cache: &mut Option<Vec<KVCache>>,
     start_pos: usize,
 ) -> PullOutcome {
-    let mut big_pity_used = false;
-    let mut is_up = false;
-    let mut action_used = None;
-    let mut luck_modifier = 0.0;
-    let mut ppo_log_prob = None;
-    let mut ppo_value = None;
-    let rarity: u8;
-
-    let current_total_pulls = state.total_pulls_in_pool + 1;
-    let big_pity_gate = if big_pity_requires_not_up {
-        !state.has_obtained_up
+    let action = if force_up_pity_triggered(state, config, big_pity_requires_not_up) {
+        GachaAction::none()
     } else {
-        true
-    };
-    // Intentionally duplicated blocks: up_pity_soft and big_pity_cumulative are
-    // semantically distinct pity thresholds that happen to share the same outcome.
-    // Merging them would obscure game-mechanical intent.
-    #[allow(clippy::if_same_then_else)]
-    if config.up_pity_soft > 0 && current_total_pulls == config.up_pity_soft && big_pity_gate {
-        rarity = 6;
-        is_up = true;
-        big_pity_used = true;
-        state.pity_6 = 0;
-        state.streak_4_star = 0;
-        state.loss_streak = 0;
-        let _ = apply_luck_budget(0.0, &mut state.luck_budget, config);
-    } else if config.big_pity_cumulative > 0
-        && current_total_pulls == config.big_pity_cumulative
-        && big_pity_gate
-    {
-        rarity = 6;
-        is_up = true;
-        big_pity_used = true;
-        state.pity_6 = 0;
-        state.streak_4_star = 0;
-        state.loss_streak = 0;
-        let _ = apply_luck_budget(0.0, &mut state.luck_budget, config);
-    } else {
-        let base_prob_6 = prob_6(state.pity_6, config);
-
         let x = build_features_with_luck_budget(
             state.pity_6,
             nn_total_pulls,
@@ -572,56 +536,24 @@ pub fn roll_one(
             kv_cache,
             start_pos,
         });
-        action_used = decision.action;
-        ppo_log_prob = decision.ppo_log_prob;
-        ppo_value = decision.ppo_value;
-        luck_modifier = apply_luck_budget(decision.luck_factor, &mut state.luck_budget, config);
-
-        let final_prob_6 = (base_prob_6 + luck_modifier).clamp(0.0, 1.0);
-        let r = rng.next_f64();
-
-        if r < final_prob_6 {
-            rarity = 6;
-            state.pity_6 = 0;
-            state.streak_4_star = 0;
-
-            if config.up_rate > 0.0 && !config.up_six.is_empty() {
-                if rng.next_f64() < config.up_rate {
-                    is_up = true;
-                    state.loss_streak = 0;
-                } else {
-                    is_up = false;
-                    state.loss_streak += 1;
-                }
-            }
-        } else {
-            state.pity_6 += 1;
-            let force_5_star = config.always_5_star
-                || (config.five_star_pity > 0 && state.streak_4_star >= config.five_star_pity - 1);
-            if force_5_star || r < (final_prob_6 + config.prob_5_base).min(1.0) {
-                rarity = 5;
-                state.streak_4_star = 0;
-            } else {
-                rarity = 4;
-                state.streak_4_star += 1;
-            }
+        GachaAction {
+            action: decision.action,
+            requested_luck: decision.luck_factor,
+            ppo_log_prob: decision.ppo_log_prob,
+            ppo_value: decision.ppo_value,
         }
-    }
+    };
 
-    state.total_pulls_in_pool = current_total_pulls;
-
-    if is_up {
-        state.has_obtained_up = true;
-    }
+    let outcome = step_pull(state, rng, config, big_pity_requires_not_up, action);
 
     PullOutcome {
-        rarity,
-        is_up,
-        big_pity_used,
-        action: action_used,
-        luck_modifier,
-        ppo_log_prob,
-        ppo_value,
+        rarity: outcome.rarity,
+        is_up: outcome.is_up,
+        big_pity_used: outcome.big_pity_used,
+        action: outcome.action,
+        luck_modifier: outcome.luck_modifier,
+        ppo_log_prob: outcome.ppo_log_prob,
+        ppo_value: outcome.ppo_value,
     }
 }
 

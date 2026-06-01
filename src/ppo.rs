@@ -1,15 +1,16 @@
 use crate::autograd::Tensor;
 use crate::config::{AchfConfig, Config};
 use crate::env_net::EnvNet;
+use crate::gacha_env::{step_pull, GachaAction};
 use crate::neural::DIM;
 use crate::nn::{Linear, Module};
 use crate::rng::Rng;
-use crate::sim::{build_features_with_luck_budget, env_net_env, prob_6, PpoExperience, PullState};
+use crate::sim::{build_features_with_luck_budget, env_net_env, PpoExperience, PullState};
 use crate::training_metrics::{StepSnapshot, TrainingMetrics, TrainingMetricsSink};
 use crate::transformer::{KVCache, LuckTransformer};
 use crate::utils::{
-    apply_luck_budget, create_bar, format_policy_eval, normalize_slice, sum_f64, sum_sq_diff,
-    PolicyEvalStats, ACTIONS, ACTION_SPACE, EPISODE_MAX_PULLS,
+    create_bar, format_policy_eval, normalize_slice, sum_f64, sum_sq_diff, PolicyEvalStats,
+    ACTIONS, ACTION_SPACE, EPISODE_MAX_PULLS,
 };
 use crate::worker::GoodJobWorker;
 use rand::seq::SliceRandom;
@@ -1355,85 +1356,23 @@ impl PpoEnvState {
             config.ppo_top_k,
         );
 
-        let current_pity = self.state_struct.pity_6;
-        let current_total_pulls = self.state_struct.total_pulls_in_pool + 1;
-        let mut luck_modifier = 0.0;
-        let mut is_six = false;
-        let mut is_up = false;
-
-        let big_pity_gate = if config.big_pity_requires_not_up {
-            !self.state_struct.has_obtained_up
-        } else {
-            true
-        };
-        // Intentionally duplicated blocks: up_pity_soft and big_pity_cumulative are
-        // semantically distinct pity thresholds that happen to share the same outcome.
-        // Merging them would obscure game-mechanical intent.
-        #[allow(clippy::if_same_then_else)]
-        if config.up_pity_soft > 0 && current_total_pulls == config.up_pity_soft && big_pity_gate {
-            is_six = true;
-            is_up = true;
-            self.state_struct.pity_6 = 0;
-            self.state_struct.streak_4_star = 0;
-            self.state_struct.loss_streak = 0;
-            self.state_struct.has_obtained_up = true;
-            let _ = apply_luck_budget(0.0, &mut self.state_struct.luck_budget, config);
-        } else if config.big_pity_cumulative > 0
-            && current_total_pulls == config.big_pity_cumulative
-            && big_pity_gate
-        {
-            is_six = true;
-            is_up = true;
-            self.state_struct.pity_6 = 0;
-            self.state_struct.streak_4_star = 0;
-            self.state_struct.loss_streak = 0;
-            self.state_struct.has_obtained_up = true;
-            let _ = apply_luck_budget(0.0, &mut self.state_struct.luck_budget, config);
-        } else {
-            luck_modifier = apply_luck_budget(
-                ACTIONS[action_idx],
-                &mut self.state_struct.luck_budget,
-                config,
-            );
-            let base_prob_6 = prob_6(current_pity, config);
-            let final_prob_6 = (base_prob_6 + luck_modifier).clamp(0.0, 1.0);
-            let r = self.rng.next_f64();
-            if r < final_prob_6 {
-                is_six = true;
-                self.state_struct.pity_6 = 0;
-                self.state_struct.streak_4_star = 0;
-                if config.up_rate > 0.0 && !config.up_six.is_empty() {
-                    if self.rng.next_f64() < config.up_rate {
-                        is_up = true;
-                        self.state_struct.loss_streak = 0;
-                        self.state_struct.has_obtained_up = true;
-                    } else {
-                        self.state_struct.loss_streak += 1;
-                    }
-                }
-            } else if config.always_5_star
-                || (config.five_star_pity > 0
-                    && self.state_struct.streak_4_star >= config.five_star_pity - 1)
-                || r < (final_prob_6 + config.prob_5_base).min(1.0)
-            {
-                self.state_struct.pity_6 = current_pity + 1;
-                self.state_struct.streak_4_star = 0;
-            } else {
-                self.state_struct.pity_6 = current_pity + 1;
-                self.state_struct.streak_4_star += 1;
-            }
-        }
-        self.state_struct.total_pulls_in_pool = current_total_pulls;
+        let outcome = step_pull(
+            &mut self.state_struct,
+            &mut self.rng,
+            config,
+            config.big_pity_requires_not_up,
+            GachaAction::ppo(action_idx, ACTIONS[action_idx], log_prob as f64, val as f64),
+        );
         self.pulls_done += 1;
 
         let mut reward = crate::utils::compute_reward_ppo(
-            is_six,
-            is_up,
+            outcome.rarity == 6,
+            outcome.is_up,
             self.state_struct.loss_streak,
-            luck_modifier,
+            outcome.luck_modifier,
             config.luck_action_cost,
         );
-        if is_six && is_up {
+        if outcome.rarity == 6 && outcome.is_up {
             if self.pulls_done < EARLY_UP_BONUS_THRESHOLD_1 {
                 reward += 5.0;
             }
@@ -1443,17 +1382,17 @@ impl PpoEnvState {
         }
         self.episode_reward += reward;
 
-        let done = is_up || self.pulls_done >= EPISODE_MAX_PULLS;
+        let done = outcome.is_up || self.pulls_done >= EPISODE_MAX_PULLS;
 
         let experience = PpoStoreRawInput {
             state: self.flat_data.clone(),
             seq_len,
             pity: self.pity_vec.clone(),
-            action: action_idx,
-            log_prob: log_prob as f64,
+            action: outcome.action.unwrap_or(action_idx),
+            log_prob: outcome.ppo_log_prob.unwrap_or(log_prob as f64),
             reward,
             done,
-            value: val as f64,
+            value: outcome.ppo_value.unwrap_or(val as f64),
         };
 
         let finished_reward = if done {
@@ -1547,83 +1486,23 @@ fn evaluate_ppo_policy(
                 *count += 1;
             }
 
-            let current_pity = state_struct.pity_6;
-            let current_total_pulls = state_struct.total_pulls_in_pool + 1;
-            let mut luck_modifier = 0.0;
-            let mut is_six = false;
-            let mut is_up = false;
-
-            let big_pity_gate = if config.big_pity_requires_not_up {
-                !state_struct.has_obtained_up
-            } else {
-                true
-            };
-
-            #[allow(clippy::if_same_then_else)]
-            if config.up_pity_soft > 0
-                && current_total_pulls == config.up_pity_soft
-                && big_pity_gate
-            {
-                is_six = true;
-                is_up = true;
-                state_struct.pity_6 = 0;
-                state_struct.streak_4_star = 0;
-                state_struct.loss_streak = 0;
-                state_struct.has_obtained_up = true;
-                let _ = apply_luck_budget(0.0, &mut state_struct.luck_budget, config);
-            } else if config.big_pity_cumulative > 0
-                && current_total_pulls == config.big_pity_cumulative
-                && big_pity_gate
-            {
-                is_six = true;
-                is_up = true;
-                state_struct.pity_6 = 0;
-                state_struct.streak_4_star = 0;
-                state_struct.loss_streak = 0;
-                state_struct.has_obtained_up = true;
-                let _ = apply_luck_budget(0.0, &mut state_struct.luck_budget, config);
-            } else {
-                luck_modifier =
-                    apply_luck_budget(ACTIONS[action_idx], &mut state_struct.luck_budget, config);
-                let base_prob_6 = prob_6(current_pity, config);
-                let final_prob_6 = (base_prob_6 + luck_modifier).clamp(0.0, 1.0);
-                let r = rng.next_f64();
-                if r < final_prob_6 {
-                    is_six = true;
-                    state_struct.pity_6 = 0;
-                    state_struct.streak_4_star = 0;
-                    if config.up_rate > 0.0 && !config.up_six.is_empty() {
-                        if rng.next_f64() < config.up_rate {
-                            is_up = true;
-                            state_struct.loss_streak = 0;
-                            state_struct.has_obtained_up = true;
-                        } else {
-                            state_struct.loss_streak += 1;
-                        }
-                    }
-                } else if config.always_5_star
-                    || (config.five_star_pity > 0
-                        && state_struct.streak_4_star >= config.five_star_pity - 1)
-                    || r < (final_prob_6 + config.prob_5_base).min(1.0)
-                {
-                    state_struct.pity_6 = current_pity + 1;
-                    state_struct.streak_4_star = 0;
-                } else {
-                    state_struct.pity_6 = current_pity + 1;
-                    state_struct.streak_4_star += 1;
-                }
-            }
-            state_struct.total_pulls_in_pool = current_total_pulls;
+            let outcome = step_pull(
+                &mut state_struct,
+                &mut rng,
+                config,
+                config.big_pity_requires_not_up,
+                GachaAction::policy(action_idx, ACTIONS[action_idx]),
+            );
             pulls_done += 1;
 
             let mut reward = crate::utils::compute_reward_ppo(
-                is_six,
-                is_up,
+                outcome.rarity == 6,
+                outcome.is_up,
                 state_struct.loss_streak,
-                luck_modifier,
+                outcome.luck_modifier,
                 config.luck_action_cost,
             );
-            if is_six && is_up {
+            if outcome.rarity == 6 && outcome.is_up {
                 if pulls_done < EARLY_UP_BONUS_THRESHOLD_1 {
                     reward += 5.0;
                 }
@@ -1633,8 +1512,8 @@ fn evaluate_ppo_policy(
             }
             episode_reward += reward;
 
-            if is_up || pulls_done >= EPISODE_MAX_PULLS {
-                if is_up {
+            if outcome.is_up || pulls_done >= EPISODE_MAX_PULLS {
+                if outcome.is_up {
                     up_hits += 1;
                 }
                 total_pulls += pulls_done;
