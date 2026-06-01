@@ -7,7 +7,7 @@ use crate::env_net::EnvNet;
 use crate::neural::{NeuralLuckOptimizer, DIM};
 use crate::nn::{Linear, Module};
 use crate::rng::Rng;
-use crate::sim::{build_features, env_net_env, prob_6, PullState};
+use crate::sim::{build_features_with_luck_budget, env_net_env, prob_6, PullState};
 use crate::training_metrics::{StepSnapshot, TrainingMetrics, TrainingMetricsSink};
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -24,7 +24,8 @@ const TRAIN_FREQ: usize = 10;
 const LOG_FREQ: usize = 100;
 const DEFAULT_DQN_HIDDEN: usize = 1024;
 use crate::utils::{
-    create_bar, format_policy_eval, PolicyEvalStats, ACTIONS, ACTION_SPACE, EPISODE_MAX_PULLS,
+    apply_luck_budget, create_bar, format_policy_eval, PolicyEvalStats, ACTIONS, ACTION_SPACE,
+    EPISODE_MAX_PULLS,
 };
 
 // PER Hyperparameters (Schaul et al. 2016)
@@ -1782,25 +1783,20 @@ fn evaluate_dqn_policy(
 
     for episode in 0..episodes {
         let mut rng = Rng::from_seed(seed.wrapping_add((episode as u64).wrapping_mul(0x9E37_79B9)));
-        let mut state_struct = PullState {
-            pity_6: 0,
-            total_pulls_in_pool: 0,
-            has_obtained_up: false,
-            streak_4_star: 0,
-            loss_streak: 0,
-        };
+        let mut state_struct = PullState::new(config);
         let (env_noise, env_bias) = env_net_env(env_net, &mut rng, 0, 0, 0, 0);
         let mut pulls_done = 0usize;
         let mut episode_reward = 0.0;
 
         loop {
-            let current_state_raw = build_features(
+            let current_state_raw = build_features_with_luck_budget(
                 state_struct.pity_6,
                 pulls_done,
                 env_noise,
                 state_struct.streak_4_star,
                 env_bias,
                 state_struct.loss_streak,
+                state_struct.luck_budget,
                 config,
             )
             .to_vec();
@@ -1810,14 +1806,12 @@ fn evaluate_dqn_policy(
                 Ok(t) => t,
                 Err(_) => current_state_tensor,
             };
-            let (action, luck_modifier) = policy.predict_action(&current_state_tensor);
+            let (action, requested_luck_modifier) = policy.predict_action(&current_state_tensor);
             if let Some(count) = action_counts.get_mut(action) {
                 *count += 1;
             }
 
-            let base_prob_6 = prob_6(state_struct.pity_6, config);
-            let final_prob_6 = (base_prob_6 + luck_modifier as f64).clamp(0.0, 1.0);
-            let r = rng.next_f64();
+            let mut luck_modifier = 0.0;
             let mut is_six = false;
             let mut is_up = false;
 
@@ -1840,6 +1834,7 @@ fn evaluate_dqn_policy(
                 state_struct.streak_4_star = 0;
                 state_struct.loss_streak = 0;
                 state_struct.has_obtained_up = true;
+                let _ = apply_luck_budget(0.0, &mut state_struct.luck_budget, config);
             } else if config.big_pity_cumulative > 0
                 && state_struct.total_pulls_in_pool == config.big_pity_cumulative
                 && big_pity_gate
@@ -1850,27 +1845,38 @@ fn evaluate_dqn_policy(
                 state_struct.streak_4_star = 0;
                 state_struct.loss_streak = 0;
                 state_struct.has_obtained_up = true;
-            } else if r < final_prob_6 {
-                is_six = true;
-                state_struct.pity_6 = 0;
-                state_struct.streak_4_star = 0;
-                if config.up_rate > 0.0 && !config.up_six.is_empty() {
-                    if rng.next_f64() < config.up_rate {
-                        is_up = true;
-                        state_struct.loss_streak = 0;
-                        state_struct.has_obtained_up = true;
-                    } else {
-                        state_struct.loss_streak += 1;
-                    }
-                }
-            } else if config.always_5_star
-                || (config.five_star_pity > 0
-                    && state_struct.streak_4_star >= config.five_star_pity - 1)
-                || r < (final_prob_6 + config.prob_5_base).min(1.0)
-            {
-                state_struct.streak_4_star = 0;
+                let _ = apply_luck_budget(0.0, &mut state_struct.luck_budget, config);
             } else {
-                state_struct.streak_4_star += 1;
+                luck_modifier = apply_luck_budget(
+                    requested_luck_modifier as f64,
+                    &mut state_struct.luck_budget,
+                    config,
+                );
+                let base_prob_6 = prob_6(state_struct.pity_6, config);
+                let final_prob_6 = (base_prob_6 + luck_modifier).clamp(0.0, 1.0);
+                let r = rng.next_f64();
+                if r < final_prob_6 {
+                    is_six = true;
+                    state_struct.pity_6 = 0;
+                    state_struct.streak_4_star = 0;
+                    if config.up_rate > 0.0 && !config.up_six.is_empty() {
+                        if rng.next_f64() < config.up_rate {
+                            is_up = true;
+                            state_struct.loss_streak = 0;
+                            state_struct.has_obtained_up = true;
+                        } else {
+                            state_struct.loss_streak += 1;
+                        }
+                    }
+                } else if config.always_5_star
+                    || (config.five_star_pity > 0
+                        && state_struct.streak_4_star >= config.five_star_pity - 1)
+                    || r < (final_prob_6 + config.prob_5_base).min(1.0)
+                {
+                    state_struct.streak_4_star = 0;
+                } else {
+                    state_struct.streak_4_star += 1;
+                }
             }
             pulls_done += 1;
 
@@ -1878,7 +1884,7 @@ fn evaluate_dqn_policy(
                 is_six,
                 is_up,
                 state_struct.loss_streak,
-                luck_modifier as f64,
+                luck_modifier,
                 config.luck_action_cost,
             );
 
@@ -1901,7 +1907,6 @@ fn evaluate_dqn_policy(
         action_counts,
     }
 }
-
 fn train_dqn_impl(
     _initial_model: &NeuralLuckOptimizer,
     rng: &mut Rng,
@@ -1933,13 +1938,7 @@ fn train_dqn_impl(
     let total_steps = if config.fast_init { 5_000 } else { 50_000 };
     let mut epsilon = EPSILON_START;
 
-    let mut state_struct = PullState {
-        pity_6: 0,
-        total_pulls_in_pool: 0,
-        has_obtained_up: false,
-        streak_4_star: 0,
-        loss_streak: 0,
-    };
+    let mut state_struct = PullState::new(config);
     let (mut env_noise, mut env_bias) = env_net_env(env_net, rng, 0, 0, 0, 0);
     let mut pulls_done = 0;
 
@@ -1968,13 +1967,14 @@ fn train_dqn_impl(
             // silence
         }
         // 1. Build State
-        let current_state_raw = build_features(
+        let current_state_raw = build_features_with_luck_budget(
             state_struct.pity_6,
             pulls_done,
             env_noise,
             state_struct.streak_4_star,
             env_bias,
             state_struct.loss_streak,
+            state_struct.luck_budget,
             config,
         )
         .to_vec();
@@ -2022,11 +2022,7 @@ fn train_dqn_impl(
         };
 
         // 3. Step Environment
-        let luck_modifier = ACTIONS[action];
-        let base_prob_6 = prob_6(state_struct.pity_6, config);
-        let final_prob_6 = (base_prob_6 + luck_modifier).clamp(0.0, 1.0);
-
-        let r = rng.next_f64();
+        let mut luck_modifier = 0.0;
         let mut is_six = false;
         let mut is_up = false;
 
@@ -2049,6 +2045,7 @@ fn train_dqn_impl(
             state_struct.streak_4_star = 0;
             state_struct.loss_streak = 0;
             state_struct.has_obtained_up = true;
+            let _ = apply_luck_budget(0.0, &mut state_struct.luck_budget, config);
         } else if config.big_pity_cumulative > 0
             && state_struct.total_pulls_in_pool == config.big_pity_cumulative
             && big_pity_gate
@@ -2059,27 +2056,35 @@ fn train_dqn_impl(
             state_struct.streak_4_star = 0;
             state_struct.loss_streak = 0;
             state_struct.has_obtained_up = true;
-        } else if r < final_prob_6 {
-            is_six = true;
-            state_struct.pity_6 = 0;
-            state_struct.streak_4_star = 0;
-            if config.up_rate > 0.0 && !config.up_six.is_empty() {
-                if rng.next_f64() < config.up_rate {
-                    is_up = true;
-                    state_struct.loss_streak = 0;
-                    state_struct.has_obtained_up = true;
-                } else {
-                    state_struct.loss_streak += 1;
-                }
-            }
-        } else if config.always_5_star
-            || (config.five_star_pity > 0
-                && state_struct.streak_4_star >= config.five_star_pity - 1)
-            || r < (final_prob_6 + config.prob_5_base).min(1.0)
-        {
-            state_struct.streak_4_star = 0;
+            let _ = apply_luck_budget(0.0, &mut state_struct.luck_budget, config);
         } else {
-            state_struct.streak_4_star += 1;
+            luck_modifier =
+                apply_luck_budget(ACTIONS[action], &mut state_struct.luck_budget, config);
+            let base_prob_6 = prob_6(state_struct.pity_6, config);
+            let final_prob_6 = (base_prob_6 + luck_modifier).clamp(0.0, 1.0);
+            let r = rng.next_f64();
+            if r < final_prob_6 {
+                is_six = true;
+                state_struct.pity_6 = 0;
+                state_struct.streak_4_star = 0;
+                if config.up_rate > 0.0 && !config.up_six.is_empty() {
+                    if rng.next_f64() < config.up_rate {
+                        is_up = true;
+                        state_struct.loss_streak = 0;
+                        state_struct.has_obtained_up = true;
+                    } else {
+                        state_struct.loss_streak += 1;
+                    }
+                }
+            } else if config.always_5_star
+                || (config.five_star_pity > 0
+                    && state_struct.streak_4_star >= config.five_star_pity - 1)
+                || r < (final_prob_6 + config.prob_5_base).min(1.0)
+            {
+                state_struct.streak_4_star = 0;
+            } else {
+                state_struct.streak_4_star += 1;
+            }
         }
         pulls_done += 1;
 
@@ -2093,13 +2098,14 @@ fn train_dqn_impl(
 
         episode_reward += reward;
 
-        let next_state_raw = build_features(
+        let next_state_raw = build_features_with_luck_budget(
             state_struct.pity_6,
             pulls_done,
             env_noise,
             state_struct.streak_4_star,
             env_bias,
             state_struct.loss_streak,
+            state_struct.luck_budget,
             config,
         )
         .to_vec();
@@ -2299,13 +2305,7 @@ fn train_dqn_impl(
                 recent_rewards.pop_front();
             }
 
-            state_struct = PullState {
-                pity_6: 0,
-                total_pulls_in_pool: 0,
-                has_obtained_up: false,
-                streak_4_star: 0,
-                loss_streak: 0,
-            };
+            state_struct = PullState::new(config);
             let new_env = env_net_env(env_net, rng, 0, 0, 0, 0);
             env_noise = new_env.0;
             env_bias = new_env.1;

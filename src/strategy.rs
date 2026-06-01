@@ -177,6 +177,7 @@ mod tests {
             has_obtained_up: false,
             streak_4_star: 2,
             loss_streak: 1,
+            ..PullState::new(&Config::default())
         }
     }
 

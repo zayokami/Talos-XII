@@ -1206,13 +1206,7 @@ impl EnvNet {
             let episode_data: EpisodeData = (0..num_episodes)
                 .into_par_iter()
                 .map(|ep| {
-                    let mut state = PullState {
-                        pity_6: 0,
-                        total_pulls_in_pool: 0,
-                        has_obtained_up: false,
-                        streak_4_star: 0,
-                        loss_streak: 0,
-                    };
+                    let mut state = PullState::new(config);
 
                     let ep_seed = base_seed.wrapping_add(ep as u64 * 7919);
                     let mut local_rng = crate::rng::Rng::from_seed(ep_seed);

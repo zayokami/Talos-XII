@@ -20,8 +20,8 @@ pub const COST_PER_PULL: u32 = 500;
 /// Number of free pulls available to F2P players per banner cycle.
 pub const FREE_PULLS_WELFARE: u32 = 135;
 use crate::utils::{
-    compute_reward_dqn, compute_reward_neural, compute_reward_ppo, ACTIONS,
-    DEFAULT_PPO_CONTEXT_LEN, EPISODE_MAX_PULLS,
+    apply_luck_budget, compute_reward_dqn, compute_reward_neural, compute_reward_ppo,
+    initial_luck_budget, luck_budget_ratio, DEFAULT_PPO_CONTEXT_LEN, EPISODE_MAX_PULLS,
 };
 
 #[derive(Clone, Debug)]
@@ -63,6 +63,20 @@ pub struct PullState {
     pub has_obtained_up: bool,
     pub streak_4_star: usize,
     pub loss_streak: usize,
+    pub luck_budget: f64,
+}
+
+impl PullState {
+    pub fn new(config: &Config) -> Self {
+        Self {
+            pity_6: 0,
+            total_pulls_in_pool: 0,
+            has_obtained_up: false,
+            streak_4_star: 0,
+            loss_streak: 0,
+            luck_budget: initial_luck_budget(config),
+        }
+    }
 }
 
 /// Result of a single gacha pull including rarity, UP status, and policy info.
@@ -72,6 +86,7 @@ pub struct PullOutcome {
     pub is_up: bool,
     pub big_pity_used: bool,
     pub action: Option<usize>,
+    pub luck_modifier: f64,
     pub ppo_log_prob: Option<f64>,
     pub ppo_value: Option<f64>,
 }
@@ -357,6 +372,7 @@ pub fn expected_pulls_per_six(config: &Config) -> f64 {
 }
 
 /// Build the DIM-dimensional feature vector for neural network input.
+#[allow(dead_code)]
 pub fn build_features(
     pity_6: usize,
     total_pulls: usize,
@@ -364,6 +380,30 @@ pub fn build_features(
     streak: usize,
     env_bias: f64,
     loss_streak: usize,
+    config: &Config,
+) -> Tensor {
+    build_features_with_luck_budget(
+        pity_6,
+        total_pulls,
+        env_noise,
+        streak,
+        env_bias,
+        loss_streak,
+        initial_luck_budget(config),
+        config,
+    )
+}
+
+/// Build the DIM-dimensional feature vector including the current luck budget.
+#[allow(clippy::too_many_arguments)]
+pub fn build_features_with_luck_budget(
+    pity_6: usize,
+    total_pulls: usize,
+    env_noise: f64,
+    streak: usize,
+    env_bias: f64,
+    loss_streak: usize,
+    luck_budget: f64,
     config: &Config,
 ) -> Tensor {
     const DEFAULT_BIG_PITY_FALLBACK: f64 = 120.0;
@@ -406,6 +446,7 @@ pub fn build_features(
     };
     let has_loss_streak = if loss_streak > 0 { 1.0 } else { 0.0 };
     let high_streak = if streak >= 10 { 1.0 } else { 0.0 };
+    let budget_norm = luck_budget_ratio(config, luck_budget);
 
     [
         // Original 8 features (kept as-is)
@@ -441,7 +482,7 @@ pub fn build_features(
         decay_pity,
         decay_total,
         is_high_pity,
-        has_loss_streak + high_streak * 0.5,
+        budget_norm + high_streak * 0.5 + has_loss_streak * 0.25,
     ]
 }
 
@@ -471,6 +512,7 @@ pub fn roll_one(
     let mut big_pity_used = false;
     let mut is_up = false;
     let mut action_used = None;
+    let mut luck_modifier = 0.0;
     let mut ppo_log_prob = None;
     let mut ppo_value = None;
     let rarity: u8;
@@ -492,6 +534,7 @@ pub fn roll_one(
         state.pity_6 = 0;
         state.streak_4_star = 0;
         state.loss_streak = 0;
+        let _ = apply_luck_budget(0.0, &mut state.luck_budget, config);
     } else if config.big_pity_cumulative > 0
         && state.total_pulls_in_pool == config.big_pity_cumulative
         && big_pity_gate
@@ -502,16 +545,18 @@ pub fn roll_one(
         state.pity_6 = 0;
         state.streak_4_star = 0;
         state.loss_streak = 0;
+        let _ = apply_luck_budget(0.0, &mut state.luck_budget, config);
     } else {
         let base_prob_6 = prob_6(state.pity_6, config);
 
-        let x = build_features(
+        let x = build_features_with_luck_budget(
             state.pity_6,
             nn_total_pulls,
             env_noise,
             state.streak_4_star,
             env_bias,
             state.loss_streak,
+            state.luck_budget,
             config,
         );
 
@@ -533,8 +578,9 @@ pub fn roll_one(
         action_used = decision.action;
         ppo_log_prob = decision.ppo_log_prob;
         ppo_value = decision.ppo_value;
+        luck_modifier = apply_luck_budget(decision.luck_factor, &mut state.luck_budget, config);
 
-        let final_prob_6 = (base_prob_6 + decision.luck_factor).clamp(0.0, 1.0);
+        let final_prob_6 = (base_prob_6 + luck_modifier).clamp(0.0, 1.0);
         let r = rng.next_f64();
 
         if r < final_prob_6 {
@@ -573,6 +619,7 @@ pub fn roll_one(
         is_up,
         big_pity_used,
         action: action_used,
+        luck_modifier,
         ppo_log_prob,
         ppo_value,
     }
@@ -628,13 +675,7 @@ fn simulate_core_with_context(
 
     let mut max_loss_streak = 0;
 
-    let mut state = PullState {
-        pity_6: 0,
-        total_pulls_in_pool: 0,
-        has_obtained_up: false,
-        streak_4_star: 0,
-        loss_streak: 0,
-    };
+    let mut state = PullState::new(ctx.config);
 
     let (env_noise, env_bias) = env_net_env(
         ctx.env_net,
@@ -691,13 +732,14 @@ fn simulate_core_with_context(
             pulls_done
         };
 
-        let current_state = build_features(
+        let current_state = build_features_with_luck_budget(
             state.pity_6,
             nn_total_pulls,
             env_noise,
             state.streak_4_star,
             env_bias,
             state.loss_streak,
+            state.luck_budget,
             ctx.config,
         );
         let has_any_sender =
@@ -750,13 +792,14 @@ fn simulate_core_with_context(
         }
 
         if has_any_sender {
-            let next_state = build_features(
+            let next_state = build_features_with_luck_budget(
                 state.pity_6,
                 nn_total_pulls + 1,
                 env_noise,
                 state.streak_4_star,
                 env_bias,
                 state.loss_streak,
+                state.luck_budget,
                 ctx.config,
             );
             record_training_samples(TrainingSampleInputs {
@@ -870,12 +913,11 @@ fn record_training_samples(inputs: TrainingSampleInputs<'_>) {
         config,
     } = inputs;
     if let (Some(action), Some(sender)) = (outcome.action, exp_sender) {
-        let luck_modifier = ACTIONS.get(action).copied().unwrap_or(0.0);
         let reward = compute_reward_dqn(
             outcome.rarity == 6,
             outcome.is_up,
             state.loss_streak,
-            luck_modifier,
+            outcome.luck_modifier,
             config.luck_action_cost,
         );
         let done = outcome.is_up || (pulls_done + 1) >= EPISODE_MAX_PULLS;
@@ -900,12 +942,11 @@ fn record_training_samples(inputs: TrainingSampleInputs<'_>) {
         (outcome.ppo_log_prob, outcome.ppo_value, ppo_sender)
     {
         if let Some(action) = outcome.action {
-            let luck_modifier = ACTIONS.get(action).copied().unwrap_or(0.0);
             let reward = compute_reward_ppo(
                 outcome.rarity == 6,
                 outcome.is_up,
                 state.loss_streak,
-                luck_modifier,
+                outcome.luck_modifier,
                 config.luck_action_cost,
             );
             let done = outcome.is_up || (pulls_done + 1) >= EPISODE_MAX_PULLS;
@@ -1246,13 +1287,7 @@ pub fn simulate_for_data_collection(
     // We run simulations and capture the state at each pull
     for _ in 0..num_sims {
         // Reset state for each user simulation
-        let mut state = PullState {
-            pity_6: 0,
-            total_pulls_in_pool: 0,
-            has_obtained_up: false,
-            streak_4_star: 0,
-            loss_streak: 0,
-        };
+        let mut state = PullState::new(config);
         let (env_noise, env_bias) = env_net_env(
             env_net,
             rng,
@@ -1271,13 +1306,14 @@ pub fn simulate_for_data_collection(
             let nn_total_pulls = pulls_done; // 0-based
 
             // Build features for CURRENT state
-            let x = build_features(
+            let x = build_features_with_luck_budget(
                 state.pity_6,
                 nn_total_pulls,
                 env_noise,
                 state.streak_4_star,
                 env_bias,
                 state.loss_streak,
+                state.luck_budget,
                 config,
             );
 
@@ -1579,10 +1615,7 @@ mod tests {
         let mut rng = Rng::from_seed(999);
         let mut state = PullState {
             pity_6: config.small_pity_guarantee - 1,
-            total_pulls_in_pool: 0,
-            has_obtained_up: false,
-            streak_4_star: 0,
-            loss_streak: 0,
+            ..PullState::new(&config)
         };
         let outcome = roll_one(
             &mut state,

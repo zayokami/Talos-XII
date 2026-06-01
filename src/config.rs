@@ -476,6 +476,11 @@ pub struct Config {
     pub ppo_num_envs: usize,
     pub ppo_top_k: usize,
     pub luck_action_cost: f64,
+    pub luck_budget_enabled: bool,
+    pub luck_budget_max: f64,
+    pub luck_budget_initial: f64,
+    pub luck_budget_recovery_per_pull: f64,
+    pub luck_budget_negative_refund: f64,
     pub policy_eval_interval: usize,
     pub policy_eval_episodes: usize,
     pub policy_eval_seed: u64,
@@ -546,6 +551,11 @@ impl Default for Config {
             ppo_num_envs: 1,
             ppo_top_k: 0, // 0 = disabled (full softmax), >0 = top-k truncation
             luck_action_cost: 8.0,
+            luck_budget_enabled: true,
+            luck_budget_max: 0.045,
+            luck_budget_initial: 0.03,
+            luck_budget_recovery_per_pull: 0.001,
+            luck_budget_negative_refund: 1.0,
             policy_eval_interval: 0,
             policy_eval_episodes: 128,
             policy_eval_seed: 0x5EED_1234,
@@ -749,6 +759,21 @@ impl Config {
             }
             if let Some(v) = map.get("luck_action_cost") {
                 config.luck_action_cost = v.as_f64().unwrap_or(8.0);
+            }
+            if let Some(v) = map.get("luck_budget_enabled") {
+                config.luck_budget_enabled = v.as_bool().unwrap_or(true);
+            }
+            if let Some(v) = map.get("luck_budget_max") {
+                config.luck_budget_max = v.as_f64().unwrap_or(0.045);
+            }
+            if let Some(v) = map.get("luck_budget_initial") {
+                config.luck_budget_initial = v.as_f64().unwrap_or(0.03);
+            }
+            if let Some(v) = map.get("luck_budget_recovery_per_pull") {
+                config.luck_budget_recovery_per_pull = v.as_f64().unwrap_or(0.001);
+            }
+            if let Some(v) = map.get("luck_budget_negative_refund") {
+                config.luck_budget_negative_refund = v.as_f64().unwrap_or(1.0);
             }
             if let Some(v) = map.get("policy_eval_interval") {
                 config.policy_eval_interval = v.as_f64().unwrap_or(0.0).round() as usize;
@@ -975,6 +1000,25 @@ impl Config {
             "root config",
         );
         sanitize_non_negative(&mut config.luck_action_cost, "luck_action_cost", 8.0);
+        sanitize_non_negative(&mut config.luck_budget_max, "luck_budget_max", 0.045);
+        sanitize_non_negative(&mut config.luck_budget_initial, "luck_budget_initial", 0.03);
+        sanitize_non_negative(
+            &mut config.luck_budget_recovery_per_pull,
+            "luck_budget_recovery_per_pull",
+            0.001,
+        );
+        sanitize_non_negative(
+            &mut config.luck_budget_negative_refund,
+            "luck_budget_negative_refund",
+            1.0,
+        );
+        if config.luck_budget_max > 0.0 && config.luck_budget_initial > config.luck_budget_max {
+            eprintln!(
+                "[Config Warning] luck_budget_initial ({}) exceeds luck_budget_max ({}), clamping",
+                config.luck_budget_initial, config.luck_budget_max
+            );
+            config.luck_budget_initial = config.luck_budget_max;
+        }
         if config.policy_eval_episodes == 0 {
             eprintln!("[Config Warning] policy_eval_episodes is 0, fallback to 1");
             config.policy_eval_episodes = 1;
@@ -1234,6 +1278,11 @@ fn warn_unknown_fields(map: &serde_json::Map<String, JsonValue>) {
         "ppo_num_envs",
         "ppo_top_k",
         "luck_action_cost",
+        "luck_budget_enabled",
+        "luck_budget_max",
+        "luck_budget_initial",
+        "luck_budget_recovery_per_pull",
+        "luck_budget_negative_refund",
         "policy_eval_interval",
         "policy_eval_episodes",
         "policy_eval_seed",

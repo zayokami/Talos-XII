@@ -1,6 +1,7 @@
 //! Shared utility functions, constants, and SIMD-accelerated math helpers.
 
 use crate::achf::AchfCacheStats;
+use crate::config::Config;
 use indicatif::{ProgressBar, ProgressStyle};
 
 /// Reward constants for training signal computation.
@@ -89,10 +90,58 @@ pub fn format_policy_eval(label: &str, step: usize, stats: &PolicyEvalStats) -> 
 
 /// Cost applied to policy-controlled luck interventions.
 pub fn luck_action_penalty(luck_modifier: f64, action_cost: f64) -> f64 {
-    if !luck_modifier.is_finite() || !action_cost.is_finite() || action_cost <= 0.0 {
+    if !luck_modifier.is_finite()
+        || !action_cost.is_finite()
+        || action_cost <= 0.0
+        || luck_modifier <= 0.0
+    {
         return 0.0;
     }
-    luck_modifier.abs() * action_cost
+    luck_modifier * action_cost
+}
+
+pub fn initial_luck_budget(config: &Config) -> f64 {
+    if !config.luck_budget_enabled || config.luck_budget_max <= 0.0 {
+        return 0.0;
+    }
+    config
+        .luck_budget_initial
+        .clamp(0.0, config.luck_budget_max)
+}
+
+pub fn luck_budget_ratio(config: &Config, budget: f64) -> f64 {
+    if !config.luck_budget_enabled || config.luck_budget_max <= 0.0 || !budget.is_finite() {
+        return 1.0;
+    }
+    (budget / config.luck_budget_max).clamp(0.0, 1.0)
+}
+
+pub fn apply_luck_budget(requested_modifier: f64, budget: &mut f64, config: &Config) -> f64 {
+    if !config.luck_budget_enabled || config.luck_budget_max <= 0.0 {
+        return requested_modifier;
+    }
+
+    if !budget.is_finite() {
+        *budget = initial_luck_budget(config);
+    }
+    *budget = budget.clamp(0.0, config.luck_budget_max);
+
+    let actual = if requested_modifier > 0.0 {
+        let granted = requested_modifier.min(*budget);
+        *budget -= granted;
+        granted
+    } else if requested_modifier < 0.0 {
+        let refund = (-requested_modifier) * config.luck_budget_negative_refund;
+        *budget = (*budget + refund).min(config.luck_budget_max);
+        requested_modifier
+    } else {
+        0.0
+    };
+
+    if config.luck_budget_recovery_per_pull > 0.0 {
+        *budget = (*budget + config.luck_budget_recovery_per_pull).min(config.luck_budget_max);
+    }
+    actual
 }
 
 /// Compute DQN-style reward for experience replay.
@@ -344,7 +393,7 @@ mod tests {
     fn luck_action_penalty_charges_nonzero_policy_actions() {
         assert_eq!(luck_action_penalty(0.0, 8.0), 0.0);
         assert!((luck_action_penalty(0.015, 8.0) - 0.12).abs() < 1e-12);
-        assert!((luck_action_penalty(-0.005, 8.0) - 0.04).abs() < 1e-12);
+        assert_eq!(luck_action_penalty(-0.005, 8.0), 0.0);
     }
 
     #[test]
@@ -352,6 +401,23 @@ mod tests {
         let free = compute_reward_dqn(false, false, 0, 0.0, 8.0);
         let boosted = compute_reward_dqn(false, false, 0, 0.015, 8.0);
         assert!((free - boosted - 0.12).abs() < 1e-12);
+    }
+
+    #[test]
+    fn luck_budget_caps_positive_actions_and_refunds_negative_actions() {
+        let config = Config {
+            luck_budget_enabled: true,
+            luck_budget_max: 0.03,
+            luck_budget_initial: 0.01,
+            luck_budget_recovery_per_pull: 0.0,
+            luck_budget_negative_refund: 1.0,
+            ..Config::default()
+        };
+        let mut budget = initial_luck_budget(&config);
+        assert!((apply_luck_budget(0.015, &mut budget, &config) - 0.01).abs() < 1e-12);
+        assert_eq!(budget, 0.0);
+        assert!((apply_luck_budget(-0.005, &mut budget, &config) + 0.005).abs() < 1e-12);
+        assert!((budget - 0.005).abs() < 1e-12);
     }
 }
 
