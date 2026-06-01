@@ -131,14 +131,14 @@ fn sanitize_pity_settings(
 fn sanitize_unit_interval(value: &mut f64, key: &str, default: f64) {
     if !value.is_finite() {
         eprintln!(
-            "[Config Warning] ACHF {key} is non-finite, fallback to {}",
+            "[Config Warning] {key} is non-finite, fallback to {}",
             default
         );
         *value = default;
         return;
     }
     if *value < 0.0 {
-        eprintln!("[Config Warning] ACHF {key} ({}) below 0, clamping", *value);
+        eprintln!("[Config Warning] {key} ({}) below 0, clamping", *value);
         *value = 0.0;
     } else if *value > 1.0 {
         eprintln!("[Config Warning] ACHF {key} ({}) above 1, clamping", *value);
@@ -475,6 +475,10 @@ pub struct Config {
     pub ppo_context_len: usize,
     pub ppo_num_envs: usize,
     pub ppo_top_k: usize,
+    pub luck_action_cost: f64,
+    pub policy_eval_interval: usize,
+    pub policy_eval_episodes: usize,
+    pub policy_eval_seed: u64,
     pub distill_enabled: bool,
     pub distill_ema_decay: f64,
     pub distill_kl_coef: f64,
@@ -541,6 +545,10 @@ impl Default for Config {
             ppo_context_len: 0,
             ppo_num_envs: 1,
             ppo_top_k: 0, // 0 = disabled (full softmax), >0 = top-k truncation
+            luck_action_cost: 8.0,
+            policy_eval_interval: 0,
+            policy_eval_episodes: 128,
+            policy_eval_seed: 0x5EED_1234,
             distill_enabled: false,
             distill_ema_decay: 0.995,
             distill_kl_coef: 0.1,
@@ -738,6 +746,18 @@ impl Config {
             }
             if let Some(v) = map.get("ppo_top_k") {
                 config.ppo_top_k = v.as_f64().unwrap_or(0.0).round() as usize;
+            }
+            if let Some(v) = map.get("luck_action_cost") {
+                config.luck_action_cost = v.as_f64().unwrap_or(8.0);
+            }
+            if let Some(v) = map.get("policy_eval_interval") {
+                config.policy_eval_interval = v.as_f64().unwrap_or(0.0).round() as usize;
+            }
+            if let Some(v) = map.get("policy_eval_episodes") {
+                config.policy_eval_episodes = v.as_f64().unwrap_or(128.0).round() as usize;
+            }
+            if let Some(v) = map.get("policy_eval_seed") {
+                config.policy_eval_seed = v.as_f64().unwrap_or(0x5EED_1234 as f64).round() as u64;
             }
             if let Some(v) = map.get("distill_enabled") {
                 config.distill_enabled = v.as_bool().unwrap_or(false);
@@ -954,6 +974,11 @@ impl Config {
             &mut config.big_pity_cumulative,
             "root config",
         );
+        sanitize_non_negative(&mut config.luck_action_cost, "luck_action_cost", 8.0);
+        if config.policy_eval_episodes == 0 {
+            eprintln!("[Config Warning] policy_eval_episodes is 0, fallback to 1");
+            config.policy_eval_episodes = 1;
+        }
         sanitize_achf_config(&mut config.achf);
 
         // Sanitize model dimension settings
@@ -1208,6 +1233,10 @@ fn warn_unknown_fields(map: &serde_json::Map<String, JsonValue>) {
         "ppo_context_len",
         "ppo_num_envs",
         "ppo_top_k",
+        "luck_action_cost",
+        "policy_eval_interval",
+        "policy_eval_episodes",
+        "policy_eval_seed",
         "distill_enabled",
         "distill_ema_decay",
         "distill_kl_coef",

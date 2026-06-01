@@ -8,7 +8,8 @@ use crate::sim::{build_features, env_net_env, prob_6, PpoExperience, PullState};
 use crate::training_metrics::{StepSnapshot, TrainingMetrics, TrainingMetricsSink};
 use crate::transformer::{KVCache, LuckTransformer};
 use crate::utils::{
-    create_bar, normalize_slice, sum_f64, sum_sq_diff, ACTIONS, ACTION_SPACE, EPISODE_MAX_PULLS,
+    create_bar, format_policy_eval, normalize_slice, sum_f64, sum_sq_diff, PolicyEvalStats,
+    ACTIONS, ACTION_SPACE, EPISODE_MAX_PULLS,
 };
 use crate::worker::GoodJobWorker;
 use rand::seq::SliceRandom;
@@ -136,6 +137,19 @@ fn softmax_sample(logits: &[f32], top_k: usize) -> (usize, f32) {
     }
     let log_prob = probs[idx].max(f32::MIN_POSITIVE).ln();
     (idx, log_prob)
+}
+
+#[inline]
+fn argmax_action(logits: &[f32]) -> usize {
+    let mut max_idx = 0usize;
+    let mut max_val = f32::NEG_INFINITY;
+    for (idx, &value) in logits.iter().enumerate().take(ACTION_SPACE) {
+        if value > max_val {
+            max_val = value;
+            max_idx = idx;
+        }
+    }
+    max_idx
 }
 
 /// Actor-Critic model combining a LuckTransformer backbone with action/value heads.
@@ -331,6 +345,26 @@ impl ActorCritic {
                 .forward_inference_step_into(state, kv_cache, start_pos, last);
             self.actor_head.forward_inference_into(last, logits);
             softmax_sample(logits, top_k).0
+        })
+    }
+
+    fn step_inference_cached_greedy(
+        &self,
+        state: &[f32],
+        kv_cache: &mut [KVCache],
+        start_pos: usize,
+    ) -> usize {
+        CACHED_STEP_SCRATCH.with(|scratch_cell| {
+            let mut scratch = scratch_cell.borrow_mut();
+            let CachedStepScratch {
+                last,
+                logits,
+                value: _,
+            } = &mut *scratch;
+            self.backbone
+                .forward_inference_step_into(state, kv_cache, start_pos, last);
+            self.actor_head.forward_inference_into(last, logits);
+            argmax_action(logits)
         })
     }
 
@@ -1395,8 +1429,13 @@ impl PpoEnvState {
         }
         self.pulls_done += 1;
 
-        let mut reward =
-            crate::utils::compute_reward_ppo(is_six, is_up, self.state_struct.loss_streak);
+        let mut reward = crate::utils::compute_reward_ppo(
+            is_six,
+            is_up,
+            self.state_struct.loss_streak,
+            luck_modifier,
+            config.luck_action_cost,
+        );
         if is_six && is_up {
             if self.pulls_done < EARLY_UP_BONUS_THRESHOLD_1 {
                 reward += 5.0;
@@ -1443,6 +1482,174 @@ struct PpoStepResult {
 /// Train a PPO agent with multi-environment rollouts.
 pub fn train_ppo(rng: &mut Rng, env_net: &EnvNet, config: &Config) -> ActorCritic {
     train_ppo_impl(rng, env_net, config, TrainingMetricsSink::noop())
+}
+
+fn evaluate_ppo_policy(
+    policy: &ActorCritic,
+    env_net: &EnvNet,
+    config: &Config,
+    context_len: usize,
+    episodes: usize,
+    seed: u64,
+) -> PolicyEvalStats {
+    let episodes = episodes.max(1);
+    let context_len = context_len.max(1);
+    let mut total_reward = 0.0;
+    let mut total_pulls = 0usize;
+    let mut up_hits = 0usize;
+    let mut action_counts = [0usize; ACTION_SPACE];
+    let mla_cfg = &policy.backbone.blocks[0].mla_layer.config;
+    let num_layers = policy.backbone.blocks.len();
+
+    for episode in 0..episodes {
+        let mut rng = Rng::from_seed(seed.wrapping_add((episode as u64).wrapping_mul(0x9E37_79B9)));
+        let mut state_struct = PullState {
+            pity_6: 0,
+            total_pulls_in_pool: 0,
+            has_obtained_up: false,
+            streak_4_star: 0,
+            loss_streak: 0,
+        };
+        let (env_noise, env_bias) = env_net_env(env_net, &mut rng, 0, 0, 0, 0);
+        let mut pulls_done = 0usize;
+        let mut episode_reward = 0.0;
+        let mut history_buffer: VecDeque<Vec<f64>> = VecDeque::with_capacity(context_len);
+        let mut kv_cache: Vec<_> = (0..num_layers)
+            .map(|_| KVCache::new(mla_cfg.num_heads))
+            .collect();
+        for cache in &mut kv_cache {
+            cache.preallocate(
+                mla_cfg.num_heads,
+                mla_cfg.kv_lora_rank,
+                mla_cfg.v_head_dim,
+                mla_cfg.qk_rope_dim,
+                mla_cfg.max_seq_len,
+            );
+        }
+
+        loop {
+            let current_state_raw = build_features(
+                state_struct.pity_6,
+                pulls_done,
+                env_noise,
+                state_struct.streak_4_star,
+                env_bias,
+                state_struct.loss_streak,
+                config,
+            )
+            .to_vec();
+            history_buffer.push_back(current_state_raw);
+            if history_buffer.len() > context_len {
+                history_buffer.pop_front();
+                policy.prune_cache(&mut kv_cache, context_len);
+            }
+
+            let seq_len = history_buffer.len();
+            let token = history_buffer
+                .back()
+                .expect("history_buffer should not be empty after push");
+            let token_f32: Vec<f32> = token.iter().map(|&v| v as f32).collect();
+            let action_idx =
+                policy.step_inference_cached_greedy(&token_f32, &mut kv_cache, seq_len - 1);
+            if let Some(count) = action_counts.get_mut(action_idx) {
+                *count += 1;
+            }
+
+            let luck_modifier = ACTIONS[action_idx];
+            let base_prob_6 = prob_6(state_struct.pity_6, config);
+            let final_prob_6 = (base_prob_6 + luck_modifier).clamp(0.0, 1.0);
+            let r = rng.next_f64();
+            let mut is_six = false;
+            let mut is_up = false;
+
+            state_struct.pity_6 += 1;
+            state_struct.total_pulls_in_pool += 1;
+            let big_pity_gate = if config.big_pity_requires_not_up {
+                !state_struct.has_obtained_up
+            } else {
+                true
+            };
+
+            #[allow(clippy::if_same_then_else)]
+            if config.up_pity_soft > 0
+                && state_struct.total_pulls_in_pool == config.up_pity_soft
+                && big_pity_gate
+            {
+                is_six = true;
+                is_up = true;
+                state_struct.pity_6 = 0;
+                state_struct.streak_4_star = 0;
+                state_struct.loss_streak = 0;
+                state_struct.has_obtained_up = true;
+            } else if config.big_pity_cumulative > 0
+                && state_struct.total_pulls_in_pool == config.big_pity_cumulative
+                && big_pity_gate
+            {
+                is_six = true;
+                is_up = true;
+                state_struct.pity_6 = 0;
+                state_struct.streak_4_star = 0;
+                state_struct.loss_streak = 0;
+                state_struct.has_obtained_up = true;
+            } else if r < final_prob_6 {
+                is_six = true;
+                state_struct.pity_6 = 0;
+                state_struct.streak_4_star = 0;
+                if config.up_rate > 0.0 && !config.up_six.is_empty() {
+                    if rng.next_f64() < config.up_rate {
+                        is_up = true;
+                        state_struct.loss_streak = 0;
+                        state_struct.has_obtained_up = true;
+                    } else {
+                        state_struct.loss_streak += 1;
+                    }
+                }
+            } else if config.always_5_star
+                || (config.five_star_pity > 0
+                    && state_struct.streak_4_star >= config.five_star_pity - 1)
+                || r < (final_prob_6 + config.prob_5_base).min(1.0)
+            {
+                state_struct.streak_4_star = 0;
+            } else {
+                state_struct.streak_4_star += 1;
+            }
+            pulls_done += 1;
+
+            let mut reward = crate::utils::compute_reward_ppo(
+                is_six,
+                is_up,
+                state_struct.loss_streak,
+                luck_modifier,
+                config.luck_action_cost,
+            );
+            if is_six && is_up {
+                if pulls_done < EARLY_UP_BONUS_THRESHOLD_1 {
+                    reward += 5.0;
+                }
+                if pulls_done < EARLY_UP_BONUS_THRESHOLD_2 {
+                    reward += 5.0;
+                }
+            }
+            episode_reward += reward;
+
+            if is_up || pulls_done >= EPISODE_MAX_PULLS {
+                if is_up {
+                    up_hits += 1;
+                }
+                total_pulls += pulls_done;
+                total_reward += episode_reward;
+                break;
+            }
+        }
+    }
+
+    PolicyEvalStats {
+        episodes,
+        avg_reward: total_reward / episodes as f64,
+        up_rate: up_hits as f64 / episodes as f64,
+        avg_pulls: total_pulls as f64 / episodes as f64,
+        action_counts,
+    }
 }
 
 fn train_ppo_impl(
@@ -1639,6 +1846,20 @@ fn train_ppo_impl(
         };
         pb.set_position(steps_done as u64);
         pb.set_message(format!("Avg R: {:.2} | LR: {:.6}", avg_r, current_lr));
+
+        if config.policy_eval_interval > 0
+            && steps_done % config.policy_eval_interval < update_steps
+        {
+            let eval = evaluate_ppo_policy(
+                &ppo.policy,
+                env_net,
+                config,
+                context_len,
+                config.policy_eval_episodes,
+                config.policy_eval_seed,
+            );
+            println!("\n{}", format_policy_eval("PPO", steps_done, &eval));
+        }
 
         if metrics.is_enabled() && steps_done % snapshot_every < update_steps {
             metrics.emit_achf_snapshot(steps_done, update_loss, avg_r, ppo.policy.snapshot_achf());

@@ -20,8 +20,8 @@ pub const COST_PER_PULL: u32 = 500;
 /// Number of free pulls available to F2P players per banner cycle.
 pub const FREE_PULLS_WELFARE: u32 = 135;
 use crate::utils::{
-    compute_reward_dqn, compute_reward_neural, compute_reward_ppo, DEFAULT_PPO_CONTEXT_LEN,
-    EPISODE_MAX_PULLS,
+    compute_reward_dqn, compute_reward_neural, compute_reward_ppo, ACTIONS,
+    DEFAULT_PPO_CONTEXT_LEN, EPISODE_MAX_PULLS,
 };
 
 #[derive(Clone, Debug)]
@@ -771,6 +771,7 @@ fn simulate_core_with_context(
                 ppo_inputs: &ppo_inputs,
                 ppo_context_seq_data: &ppo_context.seq_data,
                 ppo_context_pity_vec: &ppo_context.pity_vec,
+                config: ctx.config,
             });
         }
 
@@ -850,6 +851,7 @@ struct TrainingSampleInputs<'a> {
     ppo_inputs: &'a PpoInputs,
     ppo_context_seq_data: &'a [f64],
     ppo_context_pity_vec: &'a [usize],
+    config: &'a Config,
 }
 
 fn record_training_samples(inputs: TrainingSampleInputs<'_>) {
@@ -865,9 +867,17 @@ fn record_training_samples(inputs: TrainingSampleInputs<'_>) {
         ppo_inputs,
         ppo_context_seq_data,
         ppo_context_pity_vec,
+        config,
     } = inputs;
     if let (Some(action), Some(sender)) = (outcome.action, exp_sender) {
-        let reward = compute_reward_dqn(outcome.rarity == 6, outcome.is_up, state.loss_streak);
+        let luck_modifier = ACTIONS.get(action).copied().unwrap_or(0.0);
+        let reward = compute_reward_dqn(
+            outcome.rarity == 6,
+            outcome.is_up,
+            state.loss_streak,
+            luck_modifier,
+            config.luck_action_cost,
+        );
         let done = outcome.is_up || (pulls_done + 1) >= EPISODE_MAX_PULLS;
         let _ = sender.send(Experience {
             state: current_state.to_vec(),
@@ -890,7 +900,14 @@ fn record_training_samples(inputs: TrainingSampleInputs<'_>) {
         (outcome.ppo_log_prob, outcome.ppo_value, ppo_sender)
     {
         if let Some(action) = outcome.action {
-            let reward = compute_reward_ppo(outcome.rarity == 6, outcome.is_up, state.loss_streak);
+            let luck_modifier = ACTIONS.get(action).copied().unwrap_or(0.0);
+            let reward = compute_reward_ppo(
+                outcome.rarity == 6,
+                outcome.is_up,
+                state.loss_streak,
+                luck_modifier,
+                config.luck_action_cost,
+            );
             let done = outcome.is_up || (pulls_done + 1) >= EPISODE_MAX_PULLS;
             let _ = sender.send(PpoExperience {
                 state: ppo_context_seq_data.to_vec(),

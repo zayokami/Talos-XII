@@ -379,7 +379,7 @@ fn ppo_architecture(config: &Config) -> String {
 
 fn config_fingerprint(config: &Config) -> String {
     let payload = format!(
-        "v1|p6={:.17}|p5={:.17}|p4={:.17}|up={:.17}|soft_start={}|soft_slope={:.17}|small={}|big={}|up_soft={}|five={}|always5={}|big_requires_not_up={}|fast={}|ppo_mode={}|ppo_steps={}|ppo_update={}|ppo_epochs={}|ppo_batch={}|ppo_ctx={}|ppo_envs={}|ppo_topk={}|distill={}|distill_decay={:.17}|distill_kl={:.17}|distill_warmup={}|model_dim={}|hidden={}|layers={}|heads={}|kv={}|rope={}|multi_stream={}|stream_factor={}|achf={:?}",
+        "v1|p6={:.17}|p5={:.17}|p4={:.17}|up={:.17}|soft_start={}|soft_slope={:.17}|small={}|big={}|up_soft={}|five={}|always5={}|big_requires_not_up={}|fast={}|ppo_mode={}|ppo_steps={}|ppo_update={}|ppo_epochs={}|ppo_batch={}|ppo_ctx={}|ppo_envs={}|ppo_topk={}|luck_cost={:.17}|distill={}|distill_decay={:.17}|distill_kl={:.17}|distill_warmup={}|model_dim={}|hidden={}|layers={}|heads={}|kv={}|rope={}|multi_stream={}|stream_factor={}|achf={:?}",
         config.prob_6_base,
         config.prob_5_base,
         config.prob_4_base,
@@ -401,6 +401,7 @@ fn config_fingerprint(config: &Config) -> String {
         config.ppo_context_len,
         config.ppo_num_envs,
         config.ppo_top_k,
+        config.luck_action_cost,
         config.distill_enabled,
         config.distill_ema_decay,
         config.distill_kl_coef,
