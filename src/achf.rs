@@ -53,6 +53,12 @@ pub struct AchfState {
     pub last_gate: f64,
     pub g_min_ema: f64,
     pub freeze_projection: bool,
+    pub sinkhorn_iterations: usize,
+    pub sinkhorn_row_max_dev: f64,
+    pub sinkhorn_col_max_dev: f64,
+    pub sinkhorn_min_value: f64,
+    pub sinkhorn_negative_ratio: f64,
+    pub sinkhorn_warm_started: bool,
 }
 
 /// Lock-free atomic counters for inference hot-path stats, eliminating RwLock contention.
@@ -138,6 +144,12 @@ fn default_state() -> Arc<RwLock<AchfState>> {
         last_gate: 1.0,
         g_min_ema: 0.0,
         freeze_projection: false,
+        sinkhorn_iterations: 0,
+        sinkhorn_row_max_dev: 0.0,
+        sinkhorn_col_max_dev: 0.0,
+        sinkhorn_min_value: 0.0,
+        sinkhorn_negative_ratio: 0.0,
+        sinkhorn_warm_started: false,
     }))
 }
 
@@ -223,6 +235,22 @@ pub struct AchfStateSnapshot {
     pub ema_cached_ns: f64,
     pub ema_sparse_ns: f64,
     pub adaptive_bias: f64,
+    pub sinkhorn_iterations: usize,
+    pub sinkhorn_row_max_dev: f64,
+    pub sinkhorn_col_max_dev: f64,
+    pub sinkhorn_min_value: f64,
+    pub sinkhorn_negative_ratio: f64,
+    pub sinkhorn_warm_started: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SinkhornProjectionStats {
+    pub iterations: usize,
+    pub row_max_dev: f64,
+    pub col_max_dev: f64,
+    pub min_value: f64,
+    pub negative_ratio: f64,
+    pub warm_started: bool,
 }
 
 pub fn aggregate_cache_stats_iter<I>(iter: I) -> AchfCacheStats
@@ -366,6 +394,12 @@ impl AchfLayer {
             ema_cached_ns: cache.ema_cached_ns,
             ema_sparse_ns: cache.ema_sparse_ns,
             adaptive_bias: cache.adaptive_bias,
+            sinkhorn_iterations: state.sinkhorn_iterations,
+            sinkhorn_row_max_dev: state.sinkhorn_row_max_dev,
+            sinkhorn_col_max_dev: state.sinkhorn_col_max_dev,
+            sinkhorn_min_value: state.sinkhorn_min_value,
+            sinkhorn_negative_ratio: state.sinkhorn_negative_ratio,
+            sinkhorn_warm_started: state.sinkhorn_warm_started,
         }
     }
 
@@ -1015,8 +1049,11 @@ impl AchfLayer {
 
     fn project_weight(&self) {
         match self.proj_mode() {
-            ProjMode::None => {}
-            ProjMode::RowCol => self.project_rowcol(),
+            ProjMode::None => self.clear_sinkhorn_projection_stats(),
+            ProjMode::RowCol => {
+                self.project_rowcol();
+                self.clear_sinkhorn_projection_stats();
+            }
             ProjMode::Sinkhorn => self.project_sinkhorn(),
         }
         self.clear_cache();
@@ -1047,7 +1084,7 @@ impl AchfLayer {
             .map(|v| v.iter().map(|&x| x as f32).collect::<Vec<f32>>());
         drop(cache);
         let mut w = self.weight.weight.data_to_f32_vec();
-        let (new_row, new_col) = sinkhorn_project(
+        let (new_row, new_col, stats) = sinkhorn_project(
             &mut w,
             self.weight.in_features,
             self.weight.out_features,
@@ -1056,9 +1093,24 @@ impl AchfLayer {
             col_scales_f32.as_deref(),
         );
         write_tensor_from_f32(&self.weight.weight, &w);
+        self.update_sinkhorn_projection_stats(stats);
         let mut cache = self.cache.write().unwrap();
         cache.sinkhorn_row_scales = Some(new_row.iter().map(|&x| x as f64).collect());
         cache.sinkhorn_col_scales = Some(new_col.iter().map(|&x| x as f64).collect());
+    }
+
+    fn update_sinkhorn_projection_stats(&self, stats: SinkhornProjectionStats) {
+        let mut state = self.state.write().unwrap();
+        state.sinkhorn_iterations = stats.iterations;
+        state.sinkhorn_row_max_dev = stats.row_max_dev;
+        state.sinkhorn_col_max_dev = stats.col_max_dev;
+        state.sinkhorn_min_value = stats.min_value;
+        state.sinkhorn_negative_ratio = stats.negative_ratio;
+        state.sinkhorn_warm_started = stats.warm_started;
+    }
+
+    fn clear_sinkhorn_projection_stats(&self) {
+        self.update_sinkhorn_projection_stats(SinkhornProjectionStats::default());
     }
 
     pub fn load_state_dict(&mut self, other: &AchfLayer) {
@@ -1553,58 +1605,91 @@ pub(crate) fn sinkhorn_project(
     steps: usize,
     row_scales: Option<&[f32]>,
     col_scales: Option<&[f32]>,
-) -> (Vec<f32>, Vec<f32>) {
+) -> (Vec<f32>, Vec<f32>, SinkhornProjectionStats) {
     let eps = 1e-12f32;
     let convergence_tol = 1e-6f32;
+    let row_target = 1.0f32;
+    let col_target = if cols == 0 {
+        1.0f32
+    } else {
+        rows as f32 / cols as f32
+    };
+
+    let valid_row_scales = row_scales.and_then(|rs| (rs.len() == rows).then_some(rs));
+    let valid_col_scales = col_scales.and_then(|cs| (cs.len() == cols).then_some(cs));
+    let mut stats = SinkhornProjectionStats {
+        warm_started: valid_row_scales.is_some() || valid_col_scales.is_some(),
+        ..Default::default()
+    };
+
+    if rows == 0 || cols == 0 || w.is_empty() {
+        return (vec![1.0; rows], vec![1.0; cols], stats);
+    }
+
+    // mHC/Sinkhorn requires a positive matrix. Convert raw logits to a
+    // numerically stable positive matrix before alternating normalization.
+    let max_input = w
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold(f32::NEG_INFINITY, f32::max);
+    if max_input.is_finite() {
+        for v in w.iter_mut() {
+            let raw = if v.is_finite() { *v - max_input } else { -60.0 };
+            let shifted = raw.clamp(-60.0, 0.0);
+            *v = shifted.exp();
+        }
+    } else {
+        w.fill(1.0);
+    }
 
     // Apply warm-start scale vectors if dimensions match.
-    if let Some(rs) = row_scales {
-        if rs.len() == rows {
-            for r in 0..rows {
-                let scale = rs[r];
-                for c in 0..cols {
-                    w[r * cols + c] *= scale;
-                }
-            }
-        }
-    }
-    if let Some(cs) = col_scales {
-        if cs.len() == cols {
+    let mut out_row_scales = valid_row_scales.map_or_else(|| vec![1.0f32; rows], |rs| rs.to_vec());
+    let mut out_col_scales = valid_col_scales.map_or_else(|| vec![1.0f32; cols], |cs| cs.to_vec());
+    if let Some(rs) = valid_row_scales {
+        for r in 0..rows {
+            let scale = rs[r];
             for c in 0..cols {
-                let scale = cs[c];
-                for r in 0..rows {
-                    w[r * cols + c] *= scale;
-                }
+                w[r * cols + c] *= scale;
+            }
+        }
+    }
+    if let Some(cs) = valid_col_scales {
+        for c in 0..cols {
+            let scale = cs[c];
+            for r in 0..rows {
+                w[r * cols + c] *= scale;
             }
         }
     }
 
-    let mut out_row_scales = vec![1.0f32; rows];
-    let mut out_col_scales = vec![1.0f32; cols];
-
-    for _ in 0..steps {
+    let mut iterations = 0usize;
+    for iter in 0..steps {
+        iterations = iter + 1;
         // Row normalization
         for r in 0..rows {
             let mut sum = 0.0f32;
             for c in 0..cols {
-                sum += w[r * cols + c].abs();
+                sum += w[r * cols + c];
             }
             let denom = if sum < eps { 1.0f32 } else { sum };
-            out_row_scales[r] /= denom;
+            let scale = row_target / denom;
+            out_row_scales[r] *= scale;
             for c in 0..cols {
-                w[r * cols + c] /= denom;
+                w[r * cols + c] *= scale;
             }
         }
         // Column normalization
         for c in 0..cols {
             let mut sum = 0.0f32;
             for r in 0..rows {
-                sum += w[r * cols + c].abs();
+                sum += w[r * cols + c];
             }
             let denom = if sum < eps { 1.0f32 } else { sum };
-            out_col_scales[c] /= denom;
+            let scale = col_target / denom;
+            out_col_scales[c] *= scale;
             for r in 0..rows {
-                w[r * cols + c] /= denom;
+                w[r * cols + c] *= scale;
             }
         }
 
@@ -1613,23 +1698,62 @@ pub(crate) fn sinkhorn_project(
         for r in 0..rows {
             let mut sum = 0.0f32;
             for c in 0..cols {
-                sum += w[r * cols + c].abs();
+                sum += w[r * cols + c];
             }
-            max_dev = max_dev.max((sum - 1.0f32).abs());
+            max_dev = max_dev.max((sum - row_target).abs());
         }
         for c in 0..cols {
             let mut sum = 0.0f32;
             for r in 0..rows {
-                sum += w[r * cols + c].abs();
+                sum += w[r * cols + c];
             }
-            max_dev = max_dev.max((sum - 1.0f32).abs());
+            max_dev = max_dev.max((sum - col_target).abs());
         }
         if max_dev < convergence_tol {
             break;
         }
     }
 
-    (out_row_scales, out_col_scales)
+    let mut row_max_dev = 0.0f32;
+    let mut col_max_dev = 0.0f32;
+    let mut min_value = f32::INFINITY;
+    let mut negative_entries = 0usize;
+    for r in 0..rows {
+        let mut sum = 0.0f32;
+        for c in 0..cols {
+            let v = w[r * cols + c];
+            sum += v;
+            if v < min_value {
+                min_value = v;
+            }
+            if v < 0.0 {
+                negative_entries += 1;
+            }
+        }
+        row_max_dev = row_max_dev.max((sum - row_target).abs());
+    }
+    for c in 0..cols {
+        let mut sum = 0.0f32;
+        for r in 0..rows {
+            sum += w[r * cols + c];
+        }
+        col_max_dev = col_max_dev.max((sum - col_target).abs());
+    }
+    stats.iterations = iterations;
+    stats.row_max_dev = row_max_dev as f64;
+    stats.col_max_dev = col_max_dev as f64;
+    stats.min_value = if min_value.is_finite() {
+        min_value as f64
+    } else {
+        0.0
+    };
+    stats.negative_ratio = if w.is_empty() {
+        0.0
+    } else {
+        negative_entries as f64 / w.len() as f64
+    };
+
+    (out_row_scales, out_col_scales, stats)
 }
 
 fn copy_linear(dst: &mut Linear, src: &Linear) {
@@ -1819,6 +1943,34 @@ mod tests {
             let norm = sum_sq.sqrt();
             assert!((norm - 1.0).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn achf_sinkhorn_projection_stats_are_exposed() {
+        let cfg = AchfConfig {
+            enabled: true,
+            proj_freq: 1,
+            proj_steps: 40,
+            proj_mode: "sinkhorn".to_string(),
+            ..Default::default()
+        };
+        let layer = AchfLayer::new_square(4, cfg, 8);
+        {
+            let mut w = layer.weight.weight.data_write_f32();
+            *w = vec![
+                -2.0, 1.0, 0.5, -1.5, 3.0, -0.5, 2.0, 0.0, -3.0, 1.5, -1.0, 2.5, 0.25, -0.75, 1.25,
+                -2.25,
+            ];
+        }
+        let x = Tensor::rand(vec![1, 4], -0.1, 0.1, 10);
+        let _ = layer.forward_residual(&x);
+        let snapshot = layer.snapshot_state();
+
+        assert!(snapshot.sinkhorn_iterations > 0);
+        assert!(snapshot.sinkhorn_row_max_dev < 1e-5);
+        assert!(snapshot.sinkhorn_col_max_dev < 1e-5);
+        assert!(snapshot.sinkhorn_min_value >= 0.0);
+        assert_eq!(snapshot.sinkhorn_negative_ratio, 0.0);
     }
 
     #[test]
@@ -2334,7 +2486,7 @@ mod tests {
             1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
             16.0,
         ];
-        let (row_scales, col_scales) = sinkhorn_project(&mut w, 4, 4, 20, None, None);
+        let (row_scales, col_scales, stats) = sinkhorn_project(&mut w, 4, 4, 20, None, None);
         // Verify all row sums equal 1.0
         for r in 0..4 {
             let sum: f32 = (0..4).map(|c| w[r * 4 + c]).sum();
@@ -2357,9 +2509,51 @@ mod tests {
         }
         // All values should be non-negative
         assert!(w.iter().all(|&v| v >= 0.0));
+        assert_eq!(stats.negative_ratio, 0.0);
+        assert!(stats.row_max_dev < 1e-5);
+        assert!(stats.col_max_dev < 1e-5);
         // Returned scale vectors should not be all 1.0 (projection did real work)
         assert!(row_scales.iter().any(|&v| (v - 1.0).abs() > 1e-6));
         assert!(col_scales.iter().any(|&v| (v - 1.0).abs() > 1e-6));
+    }
+
+    #[test]
+    fn test_sinkhorn_signed_logits_project_to_nonnegative_matrix() {
+        let mut w = vec![2.0f32, -1.0, 0.25, -3.0, 1.5, -0.5, 0.0, 3.5, -2.0];
+        let (_, _, stats) = sinkhorn_project(&mut w, 3, 3, 40, None, None);
+
+        for r in 0..3 {
+            let sum: f32 = (0..3).map(|c| w[r * 3 + c]).sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-5,
+                "Row {} sum = {}, expected 1.0",
+                r,
+                sum
+            );
+        }
+        for c in 0..3 {
+            let sum: f32 = (0..3).map(|r| w[r * 3 + c]).sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-5,
+                "Col {} sum = {}, expected 1.0",
+                c,
+                sum
+            );
+        }
+        assert!(w.iter().all(|&v| v >= 0.0));
+        assert_eq!(stats.negative_ratio, 0.0);
+        assert!(stats.min_value >= 0.0);
+    }
+
+    #[test]
+    fn test_sinkhorn_ignores_mismatched_warm_start_scales() {
+        let mut w = vec![1.0f32, -2.0, 3.0, 0.5];
+        let (_, _, stats) =
+            sinkhorn_project(&mut w, 2, 2, 20, Some(&[1.0]), Some(&[1.0, 1.0, 1.0]));
+
+        assert!(!stats.warm_started);
+        assert!(stats.row_max_dev < 1e-5);
+        assert!(stats.col_max_dev < 1e-5);
     }
 
     #[test]
@@ -2370,10 +2564,10 @@ mod tests {
         ];
         // First projection with few steps (no warm-start)
         let mut w1 = w0.clone();
-        let (rs1, cs1) = sinkhorn_project(&mut w1, 4, 4, 3, None, None);
+        let (rs1, cs1, _) = sinkhorn_project(&mut w1, 4, 4, 3, None, None);
         // Second projection on same matrix with warm-start from first
         let mut w2 = w0.clone();
-        let (rs2, cs2) = sinkhorn_project(&mut w2, 4, 4, 3, Some(&rs1), Some(&cs1));
+        let (rs2, cs2, _) = sinkhorn_project(&mut w2, 4, 4, 3, Some(&rs1), Some(&cs1));
         // Warm-started result should be closer to doubly-stochastic
         let max_dev1 = {
             let mut dev = 0.0f32;

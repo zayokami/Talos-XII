@@ -79,7 +79,7 @@ impl MhcResidual {
             for v in w.iter_mut() {
                 *v = v.abs();
             }
-            crate::achf::sinkhorn_project(&mut w, dim * n, dim * n, 20, None, None);
+            let _ = crate::achf::sinkhorn_project(&mut w, dim * n, dim * n, 20, None, None);
         }
         Self {
             h_pre,

@@ -1172,11 +1172,11 @@ fn write_path_latency_outputs(latencies: &[(String, Vec<f64>)], dir: &str) {
 
 fn write_gate_curve_outputs(result: &BenchRunResult, dir: &str) {
     let mut csv = String::from(
-        "step,gate_value,g_min,grad_ema,loss,reward,cache_hit_rate,sparse_ratio,ema_cached_ns,ema_sparse_ns,adaptive_bias\n",
+        "step,gate_value,g_min,grad_ema,loss,reward,cache_hit_rate,sparse_ratio,ema_cached_ns,ema_sparse_ns,adaptive_bias,sinkhorn_iterations,sinkhorn_row_max_dev,sinkhorn_col_max_dev,sinkhorn_min_value,sinkhorn_negative_ratio,sinkhorn_warm_started\n",
     );
     for snapshot in &result.snapshots {
         csv.push_str(&format!(
-            "{},{:.8},{:.8},{:.8},{:.8},{:.8},{:.8},{:.8},{:.3},{:.3},{:.8}\n",
+            "{},{:.8},{:.8},{:.8},{:.8},{:.8},{:.8},{:.8},{:.3},{:.3},{:.8},{},{:.8},{:.8},{:.8},{:.8},{}\n",
             snapshot.step,
             snapshot.gate_value,
             snapshot.g_min,
@@ -1187,7 +1187,13 @@ fn write_gate_curve_outputs(result: &BenchRunResult, dir: &str) {
             snapshot.sparse_ratio,
             snapshot.ema_cached_ns,
             snapshot.ema_sparse_ns,
-            snapshot.adaptive_bias
+            snapshot.adaptive_bias,
+            snapshot.sinkhorn_iterations,
+            snapshot.sinkhorn_row_max_dev,
+            snapshot.sinkhorn_col_max_dev,
+            snapshot.sinkhorn_min_value,
+            snapshot.sinkhorn_negative_ratio,
+            snapshot.sinkhorn_warm_started
         ));
     }
     let csv_path = format!("{}/gate_curve.csv", dir);
@@ -1273,6 +1279,12 @@ fn step_snapshot_json(snapshot: &StepSnapshot) -> serde_json::Value {
         "ema_cached_ns": snapshot.ema_cached_ns,
         "ema_sparse_ns": snapshot.ema_sparse_ns,
         "adaptive_bias": snapshot.adaptive_bias,
+        "sinkhorn_iterations": snapshot.sinkhorn_iterations,
+        "sinkhorn_row_max_dev": snapshot.sinkhorn_row_max_dev,
+        "sinkhorn_col_max_dev": snapshot.sinkhorn_col_max_dev,
+        "sinkhorn_min_value": snapshot.sinkhorn_min_value,
+        "sinkhorn_negative_ratio": snapshot.sinkhorn_negative_ratio,
+        "sinkhorn_warm_started": snapshot.sinkhorn_warm_started,
     })
 }
 
@@ -1555,6 +1567,12 @@ mod tests {
                 ema_cached_ns: 11.0,
                 ema_sparse_ns: 22.0,
                 adaptive_bias: 1.1,
+                sinkhorn_iterations: 20,
+                sinkhorn_row_max_dev: 0.0001,
+                sinkhorn_col_max_dev: 0.0002,
+                sinkhorn_min_value: 0.01,
+                sinkhorn_negative_ratio: 0.0,
+                sinkhorn_warm_started: true,
             }],
             cache_stats: Some(AchfCacheStats {
                 calls: 8,
@@ -1585,6 +1603,10 @@ mod tests {
                 .unwrap();
         assert_eq!(json["gate_curve"]["snapshot_count"], 1);
         assert_eq!(json["gate_curve"]["final_snapshot"]["step"], 10);
+        assert_eq!(
+            json["gate_curve"]["final_snapshot"]["sinkhorn_iterations"],
+            20
+        );
         assert_eq!(json["gate_curve"]["cache_stats"]["hit_rate"], 0.25);
         let summary: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.join("gate_curve_summary.json")).unwrap(),

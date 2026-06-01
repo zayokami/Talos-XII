@@ -15,6 +15,12 @@ pub struct StepSnapshot {
     pub ema_cached_ns: f64,
     pub ema_sparse_ns: f64,
     pub adaptive_bias: f64,
+    pub sinkhorn_iterations: usize,
+    pub sinkhorn_row_max_dev: f64,
+    pub sinkhorn_col_max_dev: f64,
+    pub sinkhorn_min_value: f64,
+    pub sinkhorn_negative_ratio: f64,
+    pub sinkhorn_warm_started: bool,
 }
 
 impl StepSnapshot {
@@ -31,6 +37,12 @@ impl StepSnapshot {
             ema_cached_ns: achf.map_or(0.0, |s| s.ema_cached_ns),
             ema_sparse_ns: achf.map_or(0.0, |s| s.ema_sparse_ns),
             adaptive_bias: achf.map_or(1.0, |s| s.adaptive_bias),
+            sinkhorn_iterations: achf.map_or(0, |s| s.sinkhorn_iterations),
+            sinkhorn_row_max_dev: achf.map_or(0.0, |s| s.sinkhorn_row_max_dev),
+            sinkhorn_col_max_dev: achf.map_or(0.0, |s| s.sinkhorn_col_max_dev),
+            sinkhorn_min_value: achf.map_or(0.0, |s| s.sinkhorn_min_value),
+            sinkhorn_negative_ratio: achf.map_or(0.0, |s| s.sinkhorn_negative_ratio),
+            sinkhorn_warm_started: achf.is_some_and(|s| s.sinkhorn_warm_started),
         }
     }
 }
@@ -187,5 +199,11 @@ mod tests {
         assert_eq!(snapshot.ema_cached_ns, 0.0);
         assert_eq!(snapshot.ema_sparse_ns, 0.0);
         assert_eq!(snapshot.adaptive_bias, 1.0);
+        assert_eq!(snapshot.sinkhorn_iterations, 0);
+        assert_eq!(snapshot.sinkhorn_row_max_dev, 0.0);
+        assert_eq!(snapshot.sinkhorn_col_max_dev, 0.0);
+        assert_eq!(snapshot.sinkhorn_min_value, 0.0);
+        assert_eq!(snapshot.sinkhorn_negative_ratio, 0.0);
+        assert!(!snapshot.sinkhorn_warm_started);
     }
 }
