@@ -137,7 +137,10 @@ impl Tensor {
         parents: Vec<Tensor>,
         backward_op: BackwardOp,
     ) -> Tensor {
-        let len: usize = shape.iter().product();
+        let len = shape.iter().copied().fold(1usize, |acc, dim| {
+            acc.checked_mul(dim)
+                .unwrap_or_else(|| panic!("cuda_device_tensor shape element count overflow"))
+        });
         let out = Tensor {
             data: Tensor::empty_storage(dtype),
             grad: Storage::zeros(len, Tensor::grad_dtype_for(dtype)),

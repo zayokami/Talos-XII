@@ -174,7 +174,7 @@ Example:
 cargo run --features python -- python examples/python/autograd_minimal.py -- 1.0
 ```
 
-The final `--` separates arguments passed to the script; inside Python they are available through `sys.argv[1:]`. The embedded interpreter exposes a built-in `talos_xii` module with `Tensor`, `tensor`, `full`, `zeros`, `ones`, `arange`, `eye`, `rand`, `randn`, dtype constants, scalar/Tensor arithmetic, and autograd operations such as `matmul`, `mse_loss`, `backward`, and `grad`.
+The final `--` separates arguments passed to the script; inside Python they are available through `sys.argv[1:]`. The embedded interpreter exposes a built-in `talos_xii` module with `Tensor`, `tensor`, `full`, `zeros`, `ones`, `arange`, `eye`, `rand`, `randn`, dtype constants, scalar/Tensor arithmetic, and autograd operations such as `matmul`, `mse_loss`, `l2_loss`, `smooth_l1_loss`, cross-entropy losses, reductions, shape ops, normalization, pooling, convolution, `backward`, and `grad`.
 
 To write your own script, create a normal `.py` file, import `talos_xii`, build tensors, compute a scalar loss, then call `backward()`:
 
@@ -202,9 +202,12 @@ Run it from the project root:
 cargo run --features python -- python scripts/my_train.py -- 1.0
 ```
 
-Think of `talos_xii` as the small tensor/autograd module provided by this binary. Use `tx.tensor(...)` for your data, `tx.zeros/full/arange/eye/randn(...)` for common inputs, and normal Python operators like `x + 1.0`, `2.0 * x`, `x ** 2.0`, and `abs(x)` for math.
+Think of `talos_xii` as the small tensor/autograd module provided by this binary. Use `tx.tensor(...)` for your data, `tx.zeros/full/arange/eye/randn(...)` for common inputs, and normal Python operators like `x + 1.0`, `2.0 * x`, `x ** 2.0`, `x % 2.0`, and `abs(x)` for math. Tensor methods also cover common activation/special functions (`relu`, `gelu`, `relu6`, `elu`, `selu`, `softplus`, `softsign`, `sigmoid`, `tanh`, `sin`, `cos`, `acos`, `asin`, `atan`, `erf`, `erfc`, `sqrt`, `rsqrt`, `log1p`, `expm1`) plus `concat`, `split`, `strided_slice`, `l2_normalize`, `group_norm`, `instance_norm`, `batch_norm2d`, `avg_pool2d`, `max_pool2d`, `pooling`, `conv2d`, `conv2d_transpose`, `depthwise_conv2d`, `conv3d`, and `gemm`/`matmul`.
 
-No NumPy or PyTorch installation is required for Talos-XII tensor/autograd scripts. The optional bridge links against a local Python runtime supported by PyO3. Scripts are arbitrary Python code and are not sandboxed, so run only scripts you trust.
+Operator names with explicit `*Grad` or `*Backprop*` are handled through autograd: call `loss.backward()` and then read `tensor.grad()`. `SoftmaxV2`/`LogSoftmaxV2` map to `softmax(dim)` and `log_softmax(dim)`. `Conv2DCompress` is currently a compatibility alias for the standard `conv2d` math path; Talos-XII does not yet store a separate compressed convolution weight format.
+
+No NumPy or PyTorch installation is required for Talos-XII tensor/autograd scripts. The optional bridge links against a local Python runtime supported by PyO3. Scripts are arbitrary Python code and are not sandboxed: they run with the same OS permissions as the Talos-XII process, can read/write files, read environment variables, import local modules, start child processes, perform network access, and terminate the process. Run only scripts you trust. The Python tensor constructors and shape-producing bridge APIs enforce per-tensor allocation guards, and exporting tensors to Python lists has a separate size guard.
+Most tensor methods are also available as `tx.*` functional calls with the same names, so you can choose whichever style reads better in a script. Arithmetic is aligned too: `x.add(y)` / `tx.add(x, y)` match `x + y`, with the same pattern for `sub`, `mul`, `div`, and `neg`.
 
 ### Data Collection & Model Calibration
 
@@ -527,7 +530,7 @@ cargo run --features python -- python <script.py> -- <args>
 cargo run --features python -- python examples/python/autograd_minimal.py -- 1.0
 ```
 
-最后一个 `--` 用于分隔传给脚本的参数；在 Python 中可通过 `sys.argv[1:]` 读取。嵌入式解释器会提供内置 `talos_xii` 模块，包含 `Tensor`、`tensor`、`full`、`zeros`、`ones`、`arange`、`eye`、`rand`、`randn`、dtype 常量、标量/Tensor 混合运算，以及 `matmul`、`mse_loss`、`backward`、`grad` 等 autograd 操作。
+最后一个 `--` 用于分隔传给脚本的参数；在 Python 中可通过 `sys.argv[1:]` 读取。嵌入式解释器会提供内置 `talos_xii` 模块，包含 `Tensor`、`tensor`、`full`、`zeros`、`ones`、`arange`、`eye`、`rand`、`randn`、dtype 常量、标量/Tensor 混合运算，以及 `matmul`、`mse_loss`、`l2_loss`、`smooth_l1_loss`、交叉熵 loss、归约、shape 操作、归一化、池化、卷积、`backward`、`grad` 等 autograd 操作。
 
 自定义脚本就是普通 `.py` 文件。先 `import talos_xii as tx`，再创建 Tensor，算出一个标量 loss，最后调用 `backward()`：
 
@@ -555,9 +558,12 @@ print("grad_w:", w.grad())
 cargo run --features python -- python scripts/my_train.py -- 1.0
 ```
 
-可以把 `talos_xii` 理解成这个二进制自带的小型张量/autograd 模块。用 `tx.tensor(...)` 放入数据，用 `tx.zeros/full/arange/eye/randn(...)` 创建常见输入，也可以直接写 `x + 1.0`、`2.0 * x`、`x ** 2.0`、`abs(x)` 这类普通 Python 数学表达式。
+可以把 `talos_xii` 理解成这个二进制自带的小型张量/autograd 模块。用 `tx.tensor(...)` 放入数据，用 `tx.zeros/full/arange/eye/randn(...)` 创建常见输入，也可以直接写 `x + 1.0`、`2.0 * x`、`x ** 2.0`、`x % 2.0`、`abs(x)` 这类普通 Python 数学表达式。Tensor 方法也覆盖常见激活/特殊函数（`relu`、`gelu`、`relu6`、`elu`、`selu`、`softplus`、`softsign`、`sigmoid`、`tanh`、`sin`、`cos`、`acos`、`asin`、`atan`、`erf`、`erfc`、`sqrt`、`rsqrt`、`log1p`、`expm1`），以及 `concat`、`split`、`strided_slice`、`l2_normalize`、`group_norm`、`instance_norm`、`batch_norm2d`、`avg_pool2d`、`max_pool2d`、`pooling`、`conv2d`、`conv2d_transpose`、`depthwise_conv2d`、`conv3d`、`gemm`/`matmul`。
 
-编写 Talos-XII 张量/autograd 脚本不需要安装 NumPy 或 PyTorch。这个可选桥接会链接本机 PyO3 支持的 Python 运行时。脚本是任意 Python 代码，且不提供沙箱隔离，请只运行可信脚本。
+带 `*Grad` 或 `*Backprop*` 的算子通过 autograd 覆盖：调用 `loss.backward()` 后读取 `tensor.grad()`。`SoftmaxV2`/`LogSoftmaxV2` 对应 `softmax(dim)` 和 `log_softmax(dim)`。`Conv2DCompress` 目前是标准 `conv2d` 数学路径的兼容别名；Talos-XII 还没有单独的压缩卷积权重存储格式。
+
+编写 Talos-XII 张量/autograd 脚本不需要安装 NumPy 或 PyTorch。这个可选桥接会链接本机 PyO3 支持的 Python 运行时。脚本是任意 Python 代码，且不提供沙箱隔离：脚本会以 Talos-XII 进程相同的系统权限运行，可以读写文件、读取环境变量、导入本地模块、启动子进程、访问网络，也可以直接终止进程。请只运行可信脚本。Python Tensor 构造函数和会产生新 shape 的桥接 API 都加了单 Tensor 分配保护，导出到 Python list 也有单独的大小保护。
+大多数 Tensor 方法也提供同名 `tx.*` functional 调用，例如 `x.relu()` 和 `tx.relu(x)` 都可以用，脚本里按可读性选择即可。算术 API 也保持一致：`x.add(y)` / `tx.add(x, y)` 等价于 `x + y`，`sub`、`mul`、`div`、`neg` 也是同一套规则。
 
 ### 数据采集与模型校准
 

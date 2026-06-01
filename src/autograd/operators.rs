@@ -663,6 +663,42 @@ impl<'b> Div<&'b Tensor> for &Tensor {
 impl Neg for Tensor {
     type Output = Tensor;
     fn neg(self) -> Tensor {
+        if self.dtype != Dtype::F64 {
+            let self_data = self.data_to_f32_vec();
+            let len = self_data.len();
+            let data: Vec<f32> = if len >= PAR_THRESHOLD {
+                self_data.par_iter().map(|&x| -x).collect()
+            } else {
+                self_data.iter().map(|&x| -x).collect()
+            };
+            let parents = vec![self.clone()];
+            return Tensor {
+                data: Storage::from_f32_vec(data, self.dtype),
+                grad: Storage::zeros(len, Tensor::grad_dtype_for(self.dtype)),
+                shape: self.shape.clone(),
+                device: Device::Cpu,
+                dtype: self.dtype,
+                _ctx: Some(Arc::new(Context {
+                    parents,
+                    backward_op: Box::new(|grad_out, parents| {
+                        let grad_out_f64 = grad_out.to_f64_vec();
+                        let mut inp_grad = parents[0].grad_write_compat();
+                        let len = grad_out_f64.len();
+                        if len >= PAR_THRESHOLD {
+                            inp_grad
+                                .par_iter_mut()
+                                .zip(grad_out_f64.par_iter())
+                                .for_each(|(ig, &g)| *ig -= g);
+                        } else {
+                            for i in 0..len {
+                                inp_grad[i] -= grad_out_f64[i];
+                            }
+                        }
+                    }),
+                })),
+            };
+        }
+
         let self_data = self.data_f64();
         let len = self_data.len();
         let data: Vec<f64> = if len >= PAR_THRESHOLD {

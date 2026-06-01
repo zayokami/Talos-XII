@@ -12,6 +12,13 @@ fn temp_file_path(prefix: &str) -> String {
         .into_owned()
 }
 
+fn assert_panics<F>(f: F)
+where
+    F: FnOnce(),
+{
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err());
+}
+
 #[test]
 fn test_broadcast_scalar() {
     let t = Tensor::new_f32(vec![5.0], vec![1]);
@@ -19,6 +26,20 @@ fn test_broadcast_scalar() {
     assert_eq!(b.shape, vec![2, 2]);
     let data = b.data_as_f64_vec();
     assert_eq!(*data, vec![5.0, 5.0, 5.0, 5.0]);
+}
+
+#[test]
+fn test_broadcast_right_aligned_shape_forward_backward() {
+    let t = Tensor::new(vec![1.0, 2.0, 3.0], vec![3, 1]);
+    let b = t.broadcast(vec![3, 4]);
+    assert_eq!(b.shape, vec![3, 4]);
+    assert_eq!(
+        *b.data_as_f64_vec(),
+        vec![1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0]
+    );
+
+    b.sum().backward();
+    assert_eq!(t.grad_to_f64_vec(), vec![4.0, 4.0, 4.0]);
 }
 
 #[test]
@@ -83,6 +104,18 @@ fn test_log_softmax_dim_one_normalization() {
         let base = row * 3;
         let sum = d[base..base + 3].iter().map(|v| v.exp()).sum::<f64>();
         assert!((sum - 1.0).abs() < 1e-5, "row {} sum={}", row, sum);
+    }
+}
+
+#[test]
+fn test_softmax_dim_zero_normalization() {
+    let t = Tensor::new_f32(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
+    let out = t.softmax_dim(0);
+    let d = out.data_as_f64_vec();
+
+    for col in 0..3 {
+        let sum = d[col] + d[3 + col];
+        assert!((sum - 1.0).abs() < 1e-5, "column {} sum={}", col, sum);
     }
 }
 
@@ -263,6 +296,206 @@ fn test_cuda_device_only_reshape_transpose_roundtrip() {
     assert_eq!(data.len(), 24);
     assert_eq!(data[0], 0.0);
     assert_eq!(data[23], 23.0);
+}
+
+#[test]
+fn test_extra_unary_binary_and_loss_ops() {
+    let x = Tensor::new(vec![-1.0, 0.0, 2.0, 4.0], vec![4]);
+    assert_eq!(
+        x.relu6().data_as_f64_vec().as_slice(),
+        &[0.0, 0.0, 2.0, 4.0]
+    );
+    assert_eq!(
+        x.sign().data_as_f64_vec().as_slice(),
+        &[-1.0, 0.0, 1.0, 1.0]
+    );
+    assert_eq!(
+        x.square().data_as_f64_vec().as_slice(),
+        &[1.0, 0.0, 4.0, 16.0]
+    );
+
+    let rhs = Tensor::new(vec![0.5, 0.0, 3.0, 1.0], vec![4]);
+    assert_eq!(
+        x.maximum(&rhs).data_as_f64_vec().as_slice(),
+        &[0.5, 0.0, 3.0, 4.0]
+    );
+    assert_eq!(
+        x.equal(&rhs).data_as_f64_vec().as_slice(),
+        &[0.0, 1.0, 0.0, 0.0]
+    );
+
+    let loss_input = Tensor::new(vec![1.0, -2.0, 3.0], vec![3]);
+    let loss = loss_input.l2_loss();
+    assert!((loss.item() as f64 - 7.0).abs() < 1e-9);
+    loss.backward();
+    assert_eq!(loss_input.grad_to_f64_vec(), vec![1.0, -2.0, 3.0]);
+}
+
+#[test]
+fn test_reduce_normalize_and_shape_ops() {
+    let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3]);
+    assert_eq!(
+        x.reduce_sum_dim(1, false).data_as_f64_vec().as_slice(),
+        &[6.0, 15.0]
+    );
+    assert_eq!(
+        x.reduce_mean_dim(0, false).data_as_f64_vec().as_slice(),
+        &[2.5, 3.5, 4.5]
+    );
+    assert_eq!(x.reduce_max_dim(1, true).shape, vec![2, 1]);
+
+    let norm = x.l2_normalize(1, 1e-12);
+    let data = norm.data_as_f64_vec();
+    for row in 0..2 {
+        let base = row * 3;
+        let sum_sq = data[base..base + 3].iter().map(|v| v * v).sum::<f64>();
+        assert!((sum_sq - 1.0).abs() < 1e-9);
+    }
+
+    let a = Tensor::new(vec![1.0, 2.0], vec![1, 2]);
+    let b = Tensor::new(vec![3.0, 4.0], vec![1, 2]);
+    let cat = Tensor::concat(&[a.clone(), b.clone()], 0);
+    assert_eq!(cat.shape, vec![2, 2]);
+    assert_eq!(cat.data_as_f64_vec().as_slice(), &[1.0, 2.0, 3.0, 4.0]);
+    let split = cat.split(0, vec![1, 1]);
+    assert_eq!(split[0].data_as_f64_vec().as_slice(), &[1.0, 2.0]);
+    assert_eq!(split[1].data_as_f64_vec().as_slice(), &[3.0, 4.0]);
+
+    let sliced = x.strided_slice(vec![0, 0], vec![2, 3], vec![1, 2]);
+    assert_eq!(sliced.shape, vec![2, 2]);
+    assert_eq!(sliced.data_as_f64_vec().as_slice(), &[1.0, 3.0, 4.0, 6.0]);
+}
+
+#[test]
+fn test_pooling_and_extended_conv_shapes() {
+    let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2]);
+    let avg = x.avg_pool2d(2, 1, 0, false);
+    assert_eq!(avg.shape, vec![1, 1, 1, 1]);
+    assert!((avg.item() as f64 - 2.5).abs() < 1e-9);
+
+    let trans_weight = Tensor::new(vec![1.0], vec![1, 1, 1, 1]);
+    let transposed = x.conv2d_transpose(&trans_weight, 1, 0);
+    assert_eq!(transposed.shape, vec![1, 1, 2, 2]);
+    assert_eq!(
+        transposed.data_as_f64_vec().as_slice(),
+        &[1.0, 2.0, 3.0, 4.0]
+    );
+
+    let depthwise_weight = Tensor::new(vec![2.0], vec![1, 1, 1, 1]);
+    let depthwise = x.depthwise_conv2d(&depthwise_weight, 1, 0);
+    assert_eq!(depthwise.shape, vec![1, 1, 2, 2]);
+    assert_eq!(
+        depthwise.data_as_f64_vec().as_slice(),
+        &[2.0, 4.0, 6.0, 8.0]
+    );
+
+    let x3 = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 1, 2, 2]);
+    let w3 = Tensor::new(vec![1.0], vec![1, 1, 1, 1, 1]);
+    let conv3 = x3.conv3d(&w3, 1, 0);
+    assert_eq!(conv3.shape, vec![1, 1, 1, 2, 2]);
+    assert_eq!(conv3.data_as_f64_vec().as_slice(), &[1.0, 2.0, 3.0, 4.0]);
+}
+
+#[test]
+fn test_conv_pool_invalid_boundaries_are_rejected() {
+    let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2]);
+    let w = Tensor::new(vec![1.0], vec![1, 1, 1, 1]);
+    assert_panics(|| {
+        let _ = x.conv2d(&w, 0, 0);
+    });
+
+    let large_w = Tensor::new(vec![1.0; 9], vec![1, 1, 3, 3]);
+    assert_panics(|| {
+        let _ = x.conv2d(&large_w, 1, 0);
+    });
+
+    assert_panics(|| {
+        let _ = x.max_pool2d(0, 1, 0);
+    });
+    assert_panics(|| {
+        let _ = x.max_pool2d(2, 0, 0);
+    });
+    assert_panics(|| {
+        let _ = x.max_pool2d(2, 1, 8);
+    });
+    assert_panics(|| {
+        let _ = x.avg_pool2d(2, 1, 8, false);
+    });
+
+    assert_panics(|| {
+        let _ = x.conv2d_transpose(&w, 1, 8);
+    });
+
+    let depthwise_w = Tensor::new(vec![1.0; 9], vec![1, 1, 3, 3]);
+    assert_panics(|| {
+        let _ = x.depthwise_conv2d(&depthwise_w, 1, 0);
+    });
+
+    let x3 = Tensor::new(vec![1.0], vec![1, 1, 1, 1, 1]);
+    let w3 = Tensor::new(vec![1.0; 8], vec![1, 1, 2, 2, 2]);
+    assert_panics(|| {
+        let _ = x3.conv3d(&w3, 1, 0);
+    });
+}
+
+#[test]
+fn test_autograd_alias_and_empty_boundaries_do_not_deadlock_or_nan() {
+    let x = Tensor::new(vec![0.5, -1.0], vec![1, 2]);
+    x.smooth_l1_loss(&x, 1.0).backward();
+    x.sigmoid_cross_entropy_with_logits(&x).backward();
+    x.softmax_cross_entropy_with_logits(&x).backward();
+
+    let labels = Tensor::new(vec![1.0], vec![1]);
+    x.cosine_embedding_loss(&x, &labels, 0.0).backward();
+
+    let prelu_x = Tensor::new(vec![-2.0, 3.0], vec![2]);
+    prelu_x.prelu(&prelu_x).sum().backward();
+
+    let bias_x = Tensor::new(vec![1.0, 2.0], vec![2]);
+    bias_x.bias_add(&bias_x).sum().backward();
+
+    let norm_x = Tensor::new(vec![1.0, 2.0], vec![1, 2]);
+    norm_x.batch_norm2d(&norm_x, &norm_x, 1e-5).sum().backward();
+
+    let conv2d_t = Tensor::new(vec![1.0], vec![1, 1, 1, 1]);
+    conv2d_t.conv2d_transpose(&conv2d_t, 1, 0).sum().backward();
+    conv2d_t.depthwise_conv2d(&conv2d_t, 1, 0).sum().backward();
+
+    let conv3d_t = Tensor::new(vec![1.0], vec![1, 1, 1, 1, 1]);
+    conv3d_t.conv3d(&conv3d_t, 1, 0).sum().backward();
+
+    assert_panics(|| {
+        let _ = Tensor::new(vec![], vec![0]).mse_loss(&Tensor::new(vec![], vec![0]));
+    });
+    assert_panics(|| {
+        let _ = Tensor::new(vec![], vec![1, 0]).l2_normalize(1, 1e-12);
+    });
+    assert_panics(|| {
+        let _ = Tensor::new(vec![], vec![1, 0]).layer_norm_simple(1e-5);
+    });
+    assert_panics(|| {
+        let _ = Tensor::new(vec![1.0], vec![1]).layer_norm_simple(0.0);
+    });
+
+    assert_panics(|| {
+        let _ = Tensor::new(vec![], vec![0, 2]).cosine_embedding_loss(
+            &Tensor::new(vec![], vec![0, 2]),
+            &Tensor::new(vec![], vec![0]),
+            0.0,
+        );
+    });
+    assert_panics(|| {
+        let _ = Tensor::new(vec![], vec![1, 0]).group_norm(1, 1e-5);
+    });
+    assert_panics(|| {
+        let _ = Tensor::new(vec![1.0], vec![]).log_softmax();
+    });
+    assert_panics(|| {
+        let _ = Tensor::new(vec![], vec![2, 0]).softmax_dim(1);
+    });
+
+    let empty = Tensor::new(vec![], vec![0]);
+    empty.broadcast_to_batch(2).sum().backward();
 }
 
 #[cfg(cuda)]
@@ -526,6 +759,13 @@ fn test_f32_elementwise_ops() {
     let div_out = &b / &a;
     assert_eq!(div_out.dtype, Dtype::F32);
     assert_eq!(div_out.data_as_f64_vec(), vec![4.0, 2.5, 2.0]);
+
+    let neg_out = -&a;
+    assert_eq!(neg_out.dtype, Dtype::F32);
+    assert_eq!(neg_out.data_as_f64_vec(), vec![-1.0, -2.0, -3.0]);
+
+    neg_out.sum().backward();
+    assert_eq!(a.grad_to_f64_vec(), vec![-1.0, -1.0, -1.0]);
 }
 
 #[test]

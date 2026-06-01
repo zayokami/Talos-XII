@@ -8,6 +8,7 @@ mod core;
 mod cuda_bridge;
 #[cfg(cuda)]
 mod cuda_ops;
+mod extra_ops;
 mod guards;
 mod lifecycle;
 mod loss;

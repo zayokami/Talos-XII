@@ -7,6 +7,13 @@ use std::sync::{Arc, RwLock};
 #[cfg(cuda)]
 use super::cuda_sync_grad_to_host;
 
+fn checked_shape_product(shape: &[usize], op: &'static str) -> usize {
+    shape.iter().copied().fold(1usize, |acc, dim| {
+        acc.checked_mul(dim)
+            .unwrap_or_else(|| panic!("{op} shape element count overflow"))
+    })
+}
+
 impl Tensor {
     #[inline]
     #[cfg_attr(not(cuda), allow(dead_code))]
@@ -16,7 +23,7 @@ impl Tensor {
 
     #[inline]
     pub fn numel(&self) -> usize {
-        self.shape.iter().product()
+        checked_shape_product(&self.shape, "numel")
     }
 
     pub fn from_mmap(path: &str, shape: Vec<usize>) -> std::io::Result<Self> {
@@ -31,7 +38,7 @@ impl Tensor {
             ));
         }
 
-        let expected_len: usize = shape.iter().product();
+        let expected_len = checked_shape_product(&shape, "from_mmap");
         let expected_bytes = expected_len.checked_mul(elem_size).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "Mmap shape size overflow")
         })?;
@@ -93,7 +100,7 @@ impl Tensor {
         let len = data.len();
         assert_eq!(
             len,
-            shape.iter().product::<usize>(),
+            checked_shape_product(&shape, "with_dtype"),
             "Data length must match shape"
         );
         match dtype {
@@ -146,7 +153,7 @@ impl Tensor {
     }
 
     pub fn zeros(shape: Vec<usize>) -> Self {
-        let len = shape.iter().product::<usize>();
+        let len = checked_shape_product(&shape, "zeros");
         Tensor::new(vec![0.0; len], shape)
     }
 
@@ -162,7 +169,7 @@ impl Tensor {
 
     /// Zeros with explicit dtype.
     pub fn zeros_with_dtype(shape: Vec<usize>, dtype: Dtype) -> Self {
-        let len = shape.iter().product::<usize>();
+        let len = checked_shape_product(&shape, "zeros_with_dtype");
         match dtype {
             Dtype::F64 => Tensor::new(vec![0.0; len], shape),
             Dtype::F32 => Tensor {
@@ -499,7 +506,7 @@ impl Tensor {
     /// Generate a tensor with uniformly distributed random values in [min, max).
     pub fn rand(shape: Vec<usize>, min: f64, max: f64, seed: u64) -> Self {
         use crate::rng::Rng;
-        let len = shape.iter().product::<usize>();
+        let len = checked_shape_product(&shape, "rand");
         let mut rng = Rng::from_seed(seed);
         let data: Vec<f64> = (0..len)
             .map(|_| {
@@ -513,7 +520,7 @@ impl Tensor {
     /// Generate an F32 tensor with uniformly distributed random values in [min, max).
     pub fn rand_f32(shape: Vec<usize>, min: f32, max: f32, seed: u64) -> Self {
         use crate::rng::Rng;
-        let len = shape.iter().product::<usize>();
+        let len = checked_shape_product(&shape, "rand_f32");
         let mut rng = Rng::from_seed(seed);
         let data: Vec<f32> = (0..len)
             .map(|_| {
@@ -534,7 +541,7 @@ impl Tensor {
     /// Generate a tensor with normally distributed random values (mean=0, std=1).
     pub fn randn(shape: Vec<usize>, seed: u64) -> Self {
         use crate::rng::Rng;
-        let len = shape.iter().product::<usize>();
+        let len = checked_shape_product(&shape, "randn");
         let mut rng = Rng::from_seed(seed);
         let data: Vec<f64> = (0..len).map(|_| rng.next_f64_normal()).collect();
         Tensor::new(data, shape)
@@ -543,7 +550,7 @@ impl Tensor {
     /// Generate an F32 tensor with normally distributed random values (mean=0, std=1).
     pub fn randn_f32(shape: Vec<usize>, seed: u64) -> Self {
         use crate::rng::Rng;
-        let len = shape.iter().product::<usize>();
+        let len = checked_shape_product(&shape, "randn_f32");
         let mut rng = Rng::from_seed(seed);
         let data: Vec<f32> = (0..len).map(|_| rng.next_f64_normal() as f32).collect();
         Tensor {
@@ -570,7 +577,7 @@ impl Tensor {
 
     // Create a new leaf tensor with same data (copy)
     pub fn item(&self) -> f32 {
-        assert_eq!(self.shape.iter().product::<usize>(), 1);
+        assert_eq!(checked_shape_product(&self.shape, "item"), 1);
         #[cfg(cuda)]
         if self.device == Device::Cuda {
             use crate::cuda::memory::CudaBuffer;

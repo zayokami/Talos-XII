@@ -8,6 +8,8 @@ use std::sync::Arc;
 
 impl Tensor {
     pub fn mse_loss(&self, target: &Tensor) -> Tensor {
+        assert_eq!(self.numel(), target.numel(), "mse_loss size mismatch");
+        assert!(self.numel() > 0, "mse_loss requires a non-empty tensor");
         let diff = self - target;
         let sq = &diff * &diff;
         sq.mean()
@@ -17,6 +19,10 @@ impl Tensor {
     /// `weights` shape must broadcast to self/target shape along the batch dimension.
     /// Typical usage: pred=[B,1], target=[B,1], weights=[B,1].
     pub fn weighted_mse_loss(&self, target: &Tensor, weights: &Tensor) -> Tensor {
+        assert!(
+            self.numel() > 0,
+            "weighted_mse_loss requires a non-empty tensor"
+        );
         #[cfg(cuda)]
         if let Some(out) = self.weighted_mse_loss_cuda(target, weights) {
             return out;
@@ -56,6 +62,336 @@ impl Tensor {
                     drop(total_grad);
                     let mut wsum_grad = parents[1].grad_write_compat();
                     wsum_grad[0] += grad_out_f64[0] * (-numerator_cap / denom_cap);
+                }),
+            })),
+        }
+    }
+
+    /// L2 loss: sum(x^2) / 2.
+    pub fn l2_loss(&self) -> Tensor {
+        let input = self.data_as_f64_vec();
+        let value = input.iter().map(|x| x * x).sum::<f64>() * 0.5;
+        let len = input.len();
+        let input_cache = Arc::new(input);
+        let dtype = self.dtype;
+        Tensor {
+            data: Storage::from_f64_vec(vec![value], dtype),
+            grad: Storage::zeros(1, Tensor::grad_dtype_for(dtype)),
+            shape: vec![1],
+            device: Device::Cpu,
+            dtype,
+            _ctx: Some(Arc::new(Context {
+                parents: vec![self.clone()],
+                backward_op: Box::new(move |grad_out, parents| {
+                    let grad = grad_out.to_f64_vec()[0];
+                    let mut input_grad = parents[0].grad_write_compat();
+                    for i in 0..len {
+                        input_grad[i] += grad * input_cache[i];
+                    }
+                }),
+            })),
+        }
+    }
+
+    /// Smooth L1 loss with mean reduction.
+    pub fn smooth_l1_loss(&self, target: &Tensor, beta: f64) -> Tensor {
+        assert_eq!(self.numel(), target.numel(), "smooth_l1_loss size mismatch");
+        assert!(beta > 0.0, "smooth_l1_loss beta must be positive");
+        let input = self.data_as_f64_vec();
+        let target_data = target.data_as_f64_vec();
+        let len = input.len();
+        assert!(len > 0, "smooth_l1_loss requires a non-empty tensor");
+        let mut value = 0.0;
+        for i in 0..len {
+            let abs_diff = (input[i] - target_data[i]).abs();
+            value += if abs_diff < beta {
+                0.5 * abs_diff * abs_diff / beta
+            } else {
+                abs_diff - 0.5 * beta
+            };
+        }
+        value /= len as f64;
+
+        let input_cache = Arc::new(input);
+        let target_cache = Arc::new(target_data);
+        let dtype = Tensor::binary_dtype(self.dtype, target.dtype);
+        Tensor {
+            data: Storage::from_f64_vec(vec![value], dtype),
+            grad: Storage::zeros(1, Tensor::grad_dtype_for(dtype)),
+            shape: vec![1],
+            device: Device::Cpu,
+            dtype,
+            _ctx: Some(Arc::new(Context {
+                parents: vec![self.clone(), target.clone()],
+                backward_op: Box::new(move |grad_out, parents| {
+                    let scale = grad_out.to_f64_vec()[0] / len as f64;
+                    if !parents[0].grad.ptr_eq(&parents[1].grad) {
+                        let mut input_grad = parents[0].grad_write_compat();
+                        let mut target_grad = parents[1].grad_write_compat();
+                        for i in 0..len {
+                            let diff = input_cache[i] - target_cache[i];
+                            let grad = if diff.abs() < beta {
+                                diff / beta
+                            } else {
+                                diff.signum()
+                            } * scale;
+                            input_grad[i] += grad;
+                            target_grad[i] -= grad;
+                        }
+                    }
+                }),
+            })),
+        }
+    }
+
+    /// Numerically stable binary cross entropy with logits and mean reduction.
+    pub fn sigmoid_cross_entropy_with_logits(&self, target: &Tensor) -> Tensor {
+        assert_eq!(
+            self.numel(),
+            target.numel(),
+            "sigmoid_cross_entropy_with_logits size mismatch"
+        );
+        let logits = self.data_as_f64_vec();
+        let target_data = target.data_as_f64_vec();
+        let len = logits.len();
+        assert!(
+            len > 0,
+            "sigmoid_cross_entropy_with_logits requires a non-empty tensor"
+        );
+        let mut value = 0.0;
+        for i in 0..len {
+            let x = logits[i];
+            value += x.max(0.0) - x * target_data[i] + (-x.abs()).exp().ln_1p();
+        }
+        value /= len as f64;
+
+        let logits_cache = Arc::new(logits);
+        let target_cache = Arc::new(target_data);
+        let dtype = Tensor::binary_dtype(self.dtype, target.dtype);
+        Tensor {
+            data: Storage::from_f64_vec(vec![value], dtype),
+            grad: Storage::zeros(1, Tensor::grad_dtype_for(dtype)),
+            shape: vec![1],
+            device: Device::Cpu,
+            dtype,
+            _ctx: Some(Arc::new(Context {
+                parents: vec![self.clone(), target.clone()],
+                backward_op: Box::new(move |grad_out, parents| {
+                    let scale = grad_out.to_f64_vec()[0] / len as f64;
+                    if parents[0].grad.ptr_eq(&parents[1].grad) {
+                        let mut grad_storage = parents[0].grad_write_compat();
+                        for i in 0..len {
+                            let x = logits_cache[i];
+                            let probability = if x >= 0.0 {
+                                1.0 / (1.0 + (-x).exp())
+                            } else {
+                                let exp_x = x.exp();
+                                exp_x / (1.0 + exp_x)
+                            };
+                            grad_storage[i] += scale * (probability - target_cache[i] - x);
+                        }
+                    } else {
+                        let mut logits_grad = parents[0].grad_write_compat();
+                        let mut target_grad = parents[1].grad_write_compat();
+                        for i in 0..len {
+                            let x = logits_cache[i];
+                            let probability = if x >= 0.0 {
+                                1.0 / (1.0 + (-x).exp())
+                            } else {
+                                let exp_x = x.exp();
+                                exp_x / (1.0 + exp_x)
+                            };
+                            logits_grad[i] += scale * (probability - target_cache[i]);
+                            target_grad[i] -= scale * x;
+                        }
+                    }
+                }),
+            })),
+        }
+    }
+
+    /// Softmax cross entropy for one-hot or probability targets on the last dimension.
+    pub fn softmax_cross_entropy_with_logits(&self, target: &Tensor) -> Tensor {
+        assert_eq!(
+            self.shape, target.shape,
+            "softmax_cross_entropy_with_logits shape mismatch"
+        );
+        let cols = *self
+            .shape
+            .last()
+            .expect("softmax_cross_entropy_with_logits requires rank >= 1");
+        assert!(
+            cols > 0,
+            "softmax_cross_entropy_with_logits empty class dim"
+        );
+        let logits = self.data_as_f64_vec();
+        let targets = target.data_as_f64_vec();
+        let rows = logits.len() / cols;
+        assert!(rows > 0, "softmax_cross_entropy_with_logits empty batch");
+        let mut probabilities = vec![0.0; logits.len()];
+        let mut log_probabilities = vec![0.0; logits.len()];
+        let mut value = 0.0;
+
+        for row in 0..rows {
+            let base = row * cols;
+            let max = logits[base..base + cols]
+                .iter()
+                .copied()
+                .fold(f64::NEG_INFINITY, f64::max);
+            let sum_exp = logits[base..base + cols]
+                .iter()
+                .map(|x| (x - max).exp())
+                .sum::<f64>();
+            let log_sum_exp = sum_exp.ln() + max;
+            for col in 0..cols {
+                let idx = base + col;
+                log_probabilities[idx] = logits[idx] - log_sum_exp;
+                probabilities[idx] = log_probabilities[idx].exp();
+                value -= targets[idx] * log_probabilities[idx];
+            }
+        }
+        value /= rows as f64;
+
+        let probabilities = Arc::new(probabilities);
+        let log_probabilities = Arc::new(log_probabilities);
+        let targets = Arc::new(targets);
+        let dtype = Tensor::binary_dtype(self.dtype, target.dtype);
+        Tensor {
+            data: Storage::from_f64_vec(vec![value], dtype),
+            grad: Storage::zeros(1, Tensor::grad_dtype_for(dtype)),
+            shape: vec![1],
+            device: Device::Cpu,
+            dtype,
+            _ctx: Some(Arc::new(Context {
+                parents: vec![self.clone(), target.clone()],
+                backward_op: Box::new(move |grad_out, parents| {
+                    let scale = grad_out.to_f64_vec()[0] / rows as f64;
+                    if parents[0].grad.ptr_eq(&parents[1].grad) {
+                        let mut grad_storage = parents[0].grad_write_compat();
+                        for i in 0..probabilities.len() {
+                            grad_storage[i] +=
+                                scale * (probabilities[i] - targets[i] - log_probabilities[i]);
+                        }
+                    } else {
+                        let mut logits_grad = parents[0].grad_write_compat();
+                        let mut target_grad = parents[1].grad_write_compat();
+                        for i in 0..probabilities.len() {
+                            logits_grad[i] += scale * (probabilities[i] - targets[i]);
+                            target_grad[i] -= scale * log_probabilities[i];
+                        }
+                    }
+                }),
+            })),
+        }
+    }
+
+    /// Cosine embedding loss over the last dimension with mean reduction.
+    pub fn cosine_embedding_loss(&self, other: &Tensor, target: &Tensor, margin: f64) -> Tensor {
+        assert_eq!(
+            self.shape, other.shape,
+            "cosine_embedding_loss shape mismatch"
+        );
+        let cols = *self
+            .shape
+            .last()
+            .expect("cosine_embedding_loss requires rank >= 1");
+        assert!(cols > 0, "cosine_embedding_loss empty embedding dim");
+        let lhs = self.data_as_f64_vec();
+        let rhs = other.data_as_f64_vec();
+        let rows = lhs.len() / cols;
+        assert!(rows > 0, "cosine_embedding_loss empty batch");
+        assert_eq!(
+            target.numel(),
+            rows,
+            "cosine_embedding_loss target must contain one label per row"
+        );
+        let labels = target.data_as_f64_vec();
+        let mut cosine = vec![0.0; rows];
+        let mut lhs_norms = vec![0.0; rows];
+        let mut rhs_norms = vec![0.0; rows];
+        let mut value = 0.0;
+        for row in 0..rows {
+            let base = row * cols;
+            let mut dot = 0.0;
+            let mut lhs_sq = 0.0;
+            let mut rhs_sq = 0.0;
+            for col in 0..cols {
+                let idx = base + col;
+                dot += lhs[idx] * rhs[idx];
+                lhs_sq += lhs[idx] * lhs[idx];
+                rhs_sq += rhs[idx] * rhs[idx];
+            }
+            lhs_norms[row] = lhs_sq.max(1e-12).sqrt();
+            rhs_norms[row] = rhs_sq.max(1e-12).sqrt();
+            cosine[row] = dot / (lhs_norms[row] * rhs_norms[row]);
+            value += if labels[row] > 0.0 {
+                1.0 - cosine[row]
+            } else {
+                (cosine[row] - margin).max(0.0)
+            };
+        }
+        value /= rows as f64;
+
+        let lhs = Arc::new(lhs);
+        let rhs = Arc::new(rhs);
+        let labels = Arc::new(labels);
+        let cosine = Arc::new(cosine);
+        let lhs_norms = Arc::new(lhs_norms);
+        let rhs_norms = Arc::new(rhs_norms);
+        let dtype = Tensor::binary_dtype(self.dtype, other.dtype);
+        Tensor {
+            data: Storage::from_f64_vec(vec![value], dtype),
+            grad: Storage::zeros(1, Tensor::grad_dtype_for(dtype)),
+            shape: vec![1],
+            device: Device::Cpu,
+            dtype,
+            _ctx: Some(Arc::new(Context {
+                parents: vec![self.clone(), other.clone()],
+                backward_op: Box::new(move |grad_out, parents| {
+                    let scale = grad_out.to_f64_vec()[0] / rows as f64;
+                    if parents[0].grad.ptr_eq(&parents[1].grad) {
+                        let mut grad_storage = parents[0].grad_write_compat();
+                        for row in 0..rows {
+                            let sign = if labels[row] > 0.0 {
+                                -1.0
+                            } else if cosine[row] > margin {
+                                1.0
+                            } else {
+                                0.0
+                            } * scale;
+                            let base = row * cols;
+                            for col in 0..cols {
+                                let idx = base + col;
+                                let lhs_cos_grad = rhs[idx] / (lhs_norms[row] * rhs_norms[row])
+                                    - cosine[row] * lhs[idx] / (lhs_norms[row] * lhs_norms[row]);
+                                let rhs_cos_grad = lhs[idx] / (lhs_norms[row] * rhs_norms[row])
+                                    - cosine[row] * rhs[idx] / (rhs_norms[row] * rhs_norms[row]);
+                                grad_storage[idx] += sign * (lhs_cos_grad + rhs_cos_grad);
+                            }
+                        }
+                    } else {
+                        let mut lhs_grad = parents[0].grad_write_compat();
+                        let mut rhs_grad = parents[1].grad_write_compat();
+                        for row in 0..rows {
+                            let sign = if labels[row] > 0.0 {
+                                -1.0
+                            } else if cosine[row] > margin {
+                                1.0
+                            } else {
+                                0.0
+                            } * scale;
+                            let base = row * cols;
+                            for col in 0..cols {
+                                let idx = base + col;
+                                let lhs_cos_grad = rhs[idx] / (lhs_norms[row] * rhs_norms[row])
+                                    - cosine[row] * lhs[idx] / (lhs_norms[row] * lhs_norms[row]);
+                                let rhs_cos_grad = lhs[idx] / (lhs_norms[row] * rhs_norms[row])
+                                    - cosine[row] * rhs[idx] / (rhs_norms[row] * rhs_norms[row]);
+                                lhs_grad[idx] += sign * lhs_cos_grad;
+                                rhs_grad[idx] += sign * rhs_cos_grad;
+                            }
+                        }
+                    }
                 }),
             })),
         }

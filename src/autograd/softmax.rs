@@ -17,6 +17,7 @@ impl Tensor {
         let self_data = self.data_f64();
         let len = self_data.len();
         let cols = self.shape.last().copied().unwrap_or(len.max(1));
+        assert!(cols > 0, "cannot softmax an empty dimension");
         let rows = len.checked_div(cols).unwrap_or(0);
         assert!(
             rows.checked_mul(cols) == Some(len),
@@ -66,10 +67,83 @@ impl Tensor {
         }
     }
 
+    /// Softmax along a selected dimension.
+    pub fn softmax_dim(&self, dim: usize) -> Tensor {
+        assert!(dim < self.shape.len(), "dim out of bounds");
+        let dim_size = self.shape[dim];
+        assert!(dim_size > 0, "cannot softmax an empty dimension");
+        if dim == self.shape.len() - 1 {
+            return self.softmax();
+        }
+
+        let self_data = self.data_as_f64_vec();
+        let shape = self.shape.clone();
+        let inner: usize = shape[dim + 1..].iter().product();
+        let outer: usize = shape[..dim].iter().product();
+        let mut data = vec![0.0; self_data.len()];
+
+        for outer_idx in 0..outer {
+            let base_outer = outer_idx * dim_size * inner;
+            for inner_idx in 0..inner {
+                let mut max_val = f64::NEG_INFINITY;
+                for dim_idx in 0..dim_size {
+                    let idx = base_outer + dim_idx * inner + inner_idx;
+                    max_val = max_val.max(self_data[idx]);
+                }
+
+                let mut sum_exp = 0.0;
+                for dim_idx in 0..dim_size {
+                    let idx = base_outer + dim_idx * inner + inner_idx;
+                    let value = (self_data[idx] - max_val).exp();
+                    data[idx] = value;
+                    sum_exp += value;
+                }
+                let sum_exp = sum_exp.max(f64::MIN_POSITIVE);
+                for dim_idx in 0..dim_size {
+                    let idx = base_outer + dim_idx * inner + inner_idx;
+                    data[idx] /= sum_exp;
+                }
+            }
+        }
+
+        let softmax_cache = Arc::new(data.clone());
+        let dtype = self.dtype;
+        Tensor {
+            data: Storage::from_f64_vec(data, dtype),
+            grad: Storage::zeros(self_data.len(), Tensor::grad_dtype_for(dtype)),
+            shape,
+            device: Device::Cpu,
+            dtype,
+            _ctx: Some(Arc::new(Context {
+                parents: vec![self.clone()],
+                backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut inp_grad = parents[0].grad_write_compat();
+                    for outer_idx in 0..outer {
+                        let base_outer = outer_idx * dim_size * inner;
+                        for inner_idx in 0..inner {
+                            let mut sum_term = 0.0;
+                            for dim_idx in 0..dim_size {
+                                let idx = base_outer + dim_idx * inner + inner_idx;
+                                sum_term += grad_out_f64[idx] * softmax_cache[idx];
+                            }
+                            for dim_idx in 0..dim_size {
+                                let idx = base_outer + dim_idx * inner + inner_idx;
+                                inp_grad[idx] +=
+                                    softmax_cache[idx] * (grad_out_f64[idx] - sum_term);
+                            }
+                        }
+                    }
+                }),
+            })),
+        }
+    }
+
     fn softmax_generic(&self) -> Tensor {
         let self_f32 = self.data_to_f32_vec();
         let len = self_f32.len();
         let cols = self.shape.last().copied().unwrap_or(len.max(1));
+        assert!(cols > 0, "cannot softmax an empty dimension");
         let rows = len.checked_div(cols).unwrap_or(0);
         assert!(
             rows.checked_mul(cols) == Some(len),
@@ -132,6 +206,8 @@ impl Tensor {
     /// Fused for efficiency with numerical stability.
     pub fn log_softmax_dim(&self, dim: usize) -> Tensor {
         assert!(dim < self.shape.len(), "dim out of bounds");
+        let dim_size = self.shape[dim];
+        assert!(dim_size > 0, "cannot log_softmax an empty dimension");
         #[cfg(cuda)]
         if self.device == Device::Cuda && dim == self.shape.len() - 1 {
             return self.log_softmax_cuda_last_dim();
@@ -139,7 +215,6 @@ impl Tensor {
 
         let self_data = self.data_as_f64_vec();
         let shape = self.shape.clone();
-        let dim_size = shape[dim];
         let inner: usize = shape[dim + 1..].iter().product();
         let outer: usize = shape[..dim].iter().product();
 
@@ -257,6 +332,7 @@ impl Tensor {
     /// Single allocation instead of 6+ intermediate tensors.
     /// Uses log_softmax_dim internally for backward compatibility.
     pub fn log_softmax(&self) -> Tensor {
+        assert!(!self.shape.is_empty(), "log_softmax requires rank >= 1");
         self.log_softmax_dim(self.shape.len() - 1)
     }
 
@@ -264,13 +340,21 @@ impl Tensor {
     /// y = (x - mean) / sqrt(var + eps)
     /// No learnable gamma/beta parameters.
     pub fn layer_norm_simple(&self, eps: f64) -> Tensor {
+        assert!(
+            eps > 0.0 && eps.is_finite(),
+            "layer_norm eps must be finite and positive"
+        );
         let self_data = self.data_as_f64_vec();
         let shape = self.shape.clone();
         let ndim = shape.len();
         assert!(ndim >= 1, "layer_norm requires at least 1D tensor");
 
         let last_dim = shape[ndim - 1];
-        let outer_len = shape[..ndim - 1].iter().product();
+        assert!(last_dim > 0, "layer_norm empty normalized dimension");
+        let outer_len = shape[..ndim - 1].iter().copied().fold(1usize, |acc, dim| {
+            acc.checked_mul(dim)
+                .unwrap_or_else(|| panic!("layer_norm element count overflow"))
+        });
 
         let mut mean = vec![0.0; outer_len];
         for (i, mean_elem) in mean.iter_mut().enumerate().take(outer_len) {

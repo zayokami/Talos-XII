@@ -2,7 +2,117 @@ use crate::autograd::{Context, Device, Tensor, TensorReadGuard};
 use crate::dtype::{Dtype, Storage};
 use crate::simd::vector_fma;
 use rayon::prelude::*;
+use std::ops::Range;
 use std::sync::{Arc, RwLock};
+
+const MAX_IM2COL_TEMP_ELEMENTS: usize = 32 * 1024 * 1024;
+
+fn checked_product(shape: &[usize], op: &'static str) -> usize {
+    shape.iter().copied().fold(1usize, |acc, dim| {
+        acc.checked_mul(dim)
+            .unwrap_or_else(|| panic!("{op} output element count overflow"))
+    })
+}
+
+fn assert_nonzero_dims(op: &'static str, dims: &[(&'static str, usize)]) {
+    for (name, value) in dims {
+        assert!(*value > 0, "{op} {name} must be positive");
+        assert!(
+            *value <= isize::MAX as usize,
+            "{op} {name} is too large for index arithmetic"
+        );
+    }
+}
+
+fn padded_extent(input: usize, padding: usize, op: &'static str, axis: &'static str) -> usize {
+    assert!(
+        padding <= isize::MAX as usize,
+        "{op} {axis} padding is too large for index arithmetic"
+    );
+    let double_padding = padding
+        .checked_mul(2)
+        .unwrap_or_else(|| panic!("{op} {axis} padding overflow"));
+    let padded = input
+        .checked_add(double_padding)
+        .unwrap_or_else(|| panic!("{op} {axis} padded extent overflow"));
+    assert!(
+        padded <= isize::MAX as usize,
+        "{op} {axis} padded extent is too large for index arithmetic"
+    );
+    padded
+}
+
+fn forward_out_dim(
+    input: usize,
+    kernel: usize,
+    stride: usize,
+    padding: usize,
+    op: &'static str,
+    axis: &'static str,
+) -> usize {
+    assert_nonzero_dims(op, &[(axis, input), ("kernel", kernel), ("stride", stride)]);
+    let padded = padded_extent(input, padding, op, axis);
+    assert!(
+        padded >= kernel,
+        "{op} {axis} kernel larger than padded input"
+    );
+    (padded - kernel) / stride + 1
+}
+
+fn transposed_out_dim(
+    input: usize,
+    kernel: usize,
+    stride: usize,
+    padding: usize,
+    op: &'static str,
+    axis: &'static str,
+) -> usize {
+    assert_nonzero_dims(op, &[(axis, input), ("kernel", kernel), ("stride", stride)]);
+    let expanded = (input - 1)
+        .checked_mul(stride)
+        .and_then(|value| value.checked_add(kernel))
+        .unwrap_or_else(|| panic!("{op} {axis} transposed extent overflow"));
+    let crop = padding
+        .checked_mul(2)
+        .unwrap_or_else(|| panic!("{op} {axis} padding overflow"));
+    assert!(
+        expanded > crop,
+        "{op} {axis} padding removes the whole transposed output"
+    );
+    let output = expanded - crop;
+    assert!(
+        output <= isize::MAX as usize,
+        "{op} {axis} output is too large for index arithmetic"
+    );
+    output
+}
+
+fn window_intersection(
+    start: isize,
+    kernel: usize,
+    input_len: usize,
+    op: &'static str,
+    axis: &'static str,
+) -> Range<usize> {
+    assert!(
+        kernel <= isize::MAX as usize,
+        "{op} {axis} kernel is too large for index arithmetic"
+    );
+    assert!(
+        input_len <= isize::MAX as usize,
+        "{op} {axis} input is too large for index arithmetic"
+    );
+    let end = start
+        .checked_add(kernel as isize)
+        .unwrap_or_else(|| panic!("{op} {axis} window extent overflow"));
+    let lo = start.max(0);
+    let hi = end.min(input_len as isize);
+    assert!(
+        lo < hi,
+        "{op} {axis} pooling window does not overlap the input"
+    );
+    lo as usize..hi as usize
+}
 
 impl Tensor {
     // Winograd F(2x2, 3x3) implementation
@@ -15,12 +125,12 @@ impl Tensor {
             weight.shape[2],
             weight.shape[3],
         );
-        // h_out, w_out calculation for stride 1, kernel 3
-        let h_out = h_in + 2 * padding - 2;
-        let w_out = w_in + 2 * padding - 2;
+        // h_out, w_out calculation for stride 1, kernel 3.
+        let h_out = forward_out_dim(h_in, 3, 1, padding, "conv2d", "height");
+        let w_out = forward_out_dim(w_in, 3, 1, padding, "conv2d", "width");
 
         let out_shape = vec![n, c_out, h_out, w_out];
-        let out_len: usize = out_shape.iter().product();
+        let out_len = checked_product(&out_shape, "conv2d");
         let mut out_data = vec![0.0; out_len];
 
         // Standard Winograd F(2,3) matrices. Hardcoded for speed.
@@ -28,7 +138,7 @@ impl Tensor {
 
         // We compute U = G * g * G^T per [k, c] 3x3 block.
 
-        let u_len = c_out * c_in * 16;
+        let u_len = checked_product(&[c_out, c_in, 16], "conv2d");
         let mut u_data = vec![0.0; u_len]; // [C_out, C_in, 4, 4]
 
         {
@@ -103,9 +213,9 @@ impl Tensor {
             // Output is computed in 2x2 blocks (tiles).
             let n_tiles_h = h_out.div_ceil(2);
             let n_tiles_w = w_out.div_ceil(2);
-            let n_tiles = n_tiles_h * n_tiles_w;
+            let n_tiles = checked_product(&[n_tiles_h, n_tiles_w], "conv2d");
 
-            let out_plane_len = h_out * w_out;
+            let out_plane_len = checked_product(&[h_out, w_out], "conv2d");
 
             out_data
                 .par_chunks_mut(c_out * out_plane_len)
@@ -117,7 +227,7 @@ impl Tensor {
                     // First, transform input image into V domain: V = B^T d B.
                     // This is shared across all C_out, so we do it once per batch item.
                     // V: [Tiles, C_in, 4, 4]
-                    let mut v_data = vec![0.0; n_tiles * c_in * 16];
+                    let mut v_data = vec![0.0; checked_product(&[n_tiles, c_in, 16], "conv2d")];
 
                     // Parallelize V computation over (Tile, C_in)
                     v_data
@@ -400,6 +510,7 @@ impl Tensor {
     pub fn conv2d(&self, weight: &Tensor, stride: usize, padding: usize) -> Tensor {
         assert_eq!(self.shape.len(), 4, "Input must be 4D (NCHW)");
         assert_eq!(weight.shape.len(), 4, "Weight must be 4D (OIHW)");
+        assert!(stride > 0, "conv2d stride must be positive");
 
         let (n, c_in, h_in, w_in) = (self.shape[0], self.shape[1], self.shape[2], self.shape[3]);
         let (c_out, c_in_k, k_h, k_w) = (
@@ -413,21 +524,39 @@ impl Tensor {
             c_in, c_in_k,
             "Input channels must match weight input channels"
         );
+        assert_nonzero_dims(
+            "conv2d",
+            &[
+                ("batch", n),
+                ("input channels", c_in),
+                ("output channels", c_out),
+                ("height", h_in),
+                ("width", w_in),
+                ("kernel height", k_h),
+                ("kernel width", k_w),
+                ("stride", stride),
+            ],
+        );
+        let h_out = forward_out_dim(h_in, k_h, stride, padding, "conv2d", "height");
+        let w_out = forward_out_dim(w_in, k_w, stride, padding, "conv2d", "width");
 
         // Use Winograd F(2x2, 3x3) for 3x3 kernel with stride 1
         if k_h == 3 && k_w == 3 && stride == 1 {
             return self.winograd_conv2d_3x3(weight, padding);
         }
 
-        let h_out = (h_in + 2 * padding - k_h) / stride + 1;
-        let w_out = (w_in + 2 * padding - k_w) / stride + 1;
-
         let out_shape = vec![n, c_out, h_out, w_out];
-        let out_len: usize = out_shape.iter().product();
+        let out_len = checked_product(&out_shape, "conv2d");
         let mut out_data = vec![0.0; out_len];
 
-        let k_len = c_in * k_h * k_w;
-        let out_plane_len = h_out * w_out;
+        let k_len = checked_product(&[c_in, k_h, k_w], "conv2d");
+        let out_plane_len = checked_product(&[h_out, w_out], "conv2d");
+        let out_batch_len = checked_product(&[c_out, out_plane_len], "conv2d");
+        let im2col_len = checked_product(&[k_len, out_plane_len], "conv2d");
+        assert!(
+            im2col_len <= MAX_IM2COL_TEMP_ELEMENTS,
+            "conv2d im2col workspace too large; use smaller input/kernel or split the batch"
+        );
 
         {
             let input_data = self.data_f64();
@@ -436,11 +565,11 @@ impl Tensor {
             // Standard Im2Col implementation. Memory hungry but fast.
             // Parallelize over Batch
             out_data
-                .par_chunks_mut(c_out * out_plane_len)
+                .par_chunks_mut(out_batch_len)
                 .enumerate()
                 .for_each(|(b, out_batch)| {
                     // Im2Col: Input (C_in, H, W) -> Cols (K_len, Out_len)
-                    let mut cols = vec![0.0; k_len * out_plane_len];
+                    let mut cols = vec![0.0; im2col_len];
 
                     // Parallelize filling cols (by kernel rows)
                     cols.par_chunks_mut(out_plane_len)
@@ -638,22 +767,44 @@ impl Tensor {
         }
     }
 
+    /// Compatibility alias for Conv2DCompress-style operator names.
+    ///
+    /// This computes the same mathematical convolution as `conv2d`; the project
+    /// does not currently maintain a separate compressed-weight storage format.
+    pub fn conv2d_compress(&self, weight: &Tensor, stride: usize, padding: usize) -> Tensor {
+        self.conv2d(weight, stride, padding)
+    }
+
     pub fn max_pool2d(&self, kernel_size: usize, stride: usize, padding: usize) -> Tensor {
         assert_eq!(self.shape.len(), 4, "Input must be 4D (NCHW)");
+        assert!(kernel_size > 0, "max_pool2d kernel_size must be positive");
+        assert!(stride > 0, "max_pool2d stride must be positive");
         let (n, c, h_in, w_in) = (self.shape[0], self.shape[1], self.shape[2], self.shape[3]);
+        assert_nonzero_dims(
+            "max_pool2d",
+            &[
+                ("batch", n),
+                ("channels", c),
+                ("height", h_in),
+                ("width", w_in),
+                ("kernel", kernel_size),
+                ("stride", stride),
+            ],
+        );
 
-        let h_out = (h_in + 2 * padding - kernel_size) / stride + 1;
-        let w_out = (w_in + 2 * padding - kernel_size) / stride + 1;
+        let h_out = forward_out_dim(h_in, kernel_size, stride, padding, "max_pool2d", "height");
+        let w_out = forward_out_dim(w_in, kernel_size, stride, padding, "max_pool2d", "width");
 
         let out_shape = vec![n, c, h_out, w_out];
-        let out_len: usize = out_shape.iter().product();
+        let out_len = checked_product(&out_shape, "max_pool2d");
+        let out_plane_len = checked_product(&[h_out, w_out], "max_pool2d");
         let mut out_data = vec![0.0; out_len];
 
         {
             let input_data = self.data_f64();
             // Parallelize over (N, C)
             out_data
-                .par_chunks_mut(h_out * w_out)
+                .par_chunks_mut(out_plane_len)
                 .enumerate()
                 .for_each(|(idx, out_plane)| {
                     let b = idx / c;
@@ -666,25 +817,23 @@ impl Tensor {
 
                             let mut max_val = f64::NEG_INFINITY;
 
-                            // Optimization: Optimized bounds
-                            let kh_start = if h_start < 0 { (-h_start) as usize } else { 0 };
-                            let kw_start = if w_start < 0 { (-w_start) as usize } else { 0 };
-                            let kh_end = if h_start + kernel_size as isize > h_in as isize {
-                                (h_in as isize - h_start) as usize
-                            } else {
-                                kernel_size
-                            };
-                            let kw_end = if w_start + kernel_size as isize > w_in as isize {
-                                (w_in as isize - w_start) as usize
-                            } else {
-                                kernel_size
-                            };
+                            let h_range = window_intersection(
+                                h_start,
+                                kernel_size,
+                                h_in,
+                                "max_pool2d",
+                                "height",
+                            );
+                            let w_range = window_intersection(
+                                w_start,
+                                kernel_size,
+                                w_in,
+                                "max_pool2d",
+                                "width",
+                            );
 
-                            // Inner loops now guaranteed valid
-                            for kh in kh_start..kh_end {
-                                for kw in kw_start..kw_end {
-                                    let h_in_idx = (h_start + kh as isize) as usize;
-                                    let w_in_idx = (w_start + kw as isize) as usize;
+                            for h_in_idx in h_range {
+                                for w_in_idx in w_range.clone() {
                                     let val = input_data
                                         [((b * c + ch) * h_in + h_in_idx) * w_in + w_in_idx];
                                     if val > max_val {
@@ -762,38 +911,23 @@ impl Tensor {
                                                     // Re-find max
                                                     let mut max_val = f64::NEG_INFINITY;
 
-                                                    // Optimized bounds for inner search
-                                                    let kh_start = if h_start < 0 {
-                                                        (-h_start) as usize
-                                                    } else {
-                                                        0
-                                                    };
-                                                    let kw_start = if w_start < 0 {
-                                                        (-w_start) as usize
-                                                    } else {
-                                                        0
-                                                    };
-                                                    let kh_end = if h_start + kernel_size as isize
-                                                        > h_in as isize
-                                                    {
-                                                        (h_in as isize - h_start) as usize
-                                                    } else {
-                                                        kernel_size
-                                                    };
-                                                    let kw_end = if w_start + kernel_size as isize
-                                                        > w_in as isize
-                                                    {
-                                                        (w_in as isize - w_start) as usize
-                                                    } else {
-                                                        kernel_size
-                                                    };
+                                                    let h_range = window_intersection(
+                                                        h_start,
+                                                        kernel_size,
+                                                        h_in,
+                                                        "max_pool2d",
+                                                        "height",
+                                                    );
+                                                    let w_range = window_intersection(
+                                                        w_start,
+                                                        kernel_size,
+                                                        w_in,
+                                                        "max_pool2d",
+                                                        "width",
+                                                    );
 
-                                                    for kh in kh_start..kh_end {
-                                                        for kw in kw_start..kw_end {
-                                                            let h_k =
-                                                                (h_start + kh as isize) as usize;
-                                                            let w_k =
-                                                                (w_start + kw as isize) as usize;
+                                                    for h_k in h_range {
+                                                        for w_k in w_range.clone() {
                                                             let v = input_data[((b * c + ch)
                                                                 * h_in
                                                                 + h_k)
@@ -821,6 +955,585 @@ impl Tensor {
                             }
                         },
                     );
+                }),
+            })),
+        }
+    }
+
+    /// Average pooling over NCHW tensors.
+    ///
+    /// When `count_include_pad` is false, padded cells are excluded from the
+    /// denominator. This matches the most common neural-network API behavior.
+    pub fn avg_pool2d(
+        &self,
+        kernel_size: usize,
+        stride: usize,
+        padding: usize,
+        count_include_pad: bool,
+    ) -> Tensor {
+        assert_eq!(self.shape.len(), 4, "Input must be 4D (NCHW)");
+        assert!(kernel_size > 0, "avg_pool2d kernel_size must be positive");
+        assert!(stride > 0, "avg_pool2d stride must be positive");
+        let (n, c, h_in, w_in) = (self.shape[0], self.shape[1], self.shape[2], self.shape[3]);
+        assert_nonzero_dims(
+            "avg_pool2d",
+            &[
+                ("batch", n),
+                ("channels", c),
+                ("height", h_in),
+                ("width", w_in),
+                ("kernel", kernel_size),
+                ("stride", stride),
+            ],
+        );
+        let h_out = forward_out_dim(h_in, kernel_size, stride, padding, "avg_pool2d", "height");
+        let w_out = forward_out_dim(w_in, kernel_size, stride, padding, "avg_pool2d", "width");
+        let out_shape = vec![n, c, h_out, w_out];
+        let out_len = checked_product(&out_shape, "avg_pool2d");
+        let input = self.data_as_f64_vec();
+        let mut output = vec![0.0; out_len];
+        let plane_len = checked_product(&[h_out, w_out], "avg_pool2d");
+        let mut denominators = vec![0usize; plane_len];
+        let padded_denominator = kernel_size
+            .checked_mul(kernel_size)
+            .unwrap_or_else(|| panic!("avg_pool2d kernel area overflow"));
+
+        for oh in 0..h_out {
+            for ow in 0..w_out {
+                let h_start = (oh * stride) as isize - padding as isize;
+                let w_start = (ow * stride) as isize - padding as isize;
+                let h_range =
+                    window_intersection(h_start, kernel_size, h_in, "avg_pool2d", "height");
+                let w_range =
+                    window_intersection(w_start, kernel_size, w_in, "avg_pool2d", "width");
+                let valid = checked_product(&[h_range.len(), w_range.len()], "avg_pool2d");
+                denominators[oh * w_out + ow] = if count_include_pad {
+                    padded_denominator
+                } else {
+                    valid
+                };
+            }
+        }
+
+        for batch in 0..n {
+            for channel in 0..c {
+                for oh in 0..h_out {
+                    for ow in 0..w_out {
+                        let h_start = (oh * stride) as isize - padding as isize;
+                        let w_start = (ow * stride) as isize - padding as isize;
+                        let mut sum = 0.0;
+                        let h_range =
+                            window_intersection(h_start, kernel_size, h_in, "avg_pool2d", "height");
+                        let w_range =
+                            window_intersection(w_start, kernel_size, w_in, "avg_pool2d", "width");
+                        for ih in h_range {
+                            for iw in w_range.clone() {
+                                sum += input[((batch * c + channel) * h_in + ih) * w_in + iw];
+                            }
+                        }
+                        let denom = denominators[oh * w_out + ow] as f64;
+                        output[((batch * c + channel) * h_out + oh) * w_out + ow] = sum / denom;
+                    }
+                }
+            }
+        }
+
+        let denominators = Arc::new(denominators);
+        let dtype = self.dtype;
+        Tensor {
+            data: Storage::from_f64_vec(output, dtype),
+            grad: Storage::zeros(out_len, Tensor::grad_dtype_for(dtype)),
+            shape: out_shape,
+            device: Device::Cpu,
+            dtype,
+            _ctx: Some(Arc::new(Context {
+                parents: vec![self.clone()],
+                backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out = grad_out.to_f64_vec();
+                    let mut input_grad = parents[0].grad_write_compat();
+                    for batch in 0..n {
+                        for channel in 0..c {
+                            for oh in 0..h_out {
+                                for ow in 0..w_out {
+                                    let h_start = (oh * stride) as isize - padding as isize;
+                                    let w_start = (ow * stride) as isize - padding as isize;
+                                    let grad = grad_out
+                                        [((batch * c + channel) * h_out + oh) * w_out + ow]
+                                        / denominators[oh * w_out + ow] as f64;
+                                    let h_range = window_intersection(
+                                        h_start,
+                                        kernel_size,
+                                        h_in,
+                                        "avg_pool2d",
+                                        "height",
+                                    );
+                                    let w_range = window_intersection(
+                                        w_start,
+                                        kernel_size,
+                                        w_in,
+                                        "avg_pool2d",
+                                        "width",
+                                    );
+                                    for ih in h_range {
+                                        for iw in w_range.clone() {
+                                            input_grad[((batch * c + channel) * h_in + ih)
+                                                * w_in
+                                                + iw] += grad;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }),
+            })),
+        }
+    }
+
+    /// Transposed 2D convolution over NCHW tensors.
+    ///
+    /// Weight layout is [C_in, C_out, K_h, K_w].
+    pub fn conv2d_transpose(&self, weight: &Tensor, stride: usize, padding: usize) -> Tensor {
+        assert_eq!(self.shape.len(), 4, "Input must be 4D (NCHW)");
+        assert_eq!(weight.shape.len(), 4, "Weight must be 4D (IOHW)");
+        assert!(stride > 0, "conv2d_transpose stride must be positive");
+        let (n, c_in, h_in, w_in) = (self.shape[0], self.shape[1], self.shape[2], self.shape[3]);
+        let (w_c_in, c_out, k_h, k_w) = (
+            weight.shape[0],
+            weight.shape[1],
+            weight.shape[2],
+            weight.shape[3],
+        );
+        assert_eq!(c_in, w_c_in, "input channels must match weight channels");
+        assert_nonzero_dims(
+            "conv2d_transpose",
+            &[
+                ("batch", n),
+                ("input channels", c_in),
+                ("output channels", c_out),
+                ("height", h_in),
+                ("width", w_in),
+                ("kernel height", k_h),
+                ("kernel width", k_w),
+                ("stride", stride),
+            ],
+        );
+        let h_out = transposed_out_dim(h_in, k_h, stride, padding, "conv2d_transpose", "height");
+        let w_out = transposed_out_dim(w_in, k_w, stride, padding, "conv2d_transpose", "width");
+        let h_out_padded = h_out
+            .checked_add(padding)
+            .unwrap_or_else(|| panic!("conv2d_transpose height bound overflow"));
+        let w_out_padded = w_out
+            .checked_add(padding)
+            .unwrap_or_else(|| panic!("conv2d_transpose width bound overflow"));
+        let out_shape = vec![n, c_out, h_out, w_out];
+        let out_len = checked_product(&out_shape, "conv2d_transpose");
+        let input = self.data_as_f64_vec();
+        let weight_data = weight.data_as_f64_vec();
+        let mut output = vec![0.0; out_len];
+
+        for b in 0..n {
+            for ic in 0..c_in {
+                for ih in 0..h_in {
+                    for iw in 0..w_in {
+                        let value = input[((b * c_in + ic) * h_in + ih) * w_in + iw];
+                        for oc in 0..c_out {
+                            for kh in 0..k_h {
+                                let oh = ih * stride + kh;
+                                if oh < padding || oh >= h_out_padded {
+                                    continue;
+                                }
+                                let oh = oh - padding;
+                                for kw in 0..k_w {
+                                    let ow = iw * stride + kw;
+                                    if ow < padding || ow >= w_out_padded {
+                                        continue;
+                                    }
+                                    let ow = ow - padding;
+                                    let w = weight_data[((ic * c_out + oc) * k_h + kh) * k_w + kw];
+                                    output[((b * c_out + oc) * h_out + oh) * w_out + ow] +=
+                                        value * w;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let dtype = Tensor::binary_dtype(self.dtype, weight.dtype);
+        Tensor {
+            data: Storage::from_f64_vec(output, dtype),
+            grad: Storage::zeros(out_len, Tensor::grad_dtype_for(dtype)),
+            shape: out_shape,
+            device: Device::Cpu,
+            dtype,
+            _ctx: Some(Arc::new(Context {
+                parents: vec![self.clone(), weight.clone()],
+                backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out = grad_out.to_f64_vec();
+                    let input = parents[0].data_as_f64_vec();
+                    let weight_data = parents[1].data_as_f64_vec();
+                    let mut input_delta = vec![0.0; input.len()];
+                    let mut weight_delta = vec![0.0; weight_data.len()];
+                    for b in 0..n {
+                        for ic in 0..c_in {
+                            for ih in 0..h_in {
+                                for iw in 0..w_in {
+                                    let input_idx = ((b * c_in + ic) * h_in + ih) * w_in + iw;
+                                    let mut input_sum = 0.0;
+                                    for oc in 0..c_out {
+                                        for kh in 0..k_h {
+                                            let oh = ih * stride + kh;
+                                            if oh < padding || oh >= h_out_padded {
+                                                continue;
+                                            }
+                                            let oh = oh - padding;
+                                            for kw in 0..k_w {
+                                                let ow = iw * stride + kw;
+                                                if ow < padding || ow >= w_out_padded {
+                                                    continue;
+                                                }
+                                                let ow = ow - padding;
+                                                let out_idx =
+                                                    ((b * c_out + oc) * h_out + oh) * w_out + ow;
+                                                let w_idx =
+                                                    ((ic * c_out + oc) * k_h + kh) * k_w + kw;
+                                                let grad = grad_out[out_idx];
+                                                input_sum += grad * weight_data[w_idx];
+                                                weight_delta[w_idx] += grad * input[input_idx];
+                                            }
+                                        }
+                                    }
+                                    input_delta[input_idx] += input_sum;
+                                }
+                            }
+                        }
+                    }
+                    {
+                        let mut input_grad = parents[0].grad_write_compat();
+                        for (dst, delta) in input_grad.iter_mut().zip(input_delta.iter()) {
+                            *dst += *delta;
+                        }
+                    }
+                    {
+                        let mut weight_grad = parents[1].grad_write_compat();
+                        for (dst, delta) in weight_grad.iter_mut().zip(weight_delta.iter()) {
+                            *dst += *delta;
+                        }
+                    }
+                }),
+            })),
+        }
+    }
+
+    pub fn deconvolution(&self, weight: &Tensor, stride: usize, padding: usize) -> Tensor {
+        self.conv2d_transpose(weight, stride, padding)
+    }
+
+    /// Depthwise 2D convolution over NCHW tensors.
+    ///
+    /// Weight layout is [C_in, channel_multiplier, K_h, K_w].
+    pub fn depthwise_conv2d(&self, weight: &Tensor, stride: usize, padding: usize) -> Tensor {
+        assert_eq!(self.shape.len(), 4, "Input must be 4D (NCHW)");
+        assert_eq!(weight.shape.len(), 4, "Weight must be 4D");
+        assert!(stride > 0, "depthwise_conv2d stride must be positive");
+        let (n, c_in, h_in, w_in) = (self.shape[0], self.shape[1], self.shape[2], self.shape[3]);
+        let (w_c_in, multiplier, k_h, k_w) = (
+            weight.shape[0],
+            weight.shape[1],
+            weight.shape[2],
+            weight.shape[3],
+        );
+        assert_eq!(c_in, w_c_in, "input channels must match weight channels");
+        assert_nonzero_dims(
+            "depthwise_conv2d",
+            &[
+                ("batch", n),
+                ("input channels", c_in),
+                ("channel multiplier", multiplier),
+                ("height", h_in),
+                ("width", w_in),
+                ("kernel height", k_h),
+                ("kernel width", k_w),
+                ("stride", stride),
+            ],
+        );
+        let c_out = c_in
+            .checked_mul(multiplier)
+            .unwrap_or_else(|| panic!("depthwise_conv2d output channels overflow"));
+        let h_out = forward_out_dim(h_in, k_h, stride, padding, "depthwise_conv2d", "height");
+        let w_out = forward_out_dim(w_in, k_w, stride, padding, "depthwise_conv2d", "width");
+        let out_shape = vec![n, c_out, h_out, w_out];
+        let out_len = checked_product(&out_shape, "depthwise_conv2d");
+        let input = self.data_as_f64_vec();
+        let weight_data = weight.data_as_f64_vec();
+        let mut output = vec![0.0; out_len];
+
+        for b in 0..n {
+            for ic in 0..c_in {
+                for m in 0..multiplier {
+                    let oc = ic * multiplier + m;
+                    for oh in 0..h_out {
+                        for ow in 0..w_out {
+                            let mut sum = 0.0;
+                            for kh in 0..k_h {
+                                let ih = oh * stride + kh;
+                                if ih < padding || ih >= h_in + padding {
+                                    continue;
+                                }
+                                let ih = ih - padding;
+                                for kw in 0..k_w {
+                                    let iw = ow * stride + kw;
+                                    if iw < padding || iw >= w_in + padding {
+                                        continue;
+                                    }
+                                    let iw = iw - padding;
+                                    sum += input[((b * c_in + ic) * h_in + ih) * w_in + iw]
+                                        * weight_data
+                                            [((ic * multiplier + m) * k_h + kh) * k_w + kw];
+                                }
+                            }
+                            output[((b * c_out + oc) * h_out + oh) * w_out + ow] = sum;
+                        }
+                    }
+                }
+            }
+        }
+
+        let dtype = Tensor::binary_dtype(self.dtype, weight.dtype);
+        Tensor {
+            data: Storage::from_f64_vec(output, dtype),
+            grad: Storage::zeros(out_len, Tensor::grad_dtype_for(dtype)),
+            shape: out_shape,
+            device: Device::Cpu,
+            dtype,
+            _ctx: Some(Arc::new(Context {
+                parents: vec![self.clone(), weight.clone()],
+                backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out = grad_out.to_f64_vec();
+                    let input = parents[0].data_as_f64_vec();
+                    let weight_data = parents[1].data_as_f64_vec();
+                    let mut input_delta = vec![0.0; input.len()];
+                    let mut weight_delta = vec![0.0; weight_data.len()];
+                    for b in 0..n {
+                        for ic in 0..c_in {
+                            for m in 0..multiplier {
+                                let oc = ic * multiplier + m;
+                                for oh in 0..h_out {
+                                    for ow in 0..w_out {
+                                        let grad =
+                                            grad_out[((b * c_out + oc) * h_out + oh) * w_out + ow];
+                                        for kh in 0..k_h {
+                                            let ih = oh * stride + kh;
+                                            if ih < padding || ih >= h_in + padding {
+                                                continue;
+                                            }
+                                            let ih = ih - padding;
+                                            for kw in 0..k_w {
+                                                let iw = ow * stride + kw;
+                                                if iw < padding || iw >= w_in + padding {
+                                                    continue;
+                                                }
+                                                let iw = iw - padding;
+                                                let input_idx =
+                                                    ((b * c_in + ic) * h_in + ih) * w_in + iw;
+                                                let weight_idx =
+                                                    ((ic * multiplier + m) * k_h + kh) * k_w + kw;
+                                                input_delta[input_idx] +=
+                                                    grad * weight_data[weight_idx];
+                                                weight_delta[weight_idx] += grad * input[input_idx];
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    {
+                        let mut input_grad = parents[0].grad_write_compat();
+                        for (dst, delta) in input_grad.iter_mut().zip(input_delta.iter()) {
+                            *dst += *delta;
+                        }
+                    }
+                    {
+                        let mut weight_grad = parents[1].grad_write_compat();
+                        for (dst, delta) in weight_grad.iter_mut().zip(weight_delta.iter()) {
+                            *dst += *delta;
+                        }
+                    }
+                }),
+            })),
+        }
+    }
+
+    /// 3D convolution over NCDHW tensors, weight layout [C_out, C_in, K_d, K_h, K_w].
+    pub fn conv3d(&self, weight: &Tensor, stride: usize, padding: usize) -> Tensor {
+        assert_eq!(self.shape.len(), 5, "Input must be 5D (NCDHW)");
+        assert_eq!(weight.shape.len(), 5, "Weight must be 5D (OIDHW)");
+        assert!(stride > 0, "conv3d stride must be positive");
+        let (n, c_in, d_in, h_in, w_in) = (
+            self.shape[0],
+            self.shape[1],
+            self.shape[2],
+            self.shape[3],
+            self.shape[4],
+        );
+        let (c_out, w_c_in, k_d, k_h, k_w) = (
+            weight.shape[0],
+            weight.shape[1],
+            weight.shape[2],
+            weight.shape[3],
+            weight.shape[4],
+        );
+        assert_eq!(c_in, w_c_in, "input channels must match weight channels");
+        assert_nonzero_dims(
+            "conv3d",
+            &[
+                ("batch", n),
+                ("input channels", c_in),
+                ("output channels", c_out),
+                ("depth", d_in),
+                ("height", h_in),
+                ("width", w_in),
+                ("kernel depth", k_d),
+                ("kernel height", k_h),
+                ("kernel width", k_w),
+                ("stride", stride),
+            ],
+        );
+        let d_out = forward_out_dim(d_in, k_d, stride, padding, "conv3d", "depth");
+        let h_out = forward_out_dim(h_in, k_h, stride, padding, "conv3d", "height");
+        let w_out = forward_out_dim(w_in, k_w, stride, padding, "conv3d", "width");
+        let out_shape = vec![n, c_out, d_out, h_out, w_out];
+        let out_len = checked_product(&out_shape, "conv3d");
+        let input = self.data_as_f64_vec();
+        let weight_data = weight.data_as_f64_vec();
+        let mut output = vec![0.0; out_len];
+
+        for b in 0..n {
+            for oc in 0..c_out {
+                for od in 0..d_out {
+                    for oh in 0..h_out {
+                        for ow in 0..w_out {
+                            let mut sum = 0.0;
+                            for ic in 0..c_in {
+                                for kd in 0..k_d {
+                                    let id = od * stride + kd;
+                                    if id < padding || id >= d_in + padding {
+                                        continue;
+                                    }
+                                    let id = id - padding;
+                                    for kh in 0..k_h {
+                                        let ih = oh * stride + kh;
+                                        if ih < padding || ih >= h_in + padding {
+                                            continue;
+                                        }
+                                        let ih = ih - padding;
+                                        for kw in 0..k_w {
+                                            let iw = ow * stride + kw;
+                                            if iw < padding || iw >= w_in + padding {
+                                                continue;
+                                            }
+                                            let iw = iw - padding;
+                                            let input_idx =
+                                                (((b * c_in + ic) * d_in + id) * h_in + ih) * w_in
+                                                    + iw;
+                                            let weight_idx =
+                                                (((oc * c_in + ic) * k_d + kd) * k_h + kh) * k_w
+                                                    + kw;
+                                            sum += input[input_idx] * weight_data[weight_idx];
+                                        }
+                                    }
+                                }
+                            }
+                            output[(((b * c_out + oc) * d_out + od) * h_out + oh) * w_out + ow] =
+                                sum;
+                        }
+                    }
+                }
+            }
+        }
+
+        let dtype = Tensor::binary_dtype(self.dtype, weight.dtype);
+        Tensor {
+            data: Storage::from_f64_vec(output, dtype),
+            grad: Storage::zeros(out_len, Tensor::grad_dtype_for(dtype)),
+            shape: out_shape,
+            device: Device::Cpu,
+            dtype,
+            _ctx: Some(Arc::new(Context {
+                parents: vec![self.clone(), weight.clone()],
+                backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out = grad_out.to_f64_vec();
+                    let input = parents[0].data_as_f64_vec();
+                    let weight_data = parents[1].data_as_f64_vec();
+                    let mut input_delta = vec![0.0; input.len()];
+                    let mut weight_delta = vec![0.0; weight_data.len()];
+                    for b in 0..n {
+                        for oc in 0..c_out {
+                            for od in 0..d_out {
+                                for oh in 0..h_out {
+                                    for ow in 0..w_out {
+                                        let grad = grad_out[(((b * c_out + oc) * d_out + od)
+                                            * h_out
+                                            + oh)
+                                            * w_out
+                                            + ow];
+                                        for ic in 0..c_in {
+                                            for kd in 0..k_d {
+                                                let id = od * stride + kd;
+                                                if id < padding || id >= d_in + padding {
+                                                    continue;
+                                                }
+                                                let id = id - padding;
+                                                for kh in 0..k_h {
+                                                    let ih = oh * stride + kh;
+                                                    if ih < padding || ih >= h_in + padding {
+                                                        continue;
+                                                    }
+                                                    let ih = ih - padding;
+                                                    for kw in 0..k_w {
+                                                        let iw = ow * stride + kw;
+                                                        if iw < padding || iw >= w_in + padding {
+                                                            continue;
+                                                        }
+                                                        let iw = iw - padding;
+                                                        let input_idx =
+                                                            (((b * c_in + ic) * d_in + id) * h_in
+                                                                + ih)
+                                                                * w_in
+                                                                + iw;
+                                                        let weight_idx =
+                                                            (((oc * c_in + ic) * k_d + kd) * k_h
+                                                                + kh)
+                                                                * k_w
+                                                                + kw;
+                                                        input_delta[input_idx] +=
+                                                            grad * weight_data[weight_idx];
+                                                        weight_delta[weight_idx] +=
+                                                            grad * input[input_idx];
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    {
+                        let mut input_grad = parents[0].grad_write_compat();
+                        for (dst, delta) in input_grad.iter_mut().zip(input_delta.iter()) {
+                            *dst += *delta;
+                        }
+                    }
+                    {
+                        let mut weight_grad = parents[1].grad_write_compat();
+                        for (dst, delta) in weight_grad.iter_mut().zip(weight_delta.iter()) {
+                            *dst += *delta;
+                        }
+                    }
                 }),
             })),
         }
