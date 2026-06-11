@@ -360,6 +360,13 @@ pub fn init() -> CudaResult<()> {
         }
     }
 
+    // 5. Create the process-wide blocking transfer stream used by the
+    //    pinned-staging async copy path (cuda/memory.rs) and bound to every
+    //    thread-local cuBLAS handle (cuda/blas.rs). Failure here is benign:
+    //    the handle is recorded as unavailable and all transfers degrade to
+    //    the synchronous cudaMemcpy path.
+    stream::init_global_transfer_stream();
+
     CUDA_INITIALIZED.store(true, Ordering::Release);
     Ok(())
 }

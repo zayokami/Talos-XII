@@ -13,6 +13,7 @@ use std::os::raw::{c_char, c_int};
 pub type CUresult = u32;
 pub type CUdevice = i32;
 pub type CUstream = *mut std::ffi::c_void;
+pub type cudaEvent_t = *mut std::ffi::c_void;
 pub type CUdeviceptr = usize;
 pub type CUcontext = *mut std::ffi::c_void;
 pub type cublasHandle_t = *mut std::ffi::c_void;
@@ -54,6 +55,18 @@ pub const cudaMemcpyDeviceToHost: c_int = 2;
 #[allow(non_upper_case_globals)]
 pub const cudaMemcpyDeviceToDevice: c_int = 3;
 
+/// cudaError_t returned by `cudaEventQuery` while the recorded work has not
+/// completed yet. This is the expected "still running" answer, NOT a failure;
+/// callers must treat it as "buffer busy" rather than an error.
+#[allow(non_upper_case_globals)]
+pub const cudaErrorNotReady: c_int = 600;
+
+/// Flag for `cudaEventCreateWithFlags`: the event carries no timing data.
+/// The pinned-staging transfer path only needs completion gating, and
+/// timing-free events are cheaper to record and query.
+#[allow(non_upper_case_globals)]
+pub const cudaEventDisableTiming: u32 = 0x02;
+
 extern "C" {
     pub fn cudaSetDevice(device: c_int) -> c_int;
     pub fn cudaGetLastError() -> c_int;
@@ -66,9 +79,9 @@ extern "C" {
         count: usize,
         kind: c_int,
     ) -> c_int;
-    // Pinned (page-locked) host memory + async copy, declared for a future
-    // pinned-staging transfer path (see TODO in cuda/memory.rs). Async copies
-    // only overlap when the host buffer is pinned; on pageable memory
+    // Pinned (page-locked) host memory + async copy, used by the
+    // pinned-staging transfer path in cuda/memory.rs. Async copies only
+    // overlap when the host buffer is pinned; on pageable memory
     // cudaMemcpyAsync silently degrades to a synchronous copy.
     pub fn cudaMallocHost(ptr: *mut *mut std::ffi::c_void, size: usize) -> c_int;
     pub fn cudaFreeHost(ptr: *mut std::ffi::c_void) -> c_int;
@@ -79,6 +92,14 @@ extern "C" {
         kind: c_int,
         stream: CUstream,
     ) -> c_int;
+    // Events for gating pinned-staging buffer reuse (CUDA Runtime API 12.x).
+    // `cudaEventQuery` returns cudaSuccess (0) once the recorded work is done
+    // and `cudaErrorNotReady` (600) while it is still in flight.
+    pub fn cudaEventCreateWithFlags(event: *mut cudaEvent_t, flags: u32) -> c_int;
+    pub fn cudaEventRecord(event: cudaEvent_t, stream: CUstream) -> c_int;
+    pub fn cudaEventQuery(event: cudaEvent_t) -> c_int;
+    pub fn cudaEventSynchronize(event: cudaEvent_t) -> c_int;
+    pub fn cudaEventDestroy(event: cudaEvent_t) -> c_int;
 }
 
 // =============================================================================

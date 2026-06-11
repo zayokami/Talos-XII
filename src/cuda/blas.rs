@@ -40,8 +40,14 @@ impl Cublas {
 
     /// Set the CUDA stream for cuBLAS operations
     pub fn set_stream(&mut self, stream: &crate::cuda::stream::CudaStream) -> CudaResult<()> {
+        self.set_stream_raw(stream.as_raw())
+    }
+
+    /// Set the CUDA stream for cuBLAS operations from a raw stream handle.
+    /// Used to bind thread-local handles to the global transfer stream.
+    pub fn set_stream_raw(&mut self, stream: crate::cuda::bindings::CUstream) -> CudaResult<()> {
         unsafe {
-            let result = cublasSetStream_v2(self.handle, stream.as_raw());
+            let result = cublasSetStream_v2(self.handle, stream);
             if result != 0 {
                 return Err(CudaError::Blas {
                     op: "cublasSetStream_v2",
@@ -212,6 +218,41 @@ thread_local! {
     static THREAD_CUBLAS: RefCell<Option<Cublas>> = const { RefCell::new(None) };
 }
 
+/// Warn-once flag for `cublasSetStream` failures during thread-local init.
+#[cfg(cuda)]
+static CUBLAS_STREAM_BIND_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Create a thread-local cuBLAS handle and bind it to the global transfer
+/// stream.
+///
+/// Binding keeps cuBLAS GEMMs on the same stream as the async copies in
+/// `cuda::memory`, so "H2D copy -> GEMM -> D2H copy" sequences are ordered by
+/// plain stream order without relying on cross-stream synchronization.
+///
+/// Degradation is kept globally consistent: when the global transfer stream
+/// is unavailable, transfers run synchronously on the legacy default stream
+/// and the cuBLAS handle stays on the legacy default stream too — exactly the
+/// pre-async behavior. If only `cublasSetStream` fails, staying on the legacy
+/// default stream is still correct (the transfer stream is a *blocking*
+/// stream, and legacy <-> blocking streams implicitly synchronize in both
+/// directions), merely slower; we log once and continue.
+#[cfg(cuda)]
+fn new_thread_cublas() -> CudaResult<Cublas> {
+    let mut cublas = Cublas::new()?;
+    if let Some(stream) = crate::cuda::stream::global_transfer_stream() {
+        if let Err(err) = cublas.set_stream_raw(stream) {
+            if !CUBLAS_STREAM_BIND_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::warn!(
+                    "[CUDA] failed to bind a thread-local cuBLAS handle to the global \
+                     transfer stream ({err}); the handle stays on the legacy default stream"
+                );
+            }
+        }
+    }
+    Ok(cublas)
+}
+
 /// Thread-local cuBLAS GEMM entry.
 ///
 /// CUDA docs recommend minimizing cublasCreate/cublasDestroy and using one handle
@@ -235,7 +276,7 @@ pub fn gemm_thread_local(
     THREAD_CUBLAS.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
-            *slot = Some(Cublas::new()?);
+            *slot = Some(new_thread_cublas()?);
         }
         let cublas = slot.as_mut().ok_or(CudaError::InvalidInput {
             op: "cuda::blas::gemm_thread_local",
@@ -264,7 +305,7 @@ pub fn gemm_thread_local_f32(
     THREAD_CUBLAS.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
-            *slot = Some(Cublas::new()?);
+            *slot = Some(new_thread_cublas()?);
         }
         let cublas = slot.as_mut().ok_or(CudaError::InvalidInput {
             op: "cuda::blas::gemm_thread_local_f32",
@@ -293,7 +334,7 @@ pub fn gemm_thread_local_bf16_to_f32(
     THREAD_CUBLAS.with(|slot| {
         let mut slot = slot.borrow_mut();
         if slot.is_none() {
-            *slot = Some(Cublas::new()?);
+            *slot = Some(new_thread_cublas()?);
         }
         let cublas = slot.as_mut().ok_or(CudaError::InvalidInput {
             op: "cuda::blas::gemm_thread_local_bf16_to_f32",
