@@ -122,7 +122,7 @@
   "pool_name_en": "Quan Chu Wu Hui",
   "up_six": ["弭弗"],
   "up_six_en": ["Mifu"],
-  "up_rate": 0.75,
+  "up_rate": 0.5,
   "prob_6_base": 0.008,
   "prob_5_base": 0.08,
   "prob_4_base": 0.912,
@@ -134,11 +134,11 @@
   "always_5_star": false,
   "big_pity_requires_not_up": true,
   "six_stars": [
-    "弭弗", "伊冯", "洁尔佩塔", "余烬",
+    "弭弗", "庄方宜", "洛茜", "余烬",
     "黎风", "艾尔黛拉", "别礼", "骏卫"
   ],
   "six_stars_en": [
-    "Mifu", "Yvonne", "Gilberta", "Ember",
+    "Mifu", "Zhuang Fangyi", "Rossi", "Ember",
     "Lifeng", "Ardelia", "Last Rite", "Pogranichnik"
   ],
   "five_stars": [
@@ -164,7 +164,7 @@
       "pool_type": "character_up",
       "up_six": ["弭弗"],
       "up_six_en": ["Mifu"],
-      "up_rate": 0.75,
+      "up_rate": 0.5,
       "prob_6_base": 0.008,
       "prob_5_base": 0.08,
       "prob_4_base": 0.912,
@@ -176,11 +176,11 @@
       "always_5_star": false,
       "big_pity_requires_not_up": true,
       "six_stars": [
-        "弭弗", "伊冯", "洁尔佩塔", "余烬",
+        "弭弗", "庄方宜", "洛茜", "余烬",
         "黎风", "艾尔黛拉", "别礼", "骏卫"
       ],
       "six_stars_en": [
-        "Mifu", "Yvonne", "Gilberta", "Ember",
+        "Mifu", "Zhuang Fangyi", "Rossi", "Ember",
         "Lifeng", "Ardelia", "Last Rite", "Pogranichnik"
       ],
       "five_stars": [
@@ -204,8 +204,8 @@
       "name_en": "Zhuizuizhe",
       "pool_type": "character_up",
       "up_six": ["卡缪"],
-      "up_six_en": ["Camus"],
-      "up_rate": 0.75,
+      "up_six_en": ["Camille"],
+      "up_rate": 0.5,
       "prob_6_base": 0.008,
       "prob_5_base": 0.08,
       "prob_4_base": 0.912,
@@ -217,11 +217,11 @@
       "always_5_star": false,
       "big_pity_requires_not_up": true,
       "six_stars": [
-        "卡缪", "伊冯", "洁尔佩塔", "余烬",
+        "卡缪", "弭弗", "庄方宜", "余烬",
         "黎风", "艾尔黛拉", "别礼", "骏卫"
       ],
       "six_stars_en": [
-        "Camus", "Yvonne", "Gilberta", "Ember",
+        "Camille", "Mifu", "Zhuang Fangyi", "Ember",
         "Lifeng", "Ardelia", "Last Rite", "Pogranichnik"
       ],
       "five_stars": [
@@ -247,7 +247,7 @@
       "pool_type": "character_up",
       "up_six": ["庄方宜"],
       "up_six_en": ["Zhuang Fangyi"],
-      "up_rate": 0.75,
+      "up_rate": 0.5,
       "prob_6_base": 0.008,
       "prob_5_base": 0.08,
       "prob_4_base": 0.912,
@@ -329,7 +329,7 @@
       "pool_type": "character_up",
       "up_six": ["汤汤"],
       "up_six_en": ["Tangtang"],
-      "up_rate": 0.75,
+      "up_rate": 0.5,
       "prob_6_base": 0.008,
       "prob_5_base": 0.08,
       "prob_4_base": 0.912,
@@ -371,7 +371,7 @@
       "pool_type": "character_up",
       "up_six": ["洁尔佩塔"],
       "up_six_en": ["Gilberta"],
-      "up_rate": 0.75,
+      "up_rate": 0.5,
       "prob_6_base": 0.008,
       "prob_5_base": 0.08,
       "prob_4_base": 0.912,
@@ -413,7 +413,7 @@
       "pool_type": "character_up",
       "up_six": ["伊冯"],
       "up_six_en": ["Yvonne"],
-      "up_rate": 0.75,
+      "up_rate": 0.5,
       "prob_6_base": 0.008,
       "prob_5_base": 0.08,
       "prob_4_base": 0.912,

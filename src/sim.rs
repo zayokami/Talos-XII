@@ -348,9 +348,11 @@ pub fn env_net_env(
 
 /// Calculate 6-star probability at a given pity count.
 pub fn prob_6(pity_6: usize, config: &Config) -> f64 {
+    // pity_6 is consecutive misses before this pull; hard pity hits on pull N when pity_6 == N - 1.
+    let hard_pity_from = config.small_pity_guarantee.saturating_sub(1);
     let raw = if pity_6 < config.soft_pity_start {
         config.prob_6_base
-    } else if pity_6 < config.small_pity_guarantee {
+    } else if pity_6 < hard_pity_from {
         config.prob_6_base
             + config.soft_pity_slope * (pity_6 as f64 - (config.soft_pity_start as f64 - 1.0))
     } else {
@@ -1743,6 +1745,12 @@ mod tests {
         assert!(
             at_start > config.prob_6_base,
             "At soft pity start, rate should be boosted"
+        );
+        let at_hard_pity = prob_6(config.small_pity_guarantee - 1, &config);
+        assert!(
+            (at_hard_pity - 1.0).abs() < 1e-12,
+            "80th pull (pity={}) should be hard pity",
+            config.small_pity_guarantee - 1
         );
         let at_guarantee = prob_6(config.small_pity_guarantee, &config);
         assert!(
