@@ -732,6 +732,12 @@ impl DuelingQNetwork {
         }
     }
 
+    pub fn maybe_project_achf_after_optimizer_step(&self) {
+        if let Some(achf) = &self.achf {
+            achf.maybe_project_after_optimizer_step();
+        }
+    }
+
     pub fn freeze_achf_for_inference(&mut self) {
         if let Some(achf) = &mut self.achf {
             achf.freeze_for_inference();
@@ -2195,6 +2201,7 @@ fn train_dqn_impl(
 
             let start_opt = std::time::Instant::now();
             optimizer.step();
+            policy_net.maybe_project_achf_after_optimizer_step();
             optimizer_step_counter += 1;
             let opt_time = start_opt.elapsed();
 
@@ -2544,6 +2551,7 @@ impl OnlineDqnTrainer {
         loss.backward();
         self.policy.update_achf_after_backward();
         self.optimizer.step();
+        self.policy.maybe_project_achf_after_optimizer_step();
 
         // Write back per-sample TD errors for priority update
         {

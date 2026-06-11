@@ -1707,3 +1707,523 @@ extern "C" int attention_weighted_sum_backward_f32(const float* h_grad_out, cons
     attention_weighted_sum_backward_kernel<float><<<grid, block>>>(dev_grad_out, dev_probs, dev_values, dev_probs_grad, dev_values_grad, batches, seq, head_dim);
     return (int)cudaPeekAtLastError();
 }
+
+// =============================================================================
+// ACHF projection + PPO rollout sampling kernels
+// =============================================================================
+
+__global__ void achf_row_l2_normalize_kernel(float* w, int rows, int cols) {
+    int r = blockIdx.x;
+    if (r >= rows) return;
+    float* row = w + (size_t)r * cols;
+    __shared__ float partial[TENSOR_OP_BLOCK];
+    float local = 0.0f;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+        float v = row[c];
+        local += v * v;
+    }
+    partial[threadIdx.x] = local;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        float sum_sq = partial[0];
+        partial[0] = sum_sq > 0.0f ? rsqrtf(sum_sq) : 0.0f;
+    }
+    __syncthreads();
+    float inv_norm = partial[0];
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+        row[c] *= inv_norm;
+    }
+}
+
+__global__ void achf_col_l2_normalize_kernel(float* w, int rows, int cols) {
+    int c = blockIdx.x;
+    if (c >= cols) return;
+    __shared__ float partial[TENSOR_OP_BLOCK];
+    float local = 0.0f;
+    for (int r = threadIdx.x; r < rows; r += blockDim.x) {
+        float v = w[(size_t)r * cols + c];
+        local += v * v;
+    }
+    partial[threadIdx.x] = local;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        float sum_sq = partial[0];
+        partial[0] = sum_sq > 0.0f ? rsqrtf(sum_sq) : 0.0f;
+    }
+    __syncthreads();
+    float inv_norm = partial[0];
+    for (int r = threadIdx.x; r < rows; r += blockDim.x) {
+        w[(size_t)r * cols + c] *= inv_norm;
+    }
+}
+
+__global__ void achf_max_reduce_kernel(const float* w, float* out, int n) {
+    __shared__ float partial[TENSOR_OP_BLOCK];
+    float local = -INFINITY;
+    for (int idx = threadIdx.x; idx < n; idx += blockDim.x) {
+        float v = w[idx];
+        if (isfinite(v) && v > local) {
+            local = v;
+        }
+    }
+    partial[threadIdx.x] = local;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        *out = partial[0];
+    }
+}
+
+__global__ void achf_sinkhorn_positive_kernel(float* w, int n, float max_val) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    float v = w[idx];
+    if (!isfinite(v)) {
+        w[idx] = expf(-60.0f);
+        return;
+    }
+    float shifted = fminf(fmaxf(v - max_val, -60.0f), 0.0f);
+    w[idx] = expf(shifted);
+}
+
+__global__ void achf_scale_rows_kernel(float* w, int rows, int cols, const float* scales) {
+    int r = blockIdx.x;
+    if (r >= rows) return;
+    float scale = scales[r];
+    float* row = w + (size_t)r * cols;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+        row[c] *= scale;
+    }
+}
+
+__global__ void achf_scale_cols_kernel(float* w, int rows, int cols, const float* scales) {
+    int c = blockIdx.x;
+    if (c >= cols) return;
+    float scale = scales[c];
+    for (int r = threadIdx.x; r < rows; r += blockDim.x) {
+        w[(size_t)r * cols + c] *= scale;
+    }
+}
+
+__global__ void achf_row_sum_normalize_kernel(
+    float* w,
+    int rows,
+    int cols,
+    float target,
+    float* row_scales,
+    float eps
+) {
+    int r = blockIdx.x;
+    if (r >= rows) return;
+    __shared__ float partial[TENSOR_OP_BLOCK];
+    float local = 0.0f;
+    float* row = w + (size_t)r * cols;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+        local += row[c];
+    }
+    partial[threadIdx.x] = local;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        float sum = partial[0];
+        float denom = sum < eps ? 1.0f : sum;
+        float scale = target / denom;
+        row_scales[r] *= scale;
+        partial[0] = scale;
+    }
+    __syncthreads();
+    float scale = partial[0];
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+        row[c] *= scale;
+    }
+}
+
+__global__ void achf_col_sum_normalize_kernel(
+    float* w,
+    int rows,
+    int cols,
+    float target,
+    float* col_scales,
+    float eps
+) {
+    int c = blockIdx.x;
+    if (c >= cols) return;
+    __shared__ float partial[TENSOR_OP_BLOCK];
+    float local = 0.0f;
+    for (int r = threadIdx.x; r < rows; r += blockDim.x) {
+        local += w[(size_t)r * cols + c];
+    }
+    partial[threadIdx.x] = local;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        float sum = partial[0];
+        float denom = sum < eps ? 1.0f : sum;
+        float scale = target / denom;
+        col_scales[c] *= scale;
+        partial[0] = scale;
+    }
+    __syncthreads();
+    float scale = partial[0];
+    for (int r = threadIdx.x; r < rows; r += blockDim.x) {
+        w[(size_t)r * cols + c] *= scale;
+    }
+}
+
+__global__ void achf_max_rowcol_deviation_kernel(
+    const float* w,
+    int rows,
+    int cols,
+    float row_target,
+    float col_target,
+    float* out_max_dev
+) {
+    __shared__ float partial[TENSOR_OP_BLOCK];
+    float local = 0.0f;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < rows * cols; idx += blockDim.x * gridDim.x) {
+        int r = idx / cols;
+        int c = idx - r * cols;
+        float row_sum = 0.0f;
+        for (int cc = 0; cc < cols; ++cc) {
+            row_sum += w[(size_t)r * cols + cc];
+        }
+        local = fmaxf(local, fabsf(row_sum - row_target));
+        float col_sum = 0.0f;
+        for (int rr = 0; rr < rows; ++rr) {
+            col_sum += w[(size_t)rr * cols + c];
+        }
+        local = fmaxf(local, fabsf(col_sum - col_target));
+    }
+    partial[threadIdx.x] = local;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        atomicMax((int*)out_max_dev, __float_as_int(partial[0]));
+    }
+}
+
+__global__ void achf_copy_kernel(const float* src, float* dst, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        dst[idx] = src[idx];
+    }
+}
+
+__global__ void achf_subtract_sq_accum_kernel(
+    const float* orig,
+    const float* approx,
+    float* accum,
+    int n
+) {
+    __shared__ float partial[TENSOR_OP_BLOCK];
+    float local = 0.0f;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < n; idx += blockDim.x * gridDim.x) {
+        float d = orig[idx] - approx[idx];
+        local += d * d;
+    }
+    partial[threadIdx.x] = local;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        atomicAdd(accum, partial[0]);
+    }
+}
+
+__global__ void ppo_softmax_sample_kernel(
+    const float* logits,
+    const float* uniforms,
+    int* actions,
+    float* log_probs,
+    int batch,
+    int action_space,
+    int top_k
+) {
+    int b = blockIdx.x;
+    if (b >= batch) return;
+    const float* row = logits + (size_t)b * action_space;
+    float max_l = row[0];
+    for (int i = 1; i < action_space; ++i) {
+        max_l = fmaxf(max_l, row[i]);
+    }
+
+    float threshold = -INFINITY;
+    if (top_k > 0 && top_k < action_space) {
+        float sorted[16];
+        for (int i = 0; i < action_space; ++i) sorted[i] = row[i];
+        for (int i = 0; i < action_space - 1; ++i) {
+            for (int j = i + 1; j < action_space; ++j) {
+                if (sorted[j] > sorted[i]) {
+                    float tmp = sorted[i];
+                    sorted[i] = sorted[j];
+                    sorted[j] = tmp;
+                }
+            }
+        }
+        threshold = sorted[top_k - 1];
+    }
+
+    float probs[16];
+    float sum_exp = 0.0f;
+    for (int i = 0; i < action_space; ++i) {
+        float p = 0.0f;
+        if (top_k > 0 && top_k < action_space && row[i] < threshold) {
+            p = 0.0f;
+        } else {
+            p = expf(fminf(row[i] - max_l, 0.0f));
+        }
+        probs[i] = p;
+        sum_exp += p;
+    }
+    if (sum_exp <= 0.0f) {
+        sum_exp = (float)action_space;
+        for (int i = 0; i < action_space; ++i) {
+            probs[i] = 1.0f / sum_exp;
+        }
+    } else {
+        for (int i = 0; i < action_space; ++i) {
+            probs[i] /= sum_exp;
+        }
+    }
+
+    float u = uniforms[b];
+    int idx = action_space - 1;
+    for (int i = 0; i < action_space; ++i) {
+        if (u < probs[i]) {
+            idx = i;
+            break;
+        }
+        u -= probs[i];
+    }
+    actions[b] = idx;
+    float prob = fmaxf(probs[idx], 1.401298e-45f);
+    log_probs[b] = logf(prob);
+}
+
+extern "C" int achf_row_l2_normalize_f32(float* w, int rows, int cols, int* d_w) {
+    float* dev_w = (float*)d_w;
+    dim3 block(TENSOR_OP_BLOCK);
+    dim3 grid(rows);
+    achf_row_l2_normalize_kernel<<<grid, block>>>(dev_w, rows, cols);
+    return (int)cudaPeekAtLastError();
+}
+
+extern "C" int achf_col_l2_normalize_f32(float* w, int rows, int cols, int* d_w) {
+    float* dev_w = (float*)d_w;
+    dim3 block(TENSOR_OP_BLOCK);
+    dim3 grid(cols);
+    achf_col_l2_normalize_kernel<<<grid, block>>>(dev_w, rows, cols);
+    return (int)cudaPeekAtLastError();
+}
+
+extern "C" int achf_max_reduce_f32(const float* w, float* h_max, int n, int* d_w, int* d_max) {
+    const float* dev_w = (const float*)d_w;
+    float* dev_max = (float*)d_max;
+    dim3 block(TENSOR_OP_BLOCK);
+    achf_max_reduce_kernel<<<1, block>>>(dev_w, dev_max, n);
+    cudaMemcpy(h_max, dev_max, sizeof(float), cudaMemcpyDeviceToHost);
+    return (int)cudaPeekAtLastError();
+}
+
+extern "C" int achf_sinkhorn_positive_f32(float* w, int n, float max_val, int* d_w) {
+    float* dev_w = (float*)d_w;
+    dim3 block(TENSOR_OP_BLOCK);
+    dim3 grid((n + TENSOR_OP_BLOCK - 1) / TENSOR_OP_BLOCK);
+    achf_sinkhorn_positive_kernel<<<grid, block>>>(dev_w, n, max_val);
+    return (int)cudaPeekAtLastError();
+}
+
+extern "C" int achf_scale_rows_f32(float* w, int rows, int cols, const float* scales, int* d_w, int* d_scales) {
+    float* dev_w = (float*)d_w;
+    const float* dev_scales = (const float*)d_scales;
+    dim3 block(TENSOR_OP_BLOCK);
+    dim3 grid(rows);
+    achf_scale_rows_kernel<<<grid, block>>>(dev_w, rows, cols, dev_scales);
+    return (int)cudaPeekAtLastError();
+}
+
+extern "C" int achf_scale_cols_f32(float* w, int rows, int cols, const float* scales, int* d_w, int* d_scales) {
+    float* dev_w = (float*)d_w;
+    const float* dev_scales = (const float*)d_scales;
+    dim3 block(TENSOR_OP_BLOCK);
+    dim3 grid(cols);
+    achf_scale_cols_kernel<<<grid, block>>>(dev_w, rows, cols, dev_scales);
+    return (int)cudaPeekAtLastError();
+}
+
+extern "C" int achf_row_sum_normalize_f32(
+    float* w,
+    int rows,
+    int cols,
+    float target,
+    float* row_scales,
+    float eps,
+    int* d_w,
+    int* d_row_scales
+) {
+    float* dev_w = (float*)d_w;
+    float* dev_scales = (float*)d_row_scales;
+    dim3 block(TENSOR_OP_BLOCK);
+    dim3 grid(rows);
+    achf_row_sum_normalize_kernel<<<grid, block>>>(dev_w, rows, cols, target, dev_scales, eps);
+    return (int)cudaPeekAtLastError();
+}
+
+extern "C" int achf_col_sum_normalize_f32(
+    float* w,
+    int rows,
+    int cols,
+    float target,
+    float* col_scales,
+    float eps,
+    int* d_w,
+    int* d_col_scales
+) {
+    float* dev_w = (float*)d_w;
+    float* dev_scales = (float*)d_col_scales;
+    dim3 block(TENSOR_OP_BLOCK);
+    dim3 grid(cols);
+    achf_col_sum_normalize_kernel<<<grid, block>>>(dev_w, rows, cols, target, dev_scales, eps);
+    return (int)cudaPeekAtLastError();
+}
+
+extern "C" int achf_max_rowcol_deviation_f32(
+    const float* w,
+    int rows,
+    int cols,
+    float row_target,
+    float col_target,
+    float* h_max_dev,
+    int* d_w,
+    int* d_max_dev
+) {
+    (void)w;
+    (void)row_target;
+    (void)col_target;
+    const float* dev_w = (const float*)d_w;
+    float* dev_max = (float*)d_max_dev;
+    float host_max = 0.0f;
+    // Small projection matrices only; fixed-step GPU sinkhorn skips early exit anyway.
+    for (int r = 0; r < rows; ++r) {
+        float sum = 0.0f;
+        for (int c = 0; c < cols; ++c) {
+            float v = 0.0f;
+            cudaMemcpy(&v, dev_w + (size_t)r * cols + c, sizeof(float), cudaMemcpyDeviceToHost);
+            sum += v;
+        }
+        host_max = fmaxf(host_max, fabsf(sum - row_target));
+    }
+    for (int c = 0; c < cols; ++c) {
+        float sum = 0.0f;
+        for (int r = 0; r < rows; ++r) {
+            float v = 0.0f;
+            cudaMemcpy(&v, dev_w + (size_t)r * cols + c, sizeof(float), cudaMemcpyDeviceToHost);
+            sum += v;
+        }
+        host_max = fmaxf(host_max, fabsf(sum - col_target));
+    }
+    cudaMemcpy(dev_max, &host_max, sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(h_max_dev, dev_max, sizeof(float), cudaMemcpyDeviceToHost);
+    return (int)cudaPeekAtLastError();
+}
+
+extern "C" int achf_copy_f32(const float* src, float* dst, int n, int* d_src, int* d_dst) {
+    const float* dev_src = (const float*)d_src;
+    float* dev_dst = (float*)d_dst;
+    dim3 block(TENSOR_OP_BLOCK);
+    dim3 grid((n + TENSOR_OP_BLOCK - 1) / TENSOR_OP_BLOCK);
+    achf_copy_kernel<<<grid, block>>>(dev_src, dev_dst, n);
+    return (int)cudaPeekAtLastError();
+}
+
+extern "C" int achf_frobenius_rel_err_f32(
+    const float* orig,
+    const float* approx,
+    float* h_err_sq,
+    float* h_norm_sq,
+    int n,
+    int* d_orig,
+    int* d_approx,
+    int* d_err_sq,
+    int* d_norm_sq
+) {
+    const float* dev_orig = (const float*)d_orig;
+    const float* dev_approx = (const float*)d_approx;
+    float* dev_err = (float*)d_err_sq;
+    float* dev_norm = (float*)d_norm_sq;
+    cudaMemset(dev_err, 0, sizeof(float));
+    cudaMemset(dev_norm, 0, sizeof(float));
+    dim3 block(TENSOR_OP_BLOCK);
+    dim3 grid((n + TENSOR_OP_BLOCK - 1) / TENSOR_OP_BLOCK);
+    achf_subtract_sq_accum_kernel<<<grid, block>>>(dev_orig, dev_approx, dev_err, n);
+    sumsq_accum_kernel<float><<<grid, block>>>(dev_orig, dev_norm, n);
+    cudaMemcpy(h_err_sq, dev_err, sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_norm_sq, dev_norm, sizeof(float), cudaMemcpyDeviceToHost);
+    return (int)cudaPeekAtLastError();
+}
+
+extern "C" int ppo_softmax_sample_batch_f32(
+    const float* logits,
+    const float* uniforms,
+    int* actions,
+    float* log_probs,
+    int batch,
+    int action_space,
+    int top_k,
+    int* d_logits,
+    int* d_uniforms,
+    int* d_actions,
+    int* d_log_probs
+) {
+    const float* dev_logits = (const float*)d_logits;
+    const float* dev_uniforms = (const float*)d_uniforms;
+    int* dev_actions = (int*)d_actions;
+    float* dev_log_probs = (float*)d_log_probs;
+    dim3 grid(batch);
+    ppo_softmax_sample_kernel<<<grid, 1>>>(
+        dev_logits,
+        dev_uniforms,
+        dev_actions,
+        dev_log_probs,
+        batch,
+        action_space,
+        top_k
+    );
+    return (int)cudaPeekAtLastError();
+}

@@ -688,8 +688,11 @@ impl Module for AchfLayer {
         if !self.config.enabled {
             return self.weight.forward(input);
         }
-        self.maybe_project();
-        let g = self.compute_gate();
+        if self.is_training_mode() {
+            let _ = self.compute_gate();
+            return self.weight.forward(input);
+        }
+        let g = self.infer_gate_value();
         #[cfg(cuda)]
         if self.has_valid_sparse_state() && input.device == Device::Cuda {
             if let Some(sparse_out) = self.forward_sparse_tensor_cuda(input) {
@@ -720,8 +723,14 @@ impl AchfLayer {
             self.metrics.cache_skips.fetch_add(1, Ordering::Relaxed);
             return self.zero_tensor_output(x);
         }
-        self.maybe_project();
-        let g = self.compute_gate();
+        if self.is_training_mode() {
+            let g = self.compute_gate();
+            if g <= 0.001 {
+                return self.zero_tensor_output(x);
+            }
+            return self.weight.forward(x);
+        }
+        let g = self.infer_gate_value();
         if g <= 0.001 {
             return self.zero_tensor_output(x);
         }
@@ -902,9 +911,31 @@ impl AchfLayer {
         if !self.config.enabled {
             return;
         }
+        #[cfg(cuda)]
+        {
+            if self.weight.weight.device == Device::Cuda
+                && crate::cuda::is_available()
+                && !self.weight.weight.grad.is_empty()
+            {
+                if let Some(mean_sq) = crate::cuda::achf::grad_mean_sq(&self.weight.weight) {
+                    let grad_rms = mean_sq.sqrt();
+                    let mut state = self.state.write().unwrap();
+                    match self.gate_mode() {
+                        GateMode::GradEma => {
+                            state.grad_ema = self.config.gate_momentum * state.grad_ema
+                                + (1.0 - self.config.gate_momentum) * grad_rms;
+                        }
+                        GateMode::FimTrace => {
+                            state.fim_ema = self.config.gate_momentum * state.fim_ema
+                                + (1.0 - self.config.gate_momentum) * mean_sq;
+                        }
+                    }
+                    return;
+                }
+            }
+        }
         let mut sum_sq = 0.0;
         let mut count = 0usize;
-        // Include dense weight gradient
         {
             let grad = self.weight.weight.grad_to_f32_vec();
             for &v in grad.iter() {
@@ -928,6 +959,11 @@ impl AchfLayer {
                     + (1.0 - self.config.gate_momentum) * mean_sq;
             }
         }
+    }
+
+    /// Run periodic manifold projection after an optimizer step (not during forward).
+    pub fn maybe_project_after_optimizer_step(&self) {
+        self.maybe_project();
     }
 
     pub fn orthogonal_penalty(&self) -> Option<Tensor> {
@@ -1087,6 +1123,10 @@ impl AchfLayer {
         }
     }
 
+    fn is_training_mode(&self) -> bool {
+        !self.state.read().unwrap().freeze_projection
+    }
+
     fn maybe_project(&self) {
         if !self.config.enabled {
             return;
@@ -1157,22 +1197,47 @@ impl AchfLayer {
         };
         let rows = self.weight.in_features;
         let cols = self.weight.out_features;
-        let mut w = self.weight.weight.data_to_f32_vec();
-        // Deterministic seed so projection is reproducible across runs.
         let seed = 0xAC4F_5EEDu64 ^ (rows as u64) ^ ((cols as u64) << 20) ^ ((rank as u64) << 40);
+        #[cfg(cuda)]
+        {
+            if self.weight.weight.device == Device::Cuda && crate::cuda::is_available() {
+                if let Some(rel_err) = crate::cuda::achf::apply_low_rank_truncation(
+                    &self.weight.weight,
+                    rows,
+                    cols,
+                    rank,
+                    seed,
+                ) {
+                    let mut state = self.state.write().unwrap();
+                    state.low_rank_rel_err = rel_err;
+                    state.low_rank_applied_rank = rank;
+                    return;
+                }
+            }
+        }
+        let mut w = self.weight.weight.data_to_f32_vec();
         let rel_err = low_rank_truncate(&mut w, rows, cols, rank, seed);
-        write_tensor_from_f32(&self.weight.weight, &w);
+        sync_weight_from_host_f32(&self.weight.weight, &w);
         let mut state = self.state.write().unwrap();
         state.low_rank_rel_err = rel_err;
         state.low_rank_applied_rank = rank;
     }
 
     fn project_rowcol(&self) {
-        let mut w = self.weight.weight.data_to_f32_vec();
         let rows = self.weight.in_features;
         let cols = self.weight.out_features;
+        #[cfg(cuda)]
+        {
+            if self.weight.weight.device == Device::Cuda
+                && crate::cuda::is_available()
+                && crate::cuda::achf::project_rowcol(&self.weight.weight, rows, cols)
+            {
+                return;
+            }
+        }
+        let mut w = self.weight.weight.data_to_f32_vec();
         rowcol_project(&mut w, rows, cols);
-        write_tensor_from_f32(&self.weight.weight, &w);
+        sync_weight_from_host_f32(&self.weight.weight, &w);
     }
 
     fn project_sinkhorn(&self) {
@@ -1191,6 +1256,25 @@ impl AchfLayer {
             .as_ref()
             .map(|v| v.iter().map(|&x| x as f32).collect::<Vec<f32>>());
         drop(cache);
+        #[cfg(cuda)]
+        {
+            if self.weight.weight.device == Device::Cuda && crate::cuda::is_available() {
+                if let Some((new_row, new_col, stats)) = crate::cuda::achf::project_sinkhorn(
+                    &self.weight.weight,
+                    self.weight.in_features,
+                    self.weight.out_features,
+                    steps,
+                    row_scales_f32.as_deref(),
+                    col_scales_f32.as_deref(),
+                ) {
+                    self.update_sinkhorn_projection_stats(stats);
+                    let mut cache = self.cache.write().unwrap();
+                    cache.sinkhorn_row_scales = Some(new_row.iter().map(|&x| x as f64).collect());
+                    cache.sinkhorn_col_scales = Some(new_col.iter().map(|&x| x as f64).collect());
+                    return;
+                }
+            }
+        }
         let mut w = self.weight.weight.data_to_f32_vec();
         let (new_row, new_col, stats) = sinkhorn_project(
             &mut w,
@@ -1200,7 +1284,7 @@ impl AchfLayer {
             row_scales_f32.as_deref(),
             col_scales_f32.as_deref(),
         );
-        write_tensor_from_f32(&self.weight.weight, &w);
+        sync_weight_from_host_f32(&self.weight.weight, &w);
         self.update_sinkhorn_projection_stats(stats);
         let mut cache = self.cache.write().unwrap();
         cache.sinkhorn_row_scales = Some(new_row.iter().map(|&x| x as f64).collect());
@@ -2433,7 +2517,7 @@ fn soft_update_tensor(dst: &Tensor, src: &Tensor, tau: f64) {
     }
 }
 
-fn write_tensor_from_f32(dst: &Tensor, data: &[f32]) {
+pub(crate) fn sync_weight_from_host_f32(dst: &Tensor, data: &[f32]) {
     match dst.dtype {
         Dtype::F32 => {
             let mut dst_data = dst.data_write_f32();
@@ -2447,8 +2531,19 @@ fn write_tensor_from_f32(dst: &Tensor, data: &[f32]) {
             let mut dst_data = dst.data_write_f64();
             *dst_data = data.iter().map(|&v| v as f64).collect();
         }
-        Dtype::I8 => panic!("write_tensor_from_f32 does not support I8 tensors"),
+        Dtype::I8 => panic!("sync_weight_from_host_f32 does not support I8 tensors"),
     }
+    #[cfg(cuda)]
+    if dst.device == Device::Cuda {
+        dst.cuda_remove_cached_buffer();
+        let _ = dst.cuda_get_or_upload_buffer();
+        dst.cuda_clear_host_data_preserve_cache();
+    }
+}
+
+#[allow(dead_code)]
+fn write_tensor_from_f32(dst: &Tensor, data: &[f32]) {
+    sync_weight_from_host_f32(dst, data);
 }
 
 #[cfg(test)]
@@ -2484,6 +2579,7 @@ mod tests {
         let layer = AchfLayer::new_square(4, cfg, 7);
         let x = Tensor::rand(vec![1, 4], -0.1, 0.1, 9);
         let _ = layer.forward_residual(&x);
+        layer.maybe_project_after_optimizer_step();
         let w = layer.weight.weight.data_f32();
         for c in 0..4 {
             let mut sum_sq = 0.0;
@@ -2515,6 +2611,7 @@ mod tests {
         }
         let x = Tensor::rand(vec![1, 4], -0.1, 0.1, 10);
         let _ = layer.forward_residual(&x);
+        layer.maybe_project_after_optimizer_step();
         let snapshot = layer.snapshot_state();
 
         assert!(snapshot.sinkhorn_iterations > 0);
@@ -2535,6 +2632,7 @@ mod tests {
         let mut layer = AchfLayer::new_square(4, cfg, 11);
         let x = Tensor::rand(vec![1, 4], -0.1, 0.1, 12);
         let _ = layer.forward_residual(&x);
+        layer.maybe_project_after_optimizer_step();
         layer.freeze_for_inference();
         let w_before = layer.weight.weight.data_f32().clone();
         let x_data = x.data_to_f32_vec();

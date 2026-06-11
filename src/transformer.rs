@@ -609,6 +609,17 @@ impl LuckTransformer {
         }
     }
 
+    pub fn maybe_project_achf_after_optimizer_step(&self) {
+        for block in &self.blocks {
+            if let Some(achf) = &block.achf_ffn {
+                achf.maybe_project_after_optimizer_step();
+            }
+            if let Some(achf) = &block.mla_layer.achf_wo {
+                achf.maybe_project_after_optimizer_step();
+            }
+        }
+    }
+
     pub fn freeze_achf_for_inference(&mut self) {
         for block in &mut self.blocks {
             if let Some(achf) = &mut block.achf_ffn {

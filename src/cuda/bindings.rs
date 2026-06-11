@@ -1580,6 +1580,109 @@ extern "C" {
         d_probs_grad: *mut c_int,
         d_values_grad: *mut c_int,
     ) -> c_int;
+    #[link_name = "achf_row_l2_normalize_f32"]
+    pub fn cuda_achf_row_l2_normalize_f32(
+        w: *mut f32,
+        rows: c_int,
+        cols: c_int,
+        d_w: *mut c_int,
+    ) -> c_int;
+    #[link_name = "achf_col_l2_normalize_f32"]
+    pub fn cuda_achf_col_l2_normalize_f32(
+        w: *mut f32,
+        rows: c_int,
+        cols: c_int,
+        d_w: *mut c_int,
+    ) -> c_int;
+    #[link_name = "achf_max_reduce_f32"]
+    pub fn cuda_achf_max_reduce_f32(
+        w: *const f32,
+        h_max: *mut f32,
+        n: c_int,
+        d_w: *mut c_int,
+        d_max: *mut c_int,
+    ) -> c_int;
+    #[link_name = "achf_sinkhorn_positive_f32"]
+    pub fn cuda_achf_sinkhorn_positive_f32(
+        w: *mut f32,
+        n: c_int,
+        max_val: f32,
+        d_w: *mut c_int,
+    ) -> c_int;
+    #[link_name = "achf_scale_rows_f32"]
+    pub fn cuda_achf_scale_rows_f32(
+        w: *mut f32,
+        rows: c_int,
+        cols: c_int,
+        scales: *const f32,
+        d_w: *mut c_int,
+        d_scales: *mut c_int,
+    ) -> c_int;
+    #[link_name = "achf_scale_cols_f32"]
+    pub fn cuda_achf_scale_cols_f32(
+        w: *mut f32,
+        rows: c_int,
+        cols: c_int,
+        scales: *const f32,
+        d_w: *mut c_int,
+        d_scales: *mut c_int,
+    ) -> c_int;
+    #[link_name = "achf_row_sum_normalize_f32"]
+    pub fn cuda_achf_row_sum_normalize_f32(
+        w: *mut f32,
+        rows: c_int,
+        cols: c_int,
+        target: f32,
+        row_scales: *mut f32,
+        eps: f32,
+        d_w: *mut c_int,
+        d_row_scales: *mut c_int,
+    ) -> c_int;
+    #[link_name = "achf_col_sum_normalize_f32"]
+    pub fn cuda_achf_col_sum_normalize_f32(
+        w: *mut f32,
+        rows: c_int,
+        cols: c_int,
+        target: f32,
+        col_scales: *mut f32,
+        eps: f32,
+        d_w: *mut c_int,
+        d_col_scales: *mut c_int,
+    ) -> c_int;
+    #[link_name = "achf_copy_f32"]
+    pub fn cuda_achf_copy_f32(
+        src: *const f32,
+        dst: *mut f32,
+        n: c_int,
+        d_src: *mut c_int,
+        d_dst: *mut c_int,
+    ) -> c_int;
+    #[link_name = "achf_frobenius_rel_err_f32"]
+    pub fn cuda_achf_frobenius_rel_err_f32(
+        orig: *const f32,
+        approx: *const f32,
+        h_err_sq: *mut f32,
+        h_norm_sq: *mut f32,
+        n: c_int,
+        d_orig: *mut c_int,
+        d_approx: *mut c_int,
+        d_err_sq: *mut c_int,
+        d_norm_sq: *mut c_int,
+    ) -> c_int;
+    #[link_name = "ppo_softmax_sample_batch_f32"]
+    pub fn cuda_ppo_softmax_sample_batch_f32(
+        logits: *const f32,
+        uniforms: *const f32,
+        actions: *mut c_int,
+        log_probs: *mut f32,
+        batch: c_int,
+        action_space: c_int,
+        top_k: c_int,
+        d_logits: *mut c_int,
+        d_uniforms: *mut c_int,
+        d_actions: *mut c_int,
+        d_log_probs: *mut c_int,
+    ) -> c_int;
 }
 
 // =============================================================================

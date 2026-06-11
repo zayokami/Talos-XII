@@ -148,7 +148,7 @@ impl Tensor {
         }
     }
 
-    pub(super) fn cuda_remove_cached_buffer(&self) {
+    pub(crate) fn cuda_remove_cached_buffer(&self) {
         let key = self.cuda_cache_key();
         if let Ok(mut map) = cuda_tensor_buffer_cache().lock() {
             map.remove(&key);

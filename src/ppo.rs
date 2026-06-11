@@ -1,3 +1,5 @@
+#[cfg(cuda)]
+use crate::autograd::Device;
 use crate::autograd::Tensor;
 use crate::config::{AchfConfig, Config};
 use crate::env_net::EnvNet;
@@ -253,6 +255,10 @@ impl ActorCritic {
 
     pub fn update_achf_after_backward(&self) {
         self.backbone.update_achf_after_backward();
+    }
+
+    pub fn maybe_project_achf_after_optimizer_step(&self) {
+        self.backbone.maybe_project_achf_after_optimizer_step();
     }
 
     pub fn freeze_achf_for_inference(&mut self) {
@@ -1237,6 +1243,7 @@ impl Ppo {
                 final_loss.backward();
                 self.policy.update_achf_after_backward();
                 self.optimizer.step();
+                self.policy.maybe_project_achf_after_optimizer_step();
                 self.optimizer_step_counter += 1;
                 completed_batches += 1;
                 on_batch(
@@ -1600,17 +1607,41 @@ fn rollout_cuda_round(
             return Some(rollout_prepared_cpu(envs, policy, env_net, config));
         }
 
-        let logits_data = batch_logits.data_to_f32_vec();
-        let value_data = batch_values.data_to_f32_vec();
-        if logits_data.len() != batch_len * ACTION_SPACE || value_data.len() != batch_len {
+        if batch_logits.device != Device::Cuda {
             return Some(rollout_prepared_cpu(envs, policy, env_net, config));
         }
 
+        use crate::cuda::memory::{alloc, copy_d2h, copy_h2d};
+        let logits_buf = batch_logits.cuda_get_or_upload_buffer().ok()?;
+        let values_buf = batch_values.cuda_get_or_upload_buffer().ok()?;
+        let d_logits = logits_buf.as_f32()?;
+        let d_values = values_buf.as_f32()?;
+        let d_actions = alloc::<i32>(batch_len).ok()?;
+        let d_log_probs = alloc::<f32>(batch_len).ok()?;
+        let uniforms: Vec<f32> = (0..batch_len).map(|_| rand::random::<f32>()).collect();
+        let d_uniforms = alloc::<f32>(batch_len).ok()?;
+        copy_h2d(&d_uniforms, &uniforms).ok()?;
+        crate::cuda::kernels::ppo_softmax_sample_batch_f32(
+            d_logits,
+            &d_uniforms,
+            &d_actions,
+            &d_log_probs,
+            batch_len,
+            ACTION_SPACE,
+            config.ppo_top_k,
+        )
+        .ok()?;
+
+        let mut action_indices = vec![0i32; batch_len];
+        let mut log_probs = vec![0.0f32; batch_len];
+        let mut value_data = vec![0.0f32; batch_len];
+        copy_d2h(&mut action_indices, &d_actions).ok()?;
+        copy_d2h(&mut log_probs, &d_log_probs).ok()?;
+        copy_d2h(&mut value_data, d_values).ok()?;
+
         for (row, &idx) in indices.iter().enumerate() {
-            let row_start = row * ACTION_SPACE;
-            let row_end = row_start + ACTION_SPACE;
-            let (action_idx, log_prob) =
-                softmax_sample(&logits_data[row_start..row_end], config.ppo_top_k);
+            let action_idx = action_indices[row].max(0) as usize;
+            let log_prob = log_probs[row];
             decisions[idx] = Some((action_idx, log_prob, value_data[row]));
         }
     }

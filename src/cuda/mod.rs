@@ -5,6 +5,8 @@
 #![allow(dead_code)]
 
 #[cfg(cuda)]
+pub mod achf;
+#[cfg(cuda)]
 pub mod bindings;
 #[cfg(cuda)]
 pub mod blas;

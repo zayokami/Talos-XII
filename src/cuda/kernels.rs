@@ -1,6 +1,8 @@
 //! CUDA activation kernel wrappers.
 #![allow(clippy::too_many_arguments)]
 
+use std::os::raw::c_int;
+
 use crate::cuda::bindings;
 use crate::cuda::error::{CudaError, CudaResult};
 use crate::cuda::memory::DevicePtr;
@@ -5362,6 +5364,267 @@ define_batched_attention_wrappers!(
     "cuda::kernels::batched_qk_scores_backward_f32",
     "cuda::kernels::attention_weighted_sum_backward_f32"
 );
+
+#[cfg(cuda)]
+fn achf_launch_ok(status: i32, op: &'static str) -> CudaResult<()> {
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op,
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn achf_rowcol_project_f32(
+    weight: &DevicePtr<f32>,
+    rows: usize,
+    cols: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let rows_i32 = to_i32_len("cuda::kernels::achf_rowcol_project_f32(rows)", rows)?;
+    let cols_i32 = to_i32_len("cuda::kernels::achf_rowcol_project_f32(cols)", cols)?;
+    let status = unsafe {
+        crate::cuda::bindings::cuda_achf_row_l2_normalize_f32(
+            weight.as_raw() as *mut f32,
+            rows_i32,
+            cols_i32,
+            weight.as_raw() as *mut c_int,
+        )
+    };
+    achf_launch_ok(status, "cuda::kernels::achf_rowcol_project_f32(row)")?;
+    let status = unsafe {
+        crate::cuda::bindings::cuda_achf_col_l2_normalize_f32(
+            weight.as_raw() as *mut f32,
+            rows_i32,
+            cols_i32,
+            weight.as_raw() as *mut c_int,
+        )
+    };
+    achf_launch_ok(status, "cuda::kernels::achf_rowcol_project_f32(col)")
+}
+
+#[cfg(cuda)]
+pub fn achf_sinkhorn_project_f32(
+    weight: &DevicePtr<f32>,
+    row_scales: &DevicePtr<f32>,
+    col_scales: &DevicePtr<f32>,
+    rows: usize,
+    cols: usize,
+    steps: usize,
+    row_scales_host: &[f32],
+    col_scales_host: &[f32],
+) -> CudaResult<(usize, f32, f32)> {
+    use crate::cuda::memory::{alloc, copy_h2d};
+
+    crate::cuda::init()?;
+    let n = rows.checked_mul(cols).ok_or(CudaError::InvalidInput {
+        op: "cuda::kernels::achf_sinkhorn_project_f32(n)",
+        message: "matrix size overflow",
+    })?;
+    let rows_i32 = to_i32_len("cuda::kernels::achf_sinkhorn_project_f32(rows)", rows)?;
+    let cols_i32 = to_i32_len("cuda::kernels::achf_sinkhorn_project_f32(cols)", cols)?;
+    let n_i32 = to_i32_len("cuda::kernels::achf_sinkhorn_project_f32(n)", n)?;
+
+    let mut max_val = f32::NEG_INFINITY;
+    let d_max = alloc::<f32>(1)?;
+    let status = unsafe {
+        crate::cuda::bindings::cuda_achf_max_reduce_f32(
+            weight.as_raw() as *const f32,
+            &mut max_val,
+            n_i32,
+            weight.as_raw() as *mut c_int,
+            d_max.as_raw() as *mut c_int,
+        )
+    };
+    achf_launch_ok(status, "cuda::kernels::achf_sinkhorn_project_f32(max)")?;
+    if !max_val.is_finite() {
+        max_val = 0.0;
+    }
+    let status = unsafe {
+        crate::cuda::bindings::cuda_achf_sinkhorn_positive_f32(
+            weight.as_raw() as *mut f32,
+            n_i32,
+            max_val,
+            weight.as_raw() as *mut c_int,
+        )
+    };
+    achf_launch_ok(status, "cuda::kernels::achf_sinkhorn_project_f32(positive)")?;
+
+    copy_h2d(row_scales, row_scales_host)?;
+    copy_h2d(col_scales, col_scales_host)?;
+    let status = unsafe {
+        crate::cuda::bindings::cuda_achf_scale_rows_f32(
+            weight.as_raw() as *mut f32,
+            rows_i32,
+            cols_i32,
+            row_scales_host.as_ptr(),
+            weight.as_raw() as *mut c_int,
+            row_scales.as_raw() as *mut c_int,
+        )
+    };
+    achf_launch_ok(
+        status,
+        "cuda::kernels::achf_sinkhorn_project_f32(scale_rows)",
+    )?;
+    let status = unsafe {
+        crate::cuda::bindings::cuda_achf_scale_cols_f32(
+            weight.as_raw() as *mut f32,
+            rows_i32,
+            cols_i32,
+            col_scales_host.as_ptr(),
+            weight.as_raw() as *mut c_int,
+            col_scales.as_raw() as *mut c_int,
+        )
+    };
+    achf_launch_ok(
+        status,
+        "cuda::kernels::achf_sinkhorn_project_f32(scale_cols)",
+    )?;
+
+    let row_target = 1.0f32;
+    let col_target = if cols == 0 {
+        1.0f32
+    } else {
+        rows as f32 / cols as f32
+    };
+    let eps = 1e-12f32;
+    let iterations = steps.max(1);
+    for _ in 0..iterations {
+        let status = unsafe {
+            crate::cuda::bindings::cuda_achf_row_sum_normalize_f32(
+                weight.as_raw() as *mut f32,
+                rows_i32,
+                cols_i32,
+                row_target,
+                row_scales.as_raw() as *mut f32,
+                eps,
+                weight.as_raw() as *mut c_int,
+                row_scales.as_raw() as *mut c_int,
+            )
+        };
+        achf_launch_ok(status, "cuda::kernels::achf_sinkhorn_project_f32(row_norm)")?;
+        let status = unsafe {
+            crate::cuda::bindings::cuda_achf_col_sum_normalize_f32(
+                weight.as_raw() as *mut f32,
+                rows_i32,
+                cols_i32,
+                col_target,
+                col_scales.as_raw() as *mut f32,
+                eps,
+                weight.as_raw() as *mut c_int,
+                col_scales.as_raw() as *mut c_int,
+            )
+        };
+        achf_launch_ok(status, "cuda::kernels::achf_sinkhorn_project_f32(col_norm)")?;
+    }
+
+    Ok((iterations, 0.0, 0.0))
+}
+
+#[cfg(cuda)]
+pub fn achf_copy_f32(src: &DevicePtr<f32>, dst: &DevicePtr<f32>, n: usize) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let n_i32 = to_i32_len("cuda::kernels::achf_copy_f32(n)", n)?;
+    let status = unsafe {
+        crate::cuda::bindings::cuda_achf_copy_f32(
+            src.as_raw() as *const f32,
+            dst.as_raw() as *mut f32,
+            n_i32,
+            src.as_raw() as *mut c_int,
+            dst.as_raw() as *mut c_int,
+        )
+    };
+    achf_launch_ok(status, "cuda::kernels::achf_copy_f32")
+}
+
+#[cfg(cuda)]
+pub fn achf_frobenius_rel_err_f32(
+    orig: &DevicePtr<f32>,
+    approx: &DevicePtr<f32>,
+    n: usize,
+) -> CudaResult<f64> {
+    use crate::cuda::memory::alloc;
+
+    crate::cuda::init()?;
+    let n_i32 = to_i32_len("cuda::kernels::achf_frobenius_rel_err_f32(n)", n)?;
+    let d_err = alloc::<f32>(1)?;
+    let d_norm = alloc::<f32>(1)?;
+    let mut err_sq = 0.0f32;
+    let mut norm_sq = 0.0f32;
+    let status = unsafe {
+        crate::cuda::bindings::cuda_achf_frobenius_rel_err_f32(
+            orig.as_raw() as *const f32,
+            approx.as_raw() as *const f32,
+            &mut err_sq,
+            &mut norm_sq,
+            n_i32,
+            orig.as_raw() as *mut c_int,
+            approx.as_raw() as *mut c_int,
+            d_err.as_raw() as *mut c_int,
+            d_norm.as_raw() as *mut c_int,
+        )
+    };
+    achf_launch_ok(status, "cuda::kernels::achf_frobenius_rel_err_f32")?;
+    if norm_sq > 0.0 {
+        Ok((err_sq / norm_sq).sqrt() as f64)
+    } else {
+        Ok(0.0)
+    }
+}
+
+#[cfg(cuda)]
+pub fn grad_mean_sq_f32(grad: &DevicePtr<f32>, len: usize) -> CudaResult<f64> {
+    use crate::cuda::memory::alloc;
+
+    crate::cuda::init()?;
+    if len == 0 {
+        return Ok(0.0);
+    }
+    let d_acc = alloc::<f32>(1)?;
+    fill_f32(&d_acc, 0.0)?;
+    sumsq_accum_f32(grad, &d_acc, len)?;
+    let mut sum_sq = 0.0f32;
+    crate::cuda::memory::copy_d2h(std::slice::from_mut(&mut sum_sq), &d_acc)?;
+    Ok((sum_sq / len as f32) as f64)
+}
+
+#[cfg(cuda)]
+pub fn ppo_softmax_sample_batch_f32(
+    logits: &DevicePtr<f32>,
+    uniforms: &DevicePtr<f32>,
+    actions: &DevicePtr<i32>,
+    log_probs: &DevicePtr<f32>,
+    batch: usize,
+    action_space: usize,
+    top_k: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    let batch_i32 = to_i32_len("cuda::kernels::ppo_softmax_sample_batch_f32(batch)", batch)?;
+    let action_i32 = to_i32_len(
+        "cuda::kernels::ppo_softmax_sample_batch_f32(action_space)",
+        action_space,
+    )?;
+    let top_k_i32 = to_i32_len("cuda::kernels::ppo_softmax_sample_batch_f32(top_k)", top_k)?;
+    let status = unsafe {
+        crate::cuda::bindings::cuda_ppo_softmax_sample_batch_f32(
+            logits.as_raw() as *const f32,
+            uniforms.as_raw() as *const f32,
+            actions.as_raw() as *mut c_int,
+            log_probs.as_raw() as *mut f32,
+            batch_i32,
+            action_i32,
+            top_k_i32,
+            logits.as_raw() as *mut c_int,
+            uniforms.as_raw() as *mut c_int,
+            actions.as_raw() as *mut c_int,
+            log_probs.as_raw() as *mut c_int,
+        )
+    };
+    achf_launch_ok(status, "cuda::kernels::ppo_softmax_sample_batch_f32")
+}
 
 #[cfg(test)]
 mod tests {
