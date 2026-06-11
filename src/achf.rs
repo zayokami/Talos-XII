@@ -59,6 +59,11 @@ pub struct AchfState {
     pub sinkhorn_min_value: f64,
     pub sinkhorn_negative_ratio: f64,
     pub sinkhorn_warm_started: bool,
+    /// Relative Frobenius error of the last rank-r truncation:
+    /// ||W - W_r||_F / ||W||_F. Zero when no truncation was applied.
+    pub low_rank_rel_err: f64,
+    /// Rank actually used by the last truncation (0 = truncation inactive).
+    pub low_rank_applied_rank: usize,
 }
 
 /// Lock-free atomic counters for inference hot-path stats, eliminating RwLock contention.
@@ -125,6 +130,19 @@ pub struct AchfCache {
     pub ema_sparse_long_ns: f64,
     pub decision_ema_ns: f64,
     pub decision_ema_long_ns: f64,
+    ama_cached_cold_ns: f64,
+    ama_cached_warm_ns: f64,
+    ama_sparse_cold_ns: f64,
+    ama_sparse_warm_ns: f64,
+    ama_cached_warm_count: u64,
+    ama_sparse_warm_count: u64,
+    ama_cached_stale: u64,
+    ama_sparse_stale: u64,
+    ama_prev_path: Option<InferencePath>,
+    ama_dwell: u64,
+    ama_switches: u64,
+    ama_probes: u64,
+    ama_force_latency_sample: bool,
     pub adaptive_bias: f64,
     pub last_input_hash: Option<u64>,
     pub last_output: Option<Vec<f32>>,
@@ -133,6 +151,8 @@ pub struct AchfCache {
     pub sinkhorn_row_scales: Option<Vec<f64>>,
     /// Warm-start column scale vectors for Sinkhorn projection (cached between calls).
     pub sinkhorn_col_scales: Option<Vec<f64>>,
+    #[cfg(cuda)]
+    pub sparse_mask_cuda: Option<Arc<crate::cuda::memory::DevicePtr<u8>>>,
 }
 
 fn default_state() -> Arc<RwLock<AchfState>> {
@@ -150,6 +170,8 @@ fn default_state() -> Arc<RwLock<AchfState>> {
         sinkhorn_min_value: 0.0,
         sinkhorn_negative_ratio: 0.0,
         sinkhorn_warm_started: false,
+        low_rank_rel_err: 0.0,
+        low_rank_applied_rank: 0,
     }))
 }
 
@@ -165,12 +187,27 @@ fn default_cache() -> Arc<RwLock<AchfCache>> {
         ema_sparse_long_ns: 0.0,
         decision_ema_ns: 0.0,
         decision_ema_long_ns: 0.0,
+        ama_cached_cold_ns: 0.0,
+        ama_cached_warm_ns: 0.0,
+        ama_sparse_cold_ns: 0.0,
+        ama_sparse_warm_ns: 0.0,
+        ama_cached_warm_count: 0,
+        ama_sparse_warm_count: 0,
+        ama_cached_stale: 0,
+        ama_sparse_stale: 0,
+        ama_prev_path: None,
+        ama_dwell: 0,
+        ama_switches: 0,
+        ama_probes: 0,
+        ama_force_latency_sample: false,
         adaptive_bias: 0.0,
         last_input_hash: None,
         last_output: None,
         last_input_count: 0,
         sinkhorn_row_scales: None,
         sinkhorn_col_scales: None,
+        #[cfg(cuda)]
+        sparse_mask_cuda: None,
     }))
 }
 
@@ -241,6 +278,10 @@ pub struct AchfStateSnapshot {
     pub sinkhorn_min_value: f64,
     pub sinkhorn_negative_ratio: f64,
     pub sinkhorn_warm_started: bool,
+    /// Relative Frobenius error of the last rank-r truncation (0 when inactive).
+    pub low_rank_rel_err: f64,
+    /// Rank actually applied by the last truncation (0 when inactive).
+    pub low_rank_applied_rank: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -400,6 +441,8 @@ impl AchfLayer {
             sinkhorn_min_value: state.sinkhorn_min_value,
             sinkhorn_negative_ratio: state.sinkhorn_negative_ratio,
             sinkhorn_warm_started: state.sinkhorn_warm_started,
+            low_rank_rel_err: state.low_rank_rel_err,
+            low_rank_applied_rank: state.low_rank_applied_rank,
         }
     }
 
@@ -434,6 +477,30 @@ impl AchfLayer {
     }
 
     #[cfg(cuda)]
+    fn sparse_mask_cuda(&self, mask: &[u8]) -> Option<Arc<crate::cuda::memory::DevicePtr<u8>>> {
+        use crate::cuda::memory::{alloc, copy_h2d};
+
+        if mask.is_empty() {
+            return None;
+        }
+        {
+            let cache = self.cache.read().unwrap();
+            if let Some(mask_cuda) = cache.sparse_mask_cuda.as_ref() {
+                if mask_cuda.len() == mask.len() {
+                    return Some(mask_cuda.clone());
+                }
+            }
+        }
+
+        let d_mask = alloc::<u8>(mask.len()).ok()?;
+        copy_h2d(&d_mask, mask).ok()?;
+        let d_mask = Arc::new(d_mask);
+        let mut cache = self.cache.write().unwrap();
+        cache.sparse_mask_cuda = Some(d_mask.clone());
+        Some(d_mask)
+    }
+
+    #[cfg(cuda)]
     fn forward_sparse_inference_cuda(&self, x: &[f32]) -> Option<Vec<f32>> {
         use crate::cuda::memory::{alloc, copy_d2h, copy_h2d};
 
@@ -455,8 +522,7 @@ impl AchfLayer {
         let d_weight = d_weight.as_f32()?;
         let d_x = alloc::<f32>(x.len()).ok()?;
         copy_h2d(&d_x, x).ok()?;
-        let d_mask = alloc::<u8>(mask.len()).ok()?;
-        copy_h2d(&d_mask, mask).ok()?;
+        let d_mask = self.sparse_mask_cuda(mask)?;
         let out_len = num_rows.checked_mul(out_dim)?;
         let d_y = alloc::<f32>(out_len).ok()?;
 
@@ -487,7 +553,7 @@ impl AchfLayer {
 
     #[cfg(cuda)]
     fn forward_sparse_tensor_cuda(&self, input: &Tensor) -> Option<Tensor> {
-        use crate::cuda::memory::{alloc, copy_h2d, CudaBuffer};
+        use crate::cuda::memory::{alloc, CudaBuffer};
 
         if !crate::cuda::is_available() || input.device != Device::Cuda || input.dtype != Dtype::F32
         {
@@ -508,8 +574,7 @@ impl AchfLayer {
         let d_input = d_input.as_f32()?;
         let d_weight = sparse.weight.cuda_get_or_upload_buffer().ok()?;
         let d_weight = d_weight.as_f32()?;
-        let d_mask = alloc::<u8>(mask.len()).ok()?;
-        copy_h2d(&d_mask, mask).ok()?;
+        let d_mask = self.sparse_mask_cuda(mask)?;
         let d_out = alloc::<f32>(num_rows.checked_mul(out_dim)?).ok()?;
 
         let kernel_ok = if let Some(bias) = &sparse.bias {
@@ -672,7 +737,6 @@ impl AchfLayer {
             self.metrics.cache_skips.fetch_add(1, Ordering::Relaxed);
             return self.zero_inference_output(x);
         }
-        self.maybe_project();
         let g = self.infer_gate_value() as f32;
 
         if self.config.cache_min_reuse > 0 {
@@ -712,6 +776,7 @@ impl AchfLayer {
         } else {
             (self.choose_inference_path(x), 0.0)
         };
+        let sample_latency = sample_latency || self.consume_forced_latency_sample();
         if decision_ns > 0.0 {
             self.record_decision_latency(decision_ns);
         }
@@ -1056,7 +1121,50 @@ impl AchfLayer {
             }
             ProjMode::Sinkhorn => self.project_sinkhorn(),
         }
+        // Rank-r truncation runs AFTER the manifold projection: the manifold
+        // step (rowcol/sinkhorn) fixes the scale/marginals of the operator, and
+        // truncating last guarantees the operator that actually reaches the
+        // pruning/caching stage satisfies the low-rank constraint. Running the
+        // truncation first would let the subsequent normalization re-inflate
+        // the rank. The truncation slightly perturbs the manifold property
+        // (e.g. doubly-stochastic marginals); this is the standard
+        // project-then-truncate compromise and is surfaced via
+        // `low_rank_rel_err` diagnostics.
+        self.apply_low_rank_truncation();
         self.clear_cache();
+    }
+
+    /// Effective truncation rank: `Some(r)` only when 0 < r < min(rows, cols).
+    /// `rank == 0` or `rank >= min(dims)` means "no low-rank constraint"
+    /// (backward compatible with configs predating real rank semantics).
+    fn effective_rank(&self) -> Option<usize> {
+        let rows = self.weight.in_features;
+        let cols = self.weight.out_features;
+        let rank = self.config.rank;
+        if rank == 0 || rows == 0 || cols == 0 || rank >= rows.min(cols) {
+            None
+        } else {
+            Some(rank)
+        }
+    }
+
+    fn apply_low_rank_truncation(&self) {
+        let Some(rank) = self.effective_rank() else {
+            let mut state = self.state.write().unwrap();
+            state.low_rank_rel_err = 0.0;
+            state.low_rank_applied_rank = 0;
+            return;
+        };
+        let rows = self.weight.in_features;
+        let cols = self.weight.out_features;
+        let mut w = self.weight.weight.data_to_f32_vec();
+        // Deterministic seed so projection is reproducible across runs.
+        let seed = 0xAC4F_5EEDu64 ^ (rows as u64) ^ ((cols as u64) << 20) ^ ((rank as u64) << 40);
+        let rel_err = low_rank_truncate(&mut w, rows, cols, rank, seed);
+        write_tensor_from_f32(&self.weight.weight, &w);
+        let mut state = self.state.write().unwrap();
+        state.low_rank_rel_err = rel_err;
+        state.low_rank_applied_rank = rank;
     }
 
     fn project_rowcol(&self) {
@@ -1218,24 +1326,53 @@ impl AchfLayer {
 
     /// Post-training magnitude pruning: create sparse_weight by zeroing
     /// elements below threshold. Idempotent (re-pruning overwrites).
+    ///
+    /// When `config.rank > 0`, the parameter count of a rank-r factorization,
+    /// `r * (rows + cols)`, acts as an nnz budget for the sparse path. The
+    /// budget is distributed per row (each row keeps at most
+    /// `floor(budget / rows)` of its largest-magnitude entries) and intersects
+    /// with the magnitude threshold — whichever is sparser wins. With
+    /// `rank == 0` (or a rank large enough that the budget exceeds the dense
+    /// size) this degenerates to pure threshold pruning, the historic behavior.
     #[allow(dead_code)]
     pub fn prune(&mut self, threshold: f64) {
+        let rows = self.weight.in_features;
+        let cols = self.weight.out_features;
         let w_data = self.weight.weight.data_to_f32_vec();
         let threshold_f32 = threshold as f32;
+        let mut keep: Vec<bool> = w_data.iter().map(|&v| v.abs() >= threshold_f32).collect();
+
+        if self.config.rank > 0 && rows > 0 && cols > 0 && w_data.len() == rows * cols {
+            let budget = self.config.rank.saturating_mul(rows + cols);
+            // rank >= 1 implies budget >= rows + cols > rows, so per_row >= 1.
+            let per_row = (budget / rows).min(cols);
+            if per_row < cols {
+                let mut row_indices: Vec<usize> = Vec::with_capacity(cols);
+                for r in 0..rows {
+                    let row = &w_data[r * cols..(r + 1) * cols];
+                    row_indices.clear();
+                    row_indices.extend((0..cols).filter(|&c| keep[r * cols + c]));
+                    if row_indices.len() > per_row {
+                        row_indices.sort_unstable_by(|&a, &b| {
+                            row[b]
+                                .abs()
+                                .partial_cmp(&row[a].abs())
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        for &c in &row_indices[per_row..] {
+                            keep[r * cols + c] = false;
+                        }
+                    }
+                }
+            }
+        }
+
         let pruned: Vec<f64> = w_data
             .iter()
-            .map(|&v| {
-                if v.abs() < threshold_f32 {
-                    0.0
-                } else {
-                    v as f64
-                }
-            })
+            .zip(keep.iter())
+            .map(|(&v, &k)| if k { v as f64 } else { 0.0 })
             .collect();
-        let mask: Vec<u8> = w_data
-            .iter()
-            .map(|&v| if v.abs() < threshold_f32 { 0 } else { 1 })
-            .collect();
+        let mask: Vec<u8> = keep.iter().map(|&k| if k { 1 } else { 0 }).collect();
         let pruned_weight = Tensor::with_dtype(
             pruned,
             vec![self.weight.in_features, self.weight.out_features],
@@ -1263,12 +1400,29 @@ impl AchfLayer {
         cache.ema_sparse_long_ns = 0.0;
         cache.decision_ema_ns = 0.0;
         cache.decision_ema_long_ns = 0.0;
+        cache.ama_cached_cold_ns = 0.0;
+        cache.ama_cached_warm_ns = 0.0;
+        cache.ama_sparse_cold_ns = 0.0;
+        cache.ama_sparse_warm_ns = 0.0;
+        cache.ama_cached_warm_count = 0;
+        cache.ama_sparse_warm_count = 0;
+        cache.ama_cached_stale = 0;
+        cache.ama_sparse_stale = 0;
+        cache.ama_prev_path = None;
+        cache.ama_dwell = 0;
+        cache.ama_switches = 0;
+        cache.ama_probes = 0;
+        cache.ama_force_latency_sample = false;
         cache.adaptive_bias = self.config.cache_cost_bias;
         cache.last_input_hash = None;
         cache.last_output = None;
         cache.last_input_count = 0;
         cache.sinkhorn_row_scales = None;
         cache.sinkhorn_col_scales = None;
+        #[cfg(cuda)]
+        {
+            cache.sparse_mask_cuda = None;
+        }
         self.metrics.memo_hash.store(0, Ordering::Relaxed);
         self.metrics.memo_count.store(0, Ordering::Relaxed);
         self.metrics.latency_samples.store(0, Ordering::Relaxed);
@@ -1382,60 +1536,286 @@ impl AchfLayer {
             return InferencePath::Dense;
         }
         self.ensure_cache();
-        let (use_cache, skip_cache, has_cache) = self.should_use_cache(x);
+        let decision = self.select_ama_path(x);
         self.metrics.calls.fetch_add(1, Ordering::Relaxed);
-        if use_cache {
-            self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
-            return InferencePath::Cached;
-        }
-        if has_cache {
-            if skip_cache {
-                self.metrics.cache_skips.fetch_add(1, Ordering::Relaxed);
-            } else {
-                self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
+        match decision.path {
+            InferencePath::Cached => {
+                self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            InferencePath::Sparse => {
+                if decision.has_cache && decision.cache_skipped {
+                    self.metrics.cache_skips.fetch_add(1, Ordering::Relaxed);
+                } else if decision.has_cache {
+                    self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
+                }
+                self.metrics.sparse_paths.fetch_add(1, Ordering::Relaxed);
+            }
+            InferencePath::Dense => {
+                if decision.has_cache && decision.cache_skipped {
+                    self.metrics.cache_skips.fetch_add(1, Ordering::Relaxed);
+                }
+                self.metrics.dense_paths.fetch_add(1, Ordering::Relaxed);
             }
         }
-        self.metrics.sparse_paths.fetch_add(1, Ordering::Relaxed);
-        InferencePath::Sparse
+        decision.path
     }
 
-    fn should_use_cache(&self, x: &[f32]) -> (bool, bool, bool) {
-        let cache = self.cache.read().unwrap();
-        if cache.dense.is_none() {
-            return (false, false, false);
-        }
+    fn select_ama_path(&self, x: &[f32]) -> AmaPathDecision {
+        let Ok(mut cache) = self.cache.try_write() else {
+            return AmaPathDecision {
+                path: InferencePath::Sparse,
+                has_cache: false,
+                cache_skipped: false,
+            };
+        };
+
+        let has_cache = cache.dense.is_some();
         let in_dim = cache.in_dim;
         let out_dim = cache.out_dim;
-        if in_dim == 0 || out_dim == 0 {
-            return (false, false, false);
-        }
-        if !x.len().is_multiple_of(in_dim) {
-            return (false, true, true);
-        }
-        let num_rows = x.len() / in_dim;
-        if self.config.cache_min_rows > 0 && num_rows < self.config.cache_min_rows {
-            return (false, true, true);
-        }
-        let nonzero_ratio = self.estimate_nonzero_ratio(x, in_dim, num_rows);
-        if self.config.cache_min_nonzero_ratio > 0.0
-            && nonzero_ratio < self.config.cache_min_nonzero_ratio
-        {
-            return (false, true, true);
-        }
-        // Latency-based decision: use whichever path is empirically faster
-        if cache.ema_cached_ns > 0.0 && cache.ema_sparse_ns > 0.0 {
-            let use_cache = cache.ema_cached_ns <= cache.ema_sparse_ns;
-            return (use_cache, false, true);
-        }
-        // Cold-start fallback: both paths have same FLOPs for dense-sparse;
-        // prefer cached when adaptive bias indicates it's empirically faster.
-        let bias = if self.config.cache_adapt_rate > 0.0 {
-            cache.adaptive_bias
+        let cache_shape_ok =
+            has_cache && in_dim > 0 && out_dim > 0 && x.len().is_multiple_of(in_dim);
+        let num_rows = if cache_shape_ok { x.len() / in_dim } else { 0 };
+        let min_rows_ok = self.config.cache_min_rows == 0 || num_rows >= self.config.cache_min_rows;
+        let nonzero_ratio = if cache_shape_ok && min_rows_ok {
+            self.estimate_nonzero_ratio(x, in_dim, num_rows)
         } else {
-            self.config.cache_cost_bias
+            1.0
         };
-        let use_cache = bias <= 1.0;
-        (use_cache, false, true)
+        let sparsity_ok = self.config.cache_min_nonzero_ratio <= 0.0
+            || nonzero_ratio >= self.config.cache_min_nonzero_ratio;
+        let cache_valid = cache_shape_ok && min_rows_ok && sparsity_ok;
+        let cache_skipped = has_cache && !cache_valid;
+
+        if !cache_valid {
+            let path = if self.has_valid_sparse_state() {
+                InferencePath::Sparse
+            } else {
+                InferencePath::Dense
+            };
+            Self::ama_commit_path(&mut cache, path, false, self.ama_warmup_samples());
+            return AmaPathDecision {
+                path,
+                has_cache,
+                cache_skipped,
+            };
+        }
+
+        let path = self.ama_select_guarded_path(&mut cache);
+        AmaPathDecision {
+            path,
+            has_cache,
+            cache_skipped,
+        }
+    }
+
+    fn ama_select_guarded_path(&self, cache: &mut AchfCache) -> InferencePath {
+        let warmup_samples = self.ama_warmup_samples();
+        let cached_warmness = Self::ama_warmness(cache.ama_cached_warm_count, warmup_samples);
+        let sparse_warmness = Self::ama_warmness(cache.ama_sparse_warm_count, warmup_samples);
+        let stale_limit = self.ama_stale_limit();
+
+        let cached_needs_probe = cache.ema_cached_ns <= 0.0
+            || cache.ama_cached_stale >= stale_limit
+            || cached_warmness < 1.0;
+        let sparse_needs_probe = cache.ema_sparse_ns <= 0.0
+            || cache.ama_sparse_stale >= stale_limit
+            || sparse_warmness < 1.0;
+
+        if cached_needs_probe || sparse_needs_probe {
+            let path = if cached_needs_probe && sparse_needs_probe {
+                if cache.ema_cached_ns <= 0.0 && cache.ema_sparse_ns > 0.0 {
+                    InferencePath::Cached
+                } else if cache.ema_sparse_ns <= 0.0 && cache.ema_cached_ns > 0.0 {
+                    InferencePath::Sparse
+                } else if cache.ama_cached_stale >= cache.ama_sparse_stale {
+                    InferencePath::Cached
+                } else {
+                    InferencePath::Sparse
+                }
+            } else if cached_needs_probe {
+                InferencePath::Cached
+            } else {
+                InferencePath::Sparse
+            };
+            Self::ama_commit_path(cache, path, true, warmup_samples);
+            return path;
+        }
+
+        let cached_score = self.ama_effective_latency(cache, InferencePath::Cached);
+        let sparse_score = self.ama_effective_latency(cache, InferencePath::Sparse);
+        let mut selected = if cached_score <= sparse_score {
+            InferencePath::Cached
+        } else {
+            InferencePath::Sparse
+        };
+
+        if let Some(prev) = cache.ama_prev_path {
+            if matches!(prev, InferencePath::Cached | InferencePath::Sparse) {
+                let prev_score = self.ama_effective_latency(cache, prev);
+                let selected_score = self.ama_effective_latency(cache, selected);
+                let margin = self.ama_switch_margin(cache, prev_score, selected_score);
+                if selected != prev
+                    && (cache.ama_dwell < self.ama_min_dwell()
+                        || selected_score + margin >= prev_score)
+                {
+                    selected = prev;
+                }
+            }
+        }
+
+        Self::ama_commit_path(cache, selected, false, warmup_samples);
+        selected
+    }
+
+    fn ama_commit_path(
+        cache: &mut AchfCache,
+        path: InferencePath,
+        is_probe: bool,
+        warmup_samples: u64,
+    ) {
+        match path {
+            InferencePath::Cached => {
+                cache.ama_cached_stale = 0;
+                cache.ama_sparse_stale = cache.ama_sparse_stale.saturating_add(1);
+            }
+            InferencePath::Sparse => {
+                cache.ama_sparse_stale = 0;
+                cache.ama_cached_stale = cache.ama_cached_stale.saturating_add(1);
+            }
+            InferencePath::Dense => {
+                cache.ama_cached_stale = cache.ama_cached_stale.saturating_add(1);
+                cache.ama_sparse_stale = cache.ama_sparse_stale.saturating_add(1);
+            }
+        }
+
+        if cache.ama_prev_path == Some(path) {
+            cache.ama_dwell = cache.ama_dwell.saturating_add(1);
+        } else {
+            if cache.ama_prev_path.is_some() {
+                cache.ama_switches = cache.ama_switches.saturating_add(1);
+            }
+            cache.ama_prev_path = Some(path);
+            cache.ama_dwell = 0;
+        }
+
+        if is_probe {
+            cache.ama_probes = cache.ama_probes.saturating_add(1);
+            cache.ama_force_latency_sample = true;
+        }
+
+        let warm_count = match path {
+            InferencePath::Cached => cache.ama_cached_warm_count,
+            InferencePath::Sparse => cache.ama_sparse_warm_count,
+            InferencePath::Dense => warmup_samples,
+        };
+        if warm_count < warmup_samples {
+            cache.ama_force_latency_sample = true;
+        }
+    }
+
+    fn ama_effective_latency(&self, cache: &AchfCache, path: InferencePath) -> f64 {
+        let blend = self.config.cache_adapt_blend.clamp(0.0, 1.0);
+        let (short, long, cold, warm, warm_count) = match path {
+            InferencePath::Cached => (
+                cache.ema_cached_ns,
+                cache.ema_cached_long_ns,
+                cache.ama_cached_cold_ns,
+                cache.ama_cached_warm_ns,
+                cache.ama_cached_warm_count,
+            ),
+            InferencePath::Sparse => (
+                cache.ema_sparse_ns,
+                cache.ema_sparse_long_ns,
+                cache.ama_sparse_cold_ns,
+                cache.ama_sparse_warm_ns,
+                cache.ama_sparse_warm_count,
+            ),
+            InferencePath::Dense => return f64::INFINITY,
+        };
+
+        let base = match (short > 0.0, long > 0.0) {
+            (true, true) => blend * long + (1.0 - blend) * short,
+            (true, false) => short,
+            (false, true) => long,
+            (false, false) => {
+                return match path {
+                    InferencePath::Cached => self.config.cache_cost_bias.max(0.0),
+                    InferencePath::Sparse => 1.0,
+                    InferencePath::Dense => f64::INFINITY,
+                };
+            }
+        };
+
+        let warmness = Self::ama_warmness(warm_count, self.ama_warmup_samples());
+        let cold_penalty = if cold > 0.0 && warm > 0.0 {
+            (1.0 - warmness) * (cold - warm).max(0.0)
+        } else {
+            (1.0 - warmness) * self.ama_selector_overhead(cache)
+        };
+        let mut score = base + cold_penalty + self.ama_selector_overhead(cache);
+        if path == InferencePath::Cached {
+            let bias = if self.config.cache_adapt_rate > 0.0 {
+                cache.adaptive_bias
+            } else {
+                self.config.cache_cost_bias
+            };
+            score *= bias.max(0.0);
+        }
+        score
+    }
+
+    fn ama_switch_margin(&self, cache: &AchfCache, prev_score: f64, next_score: f64) -> f64 {
+        let overhead = self.ama_selector_overhead(cache);
+        let scale = prev_score.max(next_score).max(1.0);
+        overhead.max(scale * 0.05)
+    }
+
+    fn ama_selector_overhead(&self, cache: &AchfCache) -> f64 {
+        if cache.decision_ema_ns > 0.0 {
+            cache.decision_ema_ns
+        } else {
+            0.0
+        }
+    }
+
+    fn ama_warmup_samples(&self) -> u64 {
+        self.config.cache_min_reuse.max(1) as u64
+    }
+
+    fn ama_min_dwell(&self) -> u64 {
+        self.config.cache_min_reuse.max(1) as u64
+    }
+
+    fn ama_stale_limit(&self) -> u64 {
+        let sample_every = self.config.cache_latency_sample_every.max(1);
+        (sample_every * 4).max(self.ama_warmup_samples() * 2).max(8)
+    }
+
+    fn ama_warmness(count: u64, warmup_samples: u64) -> f64 {
+        if warmup_samples == 0 {
+            1.0
+        } else {
+            (count as f64 / warmup_samples as f64).clamp(0.0, 1.0)
+        }
+    }
+
+    fn consume_forced_latency_sample(&self) -> bool {
+        let Ok(mut cache) = self.cache.try_write() else {
+            return false;
+        };
+        let forced = cache.ama_force_latency_sample;
+        cache.ama_force_latency_sample = false;
+        forced
+    }
+
+    #[allow(dead_code)]
+    fn should_use_cache(&self, x: &[f32]) -> (bool, bool, bool) {
+        let decision = self.select_ama_path(x);
+        (
+            decision.path == InferencePath::Cached,
+            decision.cache_skipped,
+            decision.has_cache,
+        )
     }
 
     fn estimate_nonzero_ratio(&self, x: &[f32], in_dim: usize, num_rows: usize) -> f64 {
@@ -1466,6 +1846,42 @@ impl AchfLayer {
         }
     }
 
+    fn update_ema(current: &mut f64, sample: f64, momentum: f64) {
+        if *current == 0.0 || momentum <= 0.0 {
+            *current = sample;
+        } else {
+            *current = momentum * *current + (1.0 - momentum) * sample;
+        }
+    }
+
+    fn record_ama_latency(
+        cache: &mut AchfCache,
+        path: InferencePath,
+        elapsed_ns: f64,
+        warmup_samples: u64,
+        ema: f64,
+    ) {
+        match path {
+            InferencePath::Cached => {
+                if cache.ama_cached_warm_count < warmup_samples {
+                    Self::update_ema(&mut cache.ama_cached_cold_ns, elapsed_ns, ema);
+                } else {
+                    Self::update_ema(&mut cache.ama_cached_warm_ns, elapsed_ns, ema);
+                }
+                cache.ama_cached_warm_count = cache.ama_cached_warm_count.saturating_add(1);
+            }
+            InferencePath::Sparse => {
+                if cache.ama_sparse_warm_count < warmup_samples {
+                    Self::update_ema(&mut cache.ama_sparse_cold_ns, elapsed_ns, ema);
+                } else {
+                    Self::update_ema(&mut cache.ama_sparse_warm_ns, elapsed_ns, ema);
+                }
+                cache.ama_sparse_warm_count = cache.ama_sparse_warm_count.saturating_add(1);
+            }
+            InferencePath::Dense => {}
+        }
+    }
+
     fn record_path_latency(&self, path: InferencePath, elapsed_ns: f64) {
         if elapsed_ns <= 0.0 {
             return;
@@ -1475,32 +1891,15 @@ impl AchfLayer {
         };
         let ema = self.config.cache_latency_ema;
         let ema_long = self.config.cache_latency_long_ema;
+        Self::record_ama_latency(&mut cache, path, elapsed_ns, self.ama_warmup_samples(), ema);
         match path {
             InferencePath::Cached => {
-                if cache.ema_cached_ns == 0.0 || ema <= 0.0 {
-                    cache.ema_cached_ns = elapsed_ns;
-                } else {
-                    cache.ema_cached_ns = ema * cache.ema_cached_ns + (1.0 - ema) * elapsed_ns;
-                }
-                if cache.ema_cached_long_ns == 0.0 || ema_long <= 0.0 {
-                    cache.ema_cached_long_ns = elapsed_ns;
-                } else {
-                    cache.ema_cached_long_ns =
-                        ema_long * cache.ema_cached_long_ns + (1.0 - ema_long) * elapsed_ns;
-                }
+                Self::update_ema(&mut cache.ema_cached_ns, elapsed_ns, ema);
+                Self::update_ema(&mut cache.ema_cached_long_ns, elapsed_ns, ema_long);
             }
             InferencePath::Sparse => {
-                if cache.ema_sparse_ns == 0.0 || ema <= 0.0 {
-                    cache.ema_sparse_ns = elapsed_ns;
-                } else {
-                    cache.ema_sparse_ns = ema * cache.ema_sparse_ns + (1.0 - ema) * elapsed_ns;
-                }
-                if cache.ema_sparse_long_ns == 0.0 || ema_long <= 0.0 {
-                    cache.ema_sparse_long_ns = elapsed_ns;
-                } else {
-                    cache.ema_sparse_long_ns =
-                        ema_long * cache.ema_sparse_long_ns + (1.0 - ema_long) * elapsed_ns;
-                }
+                Self::update_ema(&mut cache.ema_sparse_ns, elapsed_ns, ema);
+                Self::update_ema(&mut cache.ema_sparse_long_ns, elapsed_ns, ema_long);
             }
             InferencePath::Dense => {}
         }
@@ -1565,11 +1964,163 @@ impl AchfLayer {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InferencePath {
     Cached,
     Sparse,
     Dense,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AmaPathDecision {
+    path: InferencePath,
+    has_cache: bool,
+    cache_skipped: bool,
+}
+
+/// Truncated rank-r approximation of a row-major `rows x cols` matrix via
+/// randomized subspace (power) iteration — a dependency-free truncated SVD.
+///
+/// Writes the rank-r approximation back into `w` and returns the relative
+/// Frobenius error `||W - W_r||_F / ||W||_F`. When `rank == 0` or
+/// `rank >= min(rows, cols)` the matrix is left untouched and 0.0 is returned.
+///
+/// Algorithm: sample a Gaussian test matrix `Omega (cols x r)`, form
+/// `Y = W * Omega`, orthonormalize, then run a few power iterations
+/// (`Z = W^T Y`, `Y = W Z`, re-orthonormalizing each time) so the columns of
+/// `Y` converge to the dominant r-dimensional left-singular subspace.
+/// The approximation is `W_r = Y (Y^T W)`. Three iterations are ample for the
+/// small operators used here (Halko, Martinsson & Tropp, 2011).
+pub(crate) fn low_rank_truncate(
+    w: &mut [f32],
+    rows: usize,
+    cols: usize,
+    rank: usize,
+    seed: u64,
+) -> f64 {
+    if rank == 0 || rows == 0 || cols == 0 || rank >= rows.min(cols) || w.len() != rows * cols {
+        return 0.0;
+    }
+    const POWER_ITERATIONS: usize = 3;
+    let r = rank;
+    let wf: Vec<f64> = w.iter().map(|&v| v as f64).collect();
+
+    // Gaussian test matrix Omega: cols x r (row-major).
+    let mut rng = crate::rng::Rng::from_seed(seed);
+    let mut omega = vec![0.0f64; cols * r];
+    for v in omega.iter_mut() {
+        *v = rng.next_f64_normal();
+    }
+
+    // Y = W * Omega -> rows x r.
+    let mut y = vec![0.0f64; rows * r];
+    matmul_rowmajor(&wf, &omega, &mut y, rows, cols, r);
+    orthonormalize_columns(&mut y, rows, r);
+
+    // Subspace (power) iteration: Z = W^T Y, Y = W Z.
+    let mut z = vec![0.0f64; cols * r];
+    for _ in 0..POWER_ITERATIONS {
+        matmul_transposed_lhs(&wf, &y, &mut z, rows, cols, r);
+        orthonormalize_columns(&mut z, cols, r);
+        matmul_rowmajor(&wf, &z, &mut y, rows, cols, r);
+        orthonormalize_columns(&mut y, rows, r);
+    }
+
+    // B = Y^T W -> r x cols, then W_r = Y * B.
+    let mut b = vec![0.0f64; r * cols];
+    for j in 0..r {
+        for c in 0..cols {
+            let mut sum = 0.0;
+            for i in 0..rows {
+                sum += y[i * r + j] * wf[i * cols + c];
+            }
+            b[j * cols + c] = sum;
+        }
+    }
+    let mut w_r = vec![0.0f64; rows * cols];
+    matmul_rowmajor(&y, &b, &mut w_r, rows, r, cols);
+
+    let mut err_sq = 0.0f64;
+    let mut norm_sq = 0.0f64;
+    for (orig, approx) in wf.iter().zip(w_r.iter()) {
+        let d = orig - approx;
+        err_sq += d * d;
+        norm_sq += orig * orig;
+    }
+    for (dst, &src) in w.iter_mut().zip(w_r.iter()) {
+        *dst = src as f32;
+    }
+    if norm_sq > 0.0 {
+        (err_sq / norm_sq).sqrt()
+    } else {
+        0.0
+    }
+}
+
+/// C = A * B with row-major A (m x k), B (k x n), C (m x n).
+fn matmul_rowmajor(a: &[f64], b: &[f64], c: &mut [f64], m: usize, k: usize, n: usize) {
+    c.fill(0.0);
+    for i in 0..m {
+        for p in 0..k {
+            let av = a[i * k + p];
+            if av == 0.0 {
+                continue;
+            }
+            let b_row = &b[p * n..(p + 1) * n];
+            let c_row = &mut c[i * n..(i + 1) * n];
+            for (cv, &bv) in c_row.iter_mut().zip(b_row.iter()) {
+                *cv += av * bv;
+            }
+        }
+    }
+}
+
+/// C = A^T * B with row-major A (m x k), B (m x n), C (k x n).
+fn matmul_transposed_lhs(a: &[f64], b: &[f64], c: &mut [f64], m: usize, k: usize, n: usize) {
+    c.fill(0.0);
+    for i in 0..m {
+        let a_row = &a[i * k..(i + 1) * k];
+        let b_row = &b[i * n..(i + 1) * n];
+        for (p, &av) in a_row.iter().enumerate() {
+            if av == 0.0 {
+                continue;
+            }
+            let c_row = &mut c[p * n..(p + 1) * n];
+            for (cv, &bv) in c_row.iter_mut().zip(b_row.iter()) {
+                *cv += av * bv;
+            }
+        }
+    }
+}
+
+/// Modified Gram-Schmidt over the columns of a row-major `rows x cols` matrix.
+fn orthonormalize_columns(m: &mut [f64], rows: usize, cols: usize) {
+    for j in 0..cols {
+        for k in 0..j {
+            let mut dot = 0.0;
+            for i in 0..rows {
+                dot += m[i * cols + j] * m[i * cols + k];
+            }
+            for i in 0..rows {
+                m[i * cols + j] -= dot * m[i * cols + k];
+            }
+        }
+        let mut norm_sq = 0.0;
+        for i in 0..rows {
+            let v = m[i * cols + j];
+            norm_sq += v * v;
+        }
+        let norm = norm_sq.sqrt();
+        if norm > 1e-12 {
+            for i in 0..rows {
+                m[i * cols + j] /= norm;
+            }
+        } else {
+            for i in 0..rows {
+                m[i * cols + j] = 0.0;
+            }
+        }
+    }
 }
 
 fn rowcol_project(w: &mut [f32], rows: usize, cols: usize) {
@@ -1993,6 +2544,27 @@ mod tests {
     }
 
     #[test]
+    fn achf_inference_does_not_advance_projection() {
+        let cfg = AchfConfig {
+            enabled: true,
+            proj_freq: 1,
+            proj_mode: "rowcol".to_string(),
+            ..Default::default()
+        };
+        let layer = AchfLayer::new_square(4, cfg, 13);
+        let x_data = vec![0.1, -0.2, 0.3, -0.4];
+        let step_before = layer.state.read().unwrap().step;
+        let w_before = layer.weight.weight.data_f32().clone();
+
+        let _ = layer.forward_inference_residual(&x_data);
+
+        let step_after = layer.state.read().unwrap().step;
+        let w_after = layer.weight.weight.data_f32().clone();
+        assert_eq!(step_before, step_after);
+        assert_eq!(w_before, w_after);
+    }
+
+    #[test]
     fn achf_adaptive_g_min_tracks_gate_floor() {
         let cfg = AchfConfig {
             enabled: true,
@@ -2292,6 +2864,88 @@ mod tests {
     }
 
     #[test]
+    fn achf_ama_records_cold_then_warm_latency() {
+        let cfg = AchfConfig {
+            enabled: true,
+            cache_min_reuse: 1,
+            cache_latency_ema: 0.0,
+            ..Default::default()
+        };
+        let mut layer = AchfLayer::new_square(4, cfg, 72);
+        layer.prune(0.01);
+        layer.freeze_for_inference();
+
+        layer.record_path_latency(InferencePath::Cached, 120.0);
+        layer.record_path_latency(InferencePath::Cached, 40.0);
+
+        let cache = layer.cache.read().unwrap();
+        assert_eq!(cache.ama_cached_warm_count, 2);
+        assert_eq!(cache.ama_cached_cold_ns, 120.0);
+        assert_eq!(cache.ama_cached_warm_ns, 40.0);
+    }
+
+    #[test]
+    fn achf_ama_stale_path_probe_forces_latency_sample() {
+        let cfg = AchfConfig {
+            enabled: true,
+            cache_min_reuse: 1,
+            cache_latency_sample_every: 16,
+            ..Default::default()
+        };
+        let mut layer = AchfLayer::new_square(4, cfg, 73);
+        layer.prune(0.01);
+        layer.freeze_for_inference();
+        let x_data = vec![0.1, -0.2, 0.3, 0.4];
+        {
+            let mut cache = layer.cache.write().unwrap();
+            cache.ema_cached_ns = 100.0;
+            cache.ema_sparse_ns = 100.0;
+            cache.ama_cached_warm_count = 1;
+            cache.ama_sparse_warm_count = 1;
+            cache.ama_prev_path = Some(InferencePath::Cached);
+            cache.ama_dwell = 16;
+            cache.ama_sparse_stale = layer.ama_stale_limit();
+        }
+
+        let decision = layer.select_ama_path(&x_data);
+
+        assert_eq!(decision.path, InferencePath::Sparse);
+        let cache = layer.cache.read().unwrap();
+        assert_eq!(cache.ama_sparse_stale, 0);
+        assert_eq!(cache.ama_probes, 1);
+        assert!(cache.ama_force_latency_sample);
+    }
+
+    #[test]
+    fn achf_ama_hysteresis_keeps_previous_path_inside_margin() {
+        let cfg = AchfConfig {
+            enabled: true,
+            cache_min_reuse: 1,
+            cache_cost_bias: 1.0,
+            ..Default::default()
+        };
+        let mut layer = AchfLayer::new_square(4, cfg, 74);
+        layer.prune(0.01);
+        layer.freeze_for_inference();
+        let x_data = vec![0.1, -0.2, 0.3, 0.4];
+        {
+            let mut cache = layer.cache.write().unwrap();
+            cache.ema_cached_ns = 100.0;
+            cache.ema_sparse_ns = 98.0;
+            cache.ama_cached_warm_count = 1;
+            cache.ama_sparse_warm_count = 1;
+            cache.ama_prev_path = Some(InferencePath::Cached);
+            cache.ama_dwell = 16;
+        }
+
+        let decision = layer.select_ama_path(&x_data);
+
+        assert_eq!(decision.path, InferencePath::Cached);
+        let cache = layer.cache.read().unwrap();
+        assert_eq!(cache.ama_switches, 0);
+    }
+
+    #[test]
     fn achf_memoized_output_applies_current_gate() {
         let cfg = AchfConfig {
             enabled: true,
@@ -2477,6 +3131,159 @@ mod tests {
         };
         let agg = aggregate_cache_stats_iter([s1, s2]);
         assert!((agg.adaptive_bias - 3.0).abs() < 1e-12);
+    }
+
+    fn rel_err_for_rank(w0: &[f32], rows: usize, cols: usize, rank: usize) -> f64 {
+        let mut w = w0.to_vec();
+        low_rank_truncate(&mut w, rows, cols, rank, 42)
+    }
+
+    #[test]
+    fn low_rank_truncate_error_decreases_with_rank() {
+        let rows = 16;
+        let cols = 12;
+        let w0: Vec<f32> = Tensor::rand(vec![rows * cols], -1.0, 1.0, 99).data_to_f32_vec();
+        let err2 = rel_err_for_rank(&w0, rows, cols, 2);
+        let err4 = rel_err_for_rank(&w0, rows, cols, 4);
+        let err8 = rel_err_for_rank(&w0, rows, cols, 8);
+        assert!(err2 > 0.0 && err4 > 0.0 && err8 > 0.0);
+        assert!(
+            err2 >= err4 && err4 >= err8,
+            "error must be monotonically non-increasing in rank: {err2} {err4} {err8}"
+        );
+    }
+
+    #[test]
+    fn low_rank_truncate_full_rank_is_identity() {
+        let rows = 6;
+        let cols = 4;
+        let w0: Vec<f32> = Tensor::rand(vec![rows * cols], -1.0, 1.0, 7).data_to_f32_vec();
+        for rank in [0, cols, cols + 3] {
+            let mut w = w0.clone();
+            let err = low_rank_truncate(&mut w, rows, cols, rank, 42);
+            assert_eq!(err, 0.0);
+            assert_eq!(w, w0, "rank={rank} must leave the weight unchanged");
+        }
+    }
+
+    #[test]
+    fn low_rank_truncate_recovers_exact_low_rank_matrix() {
+        // Build a true rank-2 matrix from two outer products.
+        let rows = 10;
+        let cols = 8;
+        let u1: Vec<f64> = (0..rows).map(|i| (i as f64 * 0.37).sin() + 0.5).collect();
+        let v1: Vec<f64> = (0..cols).map(|j| (j as f64 * 0.71).cos() - 0.2).collect();
+        let u2: Vec<f64> = (0..rows).map(|i| (i as f64 * 0.13).cos() - 0.4).collect();
+        let v2: Vec<f64> = (0..cols).map(|j| (j as f64 * 0.29).sin() + 0.3).collect();
+        let mut w = vec![0.0f32; rows * cols];
+        for i in 0..rows {
+            for j in 0..cols {
+                w[i * cols + j] = (u1[i] * v1[j] + u2[i] * v2[j]) as f32;
+            }
+        }
+        let err = low_rank_truncate(&mut w, rows, cols, 2, 42);
+        assert!(
+            err < 1e-4,
+            "rank-2 truncation of a rank-2 matrix: err={err}"
+        );
+    }
+
+    #[test]
+    fn achf_project_weight_applies_rank_truncation_and_snapshot() {
+        let cfg = AchfConfig {
+            enabled: true,
+            proj_mode: "none".to_string(),
+            proj_freq: 0,
+            rank: 2,
+            prune_threshold: 0.0,
+            ..Default::default()
+        };
+        let mut layer = AchfLayer::new(8, 8, false, cfg, 77);
+        let w_before = layer.weight.weight.data_f32().clone();
+        layer.freeze_for_inference();
+        let w_after = layer.weight.weight.data_f32().clone();
+        assert_ne!(
+            w_before, w_after,
+            "rank-2 truncation must change an 8x8 random weight"
+        );
+
+        let snapshot = layer.snapshot_state();
+        assert_eq!(snapshot.low_rank_applied_rank, 2);
+        assert!(snapshot.low_rank_rel_err > 0.0);
+    }
+
+    #[test]
+    fn achf_rank_zero_skips_truncation() {
+        let cfg = AchfConfig {
+            enabled: true,
+            proj_mode: "none".to_string(),
+            proj_freq: 0,
+            rank: 0,
+            prune_threshold: 0.0,
+            ..Default::default()
+        };
+        let mut layer = AchfLayer::new(8, 8, false, cfg, 78);
+        let w_before = layer.weight.weight.data_f32().clone();
+        layer.freeze_for_inference();
+        let w_after = layer.weight.weight.data_f32().clone();
+        assert_eq!(w_before, w_after);
+        let snapshot = layer.snapshot_state();
+        assert_eq!(snapshot.low_rank_applied_rank, 0);
+        assert_eq!(snapshot.low_rank_rel_err, 0.0);
+    }
+
+    #[test]
+    fn achf_prune_respects_rank_budget() {
+        let rows = 8;
+        let cols = 8;
+        let cfg = AchfConfig {
+            enabled: true,
+            rank: 1,
+            ..Default::default()
+        };
+        let mut layer = AchfLayer::new(rows, cols, false, cfg, 200);
+        // Threshold 0.0 alone would keep everything; the rank budget must cap nnz.
+        layer.prune(0.0);
+        let mask = layer.sparse_mask.as_ref().unwrap();
+        let nnz: usize = mask.iter().map(|&m| m as usize).sum();
+        let budget = rows + cols; // rank = 1
+        assert!(nnz <= budget, "nnz={nnz} exceeds budget={budget}");
+        // Sparse weight must agree with the mask.
+        let sparse = layer.sparse_weight.as_ref().unwrap().weight.data_f32();
+        for (v, &m) in sparse.iter().zip(mask.iter()) {
+            if m == 0 {
+                assert_eq!(*v, 0.0);
+            }
+        }
+        // Each row keeps its largest-magnitude entries.
+        let dense = layer.weight.weight.data_f32();
+        for r in 0..rows {
+            let kept_min = (0..cols)
+                .filter(|&c| mask[r * cols + c] == 1)
+                .map(|c| dense[r * cols + c].abs())
+                .fold(f32::INFINITY, f32::min);
+            let dropped_max = (0..cols)
+                .filter(|&c| mask[r * cols + c] == 0)
+                .map(|c| dense[r * cols + c].abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                kept_min >= dropped_max,
+                "row {r}: kept_min={kept_min} < dropped_max={dropped_max}"
+            );
+        }
+    }
+
+    #[test]
+    fn achf_prune_rank_zero_keeps_pure_threshold_behavior() {
+        let cfg = AchfConfig {
+            enabled: true,
+            rank: 0,
+            ..Default::default()
+        };
+        let mut layer = AchfLayer::new_square(4, cfg, 201);
+        layer.prune(0.0);
+        let mask = layer.sparse_mask.as_ref().unwrap();
+        assert!(mask.iter().all(|&m| m == 1));
     }
 
     #[test]

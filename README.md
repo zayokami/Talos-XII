@@ -104,10 +104,13 @@ cargo check --features cuda
 cargo run --features cuda -- simulate -n 1000 -p 100
 ```
 
-Set the NVCC target architecture via `CUDA_ARCH` (default `sm_75`):
+Set the NVCC target architecture via `CUDA_ARCH`. By default, the build emits
+`sm_75` SASS plus `compute_75` PTX for forward-compatible JIT. For Ada GPUs
+such as RTX 4060, prefer `sm_89`:
 
 ```bash
 CUDA_ARCH=sm_86 cargo check --features cuda
+CUDA_ARCH=sm_89 cargo build --release --features cuda
 ```
 
 Control device selection in `data/config.json` via the `device` field:
@@ -460,10 +463,13 @@ cargo check --features cuda
 cargo run --features cuda -- simulate -n 1000 -p 100
 ```
 
-通过 `CUDA_ARCH` 环境变量指定 NVCC 架构（默认 `sm_75`）：
+通过 `CUDA_ARCH` 环境变量指定 NVCC 架构。默认会生成 `sm_75` SASS 和
+`compute_75` PTX，方便驱动做向前兼容 JIT。RTX 4060 这类 Ada 显卡建议指定
+`sm_89`：
 
 ```bash
 CUDA_ARCH=sm_86 cargo check --features cuda
+CUDA_ARCH=sm_89 cargo build --release --features cuda
 ```
 
 在 `data/config.json` 中通过 `device` 字段控制设备：

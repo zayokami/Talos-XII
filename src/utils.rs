@@ -166,27 +166,32 @@ pub fn apply_luck_budget(requested_modifier: f64, budget: &mut f64, config: &Con
     actual
 }
 
+#[derive(Clone, Copy)]
+struct RewardCoefficients {
+    up_reward: f64,
+    non_up_reward: f64,
+    streak_penalty: f64,
+}
+
 fn compute_reward_breakdown(
     is_six: bool,
     is_up: bool,
     loss_streak: usize,
     luck_modifier: f64,
     luck_action_cost: f64,
-    up_reward: f64,
-    non_up_reward: f64,
-    streak_penalty: f64,
+    coeffs: RewardCoefficients,
 ) -> RewardBreakdown {
     let hit = if is_six {
         if is_up {
-            up_reward
+            coeffs.up_reward
         } else {
-            non_up_reward
+            coeffs.non_up_reward
         }
     } else {
         0.0
     };
     let streak = if is_six && !is_up && loss_streak >= STREAK_PENALTY_THRESHOLD {
-        -(loss_streak as f64) * streak_penalty
+        -(loss_streak as f64) * coeffs.streak_penalty
     } else {
         0.0
     };
@@ -213,9 +218,11 @@ pub fn compute_reward_dqn_breakdown(
         loss_streak,
         luck_modifier,
         luck_action_cost,
-        REWARD_SIX_UP_DQN,
-        REWARD_SIX_NON_UP_DQN,
-        STREAK_PENALTY_DQN,
+        RewardCoefficients {
+            up_reward: REWARD_SIX_UP_DQN,
+            non_up_reward: REWARD_SIX_NON_UP_DQN,
+            streak_penalty: STREAK_PENALTY_DQN,
+        },
     )
 }
 
@@ -242,9 +249,11 @@ pub fn compute_reward_neural_breakdown(
         loss_streak,
         0.0,
         0.0,
-        REWARD_SIX_UP_NEURAL,
-        REWARD_SIX_NON_UP_NEURAL,
-        STREAK_PENALTY_NEURAL,
+        RewardCoefficients {
+            up_reward: REWARD_SIX_UP_NEURAL,
+            non_up_reward: REWARD_SIX_NON_UP_NEURAL,
+            streak_penalty: STREAK_PENALTY_NEURAL,
+        },
     )
 }
 
@@ -266,9 +275,11 @@ pub fn compute_reward_ppo_breakdown(
         loss_streak,
         luck_modifier,
         luck_action_cost,
-        REWARD_SIX_UP_PPO,
-        REWARD_SIX_NON_UP_PPO,
-        STREAK_PENALTY_PPO,
+        RewardCoefficients {
+            up_reward: REWARD_SIX_UP_PPO,
+            non_up_reward: REWARD_SIX_NON_UP_PPO,
+            streak_penalty: STREAK_PENALTY_PPO,
+        },
     )
 }
 

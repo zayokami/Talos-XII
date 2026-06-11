@@ -43,27 +43,6 @@ thread_local! {
         RefCell::new(CachedStepScratch::default());
 }
 
-/// Pre-allocated scalar tensors for training loop to avoid per-sample heap allocations.
-struct TrainingScratch {
-    old_log_prob: Tensor,
-    advantage: Tensor,
-    return_val: Tensor,
-}
-
-impl Default for TrainingScratch {
-    fn default() -> Self {
-        TrainingScratch {
-            old_log_prob: Tensor::zeros_f32(vec![1]),
-            advantage: Tensor::zeros_f32(vec![1]),
-            return_val: Tensor::zeros_f32(vec![1]),
-        }
-    }
-}
-
-thread_local! {
-    static TRAINING_SCRATCH: RefCell<TrainingScratch> = RefCell::new(TrainingScratch::default());
-}
-
 // Softmax + categorical sample over fixed ACTION_SPACE logits.
 // Returns (action_index, log_prob_of_action).
 // If top_k > 0, only the top_k logits are kept (others set to -inf).
@@ -288,6 +267,16 @@ impl ActorCritic {
         self.backbone.achf_orthogonal_penalty()
     }
 
+    pub fn achf_config(&self) -> Option<AchfConfig> {
+        self.backbone.blocks.iter().find_map(|block| {
+            block
+                .achf_ffn
+                .as_ref()
+                .or(block.mla_layer.achf_wo.as_ref())
+                .map(|achf| achf.config.clone())
+        })
+    }
+
     // Returns (action_idx, log_prob, value)
     pub fn step(&self, state: &Tensor, pity: &[usize], top_k: usize) -> (usize, f64, f64) {
         let (logits, value) = self.forward_actor_critic(state, pity);
@@ -327,6 +316,28 @@ impl ActorCritic {
             let (action_idx, log_prob) = softmax_sample(logits, top_k);
             (action_idx, log_prob, value[0])
         })
+    }
+
+    fn step_sequence_with_value(
+        &self,
+        state: &[f64],
+        seq_len: usize,
+        top_k: usize,
+    ) -> (usize, f32, f32) {
+        if state.len() != seq_len.saturating_mul(DIM) || seq_len == 0 {
+            let fallback_prob = 1.0 / ACTION_SPACE as f32;
+            return (0, fallback_prob.ln(), 0.0);
+        }
+        let state_tensor = Tensor::new_f32(state.to_vec(), vec![1, seq_len, DIM]);
+        let (logits, value) = self.forward_actor_critic_batch(&state_tensor);
+        let logits_data = logits.data_to_f32_vec();
+        let value_data = value.data_to_f32_vec();
+        let (action_idx, log_prob) = softmax_sample(&logits_data, top_k);
+        (
+            action_idx,
+            log_prob,
+            value_data.first().copied().unwrap_or(0.0),
+        )
     }
 
     pub fn step_inference_cached(
@@ -799,12 +810,33 @@ pub struct Ppo {
     distill_kl_coef: f64,
     distill_warmup_steps: usize,
     distill_update_counter: usize,
+    optimizer_step_counter: usize,
+    achf_orthogonal_penalty_interval: usize,
 }
 
 impl Ppo {
+    fn achf_orthogonal_penalty_interval_from_config(config: &AchfConfig) -> usize {
+        if config.enabled && config.apply_ffn && config.lambda_ortho > 0.0 {
+            config.proj_freq.max(1)
+        } else {
+            usize::MAX
+        }
+    }
+
+    fn achf_orthogonal_penalty_interval_for_policy(policy: &ActorCritic) -> usize {
+        policy
+            .achf_config()
+            .as_ref()
+            .map(Self::achf_orthogonal_penalty_interval_from_config)
+            .unwrap_or(usize::MAX)
+    }
+
     pub fn new(seed: u64, k_epochs: usize, batch_size: usize, config: &Config) -> Self {
         let policy = ActorCritic::new_with_config(config, seed);
-        Self::from_policy(policy, k_epochs, batch_size)
+        let mut ppo = Self::from_policy(policy, k_epochs, batch_size);
+        ppo.achf_orthogonal_penalty_interval =
+            Self::achf_orthogonal_penalty_interval_from_config(&config.achf);
+        ppo
     }
 
     pub fn from_policy(policy: ActorCritic, k_epochs: usize, batch_size: usize) -> Self {
@@ -822,6 +854,8 @@ impl Ppo {
         #[cfg(not(cuda))]
         let optimizer = Optimizer::Cpu(Adam::new(params, 0.0003));
         let safe_batch_size = batch_size.max(1);
+        let achf_orthogonal_penalty_interval =
+            Self::achf_orthogonal_penalty_interval_for_policy(&policy);
         Ppo {
             policy,
             ema_policy: None,
@@ -843,6 +877,8 @@ impl Ppo {
             distill_kl_coef: 0.0,
             distill_warmup_steps: 500,
             distill_update_counter: 0,
+            optimizer_step_counter: 0,
+            achf_orthogonal_penalty_interval,
         }
     }
 
@@ -928,6 +964,13 @@ impl Ppo {
     }
 
     pub fn update(&mut self, current_lr: f64) -> f64 {
+        self.update_with_progress(current_lr, |_, _, _, _| {})
+    }
+
+    fn update_with_progress<F>(&mut self, current_lr: f64, mut on_batch: F) -> f64
+    where
+        F: FnMut(usize, usize, usize, usize),
+    {
         if self.memory.states_raw.is_empty() {
             return 0.0;
         }
@@ -988,59 +1031,6 @@ impl Ppo {
         // Target KL Divergence for Early Stopping
         let target_kl = 0.015;
         let mut indices: Vec<usize> = (0..len).collect();
-        let value_coef_tensor = Tensor::new_f32(vec![VALUE_COEF], vec![1]);
-        let entropy_coef_tensor = Tensor::new_f32(vec![ENTROPY_COEF], vec![1]);
-        let clip_low_tensor = Tensor::new_f32(vec![1.0 - CLIP_EPSILON], vec![1]);
-        let clip_high_tensor = Tensor::new_f32(vec![1.0 + CLIP_EPSILON], vec![1]);
-        let one_tensor = Tensor::new_f32(vec![1.0], vec![1]);
-        let approx_kl_zero_tensor = Tensor::zeros_f32(vec![1]);
-        #[cfg(cuda)]
-        let value_coef_tensor = match value_coef_tensor.to_cuda() {
-            Ok(t) => t,
-            Err(_) => value_coef_tensor,
-        };
-        #[cfg(cuda)]
-        let entropy_coef_tensor = match entropy_coef_tensor.to_cuda() {
-            Ok(t) => t,
-            Err(_) => entropy_coef_tensor,
-        };
-        #[cfg(cuda)]
-        let clip_low_tensor = match clip_low_tensor.to_cuda() {
-            Ok(t) => t,
-            Err(_) => clip_low_tensor,
-        };
-        #[cfg(cuda)]
-        let clip_high_tensor = match clip_high_tensor.to_cuda() {
-            Ok(t) => t,
-            Err(_) => clip_high_tensor,
-        };
-        #[cfg(cuda)]
-        let one_tensor = match one_tensor.to_cuda() {
-            Ok(t) => t,
-            Err(_) => one_tensor,
-        };
-        #[cfg(cuda)]
-        let approx_kl_zero_tensor = match approx_kl_zero_tensor.to_cuda() {
-            Ok(t) => t,
-            Err(_) => approx_kl_zero_tensor,
-        };
-
-        #[cfg(cuda)]
-        {
-            TRAINING_SCRATCH.with(|s| {
-                let mut scratch = s.borrow_mut();
-                if let Ok(t) = scratch.old_log_prob.to_cuda() {
-                    scratch.old_log_prob = t;
-                }
-                if let Ok(t) = scratch.advantage.to_cuda() {
-                    scratch.advantage = t;
-                }
-                if let Ok(t) = scratch.return_val.to_cuda() {
-                    scratch.return_val = t;
-                }
-            });
-        }
-
         let loss_sum_tensor = Tensor::zeros_f32(vec![1]);
         #[cfg(cuda)]
         let mut loss_sum_tensor = match loss_sum_tensor.to_cuda() {
@@ -1050,7 +1040,10 @@ impl Ppo {
         #[cfg(not(cuda))]
         let mut loss_sum_tensor = loss_sum_tensor;
         let mut loss_count = 0usize;
-        for _ in 0..self.k_epochs {
+        let planned_batches_per_epoch = len.div_ceil(self.batch_size);
+        let planned_batches = self.k_epochs * planned_batches_per_epoch;
+        let mut completed_batches = 0usize;
+        for epoch_idx in 0..self.k_epochs {
             indices.shuffle(&mut rand::rng());
             let mut early_stop = false;
 
@@ -1090,11 +1083,14 @@ impl Ppo {
                 let batch_entropy =
                     -(batch_probs.clone() * batch_log_probs_copy).matmul(&ones_action_1);
 
-                // Batched teacher forward (if distilling)
-                let teacher_batch_logits = if self.distill_kl_coef > 0.0 {
+                // Batched teacher forward only after warmup; detach teacher logits so KL trains
+                // the student policy without backpropagating into the EMA teacher.
+                let distillation_active = self.distill_kl_coef > 0.0
+                    && self.distill_update_counter >= self.distill_warmup_steps;
+                let teacher_batch_logits = if distillation_active {
                     if let Some(ema) = self.ema_policy.as_ref() {
                         let (t_logits, _) = ema.forward_actor_critic_batch(&batch_states);
-                        Some(t_logits)
+                        Some(t_logits.detach())
                     } else {
                         None
                     }
@@ -1102,76 +1098,105 @@ impl Ppo {
                     None
                 };
 
-                let mut loss_accum = Tensor::zeros_f32(vec![1]);
                 let mut distill_accum = Tensor::zeros_f32(vec![1]);
-                let mut approx_kl_accum = approx_kl_zero_tensor.clone();
                 #[cfg(cuda)]
                 {
-                    loss_accum = match loss_accum.to_cuda() {
-                        Ok(t) => t,
-                        Err(_) => loss_accum,
-                    };
                     distill_accum = match distill_accum.to_cuda() {
                         Ok(t) => t,
                         Err(_) => distill_accum,
                     };
-                    approx_kl_accum = match approx_kl_accum.to_cuda() {
-                        Ok(t) => t,
-                        Err(_) => approx_kl_accum,
-                    };
                 }
 
-                for (chunk_idx, &i) in chunk.iter().enumerate() {
-                    let action_idx = actions[i];
-                    let old_log_prob = log_probs[i];
-                    let advantage = norm_advantages[i];
-                    let return_val = returns[i];
-
-                    let log_prob =
-                        batch_log_probs.index_select(chunk_idx * ACTION_SPACE + action_idx);
-                    let value = batch_values.index_select(chunk_idx);
-                    let entropy = batch_entropy.index_select(chunk_idx);
-
-                    // Use scratch tensors to avoid per-sample heap allocations
-                    let old_log_prob_tensor = TRAINING_SCRATCH.with(|s| {
-                        let mut scratch = s.borrow_mut();
-                        scratch.old_log_prob.fill_(old_log_prob);
-                        scratch.old_log_prob.clone()
-                    });
-                    let log_ratio = log_prob - old_log_prob_tensor;
-                    let ratio = log_ratio.exp();
-                    let approx_kl_term = (ratio.clone() - one_tensor.clone()) - log_ratio.clone();
-                    approx_kl_accum = approx_kl_accum.detach() + approx_kl_term.detach();
-
-                    let adv_tensor = TRAINING_SCRATCH.with(|s| {
-                        let mut scratch = s.borrow_mut();
-                        scratch.advantage.fill_(advantage);
-                        scratch.advantage.clone()
-                    });
-                    let surr1 = ratio.clone() * adv_tensor.clone();
-                    let ratio_clipped = {
-                        let lo = clip_low_tensor.clone();
-                        let hi = clip_high_tensor.clone();
-                        let clipped_low = lo.clone() + (ratio.clone() - lo.clone()).relu();
-                        clipped_low.clone() - (clipped_low - hi.clone()).relu()
-                    };
-                    let surr2 = ratio_clipped * adv_tensor;
-
-                    let policy_loss = surr1.clone() - (surr1 - surr2).relu();
-
-                    let ret_tensor = TRAINING_SCRATCH.with(|s| {
-                        let mut scratch = s.borrow_mut();
-                        scratch.return_val.fill_(return_val);
-                        scratch.return_val.clone()
-                    });
-                    let value_err = value - ret_tensor;
-                    let v_loss = (value_err.clone() * value_err).sum();
-
-                    let loss = -policy_loss + v_loss * value_coef_tensor.clone()
-                        - entropy * entropy_coef_tensor.clone();
-
-                    loss_accum = loss_accum + loss;
+                let mut action_mask_data = vec![0.0; batch_len * ACTION_SPACE];
+                let mut old_log_prob_data = Vec::with_capacity(batch_len);
+                let mut advantage_data = Vec::with_capacity(batch_len);
+                let mut return_data = Vec::with_capacity(batch_len);
+                for (row, &i) in chunk.iter().enumerate() {
+                    let action_idx = actions[i].min(ACTION_SPACE - 1);
+                    action_mask_data[row * ACTION_SPACE + action_idx] = 1.0;
+                    old_log_prob_data.push(log_probs[i]);
+                    advantage_data.push(norm_advantages[i]);
+                    return_data.push(returns[i]);
                 }
+
+                let action_mask = Tensor::new_f32(action_mask_data, vec![batch_len, ACTION_SPACE]);
+                let old_log_prob_tensor = Tensor::new_f32(old_log_prob_data, vec![batch_len, 1]);
+                let advantage_tensor = Tensor::new_f32(advantage_data, vec![batch_len, 1]);
+                let return_tensor = Tensor::new_f32(return_data, vec![batch_len, 1]);
+                let one_batch = Tensor::new_f32(vec![1.0; batch_len], vec![batch_len, 1]);
+                let clip_low =
+                    Tensor::new_f32(vec![1.0 - CLIP_EPSILON; batch_len], vec![batch_len, 1]);
+                let clip_high =
+                    Tensor::new_f32(vec![1.0 + CLIP_EPSILON; batch_len], vec![batch_len, 1]);
+                let value_coef = Tensor::new_f32(vec![VALUE_COEF; batch_len], vec![batch_len, 1]);
+                let entropy_coef =
+                    Tensor::new_f32(vec![ENTROPY_COEF; batch_len], vec![batch_len, 1]);
+
+                #[cfg(cuda)]
+                let action_mask = match action_mask.to_cuda() {
+                    Ok(t) => t,
+                    Err(_) => action_mask,
+                };
+                #[cfg(cuda)]
+                let old_log_prob_tensor = match old_log_prob_tensor.to_cuda() {
+                    Ok(t) => t,
+                    Err(_) => old_log_prob_tensor,
+                };
+                #[cfg(cuda)]
+                let advantage_tensor = match advantage_tensor.to_cuda() {
+                    Ok(t) => t,
+                    Err(_) => advantage_tensor,
+                };
+                #[cfg(cuda)]
+                let return_tensor = match return_tensor.to_cuda() {
+                    Ok(t) => t,
+                    Err(_) => return_tensor,
+                };
+                #[cfg(cuda)]
+                let one_batch = match one_batch.to_cuda() {
+                    Ok(t) => t,
+                    Err(_) => one_batch,
+                };
+                #[cfg(cuda)]
+                let clip_low = match clip_low.to_cuda() {
+                    Ok(t) => t,
+                    Err(_) => clip_low,
+                };
+                #[cfg(cuda)]
+                let clip_high = match clip_high.to_cuda() {
+                    Ok(t) => t,
+                    Err(_) => clip_high,
+                };
+                #[cfg(cuda)]
+                let value_coef = match value_coef.to_cuda() {
+                    Ok(t) => t,
+                    Err(_) => value_coef,
+                };
+                #[cfg(cuda)]
+                let entropy_coef = match entropy_coef.to_cuda() {
+                    Ok(t) => t,
+                    Err(_) => entropy_coef,
+                };
+
+                let selected_log_probs =
+                    (batch_log_probs.clone() * action_mask).matmul(&ones_action_1);
+                let log_ratio = selected_log_probs - old_log_prob_tensor;
+                let ratio = log_ratio.exp();
+                let approx_kl_tensor =
+                    ((ratio.clone() - one_batch.clone()) - log_ratio.clone()).sum();
+
+                let surr1 = ratio.clone() * advantage_tensor.clone();
+                let ratio_clipped = {
+                    let clipped_low = clip_low.clone() + (ratio.clone() - clip_low.clone()).relu();
+                    clipped_low.clone() - (clipped_low - clip_high.clone()).relu()
+                };
+                let surr2 = ratio_clipped * advantage_tensor;
+                let policy_loss = surr1.clone() - (surr1 - surr2).relu();
+
+                let value_err = batch_values.clone() - return_tensor;
+                let value_loss = value_err.clone() * value_err;
+                let loss_elements =
+                    -policy_loss + value_loss * value_coef - batch_entropy * entropy_coef;
 
                 // Batched distillation KL after the per-sample loop
                 if let Some(ref teacher_logits) = teacher_batch_logits {
@@ -1187,11 +1212,9 @@ impl Ppo {
                     Ok(t) => t,
                     Err(_) => batch_size_tensor,
                 };
-                let mut final_loss = loss_accum * batch_size_tensor.clone();
+                let mut final_loss = loss_elements.sum() * batch_size_tensor.clone();
                 // Add distillation loss after warmup: distill_coef * mean(kl_divs)
-                if teacher_batch_logits.is_some()
-                    && self.distill_update_counter >= self.distill_warmup_steps
-                {
+                if teacher_batch_logits.is_some() {
                     let distill_coef_tensor = Tensor::new_f32(vec![self.distill_kl_coef], vec![1]);
                     #[cfg(cuda)]
                     let distill_coef_tensor = match distill_coef_tensor.to_cuda() {
@@ -1201,18 +1224,31 @@ impl Ppo {
                     let distill_term = distill_accum * distill_coef_tensor * batch_size_tensor;
                     final_loss = final_loss + distill_term;
                 }
-                if let Some(reg) = self.policy.achf_orthogonal_penalty() {
-                    final_loss = final_loss + reg;
+                if self.achf_orthogonal_penalty_interval != usize::MAX
+                    && (self.optimizer_step_counter + 1)
+                        .is_multiple_of(self.achf_orthogonal_penalty_interval)
+                {
+                    if let Some(reg) = self.policy.achf_orthogonal_penalty() {
+                        final_loss = final_loss + reg;
+                    }
                 }
                 loss_sum_tensor = loss_sum_tensor.detach() + final_loss.detach();
                 loss_count += 1;
                 final_loss.backward();
                 self.policy.update_achf_after_backward();
                 self.optimizer.step();
+                self.optimizer_step_counter += 1;
+                completed_batches += 1;
+                on_batch(
+                    completed_batches,
+                    planned_batches,
+                    epoch_idx + 1,
+                    self.k_epochs,
+                );
                 // Update EMA teacher after each batch for self-distillation
                 self.update_ema_teacher();
 
-                let approx_kl = approx_kl_accum.detach().item() as f64 / chunk.len() as f64;
+                let approx_kl = approx_kl_tensor.detach().item() as f64 / chunk.len() as f64;
                 if approx_kl > target_kl * 1.5 {
                     early_stop = true;
                 }
@@ -1249,6 +1285,7 @@ struct PpoEnvState {
     flat_data: Vec<f64>,
     pity_vec: Vec<usize>,
     kv_cache: Vec<KVCache>,
+    kv_cache_valid: bool,
     episode_reward: f64,
     episode_breakdown: RewardBreakdown,
     rng: Rng,
@@ -1290,6 +1327,7 @@ impl PpoEnvState {
             flat_data: Vec::with_capacity(context_len * DIM),
             pity_vec: Vec::with_capacity(context_len),
             kv_cache: caches,
+            kv_cache_valid: true,
             episode_reward: 0.0,
             episode_breakdown: RewardBreakdown::default(),
             rng,
@@ -1302,6 +1340,7 @@ impl PpoEnvState {
         for cache in self.kv_cache.iter_mut() {
             cache.clear();
         }
+        self.kv_cache_valid = true;
         self.state_struct = PullState::new(config);
         let (env_noise, env_bias) = env_net_env(env_net, &mut self.rng, 0, 0, 0, 0);
         self.env_noise = env_noise;
@@ -1311,13 +1350,12 @@ impl PpoEnvState {
         self.episode_breakdown = RewardBreakdown::default();
     }
 
-    fn step(
+    fn prepare_policy_step(
         &mut self,
         policy: &ActorCritic,
-        env_net: &EnvNet,
         config: &Config,
         context_len: usize,
-    ) -> PpoStepResult {
+    ) -> usize {
         let current_state_raw = build_features_with_luck_budget(
             self.state_struct.pity_6,
             self.pulls_done,
@@ -1337,7 +1375,9 @@ impl PpoEnvState {
         if self.history_buffer.len() > context_len {
             self.history_buffer.pop_front();
             self.pity_buffer.pop_front();
-            policy.prune_cache(&mut self.kv_cache, context_len);
+            if self.kv_cache_valid {
+                policy.prune_cache(&mut self.kv_cache, context_len.saturating_sub(1));
+            }
         }
 
         let seq_len = self.history_buffer.len();
@@ -1347,19 +1387,27 @@ impl PpoEnvState {
         }
         self.pity_vec.clear();
         self.pity_vec.extend(self.pity_buffer.iter().copied());
+        seq_len
+    }
+
+    fn current_token_f32(&self, out: &mut Vec<f32>) {
         let token = self
             .history_buffer
             .back()
             .expect("history_buffer should not be empty after push")
             .as_slice();
-        let token_f32: Vec<f32> = token.iter().map(|&v| v as f32).collect();
-        let (action_idx, log_prob, val) = policy.step_inference_cached_with_value(
-            &token_f32,
-            &mut self.kv_cache,
-            seq_len - 1,
-            config.ppo_top_k,
-        );
+        out.clear();
+        out.extend(token.iter().map(|&v| v as f32));
+    }
 
+    fn apply_policy_step(
+        &mut self,
+        action_idx: usize,
+        log_prob: f32,
+        val: f32,
+        env_net: &EnvNet,
+        config: &Config,
+    ) -> PpoStepResult {
         let outcome = step_pull(
             &mut self.state_struct,
             &mut self.rng,
@@ -1392,7 +1440,7 @@ impl PpoEnvState {
 
         let experience = PpoStoreRawInput {
             state: self.flat_data.clone(),
-            seq_len,
+            seq_len: self.history_buffer.len(),
             pity: self.pity_vec.clone(),
             action: outcome.action.unwrap_or(action_idx),
             log_prob: outcome.ppo_log_prob.unwrap_or(log_prob as f64),
@@ -1421,12 +1469,163 @@ impl PpoEnvState {
             finished_breakdown,
         }
     }
+
+    fn step(
+        &mut self,
+        policy: &ActorCritic,
+        env_net: &EnvNet,
+        config: &Config,
+        context_len: usize,
+    ) -> PpoStepResult {
+        let seq_len = self.prepare_policy_step(policy, config, context_len);
+        let (action_idx, log_prob, val) = if self.kv_cache_valid {
+            let mut token_f32 = Vec::with_capacity(DIM);
+            self.current_token_f32(&mut token_f32);
+            policy.step_inference_cached_with_value(
+                &token_f32,
+                &mut self.kv_cache,
+                seq_len - 1,
+                config.ppo_top_k,
+            )
+        } else {
+            policy.step_sequence_with_value(&self.flat_data, seq_len, config.ppo_top_k)
+        };
+        self.apply_policy_step(action_idx, log_prob, val, env_net, config)
+    }
 }
 
 struct PpoStepResult {
     experience: PpoStoreRawInput,
     finished_reward: Option<f64>,
     finished_breakdown: Option<RewardBreakdown>,
+}
+
+#[cfg(cuda)]
+fn rollout_prepared_cpu(
+    envs: &mut [PpoEnvState],
+    policy: &ActorCritic,
+    env_net: &EnvNet,
+    config: &Config,
+) -> Vec<PpoStepResult> {
+    let mut results = Vec::with_capacity(envs.len());
+    let mut token_f32 = Vec::with_capacity(DIM);
+    for env in envs {
+        let seq_len = env.history_buffer.len();
+        let (action_idx, log_prob, val) = if env.kv_cache_valid {
+            env.current_token_f32(&mut token_f32);
+            policy.step_inference_cached_with_value(
+                &token_f32,
+                &mut env.kv_cache,
+                seq_len - 1,
+                config.ppo_top_k,
+            )
+        } else {
+            policy.step_sequence_with_value(&env.flat_data, seq_len, config.ppo_top_k)
+        };
+        results.push(env.apply_policy_step(action_idx, log_prob, val, env_net, config));
+    }
+    results
+}
+
+fn rollout_cpu_round(
+    worker: &GoodJobWorker,
+    envs: &mut [PpoEnvState],
+    policy: &ActorCritic,
+    env_net: &EnvNet,
+    config: &Config,
+    context_len: usize,
+) -> Vec<PpoStepResult> {
+    worker
+        .execute(|| {
+            envs.par_iter_mut()
+                .map(|env| env.step(policy, env_net, config, context_len))
+                .collect()
+        })
+        .unwrap_or_else(|msg| {
+            log::error!("[PPO] Worker execution failed: {}", msg);
+            vec![]
+        })
+}
+
+#[cfg(cuda)]
+fn rollout_cuda_round(
+    envs: &mut [PpoEnvState],
+    policy: &ActorCritic,
+    env_net: &EnvNet,
+    config: &Config,
+    context_len: usize,
+) -> Option<Vec<PpoStepResult>> {
+    if envs.is_empty() || !crate::cuda::is_available() {
+        return None;
+    }
+
+    let mut max_seq_len = 0usize;
+    let mut seq_lens = Vec::with_capacity(envs.len());
+    for env in envs.iter_mut() {
+        let seq_len = env.prepare_policy_step(policy, config, context_len);
+        max_seq_len = max_seq_len.max(seq_len);
+        seq_lens.push(seq_len);
+    }
+
+    let mut decisions = vec![None; envs.len()];
+    for seq_len in 1..=max_seq_len {
+        let indices: Vec<usize> = seq_lens
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, &len)| (len == seq_len).then_some(idx))
+            .collect();
+        if indices.is_empty() {
+            continue;
+        }
+
+        let batch_len = indices.len();
+        let mut batch_data = Vec::with_capacity(batch_len * seq_len * DIM);
+        for &idx in &indices {
+            let env = &envs[idx];
+            if env.flat_data.len() != seq_len * DIM {
+                return Some(rollout_prepared_cpu(envs, policy, env_net, config));
+            }
+            batch_data.extend_from_slice(&env.flat_data);
+        }
+
+        let batch_states = Tensor::new_f32(batch_data, vec![batch_len, seq_len, DIM]);
+        let batch_states = match batch_states.to_cuda() {
+            Ok(t) => t,
+            Err(_) => return Some(rollout_prepared_cpu(envs, policy, env_net, config)),
+        };
+        let (batch_logits, batch_values) = policy.forward_actor_critic_batch(&batch_states);
+        if batch_logits.shape != vec![batch_len, ACTION_SPACE]
+            || batch_values.shape != vec![batch_len, 1]
+        {
+            return Some(rollout_prepared_cpu(envs, policy, env_net, config));
+        }
+
+        let logits_data = batch_logits.data_to_f32_vec();
+        let value_data = batch_values.data_to_f32_vec();
+        if logits_data.len() != batch_len * ACTION_SPACE || value_data.len() != batch_len {
+            return Some(rollout_prepared_cpu(envs, policy, env_net, config));
+        }
+
+        for (row, &idx) in indices.iter().enumerate() {
+            let row_start = row * ACTION_SPACE;
+            let row_end = row_start + ACTION_SPACE;
+            let (action_idx, log_prob) =
+                softmax_sample(&logits_data[row_start..row_end], config.ppo_top_k);
+            decisions[idx] = Some((action_idx, log_prob, value_data[row]));
+        }
+    }
+
+    if decisions.iter().any(Option::is_none) {
+        return Some(rollout_prepared_cpu(envs, policy, env_net, config));
+    }
+
+    let mut results = Vec::with_capacity(envs.len());
+    for (env, decision) in envs.iter_mut().zip(decisions.into_iter()) {
+        let (action_idx, log_prob, val) = decision.expect("rollout decision should be populated");
+        env.kv_cache_valid = false;
+        results.push(env.apply_policy_step(action_idx, log_prob, val, env_net, config));
+    }
+    Some(results)
 }
 
 /// Train a PPO agent with multi-environment rollouts.
@@ -1475,11 +1674,12 @@ fn train_ppo_impl(
     } else {
         8
     };
-    let num_envs = if config.ppo_num_envs > 0 {
+    let configured_num_envs = if config.ppo_num_envs > 0 {
         config.ppo_num_envs
     } else {
         1
     };
+    let num_envs = configured_num_envs.min(steps_per_update.max(1)).max(1);
     let worker = GoodJobWorker::new_with_config(config).expect("Failed to build PPO worker pool");
     let mut ppo = Ppo::new(rng.next_u64(), k_epochs, batch_size, config);
     ppo.init_distillation(config);
@@ -1527,17 +1727,30 @@ fn train_ppo_impl(
         let rounds = update_steps / num_envs;
         let remainder = update_steps % num_envs;
         let mut collected = 0usize;
+        let mut next_heartbeat = heartbeat_every.min(update_steps).max(1);
         for _ in 0..rounds {
-            let step_results: Vec<PpoStepResult> = worker
-                .execute(|| {
-                    envs.par_iter_mut()
-                        .map(|env| env.step(&ppo.policy, env_net, config, context_len))
-                        .collect()
-                })
-                .unwrap_or_else(|msg| {
-                    log::error!("[PPO] Worker execution failed: {}", msg);
-                    vec![]
-                });
+            #[cfg(cuda)]
+            let step_results =
+                rollout_cuda_round(&mut envs, &ppo.policy, env_net, config, context_len)
+                    .unwrap_or_else(|| {
+                        rollout_cpu_round(
+                            &worker,
+                            &mut envs,
+                            &ppo.policy,
+                            env_net,
+                            config,
+                            context_len,
+                        )
+                    });
+            #[cfg(not(cuda))]
+            let step_results = rollout_cpu_round(
+                &worker,
+                &mut envs,
+                &ppo.policy,
+                env_net,
+                config,
+                context_len,
+            );
             if step_results.is_empty() {
                 break;
             }
@@ -1558,8 +1771,7 @@ fn train_ppo_impl(
                 }
             }
             collected += num_envs;
-            if collected.is_multiple_of(heartbeat_every)
-                && last_heartbeat.elapsed() >= Duration::from_millis(300)
+            if collected >= next_heartbeat && last_heartbeat.elapsed() >= Duration::from_millis(300)
             {
                 let global_step = (steps_done + collected).min(total_steps);
                 let avg_env_reward =
@@ -1574,6 +1786,9 @@ fn train_ppo_impl(
                     current_lr
                 ));
                 last_heartbeat = Instant::now();
+                while next_heartbeat <= collected {
+                    next_heartbeat += heartbeat_every;
+                }
             }
         }
         if remainder > 0 {
@@ -1596,7 +1811,7 @@ fn train_ppo_impl(
                     }
                 }
                 collected += 1;
-                if collected.is_multiple_of(heartbeat_every)
+                if collected >= next_heartbeat
                     && last_heartbeat.elapsed() >= Duration::from_millis(300)
                 {
                     let global_step = (steps_done + collected).min(total_steps);
@@ -1609,17 +1824,40 @@ fn train_ppo_impl(
                         current_lr
                     ));
                     last_heartbeat = Instant::now();
+                    while next_heartbeat <= collected {
+                        next_heartbeat += heartbeat_every;
+                    }
                 }
             }
             remainder_offset = (remainder_offset + remainder) % num_envs;
         }
 
+        let rollout_position = (steps_done + collected).min(total_steps);
+        if collected == 0 {
+            log::error!("[PPO] No rollout samples collected; stopping PPO training loop.");
+            break;
+        }
+        pb.set_position(rollout_position as u64);
         pb.set_message(format!(
             "Updating ({} samples, {} epochs)...",
             collected, k_epochs
         ));
-        let update_loss = ppo.update(current_lr);
-        steps_done += update_steps;
+        let update_loss = ppo.update_with_progress(
+            current_lr,
+            |done_batches, total_batches, epoch_idx, total_epochs| {
+                if last_heartbeat.elapsed() >= Duration::from_millis(300)
+                    || done_batches == total_batches
+                {
+                    pb.set_position(rollout_position as u64);
+                    pb.set_message(format!(
+                        "Updating: batch {}/{} | epoch {}/{} | LR: {:.6}",
+                        done_batches, total_batches, epoch_idx, total_epochs, current_lr
+                    ));
+                    last_heartbeat = Instant::now();
+                }
+            },
+        );
+        steps_done += collected;
 
         if config.achf.cache_log_interval_steps > 0
             && steps_done % config.achf.cache_log_interval_steps == 0
@@ -1670,7 +1908,7 @@ fn train_ppo_impl(
             println!("\n{}", format_policy_eval("PPO", steps_done, &eval));
         }
 
-        if metrics.is_enabled() && steps_done % snapshot_every < update_steps {
+        if metrics.is_enabled() && steps_done % snapshot_every < collected {
             metrics.emit_achf_snapshot(steps_done, update_loss, avg_r, ppo.policy.snapshot_achf());
         }
     }
@@ -1901,6 +2139,22 @@ mod tests {
     }
 
     #[test]
+    fn online_trainer_from_policy_preserves_achf_penalty_interval() {
+        let achf = crate::config::AchfConfig {
+            enabled: true,
+            apply_ffn: true,
+            lambda_ortho: 0.001,
+            proj_freq: 64,
+            ..crate::config::AchfConfig::default()
+        };
+        let policy = ActorCritic::new(42, &achf, 16, 1);
+
+        let trainer = OnlinePpoTrainer::from_policy(policy, 2, 128);
+
+        assert_eq!(trainer.ppo.achf_orthogonal_penalty_interval, 64);
+    }
+
+    #[test]
     fn ema_update_blends_teacher_student_with_decay_0_5() {
         // Use same seed for both so they start with identical weights
         let policy = ActorCritic::new(42, &crate::config::AchfConfig::default(), 64, 2);
@@ -2043,6 +2297,44 @@ mod tests {
     }
 
     #[test]
+    fn ppo_distillation_does_not_backpropagate_into_ema_teacher() {
+        let policy = ActorCritic::new(42, &crate::config::AchfConfig::default(), 16, 1);
+        let mut ppo = Ppo::from_policy(policy, 1, 2);
+        ppo.ema_policy = Some(ActorCritic::new(
+            43,
+            &crate::config::AchfConfig::default(),
+            16,
+            1,
+        ));
+        ppo.distill_kl_coef = 0.1;
+        ppo.distill_warmup_steps = 0;
+
+        for i in 0..2 {
+            ppo.store_raw(PpoStoreRawInput {
+                state: vec![0.05 + i as f64 * 0.01; DIM],
+                seq_len: 1,
+                pity: vec![0],
+                action: i % ACTION_SPACE,
+                log_prob: 0.0,
+                reward: if i == 0 { 1.0 } else { 0.5 },
+                done: i == 1,
+                value: 0.0,
+            });
+        }
+
+        let _ = ppo.update(0.0003);
+
+        let teacher = ppo.ema_policy.as_ref().expect("EMA teacher exists");
+        for (idx, param) in teacher.parameters().iter().enumerate() {
+            let grad = param.grad_to_f32_vec();
+            assert!(
+                grad.iter().all(|v| v.abs() <= 1e-8),
+                "EMA teacher parameter {idx} received gradient"
+            );
+        }
+    }
+
+    #[test]
     fn softmax_sample_top_k_zero_like_full_softmax() {
         // top_k=0 should behave identically to full softmax (no truncation)
         let logits: Vec<f32> = (0..ACTION_SPACE).map(|i| (i + 1) as f32).collect();
@@ -2088,6 +2380,49 @@ mod tests {
     }
 
     #[test]
+    fn ppo_update_handles_minibatch_with_vectorized_loss() {
+        let policy = ActorCritic::new(7, &crate::config::AchfConfig::default(), 16, 1);
+        let mut ppo = Ppo::from_policy(policy, 1, 4);
+
+        for i in 0..8 {
+            let seq_len = 1 + (i % 3);
+            ppo.store_raw(PpoStoreRawInput {
+                state: vec![0.01 * (i as f64 + 1.0); seq_len * DIM],
+                seq_len,
+                pity: vec![0; seq_len],
+                action: i % ACTION_SPACE,
+                log_prob: -(ACTION_SPACE as f64).ln(),
+                reward: if i % 2 == 0 { 1.0 } else { -0.1 },
+                done: i % 4 == 3,
+                value: 0.0,
+            });
+        }
+
+        let loss = ppo.update(0.0003);
+
+        assert!(loss.is_finite(), "PPO update loss should stay finite");
+        assert!(
+            ppo.memory.states_raw.is_empty(),
+            "PPO update should consume rollout memory"
+        );
+    }
+
+    #[test]
+    fn ppo_batch_forward_backpropagates_into_backbone_on_cpu() {
+        let policy = ActorCritic::new(9, &crate::config::AchfConfig::default(), 64, 1);
+        let states = Tensor::new_f32(vec![0.05; 2 * 2 * DIM], vec![2, 2, DIM]);
+
+        let (logits, values) = policy.forward_actor_critic_batch(&states);
+        (logits.sum() + values.sum()).backward();
+
+        let embed_grad = policy.backbone.embed.weight.grad_to_f32_vec();
+        assert!(
+            embed_grad.iter().any(|g| g.abs() > 1e-9),
+            "PPO backbone embed gradient should not be cut off by last_token"
+        );
+    }
+
+    #[test]
     fn actor_critic_freeze_prunes_backbone_achf_for_cache_hits() {
         let achf = crate::config::AchfConfig {
             enabled: true,
@@ -2112,8 +2447,10 @@ mod tests {
         let state = vec![0.1; DIM];
         let _ = policy.step_inference(&state, 0);
         let stats = policy.achf_cache_stats_aggregate();
-        assert_eq!(stats.calls, 1);
-        assert_eq!(stats.cache_hits, 1);
+        // Default config applies ACHF to both the FFN and the MLA w_o
+        // projection, so a single block contributes two ACHF calls.
+        assert_eq!(stats.calls, 2);
+        assert_eq!(stats.cache_hits, 2);
         assert_eq!(stats.dense_paths, 0);
         assert_eq!(stats.sparse_paths, 0);
     }

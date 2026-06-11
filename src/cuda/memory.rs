@@ -17,6 +17,16 @@ use std::sync::Mutex;
 
 /// Size-keyed GPU memory pool for reusing temporary allocations.
 /// Keys are buffer size in bytes; values are lists of raw device pointers.
+///
+/// Correctness invariants:
+/// - Buffers handed out by `alloc_pooled` contain stale data from their
+///   previous use. Callers must fully overwrite them (GEMM with beta=0,
+///   full-range kernels, `copy_h2d`/`copy_d2d`) or `fill` them first.
+/// - Recycling is safe without an explicit device sync only because every
+///   kernel launch, cuBLAS call and memcpy in this crate runs on the legacy
+///   default stream, so writes into a recycled buffer are stream-ordered
+///   after any earlier reads of it. If non-default streams are ever
+///   introduced, pool recycling must synchronize on buffer return.
 #[cfg(cuda)]
 static GPU_BUFFER_POOL: std::sync::LazyLock<Mutex<std::collections::HashMap<usize, Vec<usize>>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
@@ -240,6 +250,27 @@ pub fn alloc_pooled<T>(count: usize) -> CudaResult<DevicePtr<T>> {
 pub fn free<T>(_device: &DevicePtr<T>) -> CudaResult<()> {
     Ok(())
 }
+
+// TODO(perf): transfers use synchronous `cudaMemcpy` on the legacy default
+// stream. Pinned staging + `cudaMemcpyAsync` on per-thread streams would
+// allow compute/transfer overlap, but requires per-buffer stream/event
+// tracking before the buffer pool and the cross-thread tensor caches can be
+// recycled safely (see the pool invariants above). The typical transfers in
+// this workload are tiny (latency-bound, not bandwidth-bound), so the
+// expected gain does not currently justify that complexity.
+
+// TODO(perf): pinned staging + async transfers.
+// H2D/D2H below use synchronous `cudaMemcpy` on pageable host memory. A
+// faster design is a pool of pinned staging buffers (`cudaMallocHost`, FFI
+// already declared in bindings.rs) + `cudaMemcpyAsync` on a per-thread
+// non-default stream with `cublasSetStream` bound to the same stream.
+// This was deliberately NOT enabled yet: tensor/grad GPU buffers are cached
+// in process-global maps (autograd/cuda_bridge.rs) and the size-bucketed
+// GPU_BUFFER_POOL is shared across rayon threads. Today every operation is
+// ordered by the legacy default stream, which is what makes cross-thread
+// buffer reuse safe. Introducing per-thread streams without per-buffer event
+// tracking would allow a pooled buffer released on stream A to be rewritten
+// on stream B while A's kernel is still reading it. Correctness first.
 
 /// Copy data from host (CPU) to device (GPU) - synchronous
 #[cfg(cuda)]

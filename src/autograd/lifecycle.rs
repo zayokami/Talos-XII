@@ -45,12 +45,10 @@ impl Tensor {
                         crate::cuda::memory::CudaBuffer::BF16(_) => {}
                         crate::cuda::memory::CudaBuffer::I8(_) => {}
                         crate::cuda::memory::CudaBuffer::F32(buf) => {
-                            let ones = vec![1.0f32; d_grad.len()];
-                            let _ = crate::cuda::memory::copy_h2d(buf, &ones);
+                            let _ = crate::cuda::kernels::fill_f32(buf, 1.0);
                         }
                         crate::cuda::memory::CudaBuffer::F64(buf) => {
-                            let ones = vec![1.0f64; d_grad.len()];
-                            let _ = crate::cuda::memory::copy_h2d(buf, &ones);
+                            let _ = crate::cuda::kernels::fill(buf, 1.0);
                         }
                     }
                 }

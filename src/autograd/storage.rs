@@ -206,22 +206,26 @@ impl Tensor {
     pub fn fill_(&mut self, value: f64) -> &mut Self {
         self.data.fill_f64(value);
         #[cfg(cuda)]
-        if self.device == Device::Cuda {
-            let keep_cache = if let Some(buffer) = self.cuda_cached_buffer() {
-                match &*buffer {
-                    crate::cuda::memory::CudaBuffer::F32(buf) => {
-                        crate::cuda::kernels::fill_f32(buf, value as f32).is_ok()
+        {
+            if self.device == Device::Cuda {
+                let keep_cache = if let Some(buffer) = self.cuda_cached_buffer() {
+                    match &*buffer {
+                        crate::cuda::memory::CudaBuffer::F32(buf) => {
+                            crate::cuda::kernels::fill_f32(buf, value as f32).is_ok()
+                        }
+                        crate::cuda::memory::CudaBuffer::F64(buf) => {
+                            crate::cuda::kernels::fill(buf, value).is_ok()
+                        }
+                        crate::cuda::memory::CudaBuffer::BF16(_)
+                        | crate::cuda::memory::CudaBuffer::I8(_) => false,
                     }
-                    crate::cuda::memory::CudaBuffer::F64(buf) => {
-                        crate::cuda::kernels::fill(buf, value).is_ok()
-                    }
-                    crate::cuda::memory::CudaBuffer::BF16(_)
-                    | crate::cuda::memory::CudaBuffer::I8(_) => false,
+                } else {
+                    true
+                };
+                if !keep_cache {
+                    self.cuda_remove_cached_buffer();
                 }
             } else {
-                true
-            };
-            if !keep_cache {
                 self.cuda_remove_cached_buffer();
             }
         }

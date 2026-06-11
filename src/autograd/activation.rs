@@ -172,7 +172,7 @@ impl Tensor {
         use crate::cuda::kernels::{
             relu_backward, relu_backward_f32, relu_inplace, relu_inplace_f32,
         };
-        use crate::cuda::memory::{alloc, copy_d2d, CudaBuffer};
+        use crate::cuda::memory::{alloc_pooled, copy_d2d, CudaBuffer};
 
         let len = match self.dtype {
             Dtype::F32 | Dtype::F64 => self.numel(),
@@ -195,7 +195,7 @@ impl Tensor {
             }
         };
         let d_data = match self.dtype {
-            Dtype::F32 => match alloc::<f32>(len) {
+            Dtype::F32 => match alloc_pooled::<f32>(len) {
                 Ok(buf) => CudaBuffer::F32(buf),
                 Err(err) => {
                     crate::cuda::record_activation_fallback("alloc");
@@ -206,7 +206,7 @@ impl Tensor {
                     return self.relu_cpu_fallback();
                 }
             },
-            Dtype::F64 => match alloc::<f64>(len) {
+            Dtype::F64 => match alloc_pooled::<f64>(len) {
                 Ok(buf) => CudaBuffer::F64(buf),
                 Err(err) => {
                     crate::cuda::record_activation_fallback("alloc");
@@ -440,7 +440,7 @@ impl Tensor {
         use crate::cuda::kernels::{
             gelu_backward, gelu_backward_f32, gelu_inplace, gelu_inplace_f32,
         };
-        use crate::cuda::memory::{alloc, copy_d2d, CudaBuffer};
+        use crate::cuda::memory::{alloc_pooled, copy_d2d, CudaBuffer};
 
         let len = match self.dtype {
             Dtype::F32 | Dtype::F64 => self.numel(),
@@ -463,7 +463,7 @@ impl Tensor {
             }
         };
         let d_data = match self.dtype {
-            Dtype::F32 => match alloc::<f32>(len) {
+            Dtype::F32 => match alloc_pooled::<f32>(len) {
                 Ok(buf) => CudaBuffer::F32(buf),
                 Err(err) => {
                     crate::cuda::record_activation_fallback("alloc");
@@ -474,7 +474,7 @@ impl Tensor {
                     return self.gelu_cpu_fallback();
                 }
             },
-            Dtype::F64 => match alloc::<f64>(len) {
+            Dtype::F64 => match alloc_pooled::<f64>(len) {
                 Ok(buf) => CudaBuffer::F64(buf),
                 Err(err) => {
                     crate::cuda::record_activation_fallback("alloc");

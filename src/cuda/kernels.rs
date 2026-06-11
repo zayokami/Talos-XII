@@ -60,6 +60,17 @@ fn checked_mul3(op: &'static str, a: usize, b: usize, c: usize) -> CudaResult<us
         })
 }
 
+fn attention_weighted_sum_expected_lens(
+    op: &'static str,
+    batches: usize,
+    seq: usize,
+    head_dim: usize,
+) -> CudaResult<(usize, usize, usize)> {
+    let attn_len = checked_mul3(op, batches, seq, seq)?;
+    let values_len = checked_mul3(op, batches, seq, head_dim)?;
+    Ok((attn_len, values_len, values_len))
+}
+
 #[cfg(cuda)]
 pub fn relu_inplace(data: &DevicePtr<f64>) -> CudaResult<()> {
     crate::cuda::init()?;
@@ -598,26 +609,28 @@ pub fn rope_backward(
     }
 }
 
-/// Attention weighted sum: out[row, d] = sum_k(attn[row, k] * values[k, d])
-/// where attn_weights is [rows x cols] and values is [cols x head_dim]
-/// output is [rows x head_dim]
+/// Batched attention weighted sum:
+/// out[b, i, d] = sum_j(attn[b, i, j] * values[b, j, d])
+/// where attn_weights is [batches x seq x seq], values is [batches x seq x head_dim],
+/// and output is [batches x seq x head_dim].
 #[cfg(cuda)]
 pub fn attention_weighted_sum(
     attn_weights: &DevicePtr<f64>,
     values: &DevicePtr<f64>,
     output: &DevicePtr<f64>,
-    rows: usize,
-    cols: usize,
+    batches: usize,
+    seq: usize,
     head_dim: usize,
 ) -> CudaResult<()> {
     crate::cuda::init()?;
 
-    // Validate dimensions
-    let expected_attn_len = rows.checked_mul(cols).ok_or(CudaError::SizeOverflow {
-        op: "cuda::kernels::attention_weighted_sum(attn_weights_len)",
-        count: rows,
-        elem_size: cols,
-    })?;
+    let (expected_attn_len, expected_values_len, expected_output_len) =
+        attention_weighted_sum_expected_lens(
+            "cuda::kernels::attention_weighted_sum(lengths)",
+            batches,
+            seq,
+            head_dim,
+        )?;
     if expected_attn_len != attn_weights.len() {
         return Err(CudaError::SizeMismatch {
             op: "cuda::kernels::attention_weighted_sum(attn_weights)",
@@ -626,11 +639,6 @@ pub fn attention_weighted_sum(
         });
     }
 
-    let expected_values_len = cols.checked_mul(head_dim).ok_or(CudaError::SizeOverflow {
-        op: "cuda::kernels::attention_weighted_sum(values_len)",
-        count: cols,
-        elem_size: head_dim,
-    })?;
     if expected_values_len != values.len() {
         return Err(CudaError::SizeMismatch {
             op: "cuda::kernels::attention_weighted_sum(values)",
@@ -639,11 +647,6 @@ pub fn attention_weighted_sum(
         });
     }
 
-    let expected_output_len = rows.checked_mul(head_dim).ok_or(CudaError::SizeOverflow {
-        op: "cuda::kernels::attention_weighted_sum(output_len)",
-        count: rows,
-        elem_size: head_dim,
-    })?;
     if expected_output_len != output.len() {
         return Err(CudaError::SizeMismatch {
             op: "cuda::kernels::attention_weighted_sum(output)",
@@ -652,15 +655,19 @@ pub fn attention_weighted_sum(
         });
     }
 
-    if cols == 0 || head_dim == 0 {
+    if batches == 0 {
+        return Ok(());
+    }
+
+    if seq == 0 || head_dim == 0 {
         return Err(CudaError::InvalidInput {
             op: "cuda::kernels::attention_weighted_sum",
-            message: "cols and head_dim must be greater than zero",
+            message: "seq and head_dim must be greater than zero",
         });
     }
 
-    let rows_i32 = to_i32_len("cuda::kernels::attention_weighted_sum(rows)", rows)?;
-    let cols_i32 = to_i32_len("cuda::kernels::attention_weighted_sum(cols)", cols)?;
+    let batches_i32 = to_i32_len("cuda::kernels::attention_weighted_sum(batches)", batches)?;
+    let seq_i32 = to_i32_len("cuda::kernels::attention_weighted_sum(seq)", seq)?;
     let head_dim_i32 = to_i32_len("cuda::kernels::attention_weighted_sum(head_dim)", head_dim)?;
 
     let status = unsafe {
@@ -668,8 +675,8 @@ pub fn attention_weighted_sum(
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            rows_i32,
-            cols_i32,
+            batches_i32,
+            seq_i32,
             head_dim_i32,
             attn_weights.as_raw() as *mut std::os::raw::c_int,
             values.as_raw() as *mut std::os::raw::c_int,
@@ -2554,17 +2561,19 @@ pub fn attention_weighted_sum_f32(
     attn_weights: &DevicePtr<f32>,
     values: &DevicePtr<f32>,
     output: &DevicePtr<f32>,
-    rows: usize,
-    cols: usize,
+    batches: usize,
+    seq: usize,
     head_dim: usize,
 ) -> CudaResult<()> {
     crate::cuda::init()?;
 
-    let expected_attn_len = rows.checked_mul(cols).ok_or(CudaError::SizeOverflow {
-        op: "cuda::kernels::attention_weighted_sum_f32(attn_weights_len)",
-        count: rows,
-        elem_size: cols,
-    })?;
+    let (expected_attn_len, expected_values_len, expected_output_len) =
+        attention_weighted_sum_expected_lens(
+            "cuda::kernels::attention_weighted_sum_f32(lengths)",
+            batches,
+            seq,
+            head_dim,
+        )?;
     if expected_attn_len != attn_weights.len() {
         return Err(CudaError::SizeMismatch {
             op: "cuda::kernels::attention_weighted_sum_f32(attn_weights)",
@@ -2573,11 +2582,6 @@ pub fn attention_weighted_sum_f32(
         });
     }
 
-    let expected_values_len = cols.checked_mul(head_dim).ok_or(CudaError::SizeOverflow {
-        op: "cuda::kernels::attention_weighted_sum_f32(values_len)",
-        count: cols,
-        elem_size: head_dim,
-    })?;
     if expected_values_len != values.len() {
         return Err(CudaError::SizeMismatch {
             op: "cuda::kernels::attention_weighted_sum_f32(values)",
@@ -2586,11 +2590,6 @@ pub fn attention_weighted_sum_f32(
         });
     }
 
-    let expected_output_len = rows.checked_mul(head_dim).ok_or(CudaError::SizeOverflow {
-        op: "cuda::kernels::attention_weighted_sum_f32(output_len)",
-        count: rows,
-        elem_size: head_dim,
-    })?;
     if expected_output_len != output.len() {
         return Err(CudaError::SizeMismatch {
             op: "cuda::kernels::attention_weighted_sum_f32(output)",
@@ -2599,15 +2598,22 @@ pub fn attention_weighted_sum_f32(
         });
     }
 
-    if cols == 0 || head_dim == 0 {
+    if batches == 0 {
+        return Ok(());
+    }
+
+    if seq == 0 || head_dim == 0 {
         return Err(CudaError::InvalidInput {
             op: "cuda::kernels::attention_weighted_sum_f32",
-            message: "cols and head_dim must be greater than zero",
+            message: "seq and head_dim must be greater than zero",
         });
     }
 
-    let rows_i32 = to_i32_len("cuda::kernels::attention_weighted_sum_f32(rows)", rows)?;
-    let cols_i32 = to_i32_len("cuda::kernels::attention_weighted_sum_f32(cols)", cols)?;
+    let batches_i32 = to_i32_len(
+        "cuda::kernels::attention_weighted_sum_f32(batches)",
+        batches,
+    )?;
+    let seq_i32 = to_i32_len("cuda::kernels::attention_weighted_sum_f32(seq)", seq)?;
     let head_dim_i32 = to_i32_len(
         "cuda::kernels::attention_weighted_sum_f32(head_dim)",
         head_dim,
@@ -2618,8 +2624,8 @@ pub fn attention_weighted_sum_f32(
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            rows_i32,
-            cols_i32,
+            batches_i32,
+            seq_i32,
             head_dim_i32,
             attn_weights.as_raw() as *mut std::os::raw::c_int,
             values.as_raw() as *mut std::os::raw::c_int,
@@ -3522,16 +3528,11 @@ pub fn per_store_transition_with_max_f32(
             dim_i32,
         )
     };
+    // No device synchronization here: the kernel runs on the legacy default
+    // stream, so any later kernel launch or synchronous cudaMemcpy that reads
+    // the outputs is already stream-ordered behind it.
     if status == 0 {
-        let sync = unsafe { crate::cuda::bindings::cudaDeviceSynchronize() };
-        if sync == 0 {
-            Ok(())
-        } else {
-            Err(CudaError::Runtime {
-                op: "cuda::kernels::per_store_transition_with_max_f32(sync)",
-                code: sync as u32,
-            })
-        }
+        Ok(())
     } else {
         Err(CudaError::Runtime {
             op: "cuda::kernels::per_store_transition_with_max_f32",
@@ -3701,16 +3702,11 @@ pub fn per_sample_f32(
             total_priority_hint,
         )
     };
+    // No device synchronization here: outputs are consumed by later
+    // default-stream work (GEMMs / synchronous cudaMemcpy), which is already
+    // ordered behind this kernel.
     if status == 0 {
-        let sync = unsafe { crate::cuda::bindings::cudaDeviceSynchronize() };
-        if sync == 0 {
-            Ok(())
-        } else {
-            Err(CudaError::Runtime {
-                op: "cuda::kernels::per_sample_f32(sync)",
-                code: sync as u32,
-            })
-        }
+        Ok(())
     } else {
         Err(CudaError::Runtime {
             op: "cuda::kernels::per_sample_f32",
@@ -3771,16 +3767,10 @@ pub fn per_update_priorities_f32(
             epsilon,
         )
     };
+    // No device synchronization here: priority updates are only read by later
+    // default-stream kernels (sampling), which are stream-ordered behind this.
     if status == 0 {
-        let sync = unsafe { crate::cuda::bindings::cudaDeviceSynchronize() };
-        if sync == 0 {
-            Ok(())
-        } else {
-            Err(CudaError::Runtime {
-                op: "cuda::kernels::per_update_priorities_f32(sync)",
-                code: sync as u32,
-            })
-        }
+        Ok(())
     } else {
         Err(CudaError::Runtime {
             op: "cuda::kernels::per_update_priorities_f32",
@@ -5375,7 +5365,7 @@ define_batched_attention_wrappers!(
 
 #[cfg(test)]
 mod tests {
-    use super::validate_softmax_dims;
+    use super::{attention_weighted_sum_expected_lens, validate_softmax_dims};
 
     #[test]
     fn softmax_dim_validation_rejects_zero_cols_with_rows() {
@@ -5394,5 +5384,15 @@ mod tests {
     #[test]
     fn softmax_dim_validation_allows_empty_rows() {
         assert!(validate_softmax_dims("test", 0, 4096).is_ok());
+    }
+
+    #[test]
+    fn attention_weighted_sum_uses_batched_mla_lengths() {
+        let (attn, values, output) =
+            attention_weighted_sum_expected_lens("test", 128, 8, 128).unwrap();
+
+        assert_eq!(attn, 128 * 8 * 8);
+        assert_eq!(values, 128 * 8 * 128);
+        assert_eq!(output, 128 * 8 * 128);
     }
 }

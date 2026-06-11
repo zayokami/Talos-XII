@@ -227,9 +227,9 @@ fn concat_last_dim(tensors: &[Tensor]) -> Tensor {
         );
     }
 
+    let tensor_data: Vec<Vec<f64>> = tensors.iter().map(|t| t.data_as_f64_vec()).collect();
     for p in 0..prefix_len {
-        for (i, t) in tensors.iter().enumerate() {
-            let t_data = t.data_as_f64_vec();
+        for (i, t_data) in tensor_data.iter().enumerate() {
             let src_start = p * last_dim;
             let dst_start = p * out_last_dim + i * last_dim;
             out_data[dst_start..dst_start + last_dim]
@@ -246,7 +246,30 @@ fn concat_last_dim(tensors: &[Tensor]) -> Tensor {
     } else {
         crate::dtype::Dtype::F32
     };
-    Tensor::with_dtype(out_data, out_shape, out_dtype)
+    let parents = tensors.to_vec();
+    Tensor {
+        data: Storage::from_f64_vec(out_data, out_dtype),
+        grad: Storage::zeros(total, Tensor::grad_dtype_for(out_dtype)),
+        shape: out_shape,
+        device: crate::autograd::Device::Cpu,
+        dtype: out_dtype,
+        _ctx: Some(Arc::new(Context {
+            parents,
+            backward_op: Box::new(move |grad_out, parents| {
+                let grad_out_f64 = grad_out.to_f64_vec();
+                for (i, parent) in parents.iter().enumerate() {
+                    let mut parent_grad = parent.grad_write_compat();
+                    for p in 0..prefix_len {
+                        let src_start = p * out_last_dim + i * last_dim;
+                        let dst_start = p * last_dim;
+                        for d in 0..last_dim {
+                            parent_grad[dst_start + d] += grad_out_f64[src_start + d];
+                        }
+                    }
+                }
+            }),
+        })),
+    }
 }
 
 /// Split a tensor along the last dimension into n equal parts.
@@ -280,7 +303,28 @@ fn split_last_dim(tensor: &Tensor, n: usize) -> Vec<Tensor> {
         }
         let mut chunk_shape = shape.clone();
         *chunk_shape.last_mut().unwrap() = split_dim;
-        out.push(Tensor::with_dtype(chunk_data, chunk_shape, tensor.dtype));
+        let parent = tensor.clone();
+        out.push(Tensor {
+            data: Storage::from_f64_vec(chunk_data, tensor.dtype),
+            grad: Storage::zeros(prefix_len * split_dim, Tensor::grad_dtype_for(tensor.dtype)),
+            shape: chunk_shape,
+            device: crate::autograd::Device::Cpu,
+            dtype: tensor.dtype,
+            _ctx: Some(Arc::new(Context {
+                parents: vec![parent],
+                backward_op: Box::new(move |grad_out, parents| {
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let mut input_grad = parents[0].grad_write_compat();
+                    for p in 0..prefix_len {
+                        let src_start = p * split_dim;
+                        let dst_start = p * last_dim + i * split_dim;
+                        for d in 0..split_dim {
+                            input_grad[dst_start + d] += grad_out_f64[src_start + d];
+                        }
+                    }
+                }),
+            })),
+        });
     }
     out
 }
@@ -388,7 +432,11 @@ impl LuckTransformer {
             };
             blocks.push(TransformerBlock {
                 norm_1: RMSNorm::new(hidden_dim, 1e-5, layer_seed + 5),
-                mla_layer: MultiHeadLatentAttention::new(mla_config.clone(), layer_seed + 10),
+                mla_layer: MultiHeadLatentAttention::new_with_achf(
+                    mla_config.clone(),
+                    layer_seed + 10,
+                    Some(achf),
+                ),
                 mhc,
                 norm_2: RMSNorm::new(hidden_dim, 1e-5, layer_seed + 15),
                 ffn_1: Linear::new(hidden_dim, hidden_dim * 2, true, layer_seed + 20),
@@ -536,24 +584,26 @@ impl LuckTransformer {
             return out;
         }
         let shape = &x.shape;
+        assert_eq!(shape.len(), 3, "last_token expects [Batch, Seq, Dim]");
         let batch_size = shape[0];
         let seq_len = shape[1];
         let dim = shape[2];
+        assert!(seq_len > 0, "last_token requires a non-empty sequence");
 
-        let x_data = x.data_as_f64_vec();
-        let mut out_data = Vec::with_capacity(batch_size * dim);
-
-        for b in 0..batch_size {
-            let start = b * seq_len * dim + (seq_len - 1) * dim;
-            out_data.extend_from_slice(&x_data[start..start + dim]);
-        }
-
-        Tensor::new_f32(out_data, vec![batch_size, dim])
+        x.strided_slice(
+            vec![0, seq_len - 1, 0],
+            vec![batch_size, seq_len, dim],
+            vec![1, 1, 1],
+        )
+        .reshape(vec![batch_size, dim])
     }
 
     pub fn update_achf_after_backward(&self) {
         for block in &self.blocks {
             if let Some(achf) = &block.achf_ffn {
+                achf.update_after_backward();
+            }
+            if let Some(achf) = &block.mla_layer.achf_wo {
                 achf.update_after_backward();
             }
         }
@@ -564,6 +614,9 @@ impl LuckTransformer {
             if let Some(achf) = &mut block.achf_ffn {
                 achf.freeze_for_inference();
             }
+            if let Some(achf) = &mut block.mla_layer.achf_wo {
+                achf.freeze_for_inference();
+            }
         }
     }
 
@@ -572,12 +625,20 @@ impl LuckTransformer {
             if let Some(achf) = &mut block.achf_ffn {
                 achf.prune(threshold);
             }
+            if let Some(achf) = &mut block.mla_layer.achf_wo {
+                achf.prune(threshold);
+            }
         }
     }
 
     pub fn snapshot_achf(&self) -> Option<crate::achf::AchfStateSnapshot> {
         for block in &self.blocks {
             if let Some(achf) = &block.achf_ffn {
+                return Some(achf.snapshot_state());
+            }
+        }
+        for block in &self.blocks {
+            if let Some(achf) = &block.mla_layer.achf_wo {
                 return Some(achf.snapshot_state());
             }
         }
@@ -590,7 +651,9 @@ impl LuckTransformer {
         let mut h = self.embed.forward_inference(x);
         for block in &self.blocks {
             let h_norm1 = block.norm_1.forward_inference(&h);
-            let attn_out = block.mla_layer.forward_inference(&h_norm1);
+            let attn_out = block
+                .mla_layer
+                .forward_inference_with_forced_path(&h_norm1, Some(forced_path));
             let mut h2 = vec![0.0f32; h.len()];
             if let Some(mhc) = &block.mhc {
                 let mhc_out = mhc.forward_inference(&attn_out);
@@ -621,9 +684,20 @@ impl LuckTransformer {
     }
 
     pub fn achf_cache_stats_iter(&self) -> impl Iterator<Item = AchfCacheStats> + '_ {
-        self.blocks
-            .iter()
-            .flat_map(|block| block.achf_ffn.as_ref().map(|achf| achf.cache_stats()))
+        self.blocks.iter().flat_map(|block| {
+            block
+                .achf_ffn
+                .as_ref()
+                .map(|achf| achf.cache_stats())
+                .into_iter()
+                .chain(
+                    block
+                        .mla_layer
+                        .achf_wo
+                        .as_ref()
+                        .map(|achf| achf.cache_stats()),
+                )
+        })
     }
 
     pub fn achf_cache_stats_aggregate(&self) -> AchfCacheStats {
@@ -633,7 +707,8 @@ impl LuckTransformer {
     pub fn achf_orthogonal_penalty(&self) -> Option<Tensor> {
         let mut reg: Option<Tensor> = None;
         for block in &self.blocks {
-            if let Some(achf) = &block.achf_ffn {
+            let achf_layers = block.achf_ffn.iter().chain(block.mla_layer.achf_wo.iter());
+            for achf in achf_layers {
                 if let Some(val) = achf.orthogonal_penalty() {
                     reg = Some(match reg {
                         Some(r) => r + val,
@@ -997,6 +1072,13 @@ pub struct MultiHeadLatentAttention {
     // Output Projection
     pub w_o: Linear,
 
+    /// Optional ACHF layer that replaces `w_o` when `achf.enabled && achf.apply_attn`.
+    /// `w_o` is the most regular, highest-FLOP Linear in the attention path and
+    /// sits after the KV cache, so swapping it does not affect cache semantics.
+    /// When `None`, the dense `w_o` is used and behavior is unchanged.
+    #[serde(default)]
+    pub achf_wo: Option<AchfLayer>,
+
     pub rope: RoPE,
 }
 
@@ -1114,8 +1196,30 @@ impl MultiHeadLatentAttention {
             // W_O: Heads * HeadDim -> Dim
             w_o: Linear::new(full_head_dim, dim, false, seed + 6),
 
+            achf_wo: None,
+
             rope: RoPE::new(rope_dim, config.max_seq_len),
         }
+    }
+
+    /// Construct an MLA layer, attaching an ACHF layer on the output
+    /// projection `w_o` when `achf.enabled && achf.apply_attn`.
+    pub fn new_with_achf(config: MLAConfig, seed: u64, achf: Option<&AchfConfig>) -> Self {
+        let mut mla = Self::new(config, seed);
+        if let Some(cfg) = achf {
+            if cfg.enabled && cfg.apply_attn {
+                // Same seed as w_o (seed + 6) so the ACHF dense weight starts
+                // identical to the plain w_o initialization.
+                mla.achf_wo = Some(AchfLayer::new(
+                    mla.w_o.in_features,
+                    mla.w_o.out_features,
+                    false,
+                    cfg.clone(),
+                    seed + 6,
+                ));
+            }
+        }
+        mla
     }
 
     pub fn parameters(&self) -> Vec<Tensor> {
@@ -1127,6 +1231,9 @@ impl MultiHeadLatentAttention {
         p.extend(self.w_kr.parameters());
         p.extend(self.w_qr.parameters());
         p.extend(self.w_o.parameters());
+        if let Some(achf) = &self.achf_wo {
+            p.extend(achf.parameters());
+        }
         p
     }
 
@@ -1139,6 +1246,9 @@ impl MultiHeadLatentAttention {
         self.w_kr.to_cuda();
         self.w_qr.to_cuda();
         self.w_o.to_cuda();
+        if let Some(ref mut achf) = self.achf_wo {
+            achf.to_cuda();
+        }
     }
 
     pub fn to_inference_bf16(&self) -> Self {
@@ -1151,6 +1261,7 @@ impl MultiHeadLatentAttention {
             w_kr: self.w_kr.to_inference_bf16(),
             w_qr: self.w_qr.to_inference_bf16(),
             w_o: self.w_o.to_inference_bf16(),
+            achf_wo: self.achf_wo.as_ref().map(AchfLayer::to_inference_bf16),
             rope: self.rope.clone(),
         }
     }
@@ -1163,6 +1274,9 @@ impl MultiHeadLatentAttention {
         self.w_kr.load_state_dict(&other.w_kr);
         self.w_qr.load_state_dict(&other.w_qr);
         self.w_o.load_state_dict(&other.w_o);
+        if let (Some(dst), Some(src)) = (&mut self.achf_wo, &other.achf_wo) {
+            dst.load_state_dict(src);
+        }
     }
 
     pub fn forward(&self, x: &Tensor) -> Tensor {
@@ -1249,10 +1363,39 @@ impl MultiHeadLatentAttention {
         let att_out_transposed = att_out_reshaped.transpose(1, 2); // [Batch, Seq, Heads, DimV]
         let final_out = att_out_transposed.reshape(vec![batch_size, seq_len, num_heads * head_dim]);
 
-        self.w_o.forward(&final_out)
+        match &self.achf_wo {
+            Some(achf) => achf.forward(&final_out),
+            None => self.w_o.forward(&final_out),
+        }
+    }
+
+    /// Apply the output projection on the inference path, routing through the
+    /// ACHF layer when attached. `forced_path` (0=Cached, 1=Sparse, 2=Dense)
+    /// bypasses the automatic AMA path selection; it is ignored without ACHF.
+    fn project_output_inference(&self, att_out: &[f32], forced_path: Option<u8>) -> Vec<f32> {
+        match (&self.achf_wo, forced_path) {
+            (Some(achf), Some(path)) => achf.forward_inference_forced_path(att_out, path),
+            (Some(achf), None) => achf.forward_inference_residual(att_out),
+            (None, _) => self.w_o.forward_inference(att_out),
+        }
+    }
+
+    fn project_output_inference_into(&self, att_out: &[f32], out: &mut Vec<f32>) {
+        match &self.achf_wo {
+            Some(achf) => *out = achf.forward_inference_residual(att_out),
+            None => self.w_o.forward_inference_into(att_out, out),
+        }
     }
 
     pub fn forward_inference(&self, x: &[f32]) -> Vec<f32> {
+        self.forward_inference_with_forced_path(x, None)
+    }
+
+    pub fn forward_inference_with_forced_path(
+        &self,
+        x: &[f32],
+        forced_path: Option<u8>,
+    ) -> Vec<f32> {
         use crate::simd::{add_scaled_row_f32, dot_product_f32};
         use rayon::prelude::*;
 
@@ -1384,7 +1527,7 @@ impl MultiHeadLatentAttention {
             }
         }
 
-        self.w_o.forward_inference(&att_out)
+        self.project_output_inference(&att_out, forced_path)
     }
 
     // --- KV Cache Support ---
@@ -1596,7 +1739,7 @@ impl MultiHeadLatentAttention {
                     att_out[dst..dst + head_dim].copy_from_slice(&head_buf[src..src + head_dim]);
                 }
             }
-            self.w_o.forward_inference_into(&att_out, out);
+            self.project_output_inference_into(&att_out, out);
         } else {
             for h in 0..num_heads {
                 let k_cache_head = &kv_cache.k_cache[h];
@@ -1640,7 +1783,7 @@ impl MultiHeadLatentAttention {
                     }
                 }
             }
-            self.w_o.forward_inference_into(&att_out, out);
+            self.project_output_inference_into(&att_out, out);
         }
     }
 
@@ -1772,7 +1915,7 @@ impl MultiHeadLatentAttention {
             }
         }
 
-        self.w_o.forward_inference_into(scratch_att_out, out);
+        self.project_output_inference_into(scratch_att_out, out);
     }
 
     pub fn prune_kv_cache(&self, kv_cache: &mut KVCache, max_seq_len: usize) {
@@ -2173,17 +2316,27 @@ impl MultiHeadLatentAttention {
             }
         };
 
-        let kernel_ok = match (out_dtype, &*d_probs, &*d_v, &*d_out) {
+        let kernel_result = match (out_dtype, &*d_probs, &*d_v, &*d_out) {
             (Dtype::F32, CudaBuffer::F32(p), CudaBuffer::F32(vb), CudaBuffer::F32(o)) => {
-                attention_weighted_sum_f32(p, vb, o, b, seq, dim_v).is_ok()
+                attention_weighted_sum_f32(p, vb, o, b, seq, dim_v)
             }
             (Dtype::F64, CudaBuffer::F64(p), CudaBuffer::F64(vb), CudaBuffer::F64(o)) => {
-                attention_weighted_sum(p, vb, o, b, seq, dim_v).is_ok()
+                attention_weighted_sum(p, vb, o, b, seq, dim_v)
             }
-            _ => false,
+            _ => Err(crate::cuda::error::CudaError::InvalidInput {
+                op: "MLA attention_weighted_sum",
+                message: "dtype/device buffer mismatch",
+            }),
         };
-        if !kernel_ok {
-            log::warn!("[MLA] CUDA attention_weighted_sum failed");
+        if let Err(err) = kernel_result {
+            log::warn!(
+                "[MLA] CUDA attention_weighted_sum failed (b={}, seq={}, dim_v={}, dtype={:?}): {}",
+                b,
+                seq,
+                dim_v,
+                out_dtype,
+                err
+            );
             return self.batched_matmul_probs_v_cpu_fallback(probs, v, b, seq, dim_v);
         }
 
@@ -2623,6 +2776,31 @@ mod tests {
     }
 
     #[test]
+    fn test_last_token_preserves_cpu_backward_path() {
+        let model = LuckTransformer::new_compat(4, 64, true, 1, 7, &AchfConfig::default());
+        let x = Tensor::new_f32((0..24).map(|v| v as f64).collect(), vec![2, 3, 4]);
+
+        let last = model.last_token(&x);
+        assert_eq!(last.shape, vec![2, 4]);
+        assert_eq!(
+            last.data_as_f64_vec().as_slice(),
+            &[8.0, 9.0, 10.0, 11.0, 20.0, 21.0, 22.0, 23.0]
+        );
+
+        last.sum().backward();
+        let grad = x.grad_to_f32_vec();
+        for b in 0..2 {
+            for t in 0..3 {
+                for d in 0..4 {
+                    let idx = (b * 3 + t) * 4 + d;
+                    let expected = if t == 2 { 1.0 } else { 0.0 };
+                    assert_eq!(grad[idx], expected);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_mla_forward_backward() {
         let config = MLAConfig {
             dim: 16,
@@ -3019,6 +3197,194 @@ mod tests {
         }
     }
 
+    fn attn_achf_config() -> AchfConfig {
+        AchfConfig {
+            enabled: true,
+            apply_attn: true,
+            apply_ffn: false,
+            proj_mode: "none".to_string(),
+            proj_freq: 0,
+            rank: 0,
+            prune_threshold: 0.0,
+            infer_gate: "one".to_string(),
+            cache_cost_bias: 0.0,
+            ..Default::default()
+        }
+    }
+
+    fn test_mla_config() -> MLAConfig {
+        MLAConfig {
+            dim: 16,
+            num_heads: 2,
+            q_lora_rank: 0,
+            kv_lora_rank: 8,
+            qk_rope_dim: 4,
+            v_head_dim: 8,
+            max_seq_len: 10,
+        }
+    }
+
+    #[test]
+    fn test_mla_apply_attn_forward_matches_dense() {
+        // Before freezing, with no sparse weight, the ACHF blend reduces to the
+        // dense path; since achf_wo is seeded like w_o, outputs must match the
+        // plain MLA exactly.
+        let config = test_mla_config();
+        let dense = MultiHeadLatentAttention::new(config.clone(), 42);
+        let achf = MultiHeadLatentAttention::new_with_achf(config, 42, Some(&attn_achf_config()));
+        assert!(achf.achf_wo.is_some());
+
+        let input = Tensor::rand(vec![1, 3, 16], -0.1, 0.1, 123);
+        let out_dense = dense.forward(&input).data_as_f64_vec().clone();
+        let out_achf = achf.forward(&input).data_as_f64_vec().clone();
+        assert_eq!(out_dense.len(), out_achf.len());
+        for (a, b) in out_dense.iter().zip(out_achf.iter()) {
+            assert!((a - b).abs() < 1e-9, "dense={a} achf={b}");
+        }
+    }
+
+    #[test]
+    fn test_mla_apply_attn_disabled_has_no_achf() {
+        let mut cfg = attn_achf_config();
+        cfg.apply_attn = false;
+        let mla = MultiHeadLatentAttention::new_with_achf(test_mla_config(), 42, Some(&cfg));
+        assert!(mla.achf_wo.is_none());
+    }
+
+    #[test]
+    fn test_mla_apply_attn_backward_reaches_achf_weight() {
+        let config = test_mla_config();
+        let mla = MultiHeadLatentAttention::new_with_achf(config, 42, Some(&attn_achf_config()));
+        let input = Tensor::rand(vec![1, 3, 16], -0.1, 0.1, 321);
+        mla.forward(&input).mean().backward();
+        let achf = mla.achf_wo.as_ref().unwrap();
+        let grad = achf.weight.weight.grad_to_f32_vec();
+        assert!(
+            grad.iter().any(|&g| g.abs() > 0.0),
+            "gradient must flow into the ACHF w_o replacement"
+        );
+    }
+
+    #[test]
+    fn test_mla_apply_attn_inference_paths_consistent() {
+        // After freeze with threshold 0 and gate "one", all three forced ACHF
+        // paths and the automatic path must agree with the dense projection.
+        let config = test_mla_config();
+        let mut mla =
+            MultiHeadLatentAttention::new_with_achf(config, 42, Some(&attn_achf_config()));
+        mla.achf_wo.as_mut().unwrap().freeze_for_inference();
+
+        let x: Vec<f32> = Tensor::rand(vec![3 * 16], -0.1, 0.1, 555).data_to_f32_vec();
+        let auto = mla.forward_inference(&x);
+        for forced in [0u8, 1, 2] {
+            let out = mla.forward_inference_with_forced_path(&x, Some(forced));
+            assert_eq!(auto.len(), out.len());
+            for (a, b) in auto.iter().zip(out.iter()) {
+                assert!(
+                    (a - b).abs() < 1e-5,
+                    "forced path {forced} diverges: {a} vs {b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_mla_apply_attn_kv_cache_matches_full_forward() {
+        let config = test_mla_config();
+        let mut mla =
+            MultiHeadLatentAttention::new_with_achf(config.clone(), 42, Some(&attn_achf_config()));
+        mla.achf_wo.as_mut().unwrap().freeze_for_inference();
+
+        let dim = 16;
+        let prefill: Vec<f32> = Tensor::rand(vec![2 * dim], -0.1, 0.1, 300).data_to_f32_vec();
+        let token: Vec<f32> = Tensor::rand(vec![dim], -0.1, 0.1, 400).data_to_f32_vec();
+
+        let mut cache = KVCache::new(config.num_heads);
+        let _ = mla.forward_inference_cached(&prefill, &mut cache, 0);
+        let cached_out = mla.forward_inference_cached(&token, &mut cache, 2);
+
+        let mut full_input = prefill.clone();
+        full_input.extend_from_slice(&token);
+        let full_out = mla.forward_inference(&full_input);
+        let last = &full_out[full_out.len() - dim..];
+
+        for (i, (&c, &f)) in cached_out.iter().zip(last.iter()).enumerate() {
+            assert!(
+                (c - f).abs() < 1e-4,
+                "cached decode mismatch at dim {i}: {c} vs {f}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_luck_transformer_apply_attn_matches_achf_off() {
+        // With identical seeds, an apply_attn transformer (gate=one, prune 0.0,
+        // frozen) must reproduce the achf-off transformer's inference output.
+        let achf_on = attn_achf_config();
+        let achf_off = AchfConfig::default();
+        let mut model_on = LuckTransformer::new_compat(8, 16, true, 2, 42, &achf_on);
+        let model_off = LuckTransformer::new_compat(8, 16, true, 2, 42, &achf_off);
+        assert!(model_on.blocks[0].mla_layer.achf_wo.is_some());
+        assert!(model_off.blocks[0].mla_layer.achf_wo.is_none());
+        model_on.freeze_achf_for_inference();
+
+        let x: Vec<f32> = Tensor::rand(vec![3 * 8], -0.1, 0.1, 808).data_to_f32_vec();
+        let out_on = model_on.forward_inference(&x);
+        let out_off = model_off.forward_inference(&x);
+        assert_eq!(out_on.len(), out_off.len());
+        for (a, b) in out_on.iter().zip(out_off.iter()) {
+            assert!((a - b).abs() < 1e-4, "achf-on={a} achf-off={b}");
+        }
+    }
+
+    #[test]
+    fn test_luck_transformer_apply_attn_step_matches_full() {
+        let achf = attn_achf_config();
+        let mut model = LuckTransformer::new_compat(8, 16, true, 2, 42, &achf);
+        model.freeze_achf_for_inference();
+        let num_heads = model.blocks[0].mla_layer.config.num_heads;
+
+        let prefill: Vec<f32> = Tensor::rand(vec![2 * 8], -0.1, 0.1, 500).data_to_f32_vec();
+        let token: Vec<f32> = Tensor::rand(vec![8], -0.1, 0.1, 501).data_to_f32_vec();
+
+        let mut caches = vec![KVCache::new(num_heads); model.blocks.len()];
+        let _ = model.forward_inference_step(&prefill, &mut caches, 0);
+        let stepped = model.forward_inference_step(&token, &mut caches, 2);
+
+        let mut full_input = prefill.clone();
+        full_input.extend_from_slice(&token);
+        let full_seq = model.forward_inference(&full_input);
+        let full_last = model.last_token_inference(&full_seq);
+
+        assert_eq!(stepped.len(), full_last.len());
+        for (i, (&s, &f)) in stepped.iter().zip(full_last.iter()).enumerate() {
+            assert!(
+                (s - f).abs() < 1e-3,
+                "stepped decode mismatch at dim {i}: {s} vs {f}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_luck_transformer_attn_achf_freeze_and_stats() {
+        let achf = attn_achf_config();
+        let mut model = LuckTransformer::new_compat(8, 16, true, 2, 42, &achf);
+        model.freeze_achf_for_inference();
+        for block in &model.blocks {
+            let layer = block.mla_layer.achf_wo.as_ref().unwrap();
+            assert!(layer.sparse_weight.is_some(), "freeze must prune attn ACHF");
+            assert!(layer.sparse_mask.is_some());
+        }
+        let x: Vec<f32> = Tensor::rand(vec![2 * 8], -0.1, 0.1, 909).data_to_f32_vec();
+        let _ = model.forward_inference(&x);
+        let stats = model.achf_cache_stats_aggregate();
+        assert!(
+            stats.calls > 0,
+            "attention ACHF layers must report cache stats"
+        );
+        assert!(model.snapshot_achf().is_some());
+    }
+
     #[test]
     fn test_concat_split_last_dim_roundtrip() {
         let a = Tensor::new_f32(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
@@ -3035,5 +3401,22 @@ mod tests {
         assert_eq!(s0[3], 4.0);
         assert_eq!(s1[0], 5.0);
         assert_eq!(s1[3], 8.0);
+    }
+
+    #[test]
+    fn test_concat_split_last_dim_preserve_cpu_backward_path() {
+        let a = Tensor::new_f32(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
+        let b = Tensor::new_f32(vec![5.0, 6.0, 7.0, 8.0], vec![2, 2]);
+        concat_last_dim(&[a.clone(), b.clone()]).sum().backward();
+        assert_eq!(a.grad_to_f32_vec(), vec![1.0; 4]);
+        assert_eq!(b.grad_to_f32_vec(), vec![1.0; 4]);
+
+        let x = Tensor::new_f32(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], vec![2, 4]);
+        let split = split_last_dim(&x, 2);
+        split[1].sum().backward();
+        assert_eq!(
+            x.grad_to_f32_vec(),
+            vec![0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0]
+        );
     }
 }

@@ -360,7 +360,10 @@ fn dqn_architecture(config: &Config) -> String {
 
 fn ppo_architecture(config: &Config) -> String {
     format!(
-        "ppo:v2:input={DIM}:model_dim={}:hidden={}:layers={}:heads={}:kv_rank={}:rope={}:multi_stream={}:stream_factor={}:actions={}:achf={}:attn={}:ffn={}:rank={}",
+        // v3: apply_attn now structurally attaches an AchfLayer to the MLA w_o
+        // projection and rank carries real low-rank semantics, so caches written
+        // by v2 binaries are incompatible and must be retrained.
+        "ppo:v3:input={DIM}:model_dim={}:hidden={}:layers={}:heads={}:kv_rank={}:rope={}:multi_stream={}:stream_factor={}:actions={}:achf={}:attn={}:ffn={}:rank={}",
         config.model_dim,
         config.model_hidden_dim,
         config.model_num_layers,

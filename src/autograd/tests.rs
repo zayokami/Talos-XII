@@ -632,6 +632,65 @@ fn test_cuda_grad_cache_is_separate_from_data_cache() {
     assert_eq!(grad, vec![1.0, 1.0, 1.0, 1.0]);
 }
 
+#[cfg(cuda)]
+#[test]
+fn test_cuda_fill_invalidates_cpu_tensor_cache() {
+    if crate::cuda::init().is_err() {
+        return;
+    }
+
+    let mut tensor = Tensor::new_f32(vec![1.0, 2.0], vec![2]);
+    let first_cuda = match tensor.to_cuda() {
+        Ok(tensor) => tensor,
+        Err(_) => return,
+    };
+    assert_eq!(first_cuda.data_as_f64_vec(), vec![1.0, 2.0]);
+
+    tensor.fill_(3.0);
+    let second_cuda = match tensor.to_cuda() {
+        Ok(tensor) => tensor,
+        Err(_) => return,
+    };
+    assert_eq!(second_cuda.data_as_f64_vec(), vec![3.0, 3.0]);
+}
+
+#[cfg(cuda)]
+#[test]
+fn test_cuda_neg_preserves_device_and_backward() {
+    if crate::cuda::init().is_err() {
+        return;
+    }
+
+    let input = match Tensor::new_f32(vec![1.0, -2.0, 3.0], vec![3]).to_cuda() {
+        Ok(tensor) => tensor,
+        Err(_) => return,
+    };
+    let neg = -input.clone();
+    assert_eq!(neg.device, Device::Cuda);
+    assert_eq!(neg.data_as_f64_vec(), vec![-1.0, 2.0, -3.0]);
+
+    neg.sum().backward();
+    assert_eq!(input.grad_to_f64_vec(), vec![-1.0, -1.0, -1.0]);
+}
+
+#[cfg(cuda)]
+#[test]
+fn test_cuda_reshape_backward_matches_view_layout() {
+    if crate::cuda::init().is_err() {
+        return;
+    }
+
+    let input = match Tensor::new_f32(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]).to_cuda() {
+        Ok(tensor) => tensor,
+        Err(_) => return,
+    };
+    let reshaped = input.reshape(vec![4]);
+    assert_eq!(reshaped.device, Device::Cuda);
+
+    reshaped.sum().backward();
+    assert_eq!(input.grad_to_f64_vec(), vec![1.0, 1.0, 1.0, 1.0]);
+}
+
 #[test]
 fn test_matmul_performance() {
     use std::time::Instant;

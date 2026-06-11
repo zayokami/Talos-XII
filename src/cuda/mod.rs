@@ -19,6 +19,8 @@ pub mod stream;
 use self::error::{CudaError, CudaResult};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 #[cfg(cuda)]
+use std::sync::Mutex;
+#[cfg(cuda)]
 use std::{ffi::c_char, ffi::CStr};
 
 /// Indicates whether CUDA is available and initialized
@@ -218,20 +220,55 @@ pub struct CudaDevice {
     pub total_memory: usize,
 }
 
+/// Serializes the one-time slow-path initialization in `init()`.
+#[cfg(cuda)]
+static CUDA_INIT_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(cuda)]
+thread_local! {
+    /// Whether the shared CUDA context has been bound to this thread already.
+    /// Lets `init()` skip the `cuCtxSetCurrent` call on every hot-path
+    /// invocation (alloc/copy/kernel launch) after the first one per thread.
+    static CUDA_CTX_BOUND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Bind the shared CUDA context to the calling thread (once per thread).
+#[cfg(cuda)]
+#[inline]
+fn bind_context_to_thread() {
+    CUDA_CTX_BOUND.with(|bound| {
+        if !bound.get() {
+            if let Some(ctx) = get_cuda_context() {
+                unsafe {
+                    bindings::cuCtxSetCurrent(ctx);
+                }
+            }
+            bound.set(true);
+        }
+    });
+}
+
 /// Initialize CUDA runtime and create a primary context.
 /// Must be called (directly or transitively) before any driver-API operation.
 /// Thread-safe: context is created once; on subsequent calls the same context
 /// is pushed onto the current thread.
 #[cfg(cuda)]
 pub fn init() -> CudaResult<()> {
-    if CUDA_INITIALIZED.load(Ordering::SeqCst) {
-        // Context already created — ensure it is current on this thread
-        // (CUDA contexts are thread-local).
-        if let Some(ctx) = get_cuda_context() {
-            unsafe {
-                bindings::cuCtxSetCurrent(ctx);
-            }
-        }
+    // Fast path: initialization already done. Only the first call per thread
+    // pays for the context bind; afterwards this is a single atomic load plus
+    // a thread-local flag check.
+    if CUDA_INITIALIZED.load(Ordering::Acquire) {
+        bind_context_to_thread();
+        return Ok(());
+    }
+
+    // Slow path: serialize so only one thread performs initialization.
+    let _guard = CUDA_INIT_LOCK.lock().map_err(|_| CudaError::InvalidInput {
+        op: "cuda::init",
+        message: "init lock poisoned",
+    })?;
+    if CUDA_INITIALIZED.load(Ordering::Acquire) {
+        bind_context_to_thread();
         return Ok(());
     }
 
@@ -290,6 +327,8 @@ pub fn init() -> CudaResult<()> {
         }
 
         CUDA_CONTEXT_PTR.store(ctx as usize, Ordering::SeqCst);
+        // The initializing thread already has the context current.
+        CUDA_CTX_BOUND.with(|bound| bound.set(true));
 
         // 4. cuBLAS warmup: verify cuBLAS can initialize in this context.
         //    If this fails, the user is missing cuBLAS dependencies (e.g.
@@ -321,7 +360,7 @@ pub fn init() -> CudaResult<()> {
         }
     }
 
-    CUDA_INITIALIZED.store(true, Ordering::SeqCst);
+    CUDA_INITIALIZED.store(true, Ordering::Release);
     Ok(())
 }
 

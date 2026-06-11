@@ -4,6 +4,82 @@
 use std::env;
 use std::path::Path;
 
+fn parse_cuda_arch_token(token: &str) -> Option<(u32, u32, String)> {
+    let raw = token.trim();
+    let stripped = raw
+        .strip_prefix("sm_")
+        .or_else(|| raw.strip_prefix("compute_"))
+        .unwrap_or(raw);
+    let digits: String = stripped.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() < 2 {
+        return None;
+    }
+    let (major, minor) = if digits.len() == 2 {
+        (
+            digits[0..1].parse::<u32>().ok()?,
+            digits[1..2].parse::<u32>().ok()?,
+        )
+    } else {
+        let split = digits.len() - 1;
+        (
+            digits[..split].parse::<u32>().ok()?,
+            digits[split..].parse::<u32>().ok()?,
+        )
+    };
+    Some((major, minor, format!("{major}{minor}")))
+}
+
+fn cuda_gencode_flags(cuda_arch_spec: &str) -> (Vec<String>, (u32, u32), String) {
+    let mut flags = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut primary = (7, 5);
+    let mut primary_set = false;
+
+    for token in cuda_arch_spec
+        .split([',', ';', ' '])
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        let Some((major, minor, cc)) = parse_cuda_arch_token(token) else {
+            eprintln!("[build.rs] Warning: ignoring invalid CUDA_ARCH token '{token}'");
+            continue;
+        };
+        if !primary_set {
+            primary = (major, minor);
+            primary_set = true;
+        }
+
+        if token.starts_with("compute_") {
+            let key = format!("compute_{cc}");
+            if seen.insert(key.clone()) {
+                flags.push(format!("-gencode=arch=compute_{cc},code={key}"));
+            }
+        } else {
+            let sass_key = format!("sm_{cc}");
+            if seen.insert(sass_key.clone()) {
+                flags.push(format!("-gencode=arch=compute_{cc},code={sass_key}"));
+            }
+            let ptx_key = format!("compute_{cc}");
+            if seen.insert(ptx_key.clone()) {
+                flags.push(format!("-gencode=arch=compute_{cc},code={ptx_key}"));
+            }
+        }
+    }
+
+    if flags.is_empty() {
+        flags.push("-gencode=arch=compute_75,code=sm_75".to_string());
+        flags.push("-gencode=arch=compute_75,code=compute_75".to_string());
+        primary = (7, 5);
+    }
+
+    let display = flags
+        .iter()
+        .map(|flag| flag.trim_start_matches("-gencode=arch="))
+        .collect::<Vec<_>>()
+        .join(", ");
+    (flags, primary, display)
+}
+
 fn main() {
     // Declare expected cfgs unconditionally so rustc/rust-analyzer don't warn
     println!("cargo::rustc-check-cfg=cfg(cuda)");
@@ -93,20 +169,14 @@ fn main() {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| "sm_75".to_string());
-    let cuda_arch_flag = format!("-arch={}", cuda_arch);
+    let (cuda_arch_flags, (arch_major, arch_minor), cuda_arch_display) =
+        cuda_gencode_flags(&cuda_arch);
     println!("cargo:rerun-if-env-changed=CUDA_ARCH");
-    println!("cargo:warning=Using CUDA architecture: {}", cuda_arch);
+    println!(
+        "cargo:warning=Using CUDA code generation: {}",
+        cuda_arch_display
+    );
 
-    // Parse sm_XX → major/minor for use as preprocessor constants in .cu files
-    let (arch_major, arch_minor) = if let Some(stripped) = cuda_arch.strip_prefix("sm_") {
-        let parts: Vec<&str> = stripped.split('_').collect();
-        (
-            parts.first().and_then(|s| s.parse().ok()).unwrap_or(75),
-            parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0),
-        )
-    } else {
-        (75, 0)
-    };
     let arch_defines = format!(
         "-DCUDA_ARCH_MAJOR={} -DCUDA_ARCH_MINOR={}",
         arch_major, arch_minor
@@ -149,9 +219,11 @@ fn main() {
                 .arg("cuda")
                 .arg("-o")
                 .arg(&obj)
-                .arg(f)
-                // Generate code for selected architecture
-                .arg(&cuda_arch_flag);
+                .arg(f);
+            // Generate SASS and PTX code for selected architecture targets.
+            for flag in &cuda_arch_flags {
+                cmd.arg(flag);
+            }
             // Add defines
             cmd.arg("-D").arg("CUDA_VERSION=12000");
             // Pass CUDA arch as preprocessor constants (major/minor)

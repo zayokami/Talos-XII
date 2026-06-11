@@ -3,6 +3,17 @@ use crate::dtype::{Dtype, Storage};
 use rayon::prelude::*;
 use std::sync::Arc;
 
+/// Minimum element count for which dispatching an element-wise op to the GPU
+/// pays off when neither operand is already resident in GPU memory.
+///
+/// A cold element-wise GPU op costs operand H2D uploads plus a kernel launch
+/// (tens of microseconds fixed overhead), while the SIMD CPU path processes
+/// a few thousand elements in ~1-2us. Resident operands skip this gate so
+/// chains of GPU ops stay on-device. Threshold chosen alongside
+/// `CUDA_MATMUL_MIN_OPS` in `matmul.rs` (see measurement notes there).
+#[cfg(cuda)]
+const CUDA_ELEMWISE_MIN_ELEMS: usize = 4096;
+
 #[cfg(cuda)]
 #[derive(Clone, Copy)]
 enum CudaBinaryOp {
@@ -14,7 +25,7 @@ enum CudaBinaryOp {
 
 #[cfg(cuda)]
 pub(crate) fn cuda_clip_gradients_in_place(params: &[Tensor], max_norm: f64, eps: f64) -> bool {
-    use crate::cuda::memory::{alloc, CudaBuffer};
+    use crate::cuda::memory::{alloc_pooled, CudaBuffer};
 
     let dtype = params
         .iter()
@@ -35,11 +46,11 @@ pub(crate) fn cuda_clip_gradients_in_place(params: &[Tensor], max_norm: f64, eps
 
     match dtype {
         Dtype::F32 => {
-            let sumsq = match alloc::<f32>(1) {
+            let sumsq = match alloc_pooled::<f32>(1) {
                 Ok(buf) => buf,
                 Err(_) => return false,
             };
-            let coef = match alloc::<f32>(1) {
+            let coef = match alloc_pooled::<f32>(1) {
                 Ok(buf) => buf,
                 Err(_) => return false,
             };
@@ -91,11 +102,11 @@ pub(crate) fn cuda_clip_gradients_in_place(params: &[Tensor], max_norm: f64, eps
             true
         }
         Dtype::F64 => {
-            let sumsq = match alloc::<f64>(1) {
+            let sumsq = match alloc_pooled::<f64>(1) {
                 Ok(buf) => buf,
                 Err(_) => return false,
             };
-            let coef = match alloc::<f64>(1) {
+            let coef = match alloc_pooled::<f64>(1) {
                 Ok(buf) => buf,
                 Err(_) => return false,
             };
@@ -146,7 +157,7 @@ pub(crate) fn cuda_clip_gradients_in_place(params: &[Tensor], max_norm: f64, eps
 impl Tensor {
     #[cfg(cuda)]
     pub(crate) fn index_select_cuda(&self, idx: usize) -> Option<Tensor> {
-        use crate::cuda::memory::{alloc, CudaBuffer};
+        use crate::cuda::memory::{alloc_pooled, CudaBuffer};
 
         if self.device != Device::Cuda || idx >= self.numel() {
             return None;
@@ -156,8 +167,8 @@ impl Tensor {
         }
         let d_in = self.cuda_get_or_upload_buffer().ok()?;
         let d_out = match self.dtype {
-            Dtype::F32 => CudaBuffer::F32(alloc::<f32>(1).ok()?),
-            Dtype::F64 => CudaBuffer::F64(alloc::<f64>(1).ok()?),
+            Dtype::F32 => CudaBuffer::F32(alloc_pooled::<f32>(1).ok()?),
+            Dtype::F64 => CudaBuffer::F64(alloc_pooled::<f64>(1).ok()?),
             _ => return None,
         };
         let d_out = Arc::new(d_out);
@@ -217,7 +228,7 @@ impl Tensor {
 
     #[cfg(cuda)]
     pub(crate) fn exp_cuda(&self) -> Option<Tensor> {
-        use crate::cuda::memory::{alloc, CudaBuffer};
+        use crate::cuda::memory::{alloc_pooled, CudaBuffer};
 
         if self.device != Device::Cuda || !matches!(self.dtype, Dtype::F32 | Dtype::F64) {
             return None;
@@ -225,8 +236,8 @@ impl Tensor {
         let len = self.numel();
         let d_in = self.cuda_get_or_upload_buffer().ok()?;
         let d_out = match self.dtype {
-            Dtype::F32 => CudaBuffer::F32(alloc::<f32>(len).ok()?),
-            Dtype::F64 => CudaBuffer::F64(alloc::<f64>(len).ok()?),
+            Dtype::F32 => CudaBuffer::F32(alloc_pooled::<f32>(len).ok()?),
+            Dtype::F64 => CudaBuffer::F64(alloc_pooled::<f64>(len).ok()?),
             _ => return None,
         };
         let d_out = Arc::new(d_out);
@@ -328,7 +339,7 @@ impl Tensor {
 
     #[cfg(cuda)]
     pub(crate) fn sum_cuda(&self, scale: f64) -> Option<Tensor> {
-        use crate::cuda::memory::{alloc, CudaBuffer};
+        use crate::cuda::memory::{alloc_pooled, CudaBuffer};
 
         if self.device != Device::Cuda || !matches!(self.dtype, Dtype::F32 | Dtype::F64) {
             return None;
@@ -336,8 +347,8 @@ impl Tensor {
         let len = self.numel();
         let d_in = self.cuda_get_or_upload_buffer().ok()?;
         let d_out = match self.dtype {
-            Dtype::F32 => CudaBuffer::F32(alloc::<f32>(1).ok()?),
-            Dtype::F64 => CudaBuffer::F64(alloc::<f64>(1).ok()?),
+            Dtype::F32 => CudaBuffer::F32(alloc_pooled::<f32>(1).ok()?),
+            Dtype::F64 => CudaBuffer::F64(alloc_pooled::<f64>(1).ok()?),
             _ => return None,
         };
         let d_out = Arc::new(d_out);
@@ -417,7 +428,7 @@ impl Tensor {
 
     #[cfg(cuda)]
     pub(crate) fn select_last_token_cuda(&self) -> Option<Tensor> {
-        use crate::cuda::memory::{alloc, CudaBuffer};
+        use crate::cuda::memory::{alloc_pooled, CudaBuffer};
 
         if self.device != Device::Cuda || self.shape.len() != 3 {
             return None;
@@ -434,8 +445,8 @@ impl Tensor {
         let out_len = batch.checked_mul(dim)?;
         let d_in = self.cuda_get_or_upload_buffer().ok()?;
         let d_out = match self.dtype {
-            Dtype::F32 => CudaBuffer::F32(alloc::<f32>(out_len).ok()?),
-            Dtype::F64 => CudaBuffer::F64(alloc::<f64>(out_len).ok()?),
+            Dtype::F32 => CudaBuffer::F32(alloc_pooled::<f32>(out_len).ok()?),
+            Dtype::F64 => CudaBuffer::F64(alloc_pooled::<f64>(out_len).ok()?),
             _ => return None,
         };
         let d_out = Arc::new(d_out);
@@ -509,16 +520,23 @@ impl Tensor {
 impl Tensor {
     #[cfg(cuda)]
     pub(crate) fn scale_cuda(&self, scale: f64) -> Option<Tensor> {
-        use crate::cuda::memory::{alloc, CudaBuffer};
+        use crate::cuda::memory::{alloc_pooled, CudaBuffer};
 
         if self.device != Device::Cuda || (self.dtype != Dtype::F32 && self.dtype != Dtype::F64) {
             return None;
         }
         let len = self.numel();
+        // Small host-only workloads are faster on the CPU SIMD path.
+        if len < CUDA_ELEMWISE_MIN_ELEMS
+            && self.cuda_cached_buffer().is_none()
+            && !self.data.is_empty()
+        {
+            return None;
+        }
         let d_in = self.cuda_get_or_upload_buffer().ok()?;
         let d_out = match self.dtype {
-            Dtype::F32 => CudaBuffer::F32(alloc::<f32>(len).ok()?),
-            Dtype::F64 => CudaBuffer::F64(alloc::<f64>(len).ok()?),
+            Dtype::F32 => CudaBuffer::F32(alloc_pooled::<f32>(len).ok()?),
+            Dtype::F64 => CudaBuffer::F64(alloc_pooled::<f64>(len).ok()?),
             _ => return None,
         };
         let d_out = Arc::new(d_out);
@@ -591,7 +609,7 @@ impl Tensor {
 
     #[cfg(cuda)]
     pub(crate) fn causal_mask_cuda(&self, seq_len: usize) -> Option<Tensor> {
-        use crate::cuda::memory::{alloc, CudaBuffer};
+        use crate::cuda::memory::{alloc_pooled, CudaBuffer};
 
         if self.device != Device::Cuda || (self.dtype != Dtype::F32 && self.dtype != Dtype::F64) {
             return None;
@@ -604,8 +622,8 @@ impl Tensor {
         let batches = len / seq_area;
         let d_in = self.cuda_get_or_upload_buffer().ok()?;
         let d_out = match self.dtype {
-            Dtype::F32 => CudaBuffer::F32(alloc::<f32>(len).ok()?),
-            Dtype::F64 => CudaBuffer::F64(alloc::<f64>(len).ok()?),
+            Dtype::F32 => CudaBuffer::F32(alloc_pooled::<f32>(len).ok()?),
+            Dtype::F64 => CudaBuffer::F64(alloc_pooled::<f64>(len).ok()?),
             _ => return None,
         };
         let d_out = Arc::new(d_out);
@@ -677,7 +695,7 @@ impl Tensor {
 
     #[cfg(cuda)]
     pub(crate) fn concat_last_dim_cuda(a: &Tensor, b: &Tensor) -> Option<Tensor> {
-        use crate::cuda::memory::{alloc, CudaBuffer};
+        use crate::cuda::memory::{alloc_pooled, CudaBuffer};
 
         if a.device != Device::Cuda || b.device != Device::Cuda {
             return None;
@@ -698,8 +716,8 @@ impl Tensor {
         let d_a = a.cuda_get_or_upload_buffer().ok()?;
         let d_b = b.cuda_get_or_upload_buffer().ok()?;
         let d_out = match a.dtype {
-            Dtype::F32 => CudaBuffer::F32(alloc::<f32>(out_len).ok()?),
-            Dtype::F64 => CudaBuffer::F64(alloc::<f64>(out_len).ok()?),
+            Dtype::F32 => CudaBuffer::F32(alloc_pooled::<f32>(out_len).ok()?),
+            Dtype::F64 => CudaBuffer::F64(alloc_pooled::<f64>(out_len).ok()?),
             _ => return None,
         };
         let d_out = Arc::new(d_out);
@@ -729,7 +747,6 @@ impl Tensor {
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
-                    let grad_out_f64 = grad_out.to_f64_vec();
                     let a_in = &parents[0];
                     let b_in = &parents[1];
                     if a_in.device == Device::Cuda && b_in.device == Device::Cuda {
@@ -765,6 +782,7 @@ impl Tensor {
                             }
                         }
                     }
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let mut a_grad = a_in.grad_write_compat();
                     let mut b_grad = b_in.grad_write_compat();
                     let stride = a_dim + b_dim;
@@ -789,7 +807,7 @@ impl Tensor {
 
     #[cfg(cuda)]
     pub(crate) fn split_last_dim_cuda(&self, parts: usize) -> Option<Vec<Tensor>> {
-        use crate::cuda::memory::{alloc, CudaBuffer};
+        use crate::cuda::memory::{alloc_pooled, CudaBuffer};
 
         if self.device != Device::Cuda
             || (self.dtype != Dtype::F32 && self.dtype != Dtype::F64)
@@ -808,8 +826,8 @@ impl Tensor {
         let mut out = Vec::with_capacity(parts);
         for part_idx in 0..parts {
             let d_part = match self.dtype {
-                Dtype::F32 => CudaBuffer::F32(alloc::<f32>(rows * part_dim).ok()?),
-                Dtype::F64 => CudaBuffer::F64(alloc::<f64>(rows * part_dim).ok()?),
+                Dtype::F32 => CudaBuffer::F32(alloc_pooled::<f32>(rows * part_dim).ok()?),
+                Dtype::F64 => CudaBuffer::F64(alloc_pooled::<f64>(rows * part_dim).ok()?),
                 _ => return None,
             };
             let d_part = Arc::new(d_part);
@@ -844,7 +862,6 @@ impl Tensor {
                 _ctx: Some(Arc::new(Context {
                     parents: vec![input],
                     backward_op: Box::new(move |grad_out, parents| {
-                        let grad_out_f64 = grad_out.to_f64_vec();
                         let input = &parents[0];
                         if input.device == Device::Cuda {
                             if let Some(d_grad_tmp) = cuda_grad_out_buffer(grad_out) {
@@ -870,6 +887,7 @@ impl Tensor {
                                 }
                             }
                         }
+                        let grad_out_f64 = grad_out.to_f64_vec();
                         let mut input_grad = input.grad_write_compat();
                         for r in 0..rows {
                             let src = r * part_dim;
@@ -889,7 +907,7 @@ impl Tensor {
 
     #[cfg(cuda)]
     pub(crate) fn broadcast_to_batch_cuda(&self, batch_size: usize) -> Option<Tensor> {
-        use crate::cuda::memory::{alloc, CudaBuffer};
+        use crate::cuda::memory::{alloc_pooled, CudaBuffer};
 
         if self.device != Device::Cuda || (self.dtype != Dtype::F32 && self.dtype != Dtype::F64) {
             return None;
@@ -898,8 +916,8 @@ impl Tensor {
         let out_len = inner_len.checked_mul(batch_size)?;
         let d_in = self.cuda_get_or_upload_buffer().ok()?;
         let d_out = match self.dtype {
-            Dtype::F32 => CudaBuffer::F32(alloc::<f32>(out_len).ok()?),
-            Dtype::F64 => CudaBuffer::F64(alloc::<f64>(out_len).ok()?),
+            Dtype::F32 => CudaBuffer::F32(alloc_pooled::<f32>(out_len).ok()?),
+            Dtype::F64 => CudaBuffer::F64(alloc_pooled::<f64>(out_len).ok()?),
             _ => return None,
         };
         let d_out = Arc::new(d_out);
@@ -971,7 +989,7 @@ impl Tensor {
 
     #[cfg(cuda)]
     pub(crate) fn transpose_cuda(&self, dim0: usize, dim1: usize) -> Option<Tensor> {
-        use crate::cuda::memory::{alloc, CudaBuffer};
+        use crate::cuda::memory::{alloc_pooled, CudaBuffer};
 
         if self.device != Device::Cuda || (self.dtype != Dtype::F32 && self.dtype != Dtype::F64) {
             return None;
@@ -988,8 +1006,8 @@ impl Tensor {
         new_shape.swap(dim0, dim1);
         let d_in = self.cuda_get_or_upload_buffer().ok()?;
         let d_out = match self.dtype {
-            Dtype::F32 => CudaBuffer::F32(alloc::<f32>(len).ok()?),
-            Dtype::F64 => CudaBuffer::F64(alloc::<f64>(len).ok()?),
+            Dtype::F32 => CudaBuffer::F32(alloc_pooled::<f32>(len).ok()?),
+            Dtype::F64 => CudaBuffer::F64(alloc_pooled::<f64>(len).ok()?),
             _ => return None,
         };
         let d_out = Arc::new(d_out);
@@ -1132,7 +1150,7 @@ impl Tensor {
     #[allow(dead_code)]
     pub(super) fn softmax_cuda(&self) -> Tensor {
         use crate::cuda::kernels::{softmax_inplace_auto, softmax_inplace_auto_f32};
-        use crate::cuda::memory::{alloc, copy_d2d, CudaBuffer};
+        use crate::cuda::memory::{alloc_pooled, copy_d2d, CudaBuffer};
 
         let len = match self.dtype {
             Dtype::F32 | Dtype::F64 => self.numel(),
@@ -1172,7 +1190,7 @@ impl Tensor {
             }
         };
         let d_data = match self.dtype {
-            Dtype::F32 => match alloc::<f32>(len) {
+            Dtype::F32 => match alloc_pooled::<f32>(len) {
                 Ok(buf) => CudaBuffer::F32(buf),
                 Err(err) => {
                     crate::cuda::record_activation_fallback("alloc");
@@ -1183,7 +1201,7 @@ impl Tensor {
                     return self.softmax_cpu_fallback();
                 }
             },
-            Dtype::F64 => match alloc::<f64>(len) {
+            Dtype::F64 => match alloc_pooled::<f64>(len) {
                 Ok(buf) => CudaBuffer::F64(buf),
                 Err(err) => {
                     crate::cuda::record_activation_fallback("alloc");
@@ -1335,7 +1353,7 @@ impl Tensor {
     #[allow(dead_code)]
     pub(crate) fn softmax_causal_cuda(&self) -> Tensor {
         use crate::cuda::kernels::{softmax_causal_inplace, softmax_causal_inplace_f32};
-        use crate::cuda::memory::{alloc, copy_d2d, CudaBuffer};
+        use crate::cuda::memory::{alloc_pooled, copy_d2d, CudaBuffer};
 
         let len = match self.dtype {
             Dtype::F32 | Dtype::F64 => self.numel(),
@@ -1373,7 +1391,7 @@ impl Tensor {
             }
         };
         let d_data = match self.dtype {
-            Dtype::F32 => match alloc::<f32>(len) {
+            Dtype::F32 => match alloc_pooled::<f32>(len) {
                 Ok(buf) => CudaBuffer::F32(buf),
                 Err(err) => {
                     crate::cuda::record_activation_fallback("alloc");
@@ -1384,7 +1402,7 @@ impl Tensor {
                     return self.softmax_cpu_fallback();
                 }
             },
-            Dtype::F64 => match alloc::<f64>(len) {
+            Dtype::F64 => match alloc_pooled::<f64>(len) {
                 Ok(buf) => CudaBuffer::F64(buf),
                 Err(err) => {
                     crate::cuda::record_activation_fallback("alloc");
@@ -1528,7 +1546,7 @@ impl Tensor {
         start_pos: usize,
     ) -> Tensor {
         use crate::cuda::kernels::{rope_inplace, rope_inplace_f32};
-        use crate::cuda::memory::{alloc, copy_d2d, copy_h2d, CudaBuffer};
+        use crate::cuda::memory::{alloc_pooled, copy_d2d, copy_h2d, CudaBuffer};
 
         let len = match self.dtype {
             Dtype::F32 | Dtype::F64 => self.numel(),
@@ -1552,14 +1570,14 @@ impl Tensor {
             }
         };
         let d_data = match self.dtype {
-            Dtype::F32 => match alloc::<f32>(len) {
+            Dtype::F32 => match alloc_pooled::<f32>(len) {
                 Ok(buf) => CudaBuffer::F32(buf),
                 Err(_) => {
                     crate::cuda::record_activation_fallback("alloc");
                     return self.clone();
                 }
             },
-            Dtype::F64 => match alloc::<f64>(len) {
+            Dtype::F64 => match alloc_pooled::<f64>(len) {
                 Ok(buf) => CudaBuffer::F64(buf),
                 Err(_) => {
                     crate::cuda::record_activation_fallback("alloc");
@@ -1582,14 +1600,14 @@ impl Tensor {
             (Dtype::F32, CudaBuffer::F32(b)) => {
                 let cos_f32: Vec<f32> = cos_cache.iter().map(|&v| v as f32).collect();
                 let sin_f32: Vec<f32> = sin_cache.iter().map(|&v| v as f32).collect();
-                let d_cos = match alloc::<f32>(cos_f32.len()) {
+                let d_cos = match alloc_pooled::<f32>(cos_f32.len()) {
                     Ok(buf) => buf,
                     Err(_) => {
                         crate::cuda::record_activation_fallback("alloc_cos");
                         return self.clone();
                     }
                 };
-                let d_sin = match alloc::<f32>(sin_f32.len()) {
+                let d_sin = match alloc_pooled::<f32>(sin_f32.len()) {
                     Ok(buf) => buf,
                     Err(_) => {
                         crate::cuda::record_activation_fallback("alloc_sin");
@@ -1603,14 +1621,14 @@ impl Tensor {
                 rope_inplace_f32(b, &d_cos, &d_sin, seq_len, dim, total_batches, start_pos).is_ok()
             }
             (Dtype::F64, CudaBuffer::F64(b)) => {
-                let d_cos = match alloc::<f64>(cos_cache.len()) {
+                let d_cos = match alloc_pooled::<f64>(cos_cache.len()) {
                     Ok(buf) => buf,
                     Err(_) => {
                         crate::cuda::record_activation_fallback("alloc_cos");
                         return self.clone();
                     }
                 };
-                let d_sin = match alloc::<f64>(sin_cache.len()) {
+                let d_sin = match alloc_pooled::<f64>(sin_cache.len()) {
                     Ok(buf) => buf,
                     Err(_) => {
                         crate::cuda::record_activation_fallback("alloc_sin");
@@ -1649,10 +1667,10 @@ impl Tensor {
             Dtype::F32 => {
                 let cos_f32: Vec<f32> = cos_cache.iter().map(|&v| v as f32).collect();
                 let sin_f32: Vec<f32> = sin_cache.iter().map(|&v| v as f32).collect();
-                let Ok(d_cos) = alloc::<f32>(cos_f32.len()) else {
+                let Ok(d_cos) = alloc_pooled::<f32>(cos_f32.len()) else {
                     return self.clone();
                 };
-                let Ok(d_sin) = alloc::<f32>(sin_f32.len()) else {
+                let Ok(d_sin) = alloc_pooled::<f32>(sin_f32.len()) else {
                     return self.clone();
                 };
                 if copy_h2d(&d_cos, &cos_f32).is_err() || copy_h2d(&d_sin, &sin_f32).is_err() {
@@ -1662,10 +1680,10 @@ impl Tensor {
                 d_sin_for_backward = Arc::new(CudaBuffer::F32(d_sin));
             }
             Dtype::F64 => {
-                let Ok(d_cos) = alloc::<f64>(cos_cache.len()) else {
+                let Ok(d_cos) = alloc_pooled::<f64>(cos_cache.len()) else {
                     return self.clone();
                 };
-                let Ok(d_sin) = alloc::<f64>(sin_cache.len()) else {
+                let Ok(d_sin) = alloc_pooled::<f64>(sin_cache.len()) else {
                     return self.clone();
                 };
                 if copy_h2d(&d_cos, cos_cache).is_err() || copy_h2d(&d_sin, sin_cache).is_err() {
@@ -1774,7 +1792,7 @@ impl Tensor {
     #[allow(dead_code)]
     pub(super) fn log_softmax_cuda_last_dim(&self) -> Tensor {
         use crate::cuda::kernels::log_softmax_f32;
-        use crate::cuda::memory::{alloc, CudaBuffer};
+        use crate::cuda::memory::{alloc_pooled, CudaBuffer};
 
         let shape = self.shape.clone();
         let dim_size = *shape.last().unwrap_or(&1);
@@ -1804,7 +1822,7 @@ impl Tensor {
             }
         };
         let d_out = match self.dtype {
-            Dtype::F32 => match alloc::<f32>(len) {
+            Dtype::F32 => match alloc_pooled::<f32>(len) {
                 Ok(buf) => CudaBuffer::F32(buf),
                 Err(err) => {
                     crate::cuda::record_log_softmax_fallback("alloc");
@@ -1815,7 +1833,7 @@ impl Tensor {
                     return self.log_softmax_last_dim_cpu_fallback();
                 }
             },
-            Dtype::F64 => match alloc::<f64>(len) {
+            Dtype::F64 => match alloc_pooled::<f64>(len) {
                 Ok(buf) => CudaBuffer::F64(buf),
                 Err(err) => {
                     crate::cuda::record_log_softmax_fallback("alloc");
@@ -2002,7 +2020,7 @@ impl Tensor {
             ) -> crate::cuda::error::CudaResult<()>,
         >,
     ) -> Option<Tensor> {
-        use crate::cuda::memory::{alloc, CudaBuffer};
+        use crate::cuda::memory::{alloc_pooled, CudaBuffer};
 
         if self.device != Device::Cuda || rhs.device != Device::Cuda {
             return None;
@@ -2012,11 +2030,21 @@ impl Tensor {
             return None;
         }
         let len = self.numel();
+        // Small workloads whose operands live only on the host are faster on
+        // the CPU SIMD path; returning None routes the caller there.
+        if len < CUDA_ELEMWISE_MIN_ELEMS
+            && self.cuda_cached_buffer().is_none()
+            && rhs.cuda_cached_buffer().is_none()
+            && !self.data.is_empty()
+            && !rhs.data.is_empty()
+        {
+            return None;
+        }
         let d_a = self.cuda_get_or_upload_buffer().ok()?;
         let d_b = rhs.cuda_get_or_upload_buffer().ok()?;
         let d_out = match out_dtype {
-            Dtype::F32 => alloc::<f32>(len).ok().map(CudaBuffer::F32),
-            Dtype::F64 => alloc::<f64>(len).ok().map(CudaBuffer::F64),
+            Dtype::F32 => alloc_pooled::<f32>(len).ok().map(CudaBuffer::F32),
+            Dtype::F64 => alloc_pooled::<f64>(len).ok().map(CudaBuffer::F64),
             _ => None,
         }?;
         let d_out = std::sync::Arc::new(d_out);
@@ -2044,7 +2072,6 @@ impl Tensor {
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
-                    let grad_out_f64 = grad_out.to_f64_vec();
                     let a = &parents[0];
                     let b = &parents[1];
                     let mut gpu_backward_ok = false;
@@ -2075,15 +2102,8 @@ impl Tensor {
                                                 Dtype::F32,
                                             ) => {
                                                 if let Some(bk) = backward_f32 {
-                                                    gpu_backward_ok = bk(
-                                                        gt,
-                                                        a_buf,
-                                                        b_buf,
-                                                        ag,
-                                                        bg,
-                                                        grad_out_f64.len(),
-                                                    )
-                                                    .is_ok();
+                                                    gpu_backward_ok =
+                                                        bk(gt, a_buf, b_buf, ag, bg, len).is_ok();
                                                 }
                                             }
                                             (
@@ -2095,15 +2115,8 @@ impl Tensor {
                                                 Dtype::F64,
                                             ) => {
                                                 if let Some(bk) = backward_f64 {
-                                                    gpu_backward_ok = bk(
-                                                        gt,
-                                                        a_buf,
-                                                        b_buf,
-                                                        ag,
-                                                        bg,
-                                                        grad_out_f64.len(),
-                                                    )
-                                                    .is_ok();
+                                                    gpu_backward_ok =
+                                                        bk(gt, a_buf, b_buf, ag, bg, len).is_ok();
                                                 }
                                             }
                                             _ => {}
@@ -2117,6 +2130,7 @@ impl Tensor {
                         return;
                     }
 
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let mut a_grad = a.grad_write_compat();
                     let mut b_grad = b.grad_write_compat();
                     match op {

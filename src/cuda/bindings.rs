@@ -66,6 +66,19 @@ extern "C" {
         count: usize,
         kind: c_int,
     ) -> c_int;
+    // Pinned (page-locked) host memory + async copy, declared for a future
+    // pinned-staging transfer path (see TODO in cuda/memory.rs). Async copies
+    // only overlap when the host buffer is pinned; on pageable memory
+    // cudaMemcpyAsync silently degrades to a synchronous copy.
+    pub fn cudaMallocHost(ptr: *mut *mut std::ffi::c_void, size: usize) -> c_int;
+    pub fn cudaFreeHost(ptr: *mut std::ffi::c_void) -> c_int;
+    pub fn cudaMemcpyAsync(
+        dst: *mut std::ffi::c_void,
+        src: *const std::ffi::c_void,
+        count: usize,
+        kind: c_int,
+        stream: CUstream,
+    ) -> c_int;
 }
 
 // =============================================================================
@@ -366,8 +379,8 @@ extern "C" {
         h_attn: *mut f64,
         h_values: *mut f64,
         h_output: *mut f64,
-        rows: c_int,
-        cols: c_int,
+        batches: c_int,
+        seq: c_int,
         head_dim: c_int,
         d_attn: *mut c_int,
         d_values: *mut c_int,
@@ -378,8 +391,8 @@ extern "C" {
         h_attn: *mut f32,
         h_values: *mut f32,
         h_output: *mut f32,
-        rows: c_int,
-        cols: c_int,
+        batches: c_int,
+        seq: c_int,
         head_dim: c_int,
         d_attn: *mut c_int,
         d_values: *mut c_int,

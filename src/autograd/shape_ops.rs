@@ -585,6 +585,40 @@ impl Tensor {
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
+                    #[cfg(cuda)]
+                    {
+                        let input = &parents[0];
+                        if input.device == Device::Cuda {
+                            if let Some(d_grad_tmp) =
+                                crate::autograd::cuda_grad_out_buffer(grad_out)
+                            {
+                                if let Some(d_input_grad) = input.cuda_grad_ensure_buffer() {
+                                    let ok =
+                                        match (&*d_grad_tmp, &*d_input_grad, input.grad.dtype()) {
+                                            (
+                                                crate::cuda::memory::CudaBuffer::F32(src),
+                                                crate::cuda::memory::CudaBuffer::F32(dst),
+                                                Dtype::F32,
+                                            ) => {
+                                                crate::cuda::kernels::acc_buffer_f32(dst, src, len)
+                                                    .is_ok()
+                                            }
+                                            (
+                                                crate::cuda::memory::CudaBuffer::F64(src),
+                                                crate::cuda::memory::CudaBuffer::F64(dst),
+                                                Dtype::F64,
+                                            ) => crate::cuda::kernels::acc_buffer(dst, src, len)
+                                                .is_ok(),
+                                            _ => false,
+                                        };
+                                    if ok {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     let grad_out_f64 = grad_out.to_f64_vec();
                     let mut inp_grad = parents[0].grad_write_compat();
                     let len = grad_out_f64.len();

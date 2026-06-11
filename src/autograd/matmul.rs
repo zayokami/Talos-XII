@@ -6,7 +6,38 @@ use crate::simd::{add_scaled_row, dot_product, prefetch_read_l1};
 use rayon::prelude::*;
 use std::sync::{Arc, RwLock};
 
+/// Minimum GEMM size (m*n*k multiply-adds) for which the GPU path pays off
+/// when the operands are NOT already resident in GPU memory.
+///
+/// Measured on RTX 4060 Laptop + Ryzen-class CPU with the `simulate` workload:
+/// a cold GPU matmul costs ~2 H2D copies + cuBLAS launch (~30-60us fixed
+/// overhead), while the SIMD CPU path sustains roughly 5-15 GFLOP/s, i.e.
+/// ~20-60us for 2^18 ops. Below this size the CPU finishes before the GPU
+/// even starts computing; above it the GPU wins and keeps the result cached
+/// on-device for downstream ops.
+#[cfg(cuda)]
+const CUDA_MATMUL_MIN_OPS: usize = 1 << 18; // 262_144 ≈ 64x64x64
+
 impl Tensor {
+    /// Decide whether a matmul should be dispatched to the GPU.
+    ///
+    /// Always use the GPU when either operand is already resident in GPU
+    /// memory (upload cost already paid, and the host copy may be empty after
+    /// `cuda_clear_host_data_preserve_cache`). Otherwise only use the GPU for
+    /// workloads large enough to amortize transfer + launch overhead.
+    #[cfg(cuda)]
+    fn cuda_matmul_profitable(&self, other: &Tensor, m: usize, k: usize, n: usize) -> bool {
+        if self.cuda_cached_buffer().is_some() || other.cuda_cached_buffer().is_some() {
+            return true;
+        }
+        // No cached GPU buffer and no host data: the upload would fail and the
+        // CPU path would read garbage; let the GPU path handle the error/fall
+        // back through its existing machinery.
+        if self.data.is_empty() || other.data.is_empty() {
+            return true;
+        }
+        m.saturating_mul(k).saturating_mul(n) >= CUDA_MATMUL_MIN_OPS
+    }
     pub fn matmul(&self, other: &Tensor) -> Tensor {
         assert!(self.shape.len() <= 2 && other.shape.len() == 2);
 
@@ -28,7 +59,7 @@ impl Tensor {
                         | (Dtype::F64, Dtype::F64)
                         | (Dtype::BF16, Dtype::BF16)
                 );
-            if use_gpu {
+            if use_gpu && self.cuda_matmul_profitable(other, m, k, n) {
                 return self.matmul_cuda(other, m, k, n);
             }
         }
@@ -347,7 +378,7 @@ impl Tensor {
     #[allow(dead_code)]
     fn matmul_cuda(&self, other: &Tensor, m: usize, k: usize, n: usize) -> Tensor {
         use crate::cuda::blas::gemm_thread_local;
-        use crate::cuda::memory::alloc;
+        use crate::cuda::memory::alloc_pooled;
 
         crate::cuda::record_matmul_attempt();
 
@@ -382,15 +413,18 @@ impl Tensor {
         };
         let grad_dtype = Tensor::grad_dtype_for(compute_out_dtype);
 
+        // Pooled allocation: cudaMalloc/cudaFree are implicit device sync
+        // points, so reuse buffers from the size-bucketed pool. Pool buffers
+        // hold stale data, but GEMM with beta=0 fully overwrites the output.
         let d_c = match compute_out_dtype {
-            Dtype::F32 => match alloc::<f32>(m * n) {
+            Dtype::F32 => match alloc_pooled::<f32>(m * n) {
                 Ok(buf) => crate::cuda::memory::CudaBuffer::F32(buf),
                 Err(_err) => {
                     crate::cuda::record_matmul_fallback("alloc");
                     return self.matmul_cpu_fallback(other, m, k, n);
                 }
             },
-            _ => match alloc::<f64>(m * n) {
+            _ => match alloc_pooled::<f64>(m * n) {
                 Ok(buf) => crate::cuda::memory::CudaBuffer::F64(buf),
                 Err(_err) => {
                     crate::cuda::record_matmul_fallback("alloc");
@@ -489,7 +523,6 @@ impl Tensor {
             _ctx: Some(Arc::new(Context {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
-                    let grad_out_f64 = grad_out.to_f64_vec();
                     let lhs = &parents[0];
                     let rhs = &parents[1];
 
@@ -618,6 +651,7 @@ impl Tensor {
                         }
                     }
 
+                    let grad_out_f64 = grad_out.to_f64_vec();
                     let guards = TensorReadGuard::new(&[lhs, rhs]);
                     let lhs_data = guards.get(0);
                     let rhs_data = guards.get(1);

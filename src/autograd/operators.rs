@@ -663,6 +663,11 @@ impl<'b> Div<&'b Tensor> for &Tensor {
 impl Neg for Tensor {
     type Output = Tensor;
     fn neg(self) -> Tensor {
+        #[cfg(cuda)]
+        if let Some(out) = self.scale_cuda(-1.0) {
+            return out;
+        }
+
         if self.dtype != Dtype::F64 {
             let self_data = self.data_to_f32_vec();
             let len = self_data.len();

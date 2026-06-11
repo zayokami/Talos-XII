@@ -236,7 +236,7 @@ impl Tensor {
         &self,
     ) -> Result<Arc<crate::cuda::memory::CudaBuffer>, (&'static str, crate::cuda::error::CudaError)>
     {
-        use crate::cuda::memory::{alloc, copy_h2d, CudaBuffer};
+        use crate::cuda::memory::{alloc_pooled, copy_h2d, CudaBuffer};
 
         let grad_dtype = self.grad.dtype();
         let len = self.grad.len();
@@ -260,7 +260,7 @@ impl Tensor {
         let buffer = match grad_dtype {
             Dtype::F32 => {
                 let host = self.grad_to_f32_vec();
-                let device = match alloc::<f32>(len) {
+                let device = match alloc_pooled::<f32>(len) {
                     Ok(buf) => buf,
                     Err(err) => return Err(("alloc", err)),
                 };
@@ -271,7 +271,7 @@ impl Tensor {
             }
             Dtype::F64 => {
                 let host = self.grad_to_f64_vec();
-                let device = match alloc::<f64>(len) {
+                let device = match alloc_pooled::<f64>(len) {
                     Ok(buf) => buf,
                     Err(err) => return Err(("alloc", err)),
                 };
@@ -308,12 +308,10 @@ impl Tensor {
         }
         match &*buffer {
             crate::cuda::memory::CudaBuffer::F32(b) => {
-                let zeros = vec![0.0f32; len];
-                let _ = crate::cuda::memory::copy_h2d(b, &zeros);
+                let _ = crate::cuda::kernels::fill_f32(b, 0.0);
             }
             crate::cuda::memory::CudaBuffer::F64(b) => {
-                let zeros = vec![0.0f64; len];
-                let _ = crate::cuda::memory::copy_h2d(b, &zeros);
+                let _ = crate::cuda::kernels::fill(b, 0.0);
             }
             crate::cuda::memory::CudaBuffer::BF16(_) | crate::cuda::memory::CudaBuffer::I8(_) => {}
         }
@@ -393,7 +391,7 @@ impl Tensor {
         &self,
     ) -> Result<Arc<crate::cuda::memory::CudaBuffer>, (&'static str, crate::cuda::error::CudaError)>
     {
-        use crate::cuda::memory::{alloc, copy_h2d, CudaBuffer};
+        use crate::cuda::memory::{alloc_pooled, copy_h2d, CudaBuffer};
 
         let host_len = self.data.len();
         let len = if host_len > 0 { host_len } else { self.numel() };
@@ -411,43 +409,6 @@ impl Tensor {
 
         if let Some(buffer) = self.cuda_cached_buffer() {
             if buffer.len() == len && buffer.dtype() == self.dtype {
-                if host_len > 0 {
-                    match (&*buffer, self.dtype) {
-                        (CudaBuffer::BF16(b), Dtype::BF16) => {
-                            let host = self.data_bf16();
-                            if let Err(err) = copy_h2d(b, &host) {
-                                self.cuda_remove_cached_buffer();
-                                return Err(("copy", err));
-                            }
-                        }
-                        (CudaBuffer::I8(b), Dtype::I8) => {
-                            if let Storage::I8(v) = &self.data {
-                                let host = v.read().unwrap();
-                                if let Err(err) = copy_h2d(b, &host) {
-                                    self.cuda_remove_cached_buffer();
-                                    return Err(("copy", err));
-                                }
-                            }
-                        }
-                        (CudaBuffer::F32(b), Dtype::F32) => {
-                            let host = self.data_f32();
-                            if let Err(err) = copy_h2d(b, &host) {
-                                self.cuda_remove_cached_buffer();
-                                return Err(("copy", err));
-                            }
-                        }
-                        (CudaBuffer::F64(b), Dtype::F64) => {
-                            let host = self.data_f64();
-                            if let Err(err) = copy_h2d(b, &host) {
-                                self.cuda_remove_cached_buffer();
-                                return Err(("copy", err));
-                            }
-                        }
-                        _ => {
-                            self.cuda_remove_cached_buffer();
-                        }
-                    }
-                }
                 return Ok(buffer);
             }
             self.cuda_remove_cached_buffer();
@@ -475,7 +436,7 @@ impl Tensor {
         let buffer = match self.dtype {
             Dtype::BF16 => {
                 let host = self.data_bf16();
-                let device = match alloc::<crate::dtype::bf16>(len) {
+                let device = match alloc_pooled::<crate::dtype::bf16>(len) {
                     Ok(buf) => buf,
                     Err(err) => return Err(("alloc", err)),
                 };
@@ -485,7 +446,7 @@ impl Tensor {
                 CudaBuffer::BF16(device)
             }
             Dtype::I8 => {
-                let device = match alloc::<i8>(len) {
+                let device = match alloc_pooled::<i8>(len) {
                     Ok(buf) => buf,
                     Err(err) => return Err(("alloc", err)),
                 };
@@ -499,7 +460,7 @@ impl Tensor {
             }
             Dtype::F32 => {
                 let host = self.data_f32();
-                let device = match alloc::<f32>(len) {
+                let device = match alloc_pooled::<f32>(len) {
                     Ok(buf) => buf,
                     Err(err) => return Err(("alloc", err)),
                 };
@@ -510,7 +471,7 @@ impl Tensor {
             }
             Dtype::F64 => {
                 let host = self.data_f64();
-                let device = match alloc::<f64>(len) {
+                let device = match alloc_pooled::<f64>(len) {
                     Ok(buf) => buf,
                     Err(err) => return Err(("alloc", err)),
                 };

@@ -399,7 +399,7 @@ impl Tensor {
 
     #[cfg(cuda)]
     fn weighted_mse_loss_cuda(&self, target: &Tensor, weights: &Tensor) -> Option<Tensor> {
-        use crate::cuda::memory::{alloc, CudaBuffer};
+        use crate::cuda::memory::{alloc_pooled, CudaBuffer};
 
         if self.device != Device::Cuda
             || target.device != Device::Cuda
@@ -418,13 +418,13 @@ impl Tensor {
         let d_target = target.cuda_get_or_upload_buffer().ok()?;
         let d_weights = weights.cuda_get_or_upload_buffer().ok()?;
         let d_out = match self.dtype {
-            Dtype::F32 => CudaBuffer::F32(alloc::<f32>(1).ok()?),
-            Dtype::F64 => CudaBuffer::F64(alloc::<f64>(1).ok()?),
+            Dtype::F32 => CudaBuffer::F32(alloc_pooled::<f32>(1).ok()?),
+            Dtype::F64 => CudaBuffer::F64(alloc_pooled::<f64>(1).ok()?),
             _ => return None,
         };
         let d_weight_sum = match self.dtype {
-            Dtype::F32 => CudaBuffer::F32(alloc::<f32>(1).ok()?),
-            Dtype::F64 => CudaBuffer::F64(alloc::<f64>(1).ok()?),
+            Dtype::F32 => CudaBuffer::F32(alloc_pooled::<f32>(1).ok()?),
+            Dtype::F64 => CudaBuffer::F64(alloc_pooled::<f64>(1).ok()?),
             _ => return None,
         };
         let d_out = Arc::new(d_out);

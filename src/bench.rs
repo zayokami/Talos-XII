@@ -683,6 +683,14 @@ fn train_and_measure(label: &str, config: &Config, seed: u64) -> BenchRunResult 
     let cache_stats = if config.achf.enabled {
         let stats = ppo.achf_cache_stats_aggregate();
         AchfCacheStats::debug_print(&[stats]);
+        if let Some(snapshot) = ppo.snapshot_achf() {
+            if snapshot.low_rank_applied_rank > 0 {
+                println!(
+                    "    [ACHF] low-rank: rank={} rel_err={:.4}",
+                    snapshot.low_rank_applied_rank, snapshot.low_rank_rel_err
+                );
+            }
+        }
         Some(stats)
     } else {
         None
