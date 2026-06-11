@@ -142,26 +142,27 @@ fn build_base_models_with_worker(
     worker: &GoodJobWorker,
 ) -> (EnvNet, NeuralLuckOptimizer) {
     let manifest = env_net_cache_manifest(config);
-    let mut env_net =
-        if let Some(cached) = load_env_net_cache_with_manifest("env_net.cache", &manifest) {
-            cached
+    let mut env_net = if let Some(cached) =
+        load_env_net_cache_with_manifest("env_net.cache", config, &manifest)
+    {
+        cached
+    } else {
+        let mut net = EnvNet::new(rng);
+        let (count, epochs) = if config.fast_init {
+            (256, 10)
         } else {
-            let mut net = EnvNet::new(rng);
-            let (count, epochs) = if config.fast_init {
-                (256, 10)
-            } else {
-                (1024, 50)
-            };
-            net.pretrain(rng, config, count, epochs);
-            let _ = save_env_net_cache_with_manifest(
-                "env_net.cache",
-                &net,
-                manifest.with_quality(CacheQualitySummary::note(format!(
-                    "{count}x{epochs} pretrain"
-                ))),
-            );
-            net
+            (1024, 50)
         };
+        net.pretrain(rng, config, count, epochs);
+        let _ = save_env_net_cache_with_manifest(
+            "env_net.cache",
+            &net,
+            manifest.with_quality(CacheQualitySummary::note(format!(
+                "{count}x{epochs} pretrain"
+            ))),
+        );
+        net
+    };
     env_net.set_train(false);
 
     let mut neural_opt = train_neural_optimizer(rng.next_u64(), &env_net, config, worker);

@@ -1,5 +1,5 @@
 use crate::binary_codec;
-use crate::config::Config;
+use crate::config::{AchfConfig, Config};
 use crate::env_net::EnvNet;
 use crate::neural::{NeuralLuckOptimizer, DIM};
 use log::info;
@@ -235,9 +235,6 @@ impl CacheManifest {
         if self.role != expected.role {
             return Some(format!("role {} != {}", self.role, expected.role));
         }
-        if self.config_fingerprint != expected.config_fingerprint {
-            return Some("config fingerprint mismatch".to_string());
-        }
         if self.feature_spec_version != expected.feature_spec_version {
             return Some(format!(
                 "feature spec {} != {}",
@@ -380,8 +377,98 @@ fn ppo_architecture(config: &Config) -> String {
     )
 }
 
-fn config_fingerprint(config: &Config) -> String {
-    let payload = format!(
+fn achf_config_fingerprint(achf: &AchfConfig) -> String {
+    format!(
+        "enabled={}|mode={}|proj_mode={}|proj_freq={}|proj_steps={}|lambda_ortho={:.17}|gate_mode={}|gate_momentum={:.17}|gate_beta={:.17}|gate_alpha={:.17}|g_min={:.17}|gate_warmup={}|gate_trans={}|gate_k_clip={:.17}|g_tgt_min={:.17}|g_tgt_max={:.17}|g_min_adapt={:.17}|g_min_mom={:.17}|cache_min_rows={}|cache_min_nz={:.17}|cache_min_reuse={}|cache_sp_rows={}|cache_cost={:.17}|cache_adapt={:.17}|cache_bias_min={:.17}|cache_bias_max={:.17}|cache_lat_ema={:.17}|cache_lat_long={:.17}|cache_blend={:.17}|cache_lat_every={}|cache_log_int={}|cache_log_layer={}|rank={}|prune={:.17}|attn={}|ffn={}|dqn={}|infer_gate={}",
+        achf.enabled,
+        achf.mode,
+        achf.proj_mode,
+        achf.proj_freq,
+        achf.proj_steps,
+        achf.lambda_ortho,
+        achf.gate_mode,
+        achf.gate_momentum,
+        achf.gate_beta,
+        achf.gate_alpha,
+        achf.g_min,
+        achf.gate_warmup_steps,
+        achf.gate_transition_steps,
+        achf.gate_k_clip,
+        achf.g_target_min,
+        achf.g_target_max,
+        achf.g_min_adapt_rate,
+        achf.g_min_momentum,
+        achf.cache_min_rows,
+        achf.cache_min_nonzero_ratio,
+        achf.cache_min_reuse,
+        achf.cache_sparsity_sample_rows,
+        achf.cache_cost_bias,
+        achf.cache_adapt_rate,
+        achf.cache_bias_min,
+        achf.cache_bias_max,
+        achf.cache_latency_ema,
+        achf.cache_latency_long_ema,
+        achf.cache_adapt_blend,
+        achf.cache_latency_sample_every,
+        achf.cache_log_interval_steps,
+        achf.cache_log_per_layer,
+        achf.rank,
+        achf.prune_threshold,
+        achf.apply_attn,
+        achf.apply_ffn,
+        achf.apply_dqn,
+        achf.infer_gate,
+    )
+}
+
+fn config_fingerprint_payload_v3(config: &Config) -> String {
+    format!(
+        "v3|p6={:.17}|p5={:.17}|p4={:.17}|up={:.17}|soft_start={}|soft_slope={:.17}|small={}|big={}|up_soft={}|five={}|always5={}|big_requires_not_up={}|fast={}|ppo_mode={}|ppo_steps={}|ppo_update={}|ppo_epochs={}|ppo_batch={}|ppo_ctx={}|ppo_envs={}|ppo_topk={}|luck_cost={:.17}|luck_budget_enabled={}|luck_budget_max={:.17}|luck_budget_initial={:.17}|luck_budget_recovery={:.17}|luck_budget_refund={:.17}|distill={}|distill_decay={:.17}|distill_kl={:.17}|distill_warmup={}|model_dim={}|hidden={}|layers={}|heads={}|kv={}|rope={}|multi_stream={}|stream_factor={}|achf={}",
+        config.prob_6_base,
+        config.prob_5_base,
+        config.prob_4_base,
+        config.up_rate,
+        config.soft_pity_start,
+        config.soft_pity_slope,
+        config.small_pity_guarantee,
+        config.big_pity_cumulative,
+        config.up_pity_soft,
+        config.five_star_pity,
+        config.always_5_star,
+        config.big_pity_requires_not_up,
+        config.fast_init,
+        config.ppo_mode,
+        config.ppo_total_steps,
+        config.ppo_steps_per_update,
+        config.ppo_k_epochs,
+        config.ppo_batch_size,
+        config.ppo_context_len,
+        config.ppo_num_envs,
+        config.ppo_top_k,
+        config.luck_action_cost,
+        config.luck_budget_enabled,
+        config.luck_budget_max,
+        config.luck_budget_initial,
+        config.luck_budget_recovery_per_pull,
+        config.luck_budget_negative_refund,
+        config.distill_enabled,
+        config.distill_ema_decay,
+        config.distill_kl_coef,
+        config.distill_warmup_steps,
+        config.model_dim,
+        config.model_hidden_dim,
+        config.model_num_layers,
+        config.model_num_heads,
+        config.model_kv_lora_rank,
+        config.model_qk_rope_dim,
+        config.use_multi_stream,
+        config.multi_stream_factor,
+        achf_config_fingerprint(&config.achf),
+    )
+}
+
+fn config_fingerprint_payload_legacy_v2(config: &Config) -> String {
+    format!(
         "v2|p6={:.17}|p5={:.17}|p4={:.17}|up={:.17}|soft_start={}|soft_slope={:.17}|small={}|big={}|up_soft={}|five={}|always5={}|big_requires_not_up={}|fast={}|ppo_mode={}|ppo_steps={}|ppo_update={}|ppo_epochs={}|ppo_batch={}|ppo_ctx={}|ppo_envs={}|ppo_topk={}|luck_cost={:.17}|luck_budget_enabled={}|luck_budget_max={:.17}|luck_budget_initial={:.17}|luck_budget_recovery={:.17}|luck_budget_refund={:.17}|distill={}|distill_decay={:.17}|distill_kl={:.17}|distill_warmup={}|model_dim={}|hidden={}|layers={}|heads={}|kv={}|rope={}|multi_stream={}|stream_factor={}|achf={:?}",
         config.prob_6_base,
         config.prob_5_base,
@@ -423,8 +510,19 @@ fn config_fingerprint(config: &Config) -> String {
         config.use_multi_stream,
         config.multi_stream_factor,
         config.achf
-    );
-    fnv1a_hex(payload.as_bytes())
+    )
+}
+
+fn config_fingerprint(config: &Config) -> String {
+    fnv1a_hex(config_fingerprint_payload_v3(config).as_bytes())
+}
+
+fn config_fingerprint_legacy_v2(config: &Config) -> String {
+    fnv1a_hex(config_fingerprint_payload_legacy_v2(config).as_bytes())
+}
+
+fn config_fingerprints_equivalent(config: &Config, stored: &str) -> bool {
+    stored == config_fingerprint(config) || stored == config_fingerprint_legacy_v2(config)
 }
 
 fn fnv1a_hex(bytes: &[u8]) -> String {
@@ -529,8 +627,20 @@ fn save_manifest(path: &str, manifest: &CacheManifest) -> bool {
     }
 }
 
-fn manifest_allows_load(path: &str, expected: &CacheManifest, artifact_path: Option<&str>) -> bool {
+fn manifest_allows_load(
+    path: &str,
+    config: &Config,
+    expected: &CacheManifest,
+    artifact_path: Option<&str>,
+) -> bool {
     let Some(manifest) = load_manifest(path) else {
+        if artifact_path.is_some_and(|artifact| read_cache_bytes(artifact).is_some()) {
+            log::warn!(
+                "[Cache] Missing manifest for {}. Attempting legacy artifact load.",
+                path
+            );
+            return true;
+        }
         log::warn!("[Cache] Missing manifest for {}. Rebuilding.", path);
         return false;
     };
@@ -541,6 +651,17 @@ fn manifest_allows_load(path: &str, expected: &CacheManifest, artifact_path: Opt
             reason
         );
         return false;
+    }
+    if !config_fingerprints_equivalent(config, &manifest.config_fingerprint) {
+        log::info!(
+            "[Cache] Config fingerprint differs for {} (program upgrade or fingerprint format change). Artifact and architecture still match; using cached weights.",
+            path
+        );
+    } else if manifest.config_fingerprint != expected.config_fingerprint {
+        log::info!(
+            "[Cache] Config fingerprint format upgraded for {}. Cache remains valid.",
+            path
+        );
     }
     if let Some(artifact_path) = artifact_path {
         let Some(expected_hash) = &manifest.artifact_hash else {
@@ -566,8 +687,8 @@ fn manifest_allows_load(path: &str, expected: &CacheManifest, artifact_path: Opt
 }
 
 #[cfg(test)]
-fn cache_manifest_is_compatible(path: &str, expected: &CacheManifest) -> bool {
-    manifest_allows_load(path, expected, Some(path))
+fn cache_manifest_is_compatible(path: &str, config: &Config, expected: &CacheManifest) -> bool {
+    manifest_allows_load(path, config, expected, Some(path))
 }
 
 pub fn load_neural_cache(path: &str) -> Option<NeuralLuckOptimizer> {
@@ -591,9 +712,10 @@ pub fn save_neural_cache(path: &str, net: &NeuralLuckOptimizer) -> bool {
 
 pub fn load_neural_cache_with_manifest(
     path: &str,
+    config: &Config,
     expected: &CacheManifest,
 ) -> Option<NeuralLuckOptimizer> {
-    if !manifest_allows_load(path, expected, Some(path)) {
+    if !manifest_allows_load(path, config, expected, Some(path)) {
         return None;
     }
     load_neural_cache(path)
@@ -705,8 +827,12 @@ pub fn save_env_net_cache(path: &str, env_net: &EnvNet) -> bool {
     save_bytes_with_fallback(path, json.as_bytes(), "EnvNet")
 }
 
-pub fn load_env_net_cache_with_manifest(path: &str, expected: &CacheManifest) -> Option<EnvNet> {
-    if !manifest_allows_load(path, expected, Some(path)) {
+pub fn load_env_net_cache_with_manifest(
+    path: &str,
+    config: &Config,
+    expected: &CacheManifest,
+) -> Option<EnvNet> {
+    if !manifest_allows_load(path, config, expected, Some(path)) {
         return None;
     }
     load_env_net_cache(path)
@@ -801,10 +927,11 @@ fn open_cache_file(path: &str, label: &str) -> Option<(File, PathBuf)> {
 pub fn load_model_with_manifest<T: serde::de::DeserializeOwned>(
     path: &str,
     label: &str,
+    config: &Config,
     expected: &CacheManifest,
 ) -> Option<T> {
     let bin_path = format!("{}.bin", path);
-    if !manifest_allows_load(path, expected, Some(&bin_path)) {
+    if !manifest_allows_load(path, config, expected, Some(&bin_path)) {
         return None;
     }
     load_model(path, label)
@@ -813,16 +940,25 @@ pub fn load_model_with_manifest<T: serde::de::DeserializeOwned>(
 pub fn load_model_with_manifest_allow_source_mismatch<T: serde::de::DeserializeOwned>(
     path: &str,
     label: &str,
+    config: &Config,
     expected: &CacheManifest,
 ) -> Option<T> {
     let Some(manifest) = load_manifest(path) else {
+        let bin_path = format!("{}.bin", path);
+        if read_cache_bytes(&bin_path).is_some() {
+            log::warn!(
+                "[Cache] Missing manifest for {}. Attempting legacy artifact load.",
+                path
+            );
+            return load_model(path, label);
+        }
         log::warn!("[Cache] Missing manifest for {}. Rebuilding.", path);
         return None;
     };
     let mut relaxed_expected = expected.clone();
     relaxed_expected.source_hash = manifest.source_hash.clone();
     let bin_path = format!("{}.bin", path);
-    if !manifest_allows_load(path, &relaxed_expected, Some(&bin_path)) {
+    if !manifest_allows_load(path, config, &relaxed_expected, Some(&bin_path)) {
         return None;
     }
     if expected.source_hash.is_some() && manifest.source_hash != expected.source_hash {
@@ -1083,26 +1219,28 @@ mod tests {
     }
 
     #[test]
-    fn manifest_rejects_config_fingerprint_mismatch() {
-        let path = temp_stem("talos_model_io_manifest");
+    fn manifest_rejects_architecture_shape_change() {
+        let path = temp_stem("talos_model_io_manifest_shape");
         fs::write(&path, b"artifact").unwrap();
 
         let config = crate::config::Config::default();
-        let manifest = env_net_cache_manifest(&config);
+        let manifest = dqn_master_cache_manifest(&config, CacheQualitySummary::training_steps(1));
         assert!(save_manifest(
             &path,
             &manifest.for_saved_artifact(Some(fnv1a_hex(b"artifact")))
         ));
         assert!(cache_manifest_is_compatible(
             &path,
-            &env_net_cache_manifest(&config)
+            &config,
+            &dqn_master_cache_manifest(&config, CacheQualitySummary::training_steps(1))
         ));
 
         let mut changed = config.clone();
         changed.model_hidden_dim += 1;
         assert!(!cache_manifest_is_compatible(
             &path,
-            &env_net_cache_manifest(&changed)
+            &changed,
+            &dqn_master_cache_manifest(&changed, CacheQualitySummary::training_steps(1))
         ));
 
         let _ = fs::remove_file(&path);
@@ -1123,6 +1261,7 @@ mod tests {
 
         assert!(!cache_manifest_is_compatible(
             &path,
+            &config,
             &env_net_cache_manifest(&config)
         ));
 
@@ -1144,6 +1283,7 @@ mod tests {
 
         assert!(!cache_manifest_is_compatible(
             &path,
+            &config,
             &dqn_inference_cache_manifest(&config, Some("master".to_string()))
         ));
 
@@ -1165,6 +1305,7 @@ mod tests {
 
         assert!(!cache_manifest_is_compatible(
             &path,
+            &config,
             &dqn_inference_cache_manifest(&config, Some("new".to_string()))
         ));
 
@@ -1195,13 +1336,14 @@ mod tests {
             dqn_master_cache_manifest(&config, CacheQualitySummary::training_steps(1))
                 .with_source_hash(Some("new-source".to_string()));
         assert_eq!(
-            load_model_with_manifest::<TestModel>(&path, "Test", &expected_manifest),
+            load_model_with_manifest::<TestModel>(&path, "Test", &config, &expected_manifest),
             None
         );
         assert_eq!(
             load_model_with_manifest_allow_source_mismatch::<TestModel>(
                 &path,
                 "Test",
+                &config,
                 &expected_manifest
             ),
             Some(TestModel {
@@ -1219,6 +1361,7 @@ mod tests {
             load_model_with_manifest_allow_source_mismatch::<TestModel>(
                 &path,
                 "Test",
+                &changed,
                 &incompatible_manifest
             ),
             None
@@ -1244,7 +1387,59 @@ mod tests {
         changed.multi_stream_factor += 1;
         assert!(!cache_manifest_is_compatible(
             &path,
+            &changed,
             &ppo_master_cache_manifest(&changed, CacheQualitySummary::training_steps(1))
+        ));
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(cache_manifest_path(&path));
+    }
+
+    #[test]
+    fn env_net_manifest_accepts_fingerprint_only_drift() {
+        let path = temp_stem("talos_model_io_envnet_fingerprint");
+        fs::write(&path, b"artifact").unwrap();
+
+        let config = crate::config::Config::default();
+        let manifest = env_net_cache_manifest(&config);
+        assert!(save_manifest(
+            &path,
+            &manifest.for_saved_artifact(Some(fnv1a_hex(b"artifact")))
+        ));
+        assert!(cache_manifest_is_compatible(
+            &path,
+            &config,
+            &env_net_cache_manifest(&config)
+        ));
+
+        let mut changed = config.clone();
+        changed.model_hidden_dim += 1;
+        assert!(cache_manifest_is_compatible(
+            &path,
+            &changed,
+            &env_net_cache_manifest(&changed)
+        ));
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(cache_manifest_path(&path));
+    }
+
+    #[test]
+    fn manifest_accepts_legacy_v2_config_fingerprint() {
+        let path = temp_stem("talos_model_io_legacy_fingerprint");
+        fs::write(&path, b"artifact").unwrap();
+
+        let config = crate::config::Config::default();
+        let mut manifest = env_net_cache_manifest(&config);
+        manifest.config_fingerprint = config_fingerprint_legacy_v2(&config);
+        assert!(save_manifest(
+            &path,
+            &manifest.for_saved_artifact(Some(fnv1a_hex(b"artifact")))
+        ));
+        assert!(cache_manifest_is_compatible(
+            &path,
+            &config,
+            &env_net_cache_manifest(&config)
         ));
 
         let _ = fs::remove_file(&path);
@@ -1268,6 +1463,7 @@ mod tests {
 
         assert!(!cache_manifest_is_compatible(
             &path,
+            &config,
             &dqn_master_cache_manifest(&config, CacheQualitySummary::training_steps(1))
         ));
 

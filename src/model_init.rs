@@ -214,9 +214,11 @@ fn apply_compute_device_policy(config: &mut Config) {
 
 fn build_env_net(rng: &mut Rng, config: &Config, force: bool) -> EnvNet {
     if !force {
-        if let Some(cached) =
-            load_env_net_cache_with_manifest(ENV_NET_CACHE_PATH, &env_net_cache_manifest(config))
-        {
+        if let Some(cached) = load_env_net_cache_with_manifest(
+            ENV_NET_CACHE_PATH,
+            config,
+            &env_net_cache_manifest(config),
+        ) {
             info!("[EnvNet] Cache loaded.");
             return cached;
         }
@@ -269,7 +271,9 @@ fn build_trained_neural_opt(
 ) -> NeuralLuckOptimizer {
     let neural_manifest = neural_cache_manifest(config).with_source_hash(env_net_hash);
     let mut trained_neural_opt = if !force {
-        if let Some(cached) = load_neural_cache_with_manifest(NEURAL_CACHE_PATH, &neural_manifest) {
+        if let Some(cached) =
+            load_neural_cache_with_manifest(NEURAL_CACHE_PATH, config, &neural_manifest)
+        {
             info!("[Neural Core] Cache detected. Cached weights loaded.");
             return cached;
         }
@@ -324,6 +328,7 @@ fn build_dqn_master(
         if let Some(mut cached) = load_model_with_manifest_allow_source_mismatch::<DuelingQNetwork>(
             DQN_MASTER_CACHE_PATH,
             "DQN",
+            config,
             &dqn_master_manifest,
         ) {
             cached.prune_achf(config.achf.prune_threshold);
@@ -415,6 +420,7 @@ fn prepare_dqn_inference_cache(
         if let Some(mut cached) = load_model_with_manifest::<DuelingQNetwork>(
             DQN_INFERENCE_CACHE_PATH,
             "DQN BF16",
+            config,
             &expected_manifest,
         ) {
             cached.prune_achf(config.achf.prune_threshold);
@@ -449,6 +455,7 @@ fn build_ppo_master(
         if let Some(mut cached) = load_model_with_manifest_allow_source_mismatch::<ActorCritic>(
             PPO_MASTER_CACHE_PATH,
             "PPO",
+            config,
             &ppo_master_manifest,
         ) {
             cached.prune_achf(config.achf.prune_threshold);
@@ -519,6 +526,7 @@ fn prepare_ppo_inference_cache(
         if let Some(mut cached) = load_model_with_manifest::<ActorCritic>(
             PPO_INFERENCE_CACHE_PATH,
             "PPO BF16",
+            config,
             &expected_manifest,
         ) {
             cached.prune_achf(config.achf.prune_threshold);

@@ -870,6 +870,7 @@ fn run_interactive(args: RunInteractiveArgs) {
         let dqn_train_master = load_model_with_manifest_allow_source_mismatch::<DuelingQNetwork>(
             DQN_MASTER_CACHE_PATH,
             "DQN",
+            &config,
             &dqn_manifest,
         )
         .unwrap_or_else(|| {
@@ -986,6 +987,7 @@ fn run_interactive(args: RunInteractiveArgs) {
         let ppo_train_master = load_model_with_manifest_allow_source_mismatch::<ActorCritic>(
             PPO_MASTER_CACHE_PATH,
             "PPO",
+            &config,
             &ppo_manifest,
         )
         .unwrap_or_else(|| ActorCritic::new_with_config(&config, rng.next_u64()));
@@ -2321,9 +2323,13 @@ mod tests {
             "DQN BF16 test",
             inference_manifest.clone(),
         );
-        let loaded: DuelingQNetwork =
-            load_model_with_manifest(&inference_path, "DQN BF16 test", &inference_manifest)
-                .unwrap();
+        let loaded: DuelingQNetwork = load_model_with_manifest(
+            &inference_path,
+            "DQN BF16 test",
+            &config,
+            &inference_manifest,
+        )
+        .unwrap();
 
         let _ = std::fs::remove_file(format!("{}.bin", master_path));
         let _ = std::fs::remove_file(format!("{}.manifest.json", master_path));
