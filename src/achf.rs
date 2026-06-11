@@ -3331,10 +3331,13 @@ mod tests {
             ema_cached_long_ns: 0.0,
             ema_sparse_ns: 0.0,
             ema_sparse_long_ns: 0.0,
+            ema_dense_ns: 0.0,
+            ema_dense_long_ns: 0.0,
             decision_ema_ns: 0.0,
             decision_ema_long_ns: 0.0,
             adaptive_bias: 2.0,
             latency_samples: 0,
+            dense_latency_samples: 0,
             decision_samples: 0,
         };
         let s2 = AchfCacheStats {
