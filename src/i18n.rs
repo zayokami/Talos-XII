@@ -308,7 +308,7 @@ impl I18n {
             (Language::Cn, "single_sim_result") => "\n单次 {} 抽结果 (耗时: {:.2?}):".to_string(),
 
             (Language::En, "cmd_help") => format!(
-                "\n{}\n  {}\n    {}          {}\n    {}        {}\n    {}        {}\n    {}              {}\n    {}            {}\n  {}\n    {}    {}\n    {}      {}\n    {}      {}\n  {}\n    {}   {}\n    {}  {}\n    {} {}\n    {}   {}\n  {}\n    {}         {}\n    {}           {}\n    {}       {}\n  {}\n    {}         {}\n    {}              {}\n{}\n",
+                "\n{}\n  {}\n    {}          {}\n    {}        {}\n    {}        {}\n    {}              {}\n    {}            {}\n  {}\n    {}    {}\n    {}      {}\n    {}      {}\n  {}\n    {}   {}\n    {}  {}\n    {} {}\n    {}   {}\n  {}\n    {}         {}\n    {}           {}\n    {}       {}\n  {}\n    {}         {}\n    {}              {}\n    {}         {}\n{}\n",
                 "═══ Commands ═══".cyan().bold(),
                 "[Simulation]".yellow().bold(),
                 "<number>".white().bold(), "Pull count for this run",
@@ -330,12 +330,13 @@ impl I18n {
                 "info".white().bold(), "Pool details",
                 "history".white().bold(), "Sim history",
                 "[Other]".yellow().bold(),
+                "jade <n>".white().bold(), "Budget analysis for first 6★",
                 "h/help/?".white().bold(), "Show this help",
                 "q".white().bold(), "Quit",
                 "═════════════════".cyan(),
             ),
             (Language::Cn, "cmd_help") => format!(
-                "\n{}\n  {}\n    {}          {}\n    {}        {}\n    {}        {}\n    {}              {}\n    {}            {}\n  {}\n    {}    {}\n    {}      {}\n    {}      {}\n  {}\n    {}   {}\n    {}  {}\n    {} {}\n    {}   {}\n  {}\n    {}         {}\n    {}           {}\n    {}       {}\n  {}\n    {}         {}\n    {}              {}\n{}\n",
+                "\n{}\n  {}\n    {}          {}\n    {}        {}\n    {}        {}\n    {}              {}\n    {}            {}\n  {}\n    {}    {}\n    {}      {}\n    {}      {}\n  {}\n    {}   {}\n    {}  {}\n    {} {}\n    {}   {}\n  {}\n    {}         {}\n    {}           {}\n    {}       {}\n  {}\n    {}         {}\n    {}              {}\n    {}         {}\n{}\n",
                 "═══ 指令帮助 ═══".cyan().bold(),
                 "[模拟]".yellow().bold(),
                 "<数字>".white().bold(), "本次抽数",
@@ -357,6 +358,7 @@ impl I18n {
                 "info".white().bold(), "查看卡池详情",
                 "history".white().bold(), "查看模拟历史",
                 "[其他]".yellow().bold(),
+                "jade <数量>".white().bold(), "按持有合成玉估算六星资源",
                 "h/help/?".white().bold(), "显示此帮助",
                 "q".white().bold(), "退出",
                 "═════════════════".cyan(),
@@ -702,6 +704,63 @@ impl I18n {
             (Language::Cn, "f2p_cost_line") => "平均额外合成玉成本: {:.0} (约 {:.1} 额外抽)".to_string(),
             (Language::En, "f2p_cost_line_na") => "Avg Extra Jade Cost: N/A".to_string(),
             (Language::Cn, "f2p_cost_line_na") => "平均额外合成玉成本: N/A".to_string(),
+
+            (Language::En, "jade_budget_header") => {
+                "Budget: {jade} jade ({paid} paid pulls) + {free} free = {total} total pulls"
+                    .to_string()
+            }
+            (Language::Cn, "jade_budget_header") => {
+                "资源预算: {jade} 合成玉 ({paid} 付费抽) + {free} 免费抽 = {total} 总抽数"
+                    .to_string()
+            }
+            (Language::En, "jade_budget_analytical") => {
+                "Analytical expected pulls per 6★ (pool rates): {:.1}".to_string()
+            }
+            (Language::Cn, "jade_budget_analytical") => {
+                "概率模型单六星期望抽数: {:.1}".to_string()
+            }
+            (Language::En, "jade_budget_success_rate") => {
+                "Success rate within current budget: {:.2}% ({} sims)".to_string()
+            }
+            (Language::Cn, "jade_budget_success_rate") => {
+                "现有资源内抽到六星成功率: {:.2}% ({} 次模拟)".to_string()
+            }
+            (Language::En, "jade_budget_avg_total") => {
+                "Avg jade to first 6★: {:.0} ({:.1} pulls)".to_string()
+            }
+            (Language::Cn, "jade_budget_avg_total") => {
+                "抽到首个六星平均合成玉: {:.0} (约 {:.1} 抽)".to_string()
+            }
+            (Language::En, "jade_budget_avg_extra") => {
+                "Avg extra jade still needed: {:.0} ({:.1} pulls)".to_string()
+            }
+            (Language::Cn, "jade_budget_avg_extra") => {
+                "预计还需额外合成玉: {:.0} (约 {:.1} 抽)".to_string()
+            }
+            (Language::En, "jade_budget_avg_na") => {
+                "Could not estimate average cost to first 6★.".to_string()
+            }
+            (Language::Cn, "jade_budget_avg_na") => {
+                "无法估算抽到六星的平均成本。".to_string()
+            }
+            (Language::En, "jade_budget_usage") => {
+                "Usage: jade <amount>  (e.g. jade 50000)".to_string()
+            }
+            (Language::Cn, "jade_budget_usage") => {
+                "用法: jade <合成玉数量>  (例如 jade 50000)".to_string()
+            }
+            (Language::En, "jade_budget_invalid") => {
+                "Invalid jade amount. {}".to_string()
+            }
+            (Language::Cn, "jade_budget_invalid") => {
+                "合成玉数量无效。{}".to_string()
+            }
+            (Language::En, "sys_run_jade_budget") => {
+                "Running jade budget analysis ({} sims)...".to_string()
+            }
+            (Language::Cn, "sys_run_jade_budget") => {
+                "正在运行合成玉预算分析 ({} 次模拟)...".to_string()
+            }
 
             // === System Messages ===
             (Language::En, "sys_demo_mmap") => "[System] Demonstrating High-Performance Tensor I/O (Mmap)...".to_string(),

@@ -409,6 +409,7 @@ pub fn train_neural_optimizer(
                     let control = SimControl {
                         max_pulls: None,
                         stop_on_up: true,
+                        stop_on_six: false,
                         stop_after_total_pulls: Some(
                             (FREE_PULLS_WELFARE as usize).max(config.big_pity_cumulative),
                         ),

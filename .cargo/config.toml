@@ -2,5 +2,14 @@
 rustflags = ["-C", "target-cpu=native"]
 
 [alias]
-gpu = "build --release --features cuda --target-dir target/gpu"
-gpu-test = "test --features cuda --target-dir target/gpu"
+# CPU-only Release -> target/release/
+release = "build --release"
+# CUDA Release -> target/cuda/release/
+cuda = "build --release --features cuda --target-dir target/cuda"
+cuda-test = "test --features cuda --target-dir target/cuda"
+# Python Release -> target/python/release/
+python = "build --release --features python --target-dir target/python"
+python-test = "test --features python --target-dir target/python"
+# Backward-compatible alias for cuda
+gpu = "build --release --features cuda --target-dir target/cuda"
+gpu-test = "test --features cuda --target-dir target/cuda"

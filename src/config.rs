@@ -602,7 +602,7 @@ impl Config {
         let file_result = File::open(path);
 
         // Robustness: If file not found, try to look in parent directories
-        // (useful for IDE/target builds: target/release/exe or target/gpu/release/exe)
+        // (useful for IDE/target builds: target/release/exe, target/cuda/release/exe, target/python/release/exe)
         let mut file = match file_result {
             Ok(f) => f,
             Err(_) => {

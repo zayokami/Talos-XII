@@ -68,9 +68,10 @@ use worker::GoodJobWorker;
 
 use sim::{
     build_non_up_six, format_avg_extra_cost_line, format_f2p_probability_line,
-    resolve_operator_name, simulate_f2p_clearing_with_progress, simulate_fast, simulate_one,
-    simulate_stats, simulate_stats_with_progress, NeuralSample, PpoExperience, SimModelContext,
-    SimRunContext, COST_PER_PULL, FREE_PULLS_WELFARE,
+    format_jade_budget_report, resolve_operator_name, simulate_f2p_clearing_with_progress,
+    simulate_fast, simulate_jade_budget_six_analysis_with_progress, simulate_one, simulate_stats,
+    simulate_stats_with_progress, NeuralSample, PpoExperience, SimModelContext, SimRunContext,
+    COST_PER_PULL, FREE_PULLS_WELFARE,
 };
 use trainer::OnlineNeuralTrainer;
 
@@ -113,6 +114,17 @@ enum Commands {
     },
     /// Analyze F2P welfare
     F2p,
+    /// Estimate resources to pull a 6★ given held jade
+    Budget {
+        /// Jade currently held
+        jade: u32,
+        /// Number of Monte Carlo simulations
+        #[arg(short = 'n', long, default_value_t = 10_000)]
+        sims: usize,
+        /// Include welfare free pulls in the budget
+        #[arg(long, default_value_t = false)]
+        welfare: bool,
+    },
     /// Collect player pull data
     Collect {
         #[command(subcommand)]
@@ -302,6 +314,62 @@ struct F2pAnalysisCtx<'a> {
     env_net: &'a EnvNet,
     worker: &'a GoodJobWorker,
     lang: Language,
+}
+
+fn run_jade_budget_analysis(
+    ctx: &F2pAnalysisCtx<'_>,
+    rng: &mut Rng,
+    jade_held: u32,
+    num_sims: usize,
+    use_welfare: bool,
+) {
+    let lang = ctx.lang;
+    let free_pulls = if use_welfare { FREE_PULLS_WELFARE } else { 0 };
+    let mut budget_config = ctx.config.clone();
+    budget_config.luck_mode = resolve_f2p_luck_mode(ctx.config);
+
+    println!(
+        "{}",
+        I18n::get(lang, "sys_run_jade_budget").replace("{}", &num_sims.to_string())
+    );
+
+    let sim_ctx = SimRunContext {
+        neural_opt: ctx.neural_opt,
+        dqn_policy: if budget_config.luck_mode == LuckMode::Dqn {
+            ctx.dqn_policy
+        } else {
+            None
+        },
+        ppo_policy: if budget_config.luck_mode == LuckMode::Ppo {
+            ctx.ppo_policy
+        } else {
+            None
+        },
+        env_net: ctx.env_net,
+        config: &budget_config,
+        worker: ctx.worker,
+        exp_sender: None,
+        neural_sender: None,
+        ppo_sender: None,
+    };
+
+    let pb = utils::create_bar(
+        num_sims as u64,
+        &I18n::get(lang, "sys_run_jade_budget").replace("{}", &num_sims.to_string()),
+    );
+    let analysis = simulate_jade_budget_six_analysis_with_progress(
+        num_sims,
+        jade_held,
+        free_pulls,
+        rng.next_u64(),
+        &sim_ctx,
+        Some(&pb),
+    );
+    pb.finish_and_clear();
+
+    for line in format_jade_budget_report(&analysis, lang) {
+        println!("{}", line);
+    }
 }
 
 fn run_f2p_analysis(ctx: &F2pAnalysisCtx<'_>, rng: &mut Rng) {
@@ -820,6 +888,22 @@ fn main() {
             };
             run_f2p_analysis(&f2p_ctx, &mut rng);
         }
+        Commands::Budget {
+            jade,
+            sims,
+            welfare,
+        } => {
+            let f2p_ctx = F2pAnalysisCtx {
+                config: &config,
+                neural_opt: &trained_neural_opt,
+                dqn_policy: Some(&dqn_policy),
+                ppo_policy: Some(&ppo_policy),
+                env_net: &env_net,
+                worker: &worker,
+                lang,
+            };
+            run_jade_budget_analysis(&f2p_ctx, &mut rng, jade, sims, welfare);
+        }
         Commands::Collect { .. } | Commands::Train | Commands::Python { .. } => unreachable!(),
     }
 }
@@ -1141,7 +1225,7 @@ fn run_interactive(args: RunInteractiveArgs) {
     let mut use_ppo = prompt_yes_no(&I18n::get(lang, "prompt_ppo"), true);
     let mut default_pulls = 10usize;
     let mut default_sims = 1usize;
-    let mut use_welfare_default = true;
+    let mut use_welfare_default = false;
     let mut selected_pool_ids: Vec<String> = if let Some(active) = config.active_pool.clone() {
         vec![active]
     } else if !config.pools.is_empty() {
@@ -1334,6 +1418,45 @@ fn run_interactive(args: RunInteractiveArgs) {
                 "cmd_welfare_off"
             };
             println!("{}", I18n::get(lang, key));
+            continue;
+        }
+        if cmd_lower == "jade" || cmd_lower == "j" || cmd_lower == "budget" {
+            let amount_token = parts.next().unwrap_or("");
+            if amount_token.is_empty() {
+                println!("{}", I18n::get(lang, "jade_budget_usage"));
+                continue;
+            }
+            let jade_held = match amount_token.parse::<u32>() {
+                Ok(value) => value,
+                Err(_) => {
+                    println!(
+                        "{}",
+                        I18n::get(lang, "jade_budget_invalid")
+                            .replace("{}", &I18n::get(lang, "jade_budget_usage"))
+                    );
+                    continue;
+                }
+            };
+            let sim_count = resolve_f2p_sim_count_prob(&config);
+            let dqn_guard = panic_guard::read_shared(&dqn_shared);
+            let neural_guard = panic_guard::read_shared(&neural_shared);
+            let ppo_guard = panic_guard::read_shared(&ppo_shared);
+            let f2p_ctx = F2pAnalysisCtx {
+                config: &config,
+                neural_opt: &neural_guard,
+                dqn_policy: Some(&dqn_guard),
+                ppo_policy: if use_ppo { Some(&ppo_guard) } else { None },
+                env_net: &env_net,
+                worker: &worker,
+                lang,
+            };
+            run_jade_budget_analysis(
+                &f2p_ctx,
+                &mut rng,
+                jade_held,
+                sim_count,
+                use_welfare_default,
+            );
             continue;
         }
         if cmd_lower == "status" || cmd_lower == "st" {
@@ -2249,6 +2372,7 @@ mod tests {
         let control = SimControl {
             max_pulls: None,
             stop_on_up: true,
+            stop_on_six: false,
             // Ensure test uses max range to guarantee hit
             stop_after_total_pulls: Some(
                 FREE_PULLS_WELFARE.max(config.big_pity_cumulative as u32) as usize

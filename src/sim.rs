@@ -3,6 +3,7 @@ use crate::config::{Config, LuckMode};
 use crate::dqn::{DuelingQNetwork, Experience};
 use crate::env_net::EnvNet;
 use crate::gacha_env::{force_up_pity_triggered, step_pull, GachaAction};
+use crate::i18n::I18n;
 use crate::neural::{NeuralLuckOptimizer, Tensor, DIM};
 use crate::ppo::ActorCritic;
 use crate::rng::Rng;
@@ -53,6 +54,7 @@ pub struct SimStatsResult {
     pub cost_jade: u32,
     #[allow(dead_code)]
     pub free_pulls_used: u32,
+    pub total_pulls: usize,
     pub max_loss_streak: usize, // Tracked for neural network training
 }
 
@@ -315,6 +317,7 @@ pub struct PpoExperience {
 pub struct SimControl {
     pub max_pulls: Option<usize>,
     pub stop_on_up: bool,
+    pub stop_on_six: bool,
     pub stop_after_total_pulls: Option<usize>,
     pub nn_total_pulls_one_based: bool,
     pub collect_details: bool,
@@ -793,6 +796,10 @@ fn simulate_core_with_context(
             break;
         }
 
+        if control.stop_on_six && outcome.rarity == 6 {
+            break;
+        }
+
         if let Some(limit) = control.stop_after_total_pulls {
             if state.total_pulls_in_pool >= limit {
                 break;
@@ -808,6 +815,7 @@ fn simulate_core_with_context(
         big_pity_used,
         cost_jade,
         free_pulls_used,
+        total_pulls: pulls_done,
         max_loss_streak,
     };
 
@@ -947,6 +955,7 @@ pub fn simulate_fast(
     let control = SimControl {
         max_pulls: Some(num_pulls),
         stop_on_up: false,
+        stop_on_six: false,
         stop_after_total_pulls: None,
         nn_total_pulls_one_based: false,
         collect_details: false,
@@ -966,6 +975,7 @@ pub fn simulate_one(
     let control = SimControl {
         max_pulls: Some(num_pulls),
         stop_on_up: false,
+        stop_on_six: false,
         stop_after_total_pulls: None,
         nn_total_pulls_one_based: false,
         collect_details: true,
@@ -1068,6 +1078,7 @@ pub fn simulate_stats_with_progress(
                             let control = SimControl {
                                 max_pulls: Some(num_pulls),
                                 stop_on_up: false,
+                                stop_on_six: false,
                                 stop_after_total_pulls: None,
                                 nn_total_pulls_one_based: false,
                                 collect_details: false,
@@ -1163,6 +1174,7 @@ pub fn simulate_f2p_clearing_with_progress(
                         let control = SimControl {
                             max_pulls: None,
                             stop_on_up: true,
+                            stop_on_six: false,
                             stop_after_total_pulls: Some(f2p_stop_pull_limit(ctx.config)),
                             nn_total_pulls_one_based: true,
                             collect_details: false,
@@ -1289,6 +1301,227 @@ pub fn simulate_for_data_collection(
     data
 }
 
+pub fn paid_pulls_from_jade(jade_held: u32) -> u32 {
+    jade_held / COST_PER_PULL
+}
+
+fn six_star_stop_pull_limit(config: &Config) -> usize {
+    config
+        .small_pity_guarantee
+        .max(config.big_pity_cumulative)
+        .max(config.up_pity_soft)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct JadeBudgetSixAnalysis {
+    pub jade_held: u32,
+    pub free_pulls: u32,
+    pub paid_pulls_budget: u32,
+    pub total_pull_budget: usize,
+    pub success_within_budget: usize,
+    pub total_sims: usize,
+    pub avg_jade_to_first_six: Option<f64>,
+    pub avg_pulls_to_first_six: Option<f64>,
+    pub avg_extra_jade_needed: Option<f64>,
+    pub expected_pulls_analytical: f64,
+}
+
+pub fn simulate_jade_budget_six_analysis_with_progress(
+    num_sims: usize,
+    jade_held: u32,
+    free_pulls: u32,
+    seed: u64,
+    ctx: &SimRunContext<'_>,
+    pb: Option<&ProgressBar>,
+) -> JadeBudgetSixAnalysis {
+    let paid_budget = paid_pulls_from_jade(jade_held);
+    let total_pull_budget = free_pulls as usize + paid_budget as usize;
+    let analytical = expected_pulls_per_six(ctx.config);
+    if num_sims == 0 {
+        return JadeBudgetSixAnalysis {
+            jade_held,
+            free_pulls,
+            paid_pulls_budget: paid_budget,
+            total_pull_budget,
+            success_within_budget: 0,
+            total_sims: 0,
+            avg_jade_to_first_six: None,
+            avg_pulls_to_first_six: None,
+            avg_extra_jade_needed: None,
+            expected_pulls_analytical: analytical,
+        };
+    }
+
+    let mut master_rng = Rng::from_seed(seed);
+    let base_seed = master_rng.next_u64();
+    let model_ctx = SimModelContext {
+        neural_opt: ctx.neural_opt,
+        dqn_policy: ctx.dqn_policy,
+        ppo_policy: ctx.ppo_policy,
+        env_net: ctx.env_net,
+        config: ctx.config,
+        exp_sender: ctx.exp_sender,
+        neural_sender: ctx.neural_sender,
+        ppo_sender: ctx.ppo_sender,
+    };
+    let clear_limit = six_star_stop_pull_limit(ctx.config);
+    let chunk_size = compute_chunk_size(num_sims, ctx.worker);
+    let chunk_count = num_sims.div_ceil(chunk_size);
+
+    let (success, jade_sum, pulls_sum, clear_samples) = ctx
+        .worker
+        .execute(|| {
+            (0..chunk_count)
+                .into_par_iter()
+                .map_init(
+                    || PpoContext::new(false, 0, None, false),
+                    |ppo_context, chunk_idx| {
+                        let start = chunk_idx * chunk_size;
+                        let end = (start + chunk_size).min(num_sims);
+                        let mut local_rng =
+                            Rng::from_seed(base_seed.wrapping_add(chunk_idx as u64));
+                        let budget_control = SimControl {
+                            max_pulls: Some(total_pull_budget),
+                            stop_on_up: false,
+                            stop_on_six: true,
+                            stop_after_total_pulls: None,
+                            nn_total_pulls_one_based: true,
+                            collect_details: false,
+                            big_pity_requires_not_up: ctx.config.big_pity_requires_not_up,
+                            fast_inference: true,
+                        };
+                        let clear_control = SimControl {
+                            max_pulls: None,
+                            stop_on_up: false,
+                            stop_on_six: true,
+                            stop_after_total_pulls: Some(clear_limit),
+                            nn_total_pulls_one_based: true,
+                            collect_details: false,
+                            big_pity_requires_not_up: ctx.config.big_pity_requires_not_up,
+                            fast_inference: true,
+                        };
+                        let mut local_success = 0usize;
+                        let mut local_jade_sum = 0u64;
+                        let mut local_pulls_sum = 0u64;
+                        let mut local_clear_samples = 0usize;
+                        for _ in start..end {
+                            let (budget_stats, _) = simulate_core_with_context(
+                                &budget_control,
+                                &mut local_rng,
+                                free_pulls,
+                                &model_ctx,
+                                ppo_context,
+                            );
+                            if budget_stats.six_count > 0 {
+                                local_success += 1;
+                            }
+
+                            let (clear_stats, _) = simulate_core_with_context(
+                                &clear_control,
+                                &mut local_rng,
+                                free_pulls,
+                                &model_ctx,
+                                ppo_context,
+                            );
+                            if clear_stats.six_count > 0 {
+                                local_jade_sum += clear_stats.cost_jade as u64;
+                                local_pulls_sum += clear_stats.total_pulls as u64;
+                                local_clear_samples += 1;
+                            }
+                        }
+                        if let Some(pb) = pb {
+                            pb.inc((end - start) as u64);
+                        }
+                        (
+                            local_success,
+                            local_jade_sum,
+                            local_pulls_sum,
+                            local_clear_samples,
+                        )
+                    },
+                )
+                .reduce(
+                    || (0, 0, 0, 0),
+                    |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2, a.3 + b.3),
+                )
+        })
+        .unwrap_or_else(|err| {
+            log::error!("[Error] Jade budget analysis failed: {}", err);
+            (0, 0, 0, 0)
+        });
+
+    let avg_jade = if clear_samples > 0 {
+        Some(jade_sum as f64 / clear_samples as f64)
+    } else {
+        None
+    };
+    let avg_pulls = if clear_samples > 0 {
+        Some(pulls_sum as f64 / clear_samples as f64)
+    } else {
+        None
+    };
+    let avg_extra = avg_jade.map(|total| (total - jade_held as f64).max(0.0));
+
+    JadeBudgetSixAnalysis {
+        jade_held,
+        free_pulls,
+        paid_pulls_budget: paid_budget,
+        total_pull_budget,
+        success_within_budget: success,
+        total_sims: num_sims,
+        avg_jade_to_first_six: avg_jade,
+        avg_pulls_to_first_six: avg_pulls,
+        avg_extra_jade_needed: avg_extra,
+        expected_pulls_analytical: analytical,
+    }
+}
+
+pub fn format_jade_budget_report(
+    analysis: &JadeBudgetSixAnalysis,
+    lang: crate::i18n::Language,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(
+        I18n::get(lang, "jade_budget_header")
+            .replace("{jade}", &analysis.jade_held.to_string())
+            .replace("{paid}", &analysis.paid_pulls_budget.to_string())
+            .replace("{free}", &analysis.free_pulls.to_string())
+            .replace("{total}", &analysis.total_pull_budget.to_string()),
+    );
+    lines.push(I18n::get(lang, "jade_budget_analytical").replace(
+        "{:.1}",
+        &format!("{:.1}", analysis.expected_pulls_analytical),
+    ));
+    if analysis.total_sims > 0 {
+        let rate = analysis.success_within_budget as f64 / analysis.total_sims as f64 * 100.0;
+        lines.push(
+            I18n::get(lang, "jade_budget_success_rate")
+                .replace("{:.2}", &format!("{:.2}", rate))
+                .replace("{}", &analysis.total_sims.to_string()),
+        );
+    }
+    match (
+        analysis.avg_jade_to_first_six,
+        analysis.avg_pulls_to_first_six,
+        analysis.avg_extra_jade_needed,
+    ) {
+        (Some(jade), Some(pulls), Some(extra)) => {
+            lines.push(
+                I18n::get(lang, "jade_budget_avg_total")
+                    .replace("{:.0}", &format!("{:.0}", jade))
+                    .replace("{:.1}", &format!("{:.1}", pulls)),
+            );
+            lines.push(
+                I18n::get(lang, "jade_budget_avg_extra")
+                    .replace("{:.0}", &format!("{:.0}", extra))
+                    .replace("{:.1}", &format!("{:.1}", extra / COST_PER_PULL as f64)),
+            );
+        }
+        _ => lines.push(I18n::get(lang, "jade_budget_avg_na")),
+    }
+    lines
+}
+
 pub fn format_f2p_probability_line(
     total_episodes: usize,
     early_success_episodes: usize,
@@ -1334,6 +1567,7 @@ mod tests {
         let control = SimControl {
             max_pulls: Some(config.big_pity_cumulative),
             stop_on_up: false,
+            stop_on_six: false,
             stop_after_total_pulls: None,
             nn_total_pulls_one_based: false,
             collect_details: false,
@@ -1579,6 +1813,7 @@ mod tests {
         let control = SimControl {
             max_pulls: None,
             stop_on_up: false,
+            stop_on_six: false,
             stop_after_total_pulls: Some(limit),
             nn_total_pulls_one_based: false,
             collect_details: true,
@@ -1639,5 +1874,73 @@ mod tests {
         assert_eq!(success_count, sims);
         assert_eq!(extra_cost_samples, sims);
         assert_eq!(total_extra_cost, expected_extra_per_sim * sims as u64);
+    }
+
+    #[test]
+    fn stop_on_six_stops_at_first_six_star() {
+        let (config, env_net, neural_opt) = build_context();
+        let mut rng = Rng::from_seed(909);
+        let control = SimControl {
+            max_pulls: Some(200),
+            stop_on_up: false,
+            stop_on_six: true,
+            stop_after_total_pulls: None,
+            nn_total_pulls_one_based: false,
+            collect_details: false,
+            big_pity_requires_not_up: config.big_pity_requires_not_up,
+            fast_inference: true,
+        };
+        let ctx = SimModelContext {
+            neural_opt: &neural_opt,
+            dqn_policy: None,
+            ppo_policy: None,
+            env_net: &env_net,
+            config: &config,
+            exp_sender: None,
+            neural_sender: None,
+            ppo_sender: None,
+        };
+        let (stats, _) = simulate_core(&control, &mut rng, 0, &ctx);
+        assert_eq!(stats.six_count, 1);
+        assert!(stats.total_pulls >= 1);
+        assert!(stats.total_pulls <= 200);
+    }
+
+    #[test]
+    fn paid_pulls_from_jade_uses_cost_per_pull() {
+        assert_eq!(paid_pulls_from_jade(0), 0);
+        assert_eq!(paid_pulls_from_jade(499), 0);
+        assert_eq!(paid_pulls_from_jade(500), 1);
+        assert_eq!(paid_pulls_from_jade(125_000), 250);
+    }
+
+    #[test]
+    fn jade_budget_analysis_reports_success_for_generous_budget() {
+        let (mut config, env_net, neural_opt) = build_context();
+        config.luck_mode = LuckMode::Probability;
+        let worker = GoodJobWorker::new(1).expect("Failed to build simulation worker pool");
+        let run_ctx = SimRunContext {
+            neural_opt: &neural_opt,
+            dqn_policy: None,
+            ppo_policy: None,
+            env_net: &env_net,
+            config: &config,
+            worker: &worker,
+            exp_sender: None,
+            neural_sender: None,
+            ppo_sender: None,
+        };
+        let analysis = simulate_jade_budget_six_analysis_with_progress(
+            64,
+            500_000,
+            FREE_PULLS_WELFARE,
+            42,
+            &run_ctx,
+            None,
+        );
+        assert_eq!(analysis.total_sims, 64);
+        assert!(analysis.success_within_budget >= 60);
+        assert!(analysis.avg_jade_to_first_six.is_some());
+        assert!(analysis.expected_pulls_analytical > 0.0);
     }
 }
