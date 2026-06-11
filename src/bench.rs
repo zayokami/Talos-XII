@@ -1,6 +1,6 @@
-use crate::achf::AchfCacheStats;
+use crate::achf::{aggregate_cache_stats_iter, AchfCacheStats};
 use crate::chart::{self, ChartFormat};
-use crate::config::Config;
+use crate::config::{Config, LuckMode};
 use crate::dqn::{train_dqn_with_metrics, DuelingQNetwork};
 use crate::env_net::EnvNet;
 use crate::model_io::{
@@ -26,6 +26,9 @@ const BENCH_EXPERIMENTS: &[&str] = &[
     "apply",
     "convergence",
 ];
+const THROUGHPUT_SIMS: usize = 200;
+const THROUGHPUT_PULLS: usize = 100;
+const CURVE_THROUGHPUT_SIMS: usize = 100;
 
 // ── Data structures ─────────────────────────────────────────────────────
 
@@ -182,6 +185,7 @@ fn build_base_models(
 fn bench_sized_config(base_config: &Config) -> Config {
     let mut cfg = base_config.clone();
     cfg.fast_init = true;
+    cfg.luck_mode = LuckMode::Ppo;
     cfg.model_dim = crate::neural::DIM;
     cfg.model_hidden_dim = cfg.model_hidden_dim.clamp(32, 64);
     cfg.model_num_layers = cfg.model_num_layers.clamp(1, 2);
@@ -247,6 +251,21 @@ fn measure_inference_throughput(rng: &mut Rng, params: &ThroughputParams<'_>) ->
     let elapsed = start.elapsed();
     pb.finish_and_clear();
     params.sims as f64 / elapsed.as_secs_f64()
+}
+
+fn aggregate_model_cache_stats(
+    config: &Config,
+    dqn: Option<&DuelingQNetwork>,
+    ppo: Option<&ActorCritic>,
+) -> Option<AchfCacheStats> {
+    if !config.achf.enabled {
+        return None;
+    }
+    let dqn_stats = dqn.and_then(DuelingQNetwork::achf_cache_stats);
+    let ppo_stats = ppo.map(ActorCritic::achf_cache_stats_aggregate);
+    Some(aggregate_cache_stats_iter(
+        dqn_stats.into_iter().chain(ppo_stats),
+    ))
 }
 
 fn should_run(bench_cfg: &BenchConfig, name: &str) -> bool {
@@ -523,7 +542,7 @@ fn run_gate_curve(base_config: &Config, seed: u64) -> BenchRunResult {
     cfg.ppo_steps_per_update = cfg.ppo_steps_per_update.min(256);
     cfg.ppo_k_epochs = cfg.ppo_k_epochs.min(2);
 
-    let (env_net, _neural_opt, _worker) = build_base_models(&cfg, &mut rng);
+    let (env_net, neural_opt, _worker) = build_base_models(&cfg, &mut rng);
 
     let (snapshots_tx, snapshots_rx) = std::sync::mpsc::channel();
     let start = Instant::now();
@@ -532,16 +551,28 @@ fn run_gate_curve(base_config: &Config, seed: u64) -> BenchRunResult {
 
     let snapshots: Vec<StepSnapshot> = snapshots_rx.try_iter().collect();
     let final_reward = snapshots.last().map_or(0.0, |s| s.reward);
+    let throughput = measure_inference_throughput(
+        &mut rng,
+        &ThroughputParams {
+            neural_opt: &neural_opt,
+            dqn: None,
+            ppo: Some(&ppo),
+            env_net: &env_net,
+            config: &cfg,
+            sims: CURVE_THROUGHPUT_SIMS,
+            pulls: THROUGHPUT_PULLS,
+        },
+    );
 
     BenchRunResult {
         label: "Gate Curve".to_string(),
         total_time_ms: elapsed.as_secs_f64() * 1000.0,
-        throughput_sims_per_sec: 0.0,
+        throughput_sims_per_sec: throughput,
         final_avg_reward: final_reward,
         final_loss: snapshots.last().map_or(0.0, |s| s.loss),
         param_count: ppo.param_count(),
         snapshots,
-        cache_stats: Some(ppo.achf_cache_stats_aggregate()),
+        cache_stats: aggregate_model_cache_stats(&cfg, None, Some(&ppo)),
     }
 }
 
@@ -587,6 +618,11 @@ fn run_apply_combination(base_config: &Config, seed: u64, nt: usize) -> Vec<Aggr
         cfg.achf.apply_attn = attn;
         cfg.achf.apply_ffn = ffn;
         cfg.achf.apply_dqn = dqn_flag;
+        cfg.luck_mode = if dqn_flag && !attn && !ffn {
+            LuckMode::Dqn
+        } else {
+            LuckMode::Ppo
+        };
         let runs = run_multi_trial(label, &cfg, seed, nt);
         agg.push(aggregate_trials(&runs));
     }
@@ -607,7 +643,7 @@ fn run_convergence(base_config: &Config, seed: u64, nt: usize) -> Vec<Aggregated
             cfg.ppo_total_steps = cfg.ppo_total_steps.min(4000);
             cfg.ppo_steps_per_update = cfg.ppo_steps_per_update.min(256);
             cfg.ppo_k_epochs = cfg.ppo_k_epochs.min(2);
-            let (env_net, _neural_opt, _worker) = build_base_models(&cfg, &mut rng);
+            let (env_net, neural_opt, _worker) = build_base_models(&cfg, &mut rng);
             let (tx, rx) = std::sync::mpsc::channel();
             let start = Instant::now();
             let ppo = train_ppo_with_metrics(&mut rng, &env_net, &cfg, Some(tx));
@@ -615,18 +651,32 @@ fn run_convergence(base_config: &Config, seed: u64, nt: usize) -> Vec<Aggregated
             let snapshots: Vec<StepSnapshot> = rx.try_iter().collect();
             let final_reward = snapshots.last().map_or(0.0, |s| s.reward);
             let final_loss = snapshots.last().map_or(0.0, |s| s.loss);
+            let throughput = measure_inference_throughput(
+                &mut rng,
+                &ThroughputParams {
+                    neural_opt: &neural_opt,
+                    dqn: None,
+                    ppo: Some(&ppo),
+                    env_net: &env_net,
+                    config: &cfg,
+                    sims: CURVE_THROUGHPUT_SIMS,
+                    pulls: THROUGHPUT_PULLS,
+                },
+            );
             let cache_stats = if enabled {
-                let stats = ppo.achf_cache_stats_aggregate();
+                let stats = aggregate_model_cache_stats(&cfg, None, Some(&ppo))
+                    .unwrap_or_else(|| ppo.achf_cache_stats_aggregate());
                 AchfCacheStats::debug_print(&[stats]);
                 Some(stats)
             } else {
                 None
             };
             println!(
-                "    trial {}/{}: {:.1}s | reward: {:.3} | loss: {:.4} | {} snapshots",
+                "    trial {}/{}: {:.1}s | {:.0} sims/sec | reward: {:.3} | loss: {:.4} | {} snapshots",
                 t + 1,
                 nt,
                 elapsed.as_secs_f64(),
+                throughput,
                 final_reward,
                 final_loss,
                 snapshots.len()
@@ -634,7 +684,7 @@ fn run_convergence(base_config: &Config, seed: u64, nt: usize) -> Vec<Aggregated
             runs.push(BenchRunResult {
                 label: label.to_string(),
                 total_time_ms: elapsed.as_secs_f64() * 1000.0,
-                throughput_sims_per_sec: 0.0,
+                throughput_sims_per_sec: throughput,
                 final_avg_reward: final_reward,
                 final_loss,
                 param_count: ppo.param_count(),
@@ -674,16 +724,17 @@ fn train_and_measure(label: &str, config: &Config, seed: u64) -> BenchRunResult 
             dqn: Some(&dqn),
             ppo: Some(&ppo),
             env_net: &env_net,
-            config,
-            sims: 200,
-            pulls: 100,
+            config: &cfg,
+            sims: THROUGHPUT_SIMS,
+            pulls: THROUGHPUT_PULLS,
         },
     );
 
-    let cache_stats = if config.achf.enabled {
-        let stats = ppo.achf_cache_stats_aggregate();
+    let cache_stats = if cfg.achf.enabled {
+        let stats = aggregate_model_cache_stats(&cfg, Some(&dqn), Some(&ppo))
+            .expect("enabled ACHF benchmark should produce aggregate stats");
         AchfCacheStats::debug_print(&[stats]);
-        if let Some(snapshot) = ppo.snapshot_achf() {
+        if let Some(snapshot) = ppo.snapshot_achf().or_else(|| dqn.snapshot_achf()) {
             if snapshot.low_rank_applied_rank > 0 {
                 println!(
                     "    [ACHF] low-rank: rank={} rel_err={:.4}",
@@ -1005,11 +1056,12 @@ fn write_summary_txt(
                     0.0
                 };
                 lines.push(format!(
-                    "    ACHF: calls={} hit={:.1}% lr={} dense={} bias={:.3}",
+                    "    ACHF: calls={} hit={:.1}% lr={} dense={} latency_samples={} bias={:.3}",
                     stats.calls,
                     hit_pct,
                     stats.sparse_paths,
                     stats.dense_paths,
+                    stats.latency_samples,
                     stats.adaptive_bias
                 ));
             }
@@ -1029,9 +1081,10 @@ fn write_summary_txt(
     if let Some(result) = gate_curve {
         lines.push("=== gate_curve ===".to_string());
         lines.push(format!(
-            "  {:20} | snapshots={} | reward={:.4} | loss={:.4} | params={} | time_ms={:.1}",
+            "  {:20} | snapshots={} | tput={:.0} | reward={:.4} | loss={:.4} | params={} | train_time_ms={:.1}",
             result.label,
             result.snapshots.len(),
+            result.throughput_sims_per_sec,
             result.final_avg_reward,
             result.final_loss,
             result.param_count,
@@ -1039,7 +1092,7 @@ fn write_summary_txt(
         ));
         if let Some(last) = result.snapshots.last() {
             lines.push(format!(
-                "    final: step={} gate={:.4} g_min={:.4} hit={:.1}% sparse={:.1}% bias={:.3}",
+                "    final training: step={} gate={:.4} g_min={:.4} hit={:.1}% sparse={:.1}% bias={:.3}",
                 last.step,
                 last.gate_value,
                 last.g_min,
@@ -1067,8 +1120,13 @@ fn write_summary_txt(
                 0.0
             };
             lines.push(format!(
-                "    ACHF: calls={} hit={:.1}% sparse={:.1}% dense={:.1}% decision_ns={:.1}",
-                stats.calls, hit_pct, sparse_pct, dense_pct, stats.decision_ema_ns
+                "    ACHF inference: calls={} hit={:.1}% sparse={:.1}% dense={:.1}% latency_samples={} decision_ns={:.1}",
+                stats.calls,
+                hit_pct,
+                sparse_pct,
+                dense_pct,
+                stats.latency_samples,
+                stats.decision_ema_ns
             ));
         }
         lines.push(String::new());
@@ -1089,7 +1147,7 @@ fn write_summary_json(
         let entries: Vec<serde_json::Value> = agg
             .iter()
             .map(|a| {
-                serde_json::json!({
+                let mut entry = serde_json::json!({
                     "label": a.label.as_str(),
                     "throughput_mean": a.throughput.mean,
                     "throughput_std": a.throughput.std_dev,
@@ -1100,7 +1158,11 @@ fn write_summary_json(
                     "param_count": a.param_count,
                     "throughput_ci": [a.throughput.ci_low, a.throughput.ci_high],
                     "reward_ci": [a.reward.ci_low, a.reward.ci_high],
-                })
+                });
+                if let Some(stats) = a.cache_stats {
+                    entry["cache_stats"] = cache_stats_json(stats);
+                }
+                entry
             })
             .collect();
         root.insert((*name).to_string(), serde_json::Value::Array(entries));
@@ -1469,6 +1531,7 @@ mod tests {
         assert!(bench_cfg.model_qk_rope_dim <= 4);
         assert_eq!(bench_cfg.model_qk_rope_dim % 2, 0);
         assert!(bench_cfg.multi_stream_factor <= 2);
+        assert_eq!(bench_cfg.luck_mode, LuckMode::Ppo);
     }
 
     #[test]
@@ -1494,7 +1557,23 @@ mod tests {
             time_ms: TrialStats::from_values(&[12.0]),
             param_count: 42,
             best_snapshots: Vec::new(),
-            cache_stats: None,
+            cache_stats: Some(AchfCacheStats {
+                calls: 4,
+                cache_hits: 1,
+                cache_misses: 1,
+                cache_skips: 0,
+                sparse_paths: 2,
+                dense_paths: 1,
+                ema_cached_ns: 10.0,
+                ema_cached_long_ns: 11.0,
+                ema_sparse_ns: 20.0,
+                ema_sparse_long_ns: 21.0,
+                decision_ema_ns: 3.0,
+                decision_ema_long_ns: 4.0,
+                adaptive_bias: 1.0,
+                latency_samples: 3,
+                decision_samples: 2,
+            }),
         };
 
         write_summary_json(&[("exp", vec![result])], None, None, &output_dir);
@@ -1503,6 +1582,8 @@ mod tests {
         let json = std::fs::read_to_string(&json_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["exp"][0]["label"], "label,with\"quote");
+        assert_eq!(parsed["exp"][0]["cache_stats"]["calls"], 4);
+        assert_eq!(parsed["exp"][0]["cache_stats"]["hit_rate"], 0.25);
 
         std::fs::remove_file(json_path).unwrap();
         std::fs::remove_dir(dir).unwrap();
