@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+const AMA_SPARSE_DENSE_ENABLE_MARGIN: f64 = 0.98;
+
 #[cfg(cuda)]
 use crate::autograd::Device;
 
@@ -75,6 +77,7 @@ pub struct AchfMetrics {
     pub sparse_paths: AtomicU64,
     pub dense_paths: AtomicU64,
     pub latency_samples: AtomicU64,
+    pub dense_latency_samples: AtomicU64,
     pub decision_samples: AtomicU64,
     pub memo_hash: AtomicU64,
     pub memo_count: AtomicU64,
@@ -90,6 +93,9 @@ impl Clone for AchfMetrics {
             sparse_paths: AtomicU64::new(self.sparse_paths.load(Ordering::Relaxed)),
             dense_paths: AtomicU64::new(self.dense_paths.load(Ordering::Relaxed)),
             latency_samples: AtomicU64::new(self.latency_samples.load(Ordering::Relaxed)),
+            dense_latency_samples: AtomicU64::new(
+                self.dense_latency_samples.load(Ordering::Relaxed),
+            ),
             decision_samples: AtomicU64::new(self.decision_samples.load(Ordering::Relaxed)),
             memo_hash: AtomicU64::new(self.memo_hash.load(Ordering::Relaxed)),
             memo_count: AtomicU64::new(self.memo_count.load(Ordering::Relaxed)),
@@ -107,6 +113,7 @@ impl Default for AchfMetrics {
             sparse_paths: AtomicU64::new(0),
             dense_paths: AtomicU64::new(0),
             latency_samples: AtomicU64::new(0),
+            dense_latency_samples: AtomicU64::new(0),
             decision_samples: AtomicU64::new(0),
             memo_hash: AtomicU64::new(0),
             memo_count: AtomicU64::new(0),
@@ -128,16 +135,22 @@ pub struct AchfCache {
     pub ema_cached_long_ns: f64,
     pub ema_sparse_ns: f64,
     pub ema_sparse_long_ns: f64,
+    pub ema_dense_ns: f64,
+    pub ema_dense_long_ns: f64,
     pub decision_ema_ns: f64,
     pub decision_ema_long_ns: f64,
     ama_cached_cold_ns: f64,
     ama_cached_warm_ns: f64,
     ama_sparse_cold_ns: f64,
     ama_sparse_warm_ns: f64,
+    ama_dense_cold_ns: f64,
+    ama_dense_warm_ns: f64,
     ama_cached_warm_count: u64,
     ama_sparse_warm_count: u64,
+    ama_dense_warm_count: u64,
     ama_cached_stale: u64,
     ama_sparse_stale: u64,
+    ama_dense_stale: u64,
     ama_prev_path: Option<InferencePath>,
     ama_dwell: u64,
     ama_switches: u64,
@@ -185,16 +198,22 @@ fn default_cache() -> Arc<RwLock<AchfCache>> {
         ema_cached_long_ns: 0.0,
         ema_sparse_ns: 0.0,
         ema_sparse_long_ns: 0.0,
+        ema_dense_ns: 0.0,
+        ema_dense_long_ns: 0.0,
         decision_ema_ns: 0.0,
         decision_ema_long_ns: 0.0,
         ama_cached_cold_ns: 0.0,
         ama_cached_warm_ns: 0.0,
         ama_sparse_cold_ns: 0.0,
         ama_sparse_warm_ns: 0.0,
+        ama_dense_cold_ns: 0.0,
+        ama_dense_warm_ns: 0.0,
         ama_cached_warm_count: 0,
         ama_sparse_warm_count: 0,
+        ama_dense_warm_count: 0,
         ama_cached_stale: 0,
         ama_sparse_stale: 0,
+        ama_dense_stale: 0,
         ama_prev_path: None,
         ama_dwell: 0,
         ama_switches: 0,
@@ -223,10 +242,13 @@ pub struct AchfCacheStats {
     pub ema_cached_long_ns: f64,
     pub ema_sparse_ns: f64,
     pub ema_sparse_long_ns: f64,
+    pub ema_dense_ns: f64,
+    pub ema_dense_long_ns: f64,
     pub decision_ema_ns: f64,
     pub decision_ema_long_ns: f64,
     pub adaptive_bias: f64,
     pub latency_samples: u64,
+    pub dense_latency_samples: u64,
     pub decision_samples: u64,
 }
 
@@ -309,16 +331,21 @@ where
         ema_cached_long_ns: 0.0,
         ema_sparse_ns: 0.0,
         ema_sparse_long_ns: 0.0,
+        ema_dense_ns: 0.0,
+        ema_dense_long_ns: 0.0,
         decision_ema_ns: 0.0,
         decision_ema_long_ns: 0.0,
         adaptive_bias: 0.0,
         latency_samples: 0,
+        dense_latency_samples: 0,
         decision_samples: 0,
     };
     let mut count_cached = 0usize;
     let mut count_low_rank = 0usize;
+    let mut count_dense = 0usize;
     let mut count_cached_long = 0usize;
     let mut count_low_rank_long = 0usize;
+    let mut count_dense_long = 0usize;
     let mut count_decision = 0usize;
     let mut count_decision_long = 0usize;
     let mut count_bias = 0usize;
@@ -330,6 +357,7 @@ where
         out.sparse_paths += s.sparse_paths;
         out.dense_paths += s.dense_paths;
         out.latency_samples += s.latency_samples;
+        out.dense_latency_samples += s.dense_latency_samples;
         out.decision_samples += s.decision_samples;
         if s.ema_cached_ns > 0.0 {
             out.ema_cached_ns += s.ema_cached_ns;
@@ -346,6 +374,14 @@ where
         if s.ema_sparse_long_ns > 0.0 {
             out.ema_sparse_long_ns += s.ema_sparse_long_ns;
             count_low_rank_long += 1;
+        }
+        if s.ema_dense_ns > 0.0 {
+            out.ema_dense_ns += s.ema_dense_ns;
+            count_dense += 1;
+        }
+        if s.ema_dense_long_ns > 0.0 {
+            out.ema_dense_long_ns += s.ema_dense_long_ns;
+            count_dense_long += 1;
         }
         if s.decision_ema_ns > 0.0 {
             out.decision_ema_ns += s.decision_ema_ns;
@@ -366,11 +402,17 @@ where
     if count_low_rank > 0 {
         out.ema_sparse_ns /= count_low_rank as f64;
     }
+    if count_dense > 0 {
+        out.ema_dense_ns /= count_dense as f64;
+    }
     if count_cached_long > 0 {
         out.ema_cached_long_ns /= count_cached_long as f64;
     }
     if count_low_rank_long > 0 {
         out.ema_sparse_long_ns /= count_low_rank_long as f64;
+    }
+    if count_dense_long > 0 {
+        out.ema_dense_long_ns /= count_dense_long as f64;
     }
     if count_decision > 0 {
         out.decision_ema_ns /= count_decision as f64;
@@ -1012,10 +1054,13 @@ impl AchfLayer {
             ema_cached_long_ns: cache.ema_cached_long_ns,
             ema_sparse_ns: cache.ema_sparse_ns,
             ema_sparse_long_ns: cache.ema_sparse_long_ns,
+            ema_dense_ns: cache.ema_dense_ns,
+            ema_dense_long_ns: cache.ema_dense_long_ns,
             decision_ema_ns: cache.decision_ema_ns,
             decision_ema_long_ns: cache.decision_ema_long_ns,
             adaptive_bias: cache.adaptive_bias,
             latency_samples: self.metrics.latency_samples.load(Ordering::Relaxed),
+            dense_latency_samples: self.metrics.dense_latency_samples.load(Ordering::Relaxed),
             decision_samples: self.metrics.decision_samples.load(Ordering::Relaxed),
         }
     }
@@ -1145,11 +1190,25 @@ impl AchfLayer {
             return;
         }
         state.step += 1;
-        if !state.step.is_multiple_of(self.config.proj_freq) {
+        let freq = self.effective_proj_freq();
+        if freq == 0 || !state.step.is_multiple_of(freq) {
             return;
         }
         drop(state);
         self.project_weight();
+    }
+
+    fn effective_proj_freq(&self) -> usize {
+        if self.config.proj_freq == 0 {
+            return 0;
+        }
+        if self.is_training_mode() {
+            // Training runs many optimizer steps per wall-clock second; stretch
+            // manifold projection so Sinkhorn/rank work stays off the hot path.
+            self.config.proj_freq.saturating_mul(4)
+        } else {
+            self.config.proj_freq
+        }
     }
 
     fn project_weight(&self) {
@@ -1482,16 +1541,22 @@ impl AchfLayer {
         cache.ema_cached_long_ns = 0.0;
         cache.ema_sparse_ns = 0.0;
         cache.ema_sparse_long_ns = 0.0;
+        cache.ema_dense_ns = 0.0;
+        cache.ema_dense_long_ns = 0.0;
         cache.decision_ema_ns = 0.0;
         cache.decision_ema_long_ns = 0.0;
         cache.ama_cached_cold_ns = 0.0;
         cache.ama_cached_warm_ns = 0.0;
         cache.ama_sparse_cold_ns = 0.0;
         cache.ama_sparse_warm_ns = 0.0;
+        cache.ama_dense_cold_ns = 0.0;
+        cache.ama_dense_warm_ns = 0.0;
         cache.ama_cached_warm_count = 0;
         cache.ama_sparse_warm_count = 0;
+        cache.ama_dense_warm_count = 0;
         cache.ama_cached_stale = 0;
         cache.ama_sparse_stale = 0;
+        cache.ama_dense_stale = 0;
         cache.ama_prev_path = None;
         cache.ama_dwell = 0;
         cache.ama_switches = 0;
@@ -1510,6 +1575,9 @@ impl AchfLayer {
         self.metrics.memo_hash.store(0, Ordering::Relaxed);
         self.metrics.memo_count.store(0, Ordering::Relaxed);
         self.metrics.latency_samples.store(0, Ordering::Relaxed);
+        self.metrics
+            .dense_latency_samples
+            .store(0, Ordering::Relaxed);
         self.metrics.decision_samples.store(0, Ordering::Relaxed);
     }
 
@@ -1696,6 +1764,7 @@ impl AchfLayer {
         let warmup_samples = self.ama_warmup_samples();
         let cached_warmness = Self::ama_warmness(cache.ama_cached_warm_count, warmup_samples);
         let sparse_warmness = Self::ama_warmness(cache.ama_sparse_warm_count, warmup_samples);
+        let dense_warmness = Self::ama_warmness(cache.ama_dense_warm_count, warmup_samples);
         let stale_limit = self.ama_stale_limit();
 
         let cached_needs_probe = cache.ema_cached_ns <= 0.0
@@ -1704,51 +1773,93 @@ impl AchfLayer {
         let sparse_needs_probe = cache.ema_sparse_ns <= 0.0
             || cache.ama_sparse_stale >= stale_limit
             || sparse_warmness < 1.0;
+        let dense_needs_probe = cache.ema_dense_ns <= 0.0
+            || cache.ama_dense_stale >= stale_limit
+            || dense_warmness < 1.0;
 
-        if cached_needs_probe || sparse_needs_probe {
-            let path = if cached_needs_probe && sparse_needs_probe {
-                if cache.ema_cached_ns <= 0.0 && cache.ema_sparse_ns > 0.0 {
-                    InferencePath::Cached
-                } else if cache.ema_sparse_ns <= 0.0 && cache.ema_cached_ns > 0.0 {
-                    InferencePath::Sparse
-                } else if cache.ama_cached_stale >= cache.ama_sparse_stale {
-                    InferencePath::Cached
-                } else {
-                    InferencePath::Sparse
-                }
-            } else if cached_needs_probe {
-                InferencePath::Cached
-            } else {
-                InferencePath::Sparse
-            };
+        if cached_needs_probe || sparse_needs_probe || dense_needs_probe {
+            let path = self.ama_probe_path(
+                cache,
+                cached_needs_probe,
+                sparse_needs_probe,
+                dense_needs_probe,
+            );
             Self::ama_commit_path(cache, path, true, warmup_samples);
             return path;
         }
 
         let cached_score = self.ama_effective_latency(cache, InferencePath::Cached);
         let sparse_score = self.ama_effective_latency(cache, InferencePath::Sparse);
-        let mut selected = if cached_score <= sparse_score {
-            InferencePath::Cached
-        } else {
-            InferencePath::Sparse
-        };
+        let dense_score = self.ama_effective_latency(cache, InferencePath::Dense);
+        let sparse_allowed = self.ama_sparse_beats_dense(cache);
+        let mut selected = InferencePath::Dense;
+        let mut selected_score = dense_score;
+        if cached_score < selected_score {
+            selected = InferencePath::Cached;
+            selected_score = cached_score;
+        }
+        if sparse_allowed && sparse_score < selected_score {
+            selected = InferencePath::Sparse;
+        }
 
         if let Some(prev) = cache.ama_prev_path {
-            if matches!(prev, InferencePath::Cached | InferencePath::Sparse) {
-                let prev_score = self.ama_effective_latency(cache, prev);
-                let selected_score = self.ama_effective_latency(cache, selected);
-                let margin = self.ama_switch_margin(cache, prev_score, selected_score);
-                if selected != prev
-                    && (cache.ama_dwell < self.ama_min_dwell()
-                        || selected_score + margin >= prev_score)
-                {
-                    selected = prev;
-                }
+            let prev_score = self.ama_effective_latency(cache, prev);
+            let selected_score = self.ama_effective_latency(cache, selected);
+            let margin = self.ama_switch_margin(cache, prev_score, selected_score);
+            let prev_still_allowed = prev != InferencePath::Sparse || sparse_allowed;
+            if selected != prev
+                && prev_still_allowed
+                && (cache.ama_dwell < self.ama_min_dwell() || selected_score + margin >= prev_score)
+            {
+                selected = prev;
             }
         }
 
         Self::ama_commit_path(cache, selected, false, warmup_samples);
         selected
+    }
+
+    fn ama_probe_path(
+        &self,
+        cache: &AchfCache,
+        cached_needs_probe: bool,
+        sparse_needs_probe: bool,
+        dense_needs_probe: bool,
+    ) -> InferencePath {
+        let mut selected = None;
+        let mut selected_stale = 0u64;
+        for (path, needs_probe, stale) in [
+            (
+                InferencePath::Cached,
+                cached_needs_probe,
+                cache.ama_cached_stale,
+            ),
+            (
+                InferencePath::Sparse,
+                sparse_needs_probe,
+                cache.ama_sparse_stale,
+            ),
+            (
+                InferencePath::Dense,
+                dense_needs_probe,
+                cache.ama_dense_stale,
+            ),
+        ] {
+            if needs_probe && selected.is_none_or(|_| stale >= selected_stale) {
+                selected = Some(path);
+                selected_stale = stale;
+            }
+        }
+        selected.unwrap_or(InferencePath::Dense)
+    }
+
+    fn ama_sparse_beats_dense(&self, cache: &AchfCache) -> bool {
+        if cache.ema_dense_ns <= 0.0 || cache.ema_sparse_ns <= 0.0 {
+            return true;
+        }
+        let sparse_score = self.ama_effective_latency(cache, InferencePath::Sparse);
+        let dense_score = self.ama_effective_latency(cache, InferencePath::Dense);
+        sparse_score < dense_score * AMA_SPARSE_DENSE_ENABLE_MARGIN
     }
 
     fn ama_commit_path(
@@ -1761,14 +1872,17 @@ impl AchfLayer {
             InferencePath::Cached => {
                 cache.ama_cached_stale = 0;
                 cache.ama_sparse_stale = cache.ama_sparse_stale.saturating_add(1);
+                cache.ama_dense_stale = cache.ama_dense_stale.saturating_add(1);
             }
             InferencePath::Sparse => {
                 cache.ama_sparse_stale = 0;
                 cache.ama_cached_stale = cache.ama_cached_stale.saturating_add(1);
+                cache.ama_dense_stale = cache.ama_dense_stale.saturating_add(1);
             }
             InferencePath::Dense => {
                 cache.ama_cached_stale = cache.ama_cached_stale.saturating_add(1);
                 cache.ama_sparse_stale = cache.ama_sparse_stale.saturating_add(1);
+                cache.ama_dense_stale = 0;
             }
         }
 
@@ -1790,7 +1904,7 @@ impl AchfLayer {
         let warm_count = match path {
             InferencePath::Cached => cache.ama_cached_warm_count,
             InferencePath::Sparse => cache.ama_sparse_warm_count,
-            InferencePath::Dense => warmup_samples,
+            InferencePath::Dense => cache.ama_dense_warm_count,
         };
         if warm_count < warmup_samples {
             cache.ama_force_latency_sample = true;

@@ -1,5 +1,3 @@
-#[cfg(cuda)]
-use crate::autograd::Device;
 use crate::autograd::Tensor;
 use crate::config::{AchfConfig, Config};
 use crate::env_net::EnvNet;
@@ -28,6 +26,7 @@ use std::time::{Duration, Instant};
 const CLIP_EPSILON: f64 = 0.2;
 const GAMMA: f64 = 0.99;
 const GAE_LAMBDA: f64 = 0.95;
+const KL_CHECK_INTERVAL: usize = 4;
 const VALUE_COEF: f64 = 0.5;
 const ENTROPY_COEF: f64 = 0.01;
 pub(crate) const EARLY_UP_BONUS_THRESHOLD_1: usize = 80;
@@ -334,16 +333,13 @@ impl ActorCritic {
             let fallback_prob = 1.0 / ACTION_SPACE as f32;
             return (0, fallback_prob.ln(), 0.0);
         }
-        let state_tensor = Tensor::new_f32(state.to_vec(), vec![1, seq_len, DIM]);
-        let (logits, value) = self.forward_actor_critic_batch(&state_tensor);
-        let logits_data = logits.data_to_f32_vec();
-        let value_data = value.data_to_f32_vec();
-        let (action_idx, log_prob) = softmax_sample(&logits_data, top_k);
-        (
-            action_idx,
-            log_prob,
-            value_data.first().copied().unwrap_or(0.0),
-        )
+        let seq_f32: Vec<f32> = state.iter().map(|&v| v as f32).collect();
+        let backbone_out = self.backbone.forward_inference(&seq_f32);
+        let last = self.backbone.last_token_inference(&backbone_out);
+        let logits = self.actor_head.forward_inference(&last);
+        let value = self.critic_head.forward_inference(&last);
+        let (action_idx, log_prob) = softmax_sample(&logits, top_k);
+        (action_idx, log_prob, value.first().copied().unwrap_or(0.0))
     }
 
     pub fn step_inference_cached(
@@ -803,6 +799,30 @@ pub(crate) struct PpoStoreRawInput {
     value: f64,
 }
 
+/// Cached CUDA tensors reused across PPO update minibatches.
+#[cfg(cuda)]
+struct PpoCudaUpdateCache {
+    ones_action_1: Option<Tensor>,
+}
+
+#[cfg(cuda)]
+impl PpoCudaUpdateCache {
+    fn ones_action_1(&mut self) -> Tensor {
+        if self.ones_action_1.is_none() {
+            let ones = Tensor::new_f32(vec![1.0; ACTION_SPACE], vec![ACTION_SPACE, 1]);
+            let ones = match ones.to_cuda() {
+                Ok(t) => t,
+                Err(_) => ones,
+            };
+            self.ones_action_1 = Some(ones);
+        }
+        self.ones_action_1
+            .as_ref()
+            .expect("ones_action_1 cache")
+            .clone()
+    }
+}
+
 /// PPO trainer with clipped surrogate objective and GAE.
 pub struct Ppo {
     pub policy: ActorCritic,
@@ -818,12 +838,14 @@ pub struct Ppo {
     distill_update_counter: usize,
     optimizer_step_counter: usize,
     achf_orthogonal_penalty_interval: usize,
+    #[cfg(cuda)]
+    cuda_update_cache: PpoCudaUpdateCache,
 }
 
 impl Ppo {
     fn achf_orthogonal_penalty_interval_from_config(config: &AchfConfig) -> usize {
         if config.enabled && config.apply_ffn && config.lambda_ortho > 0.0 {
-            config.proj_freq.max(1)
+            config.proj_freq.max(1).saturating_mul(4)
         } else {
             usize::MAX
         }
@@ -885,6 +907,10 @@ impl Ppo {
             distill_update_counter: 0,
             optimizer_step_counter: 0,
             achf_orthogonal_penalty_interval,
+            #[cfg(cuda)]
+            cuda_update_cache: PpoCudaUpdateCache {
+                ones_action_1: None,
+            },
         }
     }
 
@@ -1080,12 +1106,10 @@ impl Ppo {
                 let batch_log_probs = batch_logits.log_softmax();
                 let batch_log_probs_copy = batch_log_probs.clone();
                 let batch_probs = batch_log_probs_copy.exp();
-                let ones_action_1 = Tensor::new_f32(vec![1.0; ACTION_SPACE], vec![ACTION_SPACE, 1]);
                 #[cfg(cuda)]
-                let ones_action_1 = match ones_action_1.to_cuda() {
-                    Ok(t) => t,
-                    Err(_) => ones_action_1,
-                };
+                let ones_action_1 = self.cuda_update_cache.ones_action_1();
+                #[cfg(not(cuda))]
+                let ones_action_1 = Tensor::new_f32(vec![1.0; ACTION_SPACE], vec![ACTION_SPACE, 1]);
                 let batch_entropy =
                     -(batch_probs.clone() * batch_log_probs_copy).matmul(&ones_action_1);
 
@@ -1255,9 +1279,11 @@ impl Ppo {
                 // Update EMA teacher after each batch for self-distillation
                 self.update_ema_teacher();
 
-                let approx_kl = approx_kl_tensor.detach().item() as f64 / chunk.len() as f64;
-                if approx_kl > target_kl * 1.5 {
-                    early_stop = true;
+                if completed_batches.is_multiple_of(KL_CHECK_INTERVAL) {
+                    let approx_kl = approx_kl_tensor.detach().item() as f64 / chunk.len() as f64;
+                    if approx_kl > target_kl * 1.5 {
+                        early_stop = true;
+                    }
                 }
 
                 if early_stop {
@@ -1507,31 +1533,16 @@ struct PpoStepResult {
     finished_breakdown: Option<RewardBreakdown>,
 }
 
-#[cfg(cuda)]
-fn rollout_prepared_cpu(
+fn rollout_envs_sequential(
     envs: &mut [PpoEnvState],
     policy: &ActorCritic,
     env_net: &EnvNet,
     config: &Config,
+    context_len: usize,
 ) -> Vec<PpoStepResult> {
-    let mut results = Vec::with_capacity(envs.len());
-    let mut token_f32 = Vec::with_capacity(DIM);
-    for env in envs {
-        let seq_len = env.history_buffer.len();
-        let (action_idx, log_prob, val) = if env.kv_cache_valid {
-            env.current_token_f32(&mut token_f32);
-            policy.step_inference_cached_with_value(
-                &token_f32,
-                &mut env.kv_cache,
-                seq_len - 1,
-                config.ppo_top_k,
-            )
-        } else {
-            policy.step_sequence_with_value(&env.flat_data, seq_len, config.ppo_top_k)
-        };
-        results.push(env.apply_policy_step(action_idx, log_prob, val, env_net, config));
-    }
-    results
+    envs.iter_mut()
+        .map(|env| env.step(policy, env_net, config, context_len))
+        .collect()
 }
 
 fn rollout_cpu_round(
@@ -1549,8 +1560,11 @@ fn rollout_cpu_round(
                 .collect()
         })
         .unwrap_or_else(|msg| {
-            log::error!("[PPO] Worker execution failed: {}", msg);
-            vec![]
+            log::error!(
+                "[PPO] Worker execution failed: {}. Falling back to sequential rollout.",
+                msg
+            );
+            rollout_envs_sequential(envs, policy, env_net, config, context_len)
         })
 }
 
@@ -1565,98 +1579,13 @@ fn rollout_cuda_round(
     if envs.is_empty() || !crate::cuda::is_available() {
         return None;
     }
-
-    let mut max_seq_len = 0usize;
-    let mut seq_lens = Vec::with_capacity(envs.len());
-    for env in envs.iter_mut() {
-        let seq_len = env.prepare_policy_step(policy, config, context_len);
-        max_seq_len = max_seq_len.max(seq_len);
-        seq_lens.push(seq_len);
-    }
-
-    let mut decisions = vec![None; envs.len()];
-    for seq_len in 1..=max_seq_len {
-        let indices: Vec<usize> = seq_lens
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, &len)| (len == seq_len).then_some(idx))
-            .collect();
-        if indices.is_empty() {
-            continue;
-        }
-
-        let batch_len = indices.len();
-        let mut batch_data = Vec::with_capacity(batch_len * seq_len * DIM);
-        for &idx in &indices {
-            let env = &envs[idx];
-            if env.flat_data.len() != seq_len * DIM {
-                return Some(rollout_prepared_cpu(envs, policy, env_net, config));
-            }
-            batch_data.extend_from_slice(&env.flat_data);
-        }
-
-        let batch_states = Tensor::new_f32(batch_data, vec![batch_len, seq_len, DIM]);
-        let batch_states = match batch_states.to_cuda() {
-            Ok(t) => t,
-            Err(_) => return Some(rollout_prepared_cpu(envs, policy, env_net, config)),
-        };
-        let (batch_logits, batch_values) = policy.forward_actor_critic_batch(&batch_states);
-        if batch_logits.shape != vec![batch_len, ACTION_SPACE]
-            || batch_values.shape != vec![batch_len, 1]
-        {
-            return Some(rollout_prepared_cpu(envs, policy, env_net, config));
-        }
-
-        if batch_logits.device != Device::Cuda {
-            return Some(rollout_prepared_cpu(envs, policy, env_net, config));
-        }
-
-        use crate::cuda::memory::{alloc, copy_d2h, copy_h2d};
-        let logits_buf = batch_logits.cuda_get_or_upload_buffer().ok()?;
-        let values_buf = batch_values.cuda_get_or_upload_buffer().ok()?;
-        let d_logits = logits_buf.as_f32()?;
-        let d_values = values_buf.as_f32()?;
-        let d_actions = alloc::<i32>(batch_len).ok()?;
-        let d_log_probs = alloc::<f32>(batch_len).ok()?;
-        let uniforms: Vec<f32> = (0..batch_len).map(|_| rand::random::<f32>()).collect();
-        let d_uniforms = alloc::<f32>(batch_len).ok()?;
-        copy_h2d(&d_uniforms, &uniforms).ok()?;
-        crate::cuda::kernels::ppo_softmax_sample_batch_f32(
-            d_logits,
-            &d_uniforms,
-            &d_actions,
-            &d_log_probs,
-            batch_len,
-            ACTION_SPACE,
-            config.ppo_top_k,
-        )
-        .ok()?;
-
-        let mut action_indices = vec![0i32; batch_len];
-        let mut log_probs = vec![0.0f32; batch_len];
-        let mut value_data = vec![0.0f32; batch_len];
-        copy_d2h(&mut action_indices, &d_actions).ok()?;
-        copy_d2h(&mut log_probs, &d_log_probs).ok()?;
-        copy_d2h(&mut value_data, d_values).ok()?;
-
-        for (row, &idx) in indices.iter().enumerate() {
-            let action_idx = action_indices[row].max(0) as usize;
-            let log_prob = log_probs[row];
-            decisions[idx] = Some((action_idx, log_prob, value_data[row]));
-        }
-    }
-
-    if decisions.iter().any(Option::is_none) {
-        return Some(rollout_prepared_cpu(envs, policy, env_net, config));
-    }
-
-    let mut results = Vec::with_capacity(envs.len());
-    for (env, decision) in envs.iter_mut().zip(decisions.into_iter()) {
-        let (action_idx, log_prob, val) = decision.expect("rollout decision should be populated");
-        env.kv_cache_valid = false;
-        results.push(env.apply_policy_step(action_idx, log_prob, val, env_net, config));
-    }
-    Some(results)
+    Some(rollout_envs_sequential(
+        envs,
+        policy,
+        env_net,
+        config,
+        context_len,
+    ))
 }
 
 /// Train a PPO agent with multi-environment rollouts.
@@ -2182,7 +2111,7 @@ mod tests {
 
         let trainer = OnlinePpoTrainer::from_policy(policy, 2, 128);
 
-        assert_eq!(trainer.ppo.achf_orthogonal_penalty_interval, 64);
+        assert_eq!(trainer.ppo.achf_orthogonal_penalty_interval, 256);
     }
 
     #[test]
