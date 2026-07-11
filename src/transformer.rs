@@ -1688,9 +1688,7 @@ impl MultiHeadLatentAttention {
         let mut att_scores = vec![0.0f32; num_heads * head_stride];
         let scale = 1.0 / (total_head_dim as f32).sqrt();
 
-        let use_par = true;
-
-        if use_par {
+        {
             use rayon::prelude::*;
 
             let k_caches: Vec<&[f32]> = kv_cache.k_cache.iter().map(|v| v.as_slice()).collect();
@@ -1748,50 +1746,6 @@ impl MultiHeadLatentAttention {
                     let dst = i * (num_heads * head_dim) + h * head_dim;
                     let src = i * head_dim;
                     att_out[dst..dst + head_dim].copy_from_slice(&head_buf[src..src + head_dim]);
-                }
-            }
-            self.project_output_inference_into(&att_out, out);
-        } else {
-            for h in 0..num_heads {
-                let k_cache_head = &kv_cache.k_cache[h];
-                for i in 0..seq_len {
-                    let q_start = i * (num_heads * total_head_dim) + h * total_head_dim;
-                    let q_vec = &q[q_start..q_start + total_head_dim];
-
-                    for j in 0..cached_len {
-                        let k_vec = &k_cache_head[j * total_head_dim..(j + 1) * total_head_dim];
-                        att_scores[h * head_stride + i * cached_len + j] =
-                            dot_product_f32(q_vec, k_vec) * scale;
-                    }
-
-                    let abs_pos = start_pos + i;
-                    for j in (abs_pos + 1)..cached_len {
-                        att_scores[h * head_stride + i * cached_len + j] = f32::NEG_INFINITY;
-                    }
-
-                    let start = h * head_stride + i * cached_len;
-                    let end = start + cached_len;
-                    let slice = &mut att_scores[start..end];
-                    let sum = crate::simd::softmax_exp_sum_f32(slice);
-                    crate::simd::vector_scale_f32(slice, 1.0 / sum);
-                }
-            }
-
-            let mut att_out = vec![0.0f32; seq_len * num_heads * head_dim];
-            for h in 0..num_heads {
-                let v_cache_head = &kv_cache.v_cache[h];
-                for i in 0..seq_len {
-                    let out_start = i * (num_heads * head_dim) + h * head_dim;
-                    let out_slice = &mut att_out[out_start..out_start + head_dim];
-
-                    for j in 0..cached_len {
-                        let score = att_scores[h * head_stride + i * cached_len + j];
-                        if score.abs() < 1e-9f32 {
-                            continue;
-                        }
-                        let v_vec = &v_cache_head[j * head_dim..(j + 1) * head_dim];
-                        add_scaled_row_f32(out_slice, v_vec, score);
-                    }
                 }
             }
             self.project_output_inference_into(&att_out, out);
@@ -2022,15 +1976,18 @@ impl MultiHeadLatentAttention {
                     let q_data = q_in.data_as_f64_vec();
                     let k_data = k_in.data_as_f64_vec();
 
-                    let mut q_grad = q_in.grad_write_compat();
-                    let mut k_grad = k_in.grad_write_compat();
-
                     let chunk_size_grad = seq * dim;
                     let chunk_size_out = seq * seq;
 
-                    q_grad
+                    // Accumulate into local buffers first, then write back per
+                    // parent with a short-lived lock. Holding q_grad and k_grad
+                    // guards simultaneously deadlocks when q_in and k_in alias.
+                    let mut q_grad_local = vec![0.0f64; q_data.len()];
+                    let mut k_grad_local = vec![0.0f64; k_data.len()];
+
+                    q_grad_local
                         .par_chunks_mut(chunk_size_grad)
-                        .zip(k_grad.par_chunks_mut(chunk_size_grad))
+                        .zip(k_grad_local.par_chunks_mut(chunk_size_grad))
                         .zip(grad_out_f64.par_chunks(chunk_size_out))
                         .enumerate()
                         .for_each(|(batch_idx, ((q_g_chunk, k_g_chunk), g_out_chunk))| {
@@ -2051,6 +2008,9 @@ impl MultiHeadLatentAttention {
                                 }
                             }
                         });
+
+                    q_in.grad_add_slice(&q_grad_local);
+                    k_in.grad_add_slice(&k_grad_local);
                 }),
             })),
         }
@@ -2150,13 +2110,18 @@ impl MultiHeadLatentAttention {
                 let grad_out_f64 = grad_out.to_f64_vec();
                 let q_data = q_in.data_as_f64_vec();
                 let k_data = k_in.data_as_f64_vec();
-                let mut q_grad = q_in.grad_write_compat();
-                let mut k_grad = k_in.grad_write_compat();
                 let chunk_size_grad = seq * dim;
                 let chunk_size_out = seq * seq;
-                q_grad
+
+                // Accumulate into local buffers first, then write back per
+                // parent with a short-lived lock. Holding q_grad and k_grad
+                // guards simultaneously deadlocks when q_in and k_in alias.
+                let mut q_grad_local = vec![0.0f64; q_data.len()];
+                let mut k_grad_local = vec![0.0f64; k_data.len()];
+
+                q_grad_local
                     .par_chunks_mut(chunk_size_grad)
-                    .zip(k_grad.par_chunks_mut(chunk_size_grad))
+                    .zip(k_grad_local.par_chunks_mut(chunk_size_grad))
                     .zip(grad_out_f64.par_chunks(chunk_size_out))
                     .enumerate()
                     .for_each(|(batch_idx, ((q_g_chunk, k_g_chunk), g_out_chunk))| {
@@ -2173,6 +2138,9 @@ impl MultiHeadLatentAttention {
                             }
                         }
                     });
+
+                q_in.grad_add_slice(&q_grad_local);
+                k_in.grad_add_slice(&k_grad_local);
             }),
         );
         Some(out)
@@ -2246,16 +2214,18 @@ impl MultiHeadLatentAttention {
                     let p_data = p_in.data_as_f64_vec();
                     let v_data = v_in.data_as_f64_vec();
 
-                    let mut p_grad = p_in.grad_write_compat();
-                    let mut v_grad = v_in.grad_write_compat();
-
                     let chunk_size_p = seq * seq;
                     let chunk_size_v = seq * dim_v;
                     let chunk_size_grad = seq * dim_v;
 
-                    p_grad
+                    // Local buffers avoid holding p_grad and v_grad guards at
+                    // once (deadlocks if p_in and v_in alias the same node).
+                    let mut p_grad_local = vec![0.0f64; p_data.len()];
+                    let mut v_grad_local = vec![0.0f64; v_data.len()];
+
+                    p_grad_local
                         .par_chunks_mut(chunk_size_p)
-                        .zip(v_grad.par_chunks_mut(chunk_size_v))
+                        .zip(v_grad_local.par_chunks_mut(chunk_size_v))
                         .zip(grad_out_f64.par_chunks(chunk_size_grad))
                         .enumerate()
                         .for_each(|(batch_idx, ((p_g_chunk, v_g_chunk), g_out_chunk))| {
@@ -2277,6 +2247,9 @@ impl MultiHeadLatentAttention {
                                 }
                             }
                         });
+
+                    p_in.grad_add_slice(&p_grad_local);
+                    v_in.grad_add_slice(&v_grad_local);
                 }),
             })),
         }
@@ -2414,16 +2387,19 @@ impl MultiHeadLatentAttention {
                 let grad_out_f64 = grad_out.to_f64_vec();
                 let p_data = p_in.data_as_f64_vec();
                 let v_data = v_in.data_as_f64_vec();
-                let mut p_grad = p_in.grad_write_compat();
-                let mut v_grad = v_in.grad_write_compat();
 
                 let chunk_size_p = seq * seq;
                 let chunk_size_v = seq * dim_v;
                 let chunk_size_grad = seq * dim_v;
 
-                p_grad
+                // Local buffers avoid holding p_grad and v_grad guards at
+                // once (deadlocks if p_in and v_in alias the same node).
+                let mut p_grad_local = vec![0.0f64; p_data.len()];
+                let mut v_grad_local = vec![0.0f64; v_data.len()];
+
+                p_grad_local
                     .par_chunks_mut(chunk_size_p)
-                    .zip(v_grad.par_chunks_mut(chunk_size_v))
+                    .zip(v_grad_local.par_chunks_mut(chunk_size_v))
                     .zip(grad_out_f64.par_chunks(chunk_size_grad))
                     .enumerate()
                     .for_each(|(batch_idx, ((p_g_chunk, v_g_chunk), g_out_chunk))| {
@@ -2442,6 +2418,9 @@ impl MultiHeadLatentAttention {
                             }
                         }
                     });
+
+                p_in.grad_add_slice(&p_grad_local);
+                v_in.grad_add_slice(&v_grad_local);
             }),
         )
     }
@@ -2499,16 +2478,18 @@ impl MultiHeadLatentAttention {
                     let p_data = p_in.data_as_f64_vec();
                     let v_data = v_in.data_as_f64_vec();
 
-                    let mut p_grad = p_in.grad_write_compat();
-                    let mut v_grad = v_in.grad_write_compat();
-
                     let chunk_size_p = seq * seq;
                     let chunk_size_v = seq * dim_v;
                     let chunk_size_grad = seq * dim_v;
 
-                    p_grad
+                    // Local buffers avoid holding p_grad and v_grad guards at
+                    // once (deadlocks if p_in and v_in alias the same node).
+                    let mut p_grad_local = vec![0.0f64; p_data.len()];
+                    let mut v_grad_local = vec![0.0f64; v_data.len()];
+
+                    p_grad_local
                         .par_chunks_mut(chunk_size_p)
-                        .zip(v_grad.par_chunks_mut(chunk_size_v))
+                        .zip(v_grad_local.par_chunks_mut(chunk_size_v))
                         .zip(grad_out_f64.par_chunks(chunk_size_grad))
                         .enumerate()
                         .for_each(|(batch_idx, ((p_g_chunk, v_g_chunk), g_out_chunk))| {
@@ -2527,6 +2508,9 @@ impl MultiHeadLatentAttention {
                                 }
                             }
                         });
+
+                    p_in.grad_add_slice(&p_grad_local);
+                    v_in.grad_add_slice(&v_grad_local);
                 }),
             })),
         }
@@ -2718,14 +2702,18 @@ impl MultiHeadLatentAttention {
                 parents,
                 backward_op: Box::new(move |grad_out, parents| {
                     let grad_out_f64 = grad_out.to_f64_vec();
-                    let mut a_grad = parents[0].grad_write_compat();
-                    let mut b_grad = parents[1].grad_write_compat();
 
                     let stride = last_dim_a + last_dim_b;
+                    let rows = grad_out_f64.len() / stride;
 
-                    a_grad
+                    // Local buffers avoid holding a_grad and b_grad guards at
+                    // once (deadlocks if the two parents alias the same node).
+                    let mut a_grad_local = vec![0.0f64; rows * last_dim_a];
+                    let mut b_grad_local = vec![0.0f64; rows * last_dim_b];
+
+                    a_grad_local
                         .par_chunks_mut(last_dim_a)
-                        .zip(b_grad.par_chunks_mut(last_dim_b))
+                        .zip(b_grad_local.par_chunks_mut(last_dim_b))
                         .zip(grad_out_f64.par_chunks(stride))
                         .for_each(|((ag_row, bg_row), g_row)| {
                             for k in 0..last_dim_a {
@@ -2735,6 +2723,9 @@ impl MultiHeadLatentAttention {
                                 bg_row[k] += g_row[last_dim_a + k];
                             }
                         });
+
+                    parents[0].grad_add_slice(&a_grad_local);
+                    parents[1].grad_add_slice(&b_grad_local);
                 }),
             })),
         }
@@ -3394,6 +3385,17 @@ mod tests {
             "attention ACHF layers must report cache stats"
         );
         assert!(model.snapshot_achf().is_some());
+    }
+
+    // Aliasing safety: custom backward ops must not hold two grad write guards
+    // at once, or F64 grads with aliased parents (concat(x, x)) deadlock on the
+    // non-reentrant RwLock. Must terminate and yield grad 2.0 (each element
+    // flows back through both halves of the concat).
+    #[test]
+    fn test_concat_last_dim_aliased_parents_no_deadlock() {
+        let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
+        concat_last_dim(&[x.clone(), x.clone()]).sum().backward();
+        assert_eq!(x.grad_to_f64_vec(), vec![2.0; 4]);
     }
 
     #[test]

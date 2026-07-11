@@ -507,6 +507,23 @@ impl Tensor {
         }
     }
 
+    /// Accumulate an f64 gradient slice into this tensor's grad, holding the
+    /// write lock only for the duration of the add.
+    ///
+    /// Use this per-parent inside custom `backward_op` closures instead of
+    /// holding two `grad_write_compat()` guards at once: `std::sync::RwLock` is
+    /// not reentrant, so locking two guards deadlocks when both parents are the
+    /// same tensor node (e.g. self-attention / `concat(x, x)` graphs).
+    #[inline]
+    pub fn grad_add_slice(&self, slice: &[f64]) {
+        #[cfg(cuda)]
+        {
+            let _ = cuda_sync_grad_to_host(self);
+            self.cuda_grad_remove_cached_buffer();
+        }
+        self.grad.accumulate_f64_slice(slice);
+    }
+
     /// Generate a tensor with uniformly distributed random values in [min, max).
     pub fn rand(shape: Vec<usize>, min: f64, max: f64, seed: u64) -> Self {
         use crate::rng::Rng;

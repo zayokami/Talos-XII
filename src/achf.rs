@@ -1190,25 +1190,17 @@ impl AchfLayer {
             return;
         }
         state.step += 1;
-        let freq = self.effective_proj_freq();
+        // Project every `proj_freq` optimizer steps. Do NOT call a helper that
+        // re-locks `self.state` here: we are holding the write guard above, and
+        // `std::sync::RwLock` is not reentrant, so re-locking would deadlock the
+        // thread. `proj_freq` is honored as-is; to reduce projection cost during
+        // training, raise `proj_freq` in the config rather than scaling it here.
+        let freq = self.config.proj_freq;
         if freq == 0 || !state.step.is_multiple_of(freq) {
             return;
         }
         drop(state);
         self.project_weight();
-    }
-
-    fn effective_proj_freq(&self) -> usize {
-        if self.config.proj_freq == 0 {
-            return 0;
-        }
-        if self.is_training_mode() {
-            // Training runs many optimizer steps per wall-clock second; stretch
-            // manifold projection so Sinkhorn/rank work stays off the hot path.
-            self.config.proj_freq.saturating_mul(4)
-        } else {
-            self.config.proj_freq
-        }
     }
 
     fn project_weight(&self) {
@@ -1688,7 +1680,15 @@ impl AchfLayer {
             return InferencePath::Dense;
         }
         self.ensure_cache();
-        let decision = self.select_ama_path(x);
+        // A frozen layer has fixed weights, so its fused cached operator is
+        // permanently valid and is the cheapest path. Skip the adaptive latency
+        // probing (which is only meaningful while weights keep changing during
+        // training) and deterministically use the cache when it is valid.
+        let decision = if self.is_training_mode() {
+            self.select_ama_path(x)
+        } else {
+            self.select_frozen_path(x)
+        };
         self.metrics.calls.fetch_add(1, Ordering::Relaxed);
         match decision.path {
             InferencePath::Cached => {
@@ -1710,6 +1710,49 @@ impl AchfLayer {
             }
         }
         decision.path
+    }
+
+    /// Deterministic path selection for a frozen (inference-only) layer.
+    /// Weights no longer change, so the fused cached operator is always valid
+    /// and fastest; use it whenever the cache is shape/rows/sparsity-valid,
+    /// otherwise fall back to the sparse (or dense) operator. This mirrors the
+    /// cache-validity checks in `select_ama_path` but skips latency probing.
+    fn select_frozen_path(&self, x: &[f32]) -> AmaPathDecision {
+        let Ok(cache) = self.cache.try_read() else {
+            return AmaPathDecision {
+                path: InferencePath::Sparse,
+                has_cache: false,
+                cache_skipped: false,
+            };
+        };
+        let has_cache = cache.dense.is_some();
+        let in_dim = cache.in_dim;
+        let out_dim = cache.out_dim;
+        let cache_shape_ok =
+            has_cache && in_dim > 0 && out_dim > 0 && x.len().is_multiple_of(in_dim);
+        let num_rows = if cache_shape_ok { x.len() / in_dim } else { 0 };
+        let min_rows_ok = self.config.cache_min_rows == 0 || num_rows >= self.config.cache_min_rows;
+        let nonzero_ratio = if cache_shape_ok && min_rows_ok {
+            self.estimate_nonzero_ratio(x, in_dim, num_rows)
+        } else {
+            1.0
+        };
+        let sparsity_ok = self.config.cache_min_nonzero_ratio <= 0.0
+            || nonzero_ratio >= self.config.cache_min_nonzero_ratio;
+        let cache_valid = cache_shape_ok && min_rows_ok && sparsity_ok;
+        let cache_skipped = has_cache && !cache_valid;
+        let path = if cache_valid {
+            InferencePath::Cached
+        } else if self.has_valid_sparse_state() {
+            InferencePath::Sparse
+        } else {
+            InferencePath::Dense
+        };
+        AmaPathDecision {
+            path,
+            has_cache,
+            cache_skipped,
+        }
     }
 
     fn select_ama_path(&self, x: &[f32]) -> AmaPathDecision {
@@ -3144,8 +3187,13 @@ mod tests {
             let mut cache = layer.cache.write().unwrap();
             cache.ema_cached_ns = 100.0;
             cache.ema_sparse_ns = 98.0;
+            // Warm all three arms: hysteresis only applies once every arm has a
+            // latency estimate, otherwise the un-probed arm forces a probe and
+            // short-circuits the score/margin comparison this test exercises.
+            cache.ema_dense_ns = 200.0;
             cache.ama_cached_warm_count = 1;
             cache.ama_sparse_warm_count = 1;
+            cache.ama_dense_warm_count = 1;
             cache.ama_prev_path = Some(InferencePath::Cached);
             cache.ama_dwell = 16;
         }

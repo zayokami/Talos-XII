@@ -1,6 +1,6 @@
 [package]
 name = "talos_xii"
-version = "0.7.6-beta.1"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.89.0"
 
@@ -9,8 +9,8 @@ rayon = "1.11.0"
 rand = "0.10"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
-memmap2 = "0.9.10"
-bytemuck = "1.14"
+memmap2 = "0.9.11"
+bytemuck = "1.25.0"
 
 clap = { version = "4.6.0", features = ["derive"] }
 log = "0.4.29"
@@ -22,7 +22,7 @@ plotters = { version = "0.3", default-features = false, features = [
     "line_series", "errorbar", "full_palette",
     "ttf", "ab_glyph",
 ] }
-pyo3 = { version = "0.28.3", optional = true, features = ["auto-initialize"] }
+pyo3 = { version = "0.29.0", optional = true, features = ["auto-initialize"] }
 
 [features]
 default = []

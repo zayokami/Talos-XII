@@ -783,12 +783,15 @@ impl Tensor {
                         }
                     }
                     let grad_out_f64 = grad_out.to_f64_vec();
-                    let mut a_grad = a_in.grad_write_compat();
-                    let mut b_grad = b_in.grad_write_compat();
                     let stride = a_dim + b_dim;
-                    a_grad
+
+                    // Local buffers avoid holding a_grad and b_grad guards at
+                    // once (deadlocks if a_in and b_in alias the same node).
+                    let mut a_grad_local = vec![0.0f64; a_in.numel()];
+                    let mut b_grad_local = vec![0.0f64; b_in.numel()];
+                    a_grad_local
                         .par_chunks_mut(a_dim)
-                        .zip(b_grad.par_chunks_mut(b_dim))
+                        .zip(b_grad_local.par_chunks_mut(b_dim))
                         .zip(grad_out_f64.par_chunks(stride))
                         .for_each(|((ag_row, bg_row), g_row)| {
                             for k in 0..a_dim {
@@ -798,6 +801,9 @@ impl Tensor {
                                 bg_row[k] += g_row[a_dim + k];
                             }
                         });
+
+                    a_in.grad_add_slice(&a_grad_local);
+                    b_in.grad_add_slice(&b_grad_local);
                 }),
             })),
         };
@@ -2131,8 +2137,11 @@ impl Tensor {
                     }
 
                     let grad_out_f64 = grad_out.to_f64_vec();
-                    let mut a_grad = a.grad_write_compat();
-                    let mut b_grad = b.grad_write_compat();
+
+                    // Local buffers avoid holding a_grad and b_grad guards at
+                    // once (deadlocks if a and b alias, e.g. `x * x`).
+                    let mut a_grad = vec![0.0f64; grad_out_f64.len()];
+                    let mut b_grad = vec![0.0f64; grad_out_f64.len()];
                     match op {
                         CudaBinaryOp::Add => {
                             for i in 0..grad_out_f64.len() {
@@ -2164,6 +2173,9 @@ impl Tensor {
                             }
                         }
                     }
+
+                    a.grad_add_slice(&a_grad);
+                    b.grad_add_slice(&b_grad);
                 }),
             })),
         };

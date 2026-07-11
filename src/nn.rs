@@ -483,12 +483,16 @@ impl Module for RMSNorm {
                     let x_in = &parents[0];
                     let w_in = &parents[1];
 
-                    let mut x_grad = x_in.grad_write_compat();
-                    let mut w_grad = w_in.grad_write_compat();
                     let w_data = w_in.data_as_f64_vec();
 
+                    // Accumulate into local buffers, then write back per parent
+                    // with a short-lived lock. Holding x_grad and w_grad guards
+                    // simultaneously deadlocks if x_in and w_in alias.
+                    let mut x_grad_local = vec![0.0f64; grad_out_f64.len()];
+                    let mut w_grad_local = vec![0.0f64; w_data.len()];
+
                     // 1. Calculate dL/dx parallel over rows
-                    x_grad
+                    x_grad_local
                         .par_chunks_mut(dim)
                         .zip(grad_out_f64.par_chunks(dim))
                         .enumerate()
@@ -520,7 +524,7 @@ impl Module for RMSNorm {
                     let num_rows = grad_out_f64.len() / dim;
 
                     // Parallelize over dimension (feature)
-                    w_grad.par_iter_mut().enumerate().for_each(|(i, wg)| {
+                    w_grad_local.par_iter_mut().enumerate().for_each(|(i, wg)| {
                         let mut sum = 0.0f64;
                         for r in 0..num_rows {
                             let base = r * dim;
@@ -528,6 +532,9 @@ impl Module for RMSNorm {
                         }
                         *wg += sum;
                     });
+
+                    x_in.grad_add_slice(&x_grad_local);
+                    w_in.grad_add_slice(&w_grad_local);
                 }),
             })),
         }
