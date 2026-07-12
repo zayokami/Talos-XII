@@ -399,8 +399,9 @@ impl ActorCritic {
         self.backbone.snapshot_achf()
     }
 
-    pub fn forward_inference_forced_path(&self, x: &[f32], forced_path: u8) -> Vec<f32> {
-        self.backbone.forward_inference_forced_path(x, forced_path)
+    /// First ACHF layer + its input width, for isolating operator latency.
+    pub fn first_achf_layer(&self) -> Option<(&crate::achf::AchfLayer, usize)> {
+        self.backbone.first_achf_layer()
     }
 
     pub fn param_count(&self) -> usize {

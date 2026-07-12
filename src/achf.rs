@@ -798,7 +798,9 @@ impl AchfLayer {
         // Frozen fast path: skip input hashing, memoization write-back and
         // latency probing (all training-only aids). Produces the same values as
         // the general path below when the frozen selector would pick Cached.
-        if self.metrics.frozen.load(Ordering::Relaxed) {
+        // Disabled under `adaptive_inference`, which deliberately routes through
+        // the full path so the AMA selector and latency sampling stay live.
+        if self.metrics.frozen.load(Ordering::Relaxed) && !self.config.adaptive_inference {
             if let Some(out) = self.try_frozen_cached_scaled(x) {
                 return out;
             }
@@ -941,6 +943,7 @@ impl AchfLayer {
     /// results are identical to `forward_inference_residual` in every case.
     pub fn forward_inference_residual_add_into(&self, x: &[f32], out: &mut [f32]) {
         if self.metrics.frozen.load(Ordering::Relaxed)
+            && !self.config.adaptive_inference
             && self.config.enabled
             && self.try_frozen_cached_add_into(x, out)
         {
@@ -1849,11 +1852,16 @@ impl AchfLayer {
             return InferencePath::Dense;
         }
         self.ensure_cache();
-        // A frozen layer has fixed weights, so its fused cached operator is
-        // permanently valid and is the cheapest path. Skip the adaptive latency
-        // probing (which is only meaningful while weights keep changing during
-        // training) and deterministically use the cache when it is valid.
-        let decision = if self.is_training_mode() {
+        // Path selection has two regimes:
+        //   * Adaptive (AMA): latency-driven probing + EMA scoring. Used while
+        //     training (weights change, so the best path can shift), and also at
+        //     inference when `adaptive_inference` is set — the weights are frozen
+        //     but the runtime keeps measuring path latency and re-selecting. This
+        //     is what actually exercises the latency-feedback machinery online.
+        //   * Frozen deterministic: a frozen layer's fused cached operator is
+        //     permanently valid and cheapest, so skip probing and use it. This is
+        //     the peak-throughput default once weights stop changing.
+        let decision = if self.is_training_mode() || self.config.adaptive_inference {
             self.select_ama_path(x)
         } else {
             self.select_frozen_path(x)
@@ -3051,6 +3059,52 @@ mod tests {
         for (a, b) in out_cached.iter().zip(out_unfused.iter()) {
             assert!((a - b).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn achf_adaptive_inference_runs_ama_on_frozen_layer() {
+        // With `adaptive_inference`, a frozen layer must keep exercising the
+        // latency-driven AMA selector: latency samples must accumulate (proving
+        // the machinery is live), whereas the default frozen fast path records
+        // none. This is the core fix — otherwise the AMA code is unreachable.
+        let cfg = AchfConfig {
+            enabled: true,
+            adaptive_inference: true,
+            cache_latency_sample_every: 1,
+            ..Default::default()
+        };
+        let mut layer = AchfLayer::new(4, 3, true, cfg, 55);
+        layer.prune(0.01);
+        layer.freeze_for_inference();
+
+        let x = vec![0.3, -0.7, 0.9, -0.1];
+        for _ in 0..64 {
+            let _ = layer.forward_inference_residual(&x);
+        }
+        let stats = layer.cache_stats();
+        assert!(
+            stats.latency_samples > 0,
+            "adaptive_inference must produce latency samples, got {}",
+            stats.latency_samples
+        );
+
+        // Control: same layer frozen WITHOUT adaptive_inference records none.
+        let cfg2 = AchfConfig {
+            enabled: true,
+            adaptive_inference: false,
+            ..Default::default()
+        };
+        let mut frozen = AchfLayer::new(4, 3, true, cfg2, 55);
+        frozen.prune(0.01);
+        frozen.freeze_for_inference();
+        for _ in 0..64 {
+            let _ = frozen.forward_inference_residual(&x);
+        }
+        assert_eq!(
+            frozen.cache_stats().latency_samples,
+            0,
+            "deterministic frozen path must not sample latency"
+        );
     }
 
     #[test]

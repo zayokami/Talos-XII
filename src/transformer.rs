@@ -10,6 +10,11 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::sync::Arc;
 
+/// Minimum attention work (num_heads × seq_len²) below which the non-cached
+/// attention runs serially. Below this, rayon fork/join overhead exceeds the
+/// arithmetic — notably for single-token interactive inference (seq_len=1).
+const ATTN_PARALLEL_MIN_WORK: usize = 4096;
+
 // --- Configuration ---
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MLAConfig {
@@ -656,42 +661,21 @@ impl LuckTransformer {
         None
     }
 
-    /// Run inference forcing a specific ACHF path (0=Cached, 1=Sparse, 2=Dense).
-    pub fn forward_inference_forced_path(&self, x: &[f32], forced_path: u8) -> Vec<f32> {
-        use crate::simd::vector_gelu_f32;
-        let mut h = self.embed.forward_inference(x);
+    /// First ACHF layer in the backbone (FFN preferred, else attention output),
+    /// for micro-benchmarking the operator in isolation. Returns the layer and
+    /// its input feature count so the caller can size a representative input.
+    pub fn first_achf_layer(&self) -> Option<(&AchfLayer, usize)> {
         for block in &self.blocks {
-            let h_norm1 = block.norm_1.forward_inference(&h);
-            let attn_out = block
-                .mla_layer
-                .forward_inference_with_forced_path(&h_norm1, Some(forced_path));
-            let mut h2 = vec![0.0f32; h.len()];
-            if let Some(mhc) = &block.mhc {
-                let mhc_out = mhc.forward_inference(&attn_out);
-                for i in 0..h.len() {
-                    h2[i] = h[i] + mhc_out[i];
-                }
-            } else {
-                for i in 0..h.len() {
-                    h2[i] = h[i] + attn_out[i];
-                }
+            if let Some(achf) = &block.achf_ffn {
+                return Some((achf, achf.weight.in_features));
             }
-            let h_norm2 = block.norm_2.forward_inference(&h2);
-            let f1 = block.ffn_1.forward_inference(&h_norm2);
-            let mut f1_gelu = vec![0.0f32; f1.len()];
-            vector_gelu_f32(&mut f1_gelu, &f1);
-            let f2 = if let Some(achf) = &block.achf_ffn {
-                achf.forward_inference_forced_path(&f1_gelu, forced_path)
-            } else {
-                block.ffn_2.forward_inference(&f1_gelu)
-            };
-            let mut h3 = vec![0.0f32; h2.len()];
-            for i in 0..h2.len() {
-                h3[i] = h2[i] + f2[i];
-            }
-            h = h3;
         }
-        h
+        for block in &self.blocks {
+            if let Some(achf) = &block.mla_layer.achf_wo {
+                return Some((achf, achf.weight.in_features));
+            }
+        }
+        None
     }
 
     pub fn achf_cache_stats_iter(&self) -> impl Iterator<Item = AchfCacheStats> + '_ {
@@ -1481,51 +1465,65 @@ impl MultiHeadLatentAttention {
         let mut att_scores = vec![0.0f32; num_heads * head_stride];
         let scale = 1.0 / (total_head_dim as f32).sqrt();
 
-        att_scores
-            .par_chunks_mut(head_stride)
-            .enumerate()
-            .for_each(|(h, head_scores)| {
-                for i in 0..seq_len {
-                    let base_q = i * (num_heads * total_head_dim) + h * total_head_dim;
-                    let q_slice = &q[base_q..base_q + total_head_dim];
+        // Only dispatch to the thread pool when there is enough work to amortize
+        // it. For short sequences (e.g. single-token interactive inference) the
+        // rayon fork/join overhead dwarfs the arithmetic, so run serially.
+        let score_row = |h: usize, head_scores: &mut [f32]| {
+            for i in 0..seq_len {
+                let base_q = i * (num_heads * total_head_dim) + h * total_head_dim;
+                let q_slice = &q[base_q..base_q + total_head_dim];
 
-                    for j in 0..seq_len {
-                        let base_k = j * (num_heads * total_head_dim) + h * total_head_dim;
-                        let k_slice = &k[base_k..base_k + total_head_dim];
-                        head_scores[i * seq_len + j] = dot_product_f32(q_slice, k_slice) * scale;
-                    }
-
-                    for j in (i + 1)..seq_len {
-                        head_scores[i * seq_len + j] = f32::NEG_INFINITY;
-                    }
-
-                    let row = &mut head_scores[i * seq_len..(i + 1) * seq_len];
-                    let sum = crate::simd::softmax_exp_sum_f32(row);
-                    crate::simd::vector_scale_f32(row, 1.0 / sum);
+                for j in 0..seq_len {
+                    let base_k = j * (num_heads * total_head_dim) + h * total_head_dim;
+                    let k_slice = &k[base_k..base_k + total_head_dim];
+                    head_scores[i * seq_len + j] = dot_product_f32(q_slice, k_slice) * scale;
                 }
-            });
+
+                for j in (i + 1)..seq_len {
+                    head_scores[i * seq_len + j] = f32::NEG_INFINITY;
+                }
+
+                let row = &mut head_scores[i * seq_len..(i + 1) * seq_len];
+                let sum = crate::simd::softmax_exp_sum_f32(row);
+                crate::simd::vector_scale_f32(row, 1.0 / sum);
+            }
+        };
+        if num_heads * head_stride >= ATTN_PARALLEL_MIN_WORK {
+            att_scores
+                .par_chunks_mut(head_stride)
+                .enumerate()
+                .for_each(|(h, head_scores)| score_row(h, head_scores));
+        } else {
+            att_scores
+                .chunks_mut(head_stride)
+                .enumerate()
+                .for_each(|(h, head_scores)| score_row(h, head_scores));
+        }
 
         let mut att_out = vec![0.0f32; seq_len * num_heads * head_dim];
 
-        let per_head_out: Vec<Vec<f32>> = (0..num_heads)
-            .into_par_iter()
-            .map(|h| {
-                let mut head_out = vec![0.0f32; seq_len * head_dim];
-                for i in 0..seq_len {
-                    let out_slice = &mut head_out[i * head_dim..(i + 1) * head_dim];
-                    for j in 0..seq_len {
-                        let score = att_scores[h * head_stride + i * seq_len + j];
-                        if score == 0.0 {
-                            continue;
-                        }
-                        let base_v = j * (num_heads * head_dim) + h * head_dim;
-                        let v_slice = &v_c[base_v..base_v + head_dim];
-                        add_scaled_row_f32(out_slice, v_slice, score);
+        let head_out_fn = |h: usize| {
+            let mut head_out = vec![0.0f32; seq_len * head_dim];
+            for i in 0..seq_len {
+                let out_slice = &mut head_out[i * head_dim..(i + 1) * head_dim];
+                for j in 0..seq_len {
+                    let score = att_scores[h * head_stride + i * seq_len + j];
+                    if score == 0.0 {
+                        continue;
                     }
+                    let base_v = j * (num_heads * head_dim) + h * head_dim;
+                    let v_slice = &v_c[base_v..base_v + head_dim];
+                    add_scaled_row_f32(out_slice, v_slice, score);
                 }
-                head_out
-            })
-            .collect();
+            }
+            head_out
+        };
+        // Same work-threshold gate as the score computation above.
+        let per_head_out: Vec<Vec<f32>> = if num_heads * head_stride >= ATTN_PARALLEL_MIN_WORK {
+            (0..num_heads).into_par_iter().map(head_out_fn).collect()
+        } else {
+            (0..num_heads).map(head_out_fn).collect()
+        };
 
         for (h, head_buf) in per_head_out.iter().enumerate() {
             for i in 0..seq_len {

@@ -502,7 +502,14 @@ fn run_path_comparison(base_config: &Config, seed: u64) -> Vec<(String, Vec<f64>
     let (env_net, _neural_opt, _worker) = build_base_models(&cfg, &mut rng);
     let ppo = train_ppo_with_metrics(&mut rng, &env_net, &cfg, None);
 
-    let input_dim = crate::neural::DIM;
+    // Measure the ACHF operator in ISOLATION, not the whole transformer forward.
+    // A full forward is dominated by embed/norm/attention/FFN work that is
+    // identical across paths, which dilutes the Cached/Sparse/Dense difference
+    // into single-digit percent. Timing the operator alone is what the path
+    // comparison is supposed to show.
+    let (achf, input_dim) = ppo
+        .first_achf_layer()
+        .expect("path comparison requires an ACHF layer; achf.enabled=true");
     let sample_input: Vec<f32> = (0..input_dim).map(|i| (i as f32) * 0.1 + 0.05).collect();
     let warmup_iterations = 100;
     let iterations = 2000;
@@ -512,13 +519,13 @@ fn run_path_comparison(base_config: &Config, seed: u64) -> Vec<(String, Vec<f64>
     // 0 = Cached, 1 = Sparse, 2 = Dense
     for (path_name, path_id) in [("Cached", 0u8), ("Sparse", 1), ("Dense", 2)] {
         for _ in 0..warmup_iterations {
-            let _ = ppo.forward_inference_forced_path(&sample_input, path_id);
+            let _ = achf.forward_inference_forced_path(&sample_input, path_id);
         }
 
         let mut latencies = Vec::with_capacity(iterations);
         for _ in 0..iterations {
             let start = Instant::now();
-            let _out = ppo.forward_inference_forced_path(&sample_input, path_id);
+            let _out = achf.forward_inference_forced_path(&sample_input, path_id);
             let ns = start.elapsed().as_nanos() as f64;
             latencies.push(ns);
         }

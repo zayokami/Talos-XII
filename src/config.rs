@@ -367,6 +367,12 @@ pub struct AchfConfig {
     pub apply_ffn: bool,
     pub apply_dqn: bool,
     pub infer_gate: String,
+    /// When true, a frozen (inference-only) layer keeps using the adaptive
+    /// latency-driven path selector (AMA) instead of the deterministic Cached
+    /// fast path. Weights stay fixed; only path *selection* remains adaptive.
+    /// This is what exercises the latency-EMA machinery at inference time.
+    /// Default false: freeze to the deterministic fast path for peak throughput.
+    pub adaptive_inference: bool,
 }
 
 impl Default for AchfConfig {
@@ -410,6 +416,7 @@ impl Default for AchfConfig {
             apply_ffn: true,
             apply_dqn: false,
             infer_gate: "last".to_string(),
+            adaptive_inference: false,
         }
     }
 }
@@ -931,6 +938,9 @@ impl Config {
                 }
                 if let Some(v) = achf_map.get("infer_gate") {
                     config.achf.infer_gate = v.as_str().unwrap_or("g_min").to_string();
+                }
+                if let Some(v) = achf_map.get("adaptive_inference") {
+                    config.achf.adaptive_inference = v.as_bool().unwrap_or(false);
                 }
             }
         }
