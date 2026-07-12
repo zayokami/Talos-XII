@@ -832,10 +832,7 @@ impl LuckTransformer {
                 vector_gelu_f32(ffn2, ffn1);
 
                 if let Some(achf) = &block.achf_ffn {
-                    let achf_out = achf.forward_inference_residual(ffn2);
-                    for (i, &v) in achf_out.iter().enumerate() {
-                        h[i] += v;
-                    }
+                    achf.forward_inference_residual_add_into(ffn2, h);
                 } else {
                     block.ffn_2.forward_inference_into(ffn2, attn);
                     vector_grad_acc_f32(h, attn);

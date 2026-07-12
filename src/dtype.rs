@@ -177,6 +177,33 @@ impl Storage {
         }
     }
 
+    /// Convert storage data into an existing `Vec<f32>`, reusing its capacity.
+    ///
+    /// Hot-path helper: inference forward passes call this per token/layer, so
+    /// avoiding a fresh allocation on every call materially reduces allocator
+    /// pressure. The buffer is cleared and refilled in place.
+    pub fn to_f32_vec_into(&self, out: &mut Vec<f32>) {
+        out.clear();
+        match self {
+            Storage::F64(v) => {
+                let g = v.read().unwrap();
+                out.extend(g.iter().map(|&x| x as f32));
+            }
+            Storage::F32(v) => {
+                let g = v.read().unwrap();
+                out.extend_from_slice(&g);
+            }
+            Storage::BF16(v) => {
+                let g = v.read().unwrap();
+                out.extend(g.iter().map(|&x| x.to_f32()));
+            }
+            Storage::I8(v) => {
+                let g = v.read().unwrap();
+                out.extend(g.iter().map(|&x| x as f32));
+            }
+        }
+    }
+
     /// Convert storage data to Vec<bf16>, regardless of original dtype.
     pub fn to_bf16_vec(&self) -> Vec<bf16> {
         match self {

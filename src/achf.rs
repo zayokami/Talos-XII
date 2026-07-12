@@ -5,11 +5,17 @@ use crate::config::AchfConfig;
 use crate::dtype::{bf16, Dtype};
 use crate::nn::{Linear, Module};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 const AMA_SPARSE_DENSE_ENABLE_MARGIN: f64 = 0.98;
+
+thread_local! {
+    // Reused per-thread accumulator row for the fused frozen-inference residual
+    // add-into path, avoiding a heap allocation per call.
+    static ACHF_ROW_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 #[cfg(cuda)]
 use crate::autograd::Device;
@@ -81,6 +87,10 @@ pub struct AchfMetrics {
     pub decision_samples: AtomicU64,
     pub memo_hash: AtomicU64,
     pub memo_count: AtomicU64,
+    /// Lock-free mirror of `AchfState::freeze_projection`, set once by
+    /// `freeze_for_inference`. Lets the inference hot path detect frozen mode
+    /// without taking the `state` RwLock on every call.
+    pub frozen: AtomicBool,
 }
 
 impl Clone for AchfMetrics {
@@ -99,6 +109,7 @@ impl Clone for AchfMetrics {
             decision_samples: AtomicU64::new(self.decision_samples.load(Ordering::Relaxed)),
             memo_hash: AtomicU64::new(self.memo_hash.load(Ordering::Relaxed)),
             memo_count: AtomicU64::new(self.memo_count.load(Ordering::Relaxed)),
+            frozen: AtomicBool::new(self.frozen.load(Ordering::Relaxed)),
         }
     }
 }
@@ -117,6 +128,7 @@ impl Default for AchfMetrics {
             decision_samples: AtomicU64::new(0),
             memo_hash: AtomicU64::new(0),
             memo_count: AtomicU64::new(0),
+            frozen: AtomicBool::new(false),
         }
     }
 }
@@ -783,6 +795,14 @@ impl AchfLayer {
         if !self.config.enabled {
             return self.zero_inference_output(x);
         }
+        // Frozen fast path: skip input hashing, memoization write-back and
+        // latency probing (all training-only aids). Produces the same values as
+        // the general path below when the frozen selector would pick Cached.
+        if self.metrics.frozen.load(Ordering::Relaxed) {
+            if let Some(out) = self.try_frozen_cached_scaled(x) {
+                return out;
+            }
+        }
         if self.weight.in_features == 0 || !x.len().is_multiple_of(self.weight.in_features) {
             self.metrics.calls.fetch_add(1, Ordering::Relaxed);
             self.metrics.cache_skips.fetch_add(1, Ordering::Relaxed);
@@ -907,6 +927,154 @@ impl AchfLayer {
         }
 
         out
+    }
+
+    /// Fused frozen-inference residual: computes the cached dense operator,
+    /// scales by the inference gate, and ADDS it into `out` in place — with no
+    /// heap allocation and none of the adaptive machinery (input hashing,
+    /// memoization write-back, latency probing) that `forward_inference_residual`
+    /// performs. That machinery only helps while weights change during training;
+    /// on a frozen layer with per-step-varying inputs it is pure overhead.
+    ///
+    /// Falls back to the general (allocating) path and a manual add whenever the
+    /// layer is not frozen or the cached operator is not the selected path, so
+    /// results are identical to `forward_inference_residual` in every case.
+    pub fn forward_inference_residual_add_into(&self, x: &[f32], out: &mut [f32]) {
+        if self.metrics.frozen.load(Ordering::Relaxed)
+            && self.config.enabled
+            && self.try_frozen_cached_add_into(x, out)
+        {
+            return;
+        }
+        let residual = self.forward_inference_residual(x);
+        let n = residual.len().min(out.len());
+        for (o, &r) in out[..n].iter_mut().zip(&residual[..n]) {
+            *o += r;
+        }
+    }
+
+    /// Frozen fast path that allocates and returns the gated residual (used by
+    /// `forward_inference_residual`). Returns `None` — leaving the caller to run
+    /// the general path — whenever the cached operator is not the selected path,
+    /// mirroring `select_frozen_path`'s validity checks so numerics stay identical.
+    fn try_frozen_cached_scaled(&self, x: &[f32]) -> Option<Vec<f32>> {
+        if !self.frozen_cache_selectable(x) {
+            return None;
+        }
+        let mut out = self.forward_inference_cached(x)?;
+        let g = self.infer_gate_value() as f32;
+        for v in out.iter_mut() {
+            *v *= g;
+        }
+        self.metrics.calls.fetch_add(1, Ordering::Relaxed);
+        self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
+        Some(out)
+    }
+
+    /// Shared validity gate mirroring `select_frozen_path`: true when the fused
+    /// cached operator is shape/rows/sparsity-valid for `x` and would be picked.
+    fn frozen_cache_selectable(&self, x: &[f32]) -> bool {
+        let Ok(cache) = self.cache.try_read() else {
+            return false;
+        };
+        let Some(dense) = cache.dense.as_ref() else {
+            return false;
+        };
+        let in_dim = cache.in_dim;
+        let out_dim = cache.out_dim;
+        if in_dim == 0 || out_dim == 0 {
+            return false;
+        }
+        if dense.len() != in_dim.saturating_mul(out_dim) {
+            return false;
+        }
+        if cache.bias.as_ref().is_some_and(|b| b.len() != out_dim) {
+            return false;
+        }
+        if !x.len().is_multiple_of(in_dim) {
+            return false;
+        }
+        let num_rows = x.len() / in_dim;
+        if self.config.cache_min_rows > 0 && num_rows < self.config.cache_min_rows {
+            return false;
+        }
+        if self.config.cache_min_nonzero_ratio > 0.0 {
+            let ratio = self.estimate_nonzero_ratio(x, in_dim, num_rows);
+            if ratio < self.config.cache_min_nonzero_ratio {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Attempt the fused cached matmul + gate scale + add-into. Returns `false`
+    /// (touching nothing) when the cache is unavailable or the frozen path would
+    /// not select `Cached`, mirroring `select_frozen_path`'s validity checks so
+    /// numerics stay identical.
+    fn try_frozen_cached_add_into(&self, x: &[f32], out: &mut [f32]) -> bool {
+        use crate::simd::add_scaled_row_f32;
+        let Ok(cache) = self.cache.try_read() else {
+            return false;
+        };
+        let Some(dense) = cache.dense.as_ref() else {
+            return false;
+        };
+        let bias = cache.bias.as_ref();
+        let in_dim = cache.in_dim;
+        let out_dim = cache.out_dim;
+        if in_dim == 0 || out_dim == 0 {
+            return false;
+        }
+        if dense.len() != in_dim.saturating_mul(out_dim) {
+            return false;
+        }
+        if bias.is_some_and(|b| b.len() != out_dim) {
+            return false;
+        }
+        if !x.len().is_multiple_of(in_dim) {
+            return false;
+        }
+        let num_rows = x.len() / in_dim;
+        if self.config.cache_min_rows > 0 && num_rows < self.config.cache_min_rows {
+            return false;
+        }
+        if out.len() != num_rows * out_dim {
+            return false;
+        }
+        // Sparsity gate: matches select_frozen_path so we only take the Cached
+        // path when it would have been chosen.
+        if self.config.cache_min_nonzero_ratio > 0.0 {
+            let ratio = self.estimate_nonzero_ratio(x, in_dim, num_rows);
+            if ratio < self.config.cache_min_nonzero_ratio {
+                return false;
+            }
+        }
+        let g = self.infer_gate_value() as f32;
+        ACHF_ROW_SCRATCH.with(|cell| {
+            let mut acc = cell.borrow_mut();
+            acc.resize(out_dim, 0.0);
+            for r in 0..num_rows {
+                let row_in = r * in_dim;
+                let row_out = r * out_dim;
+                if let Some(b) = bias {
+                    acc.copy_from_slice(b);
+                } else {
+                    acc.iter_mut().for_each(|v| *v = 0.0);
+                }
+                for i in 0..in_dim {
+                    let scale = x[row_in + i];
+                    if scale == 0.0 {
+                        continue;
+                    }
+                    let w_row = &dense[i * out_dim..(i + 1) * out_dim];
+                    add_scaled_row_f32(&mut acc, w_row, scale);
+                }
+                add_scaled_row_f32(&mut out[row_out..row_out + out_dim], &acc, g);
+            }
+        });
+        self.metrics.calls.fetch_add(1, Ordering::Relaxed);
+        self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// Run inference through a specific path, bypassing the automatic path selection.
@@ -1082,6 +1250,8 @@ impl AchfLayer {
         let mut state = self.state.write().unwrap();
         state.freeze_projection = true;
         state.g_min_ema = self.config.g_min;
+        drop(state);
+        self.metrics.frozen.store(true, Ordering::Release);
     }
 
     fn gate_mode(&self) -> GateMode {
@@ -1651,6 +1821,7 @@ impl AchfLayer {
         if self.config.cache_min_rows > 0 && num_rows < self.config.cache_min_rows {
             return None;
         }
+        use crate::simd::add_scaled_row_f32;
         let mut out = vec![0.0f32; num_rows * out_dim];
         for r in 0..num_rows {
             let row_offset_in = r * in_dim;
@@ -1665,9 +1836,7 @@ impl AchfLayer {
                     continue;
                 }
                 let w_row = &dense[i * out_dim..(i + 1) * out_dim];
-                for j in 0..out_dim {
-                    out_row[j] += scale * w_row[j];
-                }
+                add_scaled_row_f32(out_row, w_row, scale);
             }
         }
         Some(out)
@@ -2881,6 +3050,60 @@ mod tests {
         assert_eq!(out_cached.len(), out_unfused.len());
         for (a, b) in out_cached.iter().zip(out_unfused.iter()) {
             assert!((a - b).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn achf_residual_add_into_matches_residual() {
+        // The fused frozen add-into path must equal `forward_inference_residual`
+        // added onto an existing accumulator, element for element.
+        let cfg = AchfConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut layer = AchfLayer::new(3, 2, true, cfg, 77);
+        layer.prune(0.01);
+        layer.freeze_for_inference();
+
+        let x = vec![0.7, -1.3, 0.2];
+        let base = vec![10.0f32, -4.0];
+
+        let residual = layer.forward_inference_residual(&x);
+        let mut expected = base.clone();
+        for (e, r) in expected.iter_mut().zip(&residual) {
+            *e += *r;
+        }
+
+        let mut got = base.clone();
+        layer.forward_inference_residual_add_into(&x, &mut got);
+
+        assert_eq!(got.len(), expected.len());
+        for (g, e) in got.iter().zip(&expected) {
+            assert!((g - e).abs() < 1e-5, "add_into {g} vs expected {e}");
+        }
+    }
+
+    #[test]
+    fn achf_frozen_fast_path_matches_cached_path() {
+        // On a frozen layer, the fast path (`forward_inference_residual` taking
+        // the frozen branch) must equal the explicitly forced Cached path — same
+        // weights, same operator, so the optimization changes nothing numerically.
+        let cfg = AchfConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut frozen = AchfLayer::new(4, 3, true, cfg, 91);
+        frozen.prune(0.01);
+        frozen.freeze_for_inference();
+        assert!(frozen.metrics.frozen.load(Ordering::Relaxed));
+
+        let x = vec![0.4, -0.9, 1.1, -0.2];
+        let fast_out = frozen.forward_inference_residual(&x);
+        let forced_cached = frozen.forward_inference_forced_path(&x, 0);
+
+        assert_eq!(fast_out.len(), forced_cached.len());
+        for (f, c) in fast_out.iter().zip(&forced_cached) {
+            assert!((f - c).abs() < 1e-5, "fast {f} vs forced-cached {c}");
         }
     }
 

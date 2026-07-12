@@ -9,6 +9,15 @@ pub trait Module {
     fn parameters(&self) -> Vec<Tensor>;
 }
 
+thread_local! {
+    // Reused per-thread scratch for materializing f32 weights/bias during
+    // inference forward passes. These forwards run millions of times in
+    // simulation; reusing the buffers avoids a heap allocation per call.
+    static LINEAR_W_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static LINEAR_B_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static RMSNORM_W_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Linear {
     pub weight: Tensor,
@@ -52,60 +61,41 @@ impl Linear {
         );
         let num_rows = input.len() / in_dim;
         out.resize(num_rows * out_dim, 0.0f32);
-        let w_data = self.weight.data_to_f32_vec();
-        let b_data = self.bias.as_ref().map(|b| b.data_to_f32_vec());
 
         use crate::simd::add_scaled_row_f32;
 
-        // Disabled: nested parallelism causes thread pool oversubscription when called
-        // from within an outer par_iter. External parallelism handles this better.
-        let parallel_matvec = false;
-
-        for r in 0..num_rows {
-            let row_offset_in = r * in_dim;
-            let row_offset_out = r * out_dim;
-
-            if parallel_matvec {
-                let out_row = &mut out[row_offset_out..row_offset_out + out_dim];
-                let input_row = &input[row_offset_in..row_offset_in + in_dim];
-                let n_chunks = rayon::current_num_threads().min(8);
-                let chunk_size = out_dim.div_ceil(n_chunks);
-                out_row
-                    .par_chunks_mut(chunk_size)
-                    .enumerate()
-                    .for_each(|(ci, chunk)| {
-                        let col_start = ci * chunk_size;
-                        if let Some(b) = &b_data {
-                            chunk.copy_from_slice(&b[col_start..col_start + chunk.len()]);
-                        }
-                        for i in 0..in_dim {
-                            let scale = input_row[i];
-                            if scale == 0.0 {
-                                continue;
-                            }
-                            let w_slice = &w_data
-                                [i * out_dim + col_start..i * out_dim + col_start + chunk.len()];
-                            add_scaled_row_f32(chunk, w_slice, scale);
-                        }
-                    });
-            } else {
-                let out_row = &mut out[row_offset_out..row_offset_out + out_dim];
-                if let Some(b) = &b_data {
-                    out_row.copy_from_slice(b);
-                } else {
-                    out_row.fill(0.0f32);
+        LINEAR_W_SCRATCH.with(|w_cell| {
+            LINEAR_B_SCRATCH.with(|b_cell| {
+                let mut w_data = w_cell.borrow_mut();
+                self.weight.data_to_f32_vec_into(&mut w_data);
+                let mut b_data = b_cell.borrow_mut();
+                let has_bias = self.bias.is_some();
+                if let Some(b) = &self.bias {
+                    b.data_to_f32_vec_into(&mut b_data);
                 }
 
-                for i in 0..in_dim {
-                    let scale = input[row_offset_in + i];
-                    if scale == 0.0 {
-                        continue;
+                for r in 0..num_rows {
+                    let row_offset_in = r * in_dim;
+                    let row_offset_out = r * out_dim;
+
+                    let out_row = &mut out[row_offset_out..row_offset_out + out_dim];
+                    if has_bias {
+                        out_row.copy_from_slice(&b_data);
+                    } else {
+                        out_row.fill(0.0f32);
                     }
-                    let w_row = &w_data[i * out_dim..(i + 1) * out_dim];
-                    add_scaled_row_f32(out_row, w_row, scale);
+
+                    for i in 0..in_dim {
+                        let scale = input[row_offset_in + i];
+                        if scale == 0.0 {
+                            continue;
+                        }
+                        let w_row = &w_data[i * out_dim..(i + 1) * out_dim];
+                        add_scaled_row_f32(out_row, w_row, scale);
+                    }
                 }
-            }
-        }
+            });
+        });
     }
 
     pub fn to_inference_bf16(&self) -> Self {
@@ -235,20 +225,24 @@ impl RMSNorm {
         let dim = self.dim;
         let num_rows = input.len() / dim;
         out.resize(input.len(), 0.0f32);
-        let w_data = self.weight.data_to_f32_vec();
 
-        for r in 0..num_rows {
-            let base = r * dim;
-            let mut sum_sq = 0.0f32;
-            for i in 0..dim {
-                let val = input[base + i];
-                sum_sq += val * val;
+        RMSNORM_W_SCRATCH.with(|w_cell| {
+            let mut w_data = w_cell.borrow_mut();
+            self.weight.data_to_f32_vec_into(&mut w_data);
+
+            for r in 0..num_rows {
+                let base = r * dim;
+                let mut sum_sq = 0.0f32;
+                for i in 0..dim {
+                    let val = input[base + i];
+                    sum_sq += val * val;
+                }
+                let rms = (sum_sq / dim as f32 + self.eps).sqrt();
+                for i in 0..dim {
+                    out[base + i] = (input[base + i] / rms) * w_data[i];
+                }
             }
-            let rms = (sum_sq / dim as f32 + self.eps).sqrt();
-            for i in 0..dim {
-                out[base + i] = (input[base + i] / rms) * w_data[i];
-            }
-        }
+        });
     }
 
     #[cfg(cuda)]

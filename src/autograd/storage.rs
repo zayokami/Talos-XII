@@ -368,6 +368,14 @@ impl Tensor {
         self.data.to_f32_vec()
     }
 
+    /// Materialize this tensor's data as f32 into a reused buffer (no alloc).
+    /// See [`crate::dtype::Storage::to_f32_vec_into`].
+    pub fn data_to_f32_vec_into(&self, out: &mut Vec<f32>) {
+        #[cfg(cuda)]
+        self.cuda_materialize();
+        self.data.to_f32_vec_into(out);
+    }
+
     /// Output dtype for a binary op.
     ///
     /// F64 is preserved only when explicitly present. Mixed F32/BF16 compute
