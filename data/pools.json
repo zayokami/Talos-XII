@@ -1,0 +1,579 @@
+{
+  "_comment": {
+    "pool_name": "卡池名称",
+    "pool_name_en": "Pool name (English)",
+    "up_six": "当期 UP 六星列表",
+    "up_six_en": "UP 6-star list (English)",
+    "six_stars_en": "6-star pool (English)",
+    "five_stars_en": "5-star pool (English)",
+    "four_stars_en": "4-star pool (English)",
+    "prob_6_base": "六星基础概率",
+    "prob_5_base": "五星基础概率",
+    "prob_4_base": "四星基础概率",
+    "soft_pity_start": "软保底开始抽数",
+    "small_pity_guarantee": "小保底触发抽数",
+    "big_pity_cumulative": "大保底累计抽数",
+    "up_rate": "UP 六星命中率",
+    "up_pity_soft": "UP 软保底抽数（0 表示关闭）",
+    "five_star_pity": "五星保底抽数",
+    "always_5_star": "每抽至少五星",
+    "big_pity_requires_not_up": "大保底是否要求未出 UP",
+    "active_pool": "当前激活的卡池 ID",
+    "pools": "所有可切换的卡池定义数组",
+    "is_archived": "true 表示已归档卡池（仍可手动切换回溯）"
+  },
+  "pool_name": "拳出无悔",
+  "pool_name_en": "Quan Chu Wu Hui",
+  "up_six": ["弭弗"],
+  "up_six_en": ["Mifu"],
+  "up_rate": 0.5,
+  "prob_6_base": 0.008,
+  "prob_5_base": 0.08,
+  "prob_4_base": 0.912,
+  "soft_pity_start": 65,
+  "small_pity_guarantee": 80,
+  "big_pity_cumulative": 120,
+  "up_pity_soft": 0,
+  "five_star_pity": 10,
+  "always_5_star": false,
+  "big_pity_requires_not_up": true,
+  "six_stars": [
+    "弭弗", "庄方宜", "洛茜", "余烬",
+    "黎风", "艾尔黛拉", "别礼", "骏卫"
+  ],
+  "six_stars_en": [
+    "Mifu", "Zhuang Fangyi", "Rossi", "Ember",
+    "Lifeng", "Ardelia", "Last Rite", "Pogranichnik"
+  ],
+  "five_stars": [
+    "昼雪", "赛希", "狼卫", "佩丽卡",
+    "弧光", "阿列什", "艾维文娜", "大潘", "埃特拉"
+  ],
+  "five_stars_en": [
+    "Snowshine", "Xaihi", "Wulfgard", "Perlica",
+    "Arclight", "Alesh", "Avywenna", "Da Pan", "Estella"
+  ],
+  "four_stars": [
+    "卡契尔", "安塔尔", "萤石", "秋栗"
+  ],
+  "four_stars_en": [
+    "Catcher", "Antal", "Fluorite", "Akekuri"
+  ],
+  "active_pool": "char_up_20260605",
+  "pools": [
+    {
+      "id": "char_up_20260605",
+      "name": "拳出无悔",
+      "name_en": "Quan Chu Wu Hui",
+      "pool_type": "character_up",
+      "up_six": ["弭弗"],
+      "up_six_en": ["Mifu"],
+      "up_rate": 0.5,
+      "prob_6_base": 0.008,
+      "prob_5_base": 0.08,
+      "prob_4_base": 0.912,
+      "soft_pity_start": 65,
+      "small_pity_guarantee": 80,
+      "big_pity_cumulative": 120,
+      "up_pity_soft": 0,
+      "five_star_pity": 10,
+      "always_5_star": false,
+      "big_pity_requires_not_up": true,
+      "six_stars": [
+        "弭弗", "庄方宜", "洛茜", "余烬",
+        "黎风", "艾尔黛拉", "别礼", "骏卫"
+      ],
+      "six_stars_en": [
+        "Mifu", "Zhuang Fangyi", "Rossi", "Ember",
+        "Lifeng", "Ardelia", "Last Rite", "Pogranichnik"
+      ],
+      "five_stars": [
+        "昼雪", "赛希", "狼卫", "佩丽卡",
+        "弧光", "阿列什", "艾维文娜", "大潘", "埃特拉"
+      ],
+      "five_stars_en": [
+        "Snowshine", "Xaihi", "Wulfgard", "Perlica",
+        "Arclight", "Alesh", "Avywenna", "Da Pan", "Estella"
+      ],
+      "four_stars": [
+        "卡契尔", "安塔尔", "萤石", "秋栗"
+      ],
+      "four_stars_en": [
+        "Catcher", "Antal", "Fluorite", "Akekuri"
+      ]
+    },
+    {
+      "id": "char_up_20260626",
+      "name": "逐罪者",
+      "name_en": "Zhuizuizhe",
+      "pool_type": "character_up",
+      "up_six": ["卡缪"],
+      "up_six_en": ["Camille"],
+      "up_rate": 0.5,
+      "prob_6_base": 0.008,
+      "prob_5_base": 0.08,
+      "prob_4_base": 0.912,
+      "soft_pity_start": 65,
+      "small_pity_guarantee": 80,
+      "big_pity_cumulative": 120,
+      "up_pity_soft": 0,
+      "five_star_pity": 10,
+      "always_5_star": false,
+      "big_pity_requires_not_up": true,
+      "six_stars": [
+        "卡缪", "弭弗", "庄方宜", "余烬",
+        "黎风", "艾尔黛拉", "别礼", "骏卫"
+      ],
+      "six_stars_en": [
+        "Camille", "Mifu", "Zhuang Fangyi", "Ember",
+        "Lifeng", "Ardelia", "Last Rite", "Pogranichnik"
+      ],
+      "five_stars": [
+        "昼雪", "赛希", "狼卫", "佩丽卡",
+        "弧光", "阿列什", "艾维文娜", "大潘", "埃特拉"
+      ],
+      "five_stars_en": [
+        "Snowshine", "Xaihi", "Wulfgard", "Perlica",
+        "Arclight", "Alesh", "Avywenna", "Da Pan", "Estella"
+      ],
+      "four_stars": [
+        "卡契尔", "安塔尔", "萤石", "秋栗"
+      ],
+      "four_stars_en": [
+        "Catcher", "Antal", "Fluorite", "Akekuri"
+      ]
+    },
+    {
+      "id": "char_up_20260417",
+      "name": "春晓时",
+      "name_en": "Spring Dawn",
+      "is_archived": true,
+      "pool_type": "character_up",
+      "up_six": ["庄方宜"],
+      "up_six_en": ["Zhuang Fangyi"],
+      "up_rate": 0.5,
+      "prob_6_base": 0.008,
+      "prob_5_base": 0.08,
+      "prob_4_base": 0.912,
+      "soft_pity_start": 65,
+      "small_pity_guarantee": 80,
+      "big_pity_cumulative": 120,
+      "up_pity_soft": 0,
+      "five_star_pity": 10,
+      "always_5_star": false,
+      "big_pity_requires_not_up": true,
+      "six_stars": [
+        "庄方宜", "伊冯", "洁尔佩塔", "余烬",
+        "黎风", "艾尔黛拉", "别礼", "骏卫"
+      ],
+      "six_stars_en": [
+        "Zhuang Fangyi", "Yvonne", "Gilberta", "Ember",
+        "Lifeng", "Ardelia", "Last Rite", "Pogranichnik"
+      ],
+      "five_stars": [
+        "昼雪", "赛希", "狼卫", "佩丽卡",
+        "弧光", "阿列什", "艾维文娜", "大潘", "埃特拉"
+      ],
+      "five_stars_en": [
+        "Snowshine", "Xaihi", "Wulfgard", "Perlica",
+        "Arclight", "Alesh", "Avywenna", "Da Pan", "Estella"
+      ],
+      "four_stars": [
+        "卡契尔", "安塔尔", "萤石", "秋栗"
+      ],
+      "four_stars_en": [
+        "Catcher", "Antal", "Fluorite", "Akekuri"
+      ]
+    },
+    {
+      "id": "char_up_20260514",
+      "name": "辉光庆典",
+      "name_en": "Radiance Celebration",
+      "is_archived": true,
+      "pool_type": "character_up",
+      "up_six": ["骏卫", "莱万汀", "艾尔黛拉", "洁尔佩塔"],
+      "up_six_en": ["Pogranichnik", "Laevatain", "Ardelia", "Gilberta"],
+      "up_rate": 1.0,
+      "prob_6_base": 0.008,
+      "prob_5_base": 0.08,
+      "prob_4_base": 0.912,
+      "soft_pity_start": 65,
+      "small_pity_guarantee": 80,
+      "big_pity_cumulative": 120,
+      "up_pity_soft": 0,
+      "five_star_pity": 10,
+      "always_5_star": false,
+      "big_pity_requires_not_up": false,
+      "six_stars": [
+        "骏卫", "莱万汀", "艾尔黛拉", "洁尔佩塔"
+      ],
+      "six_stars_en": [
+        "Pogranichnik", "Laevatain", "Ardelia", "Gilberta"
+      ],
+      "five_stars": [
+        "昼雪", "赛希", "狼卫", "佩丽卡",
+        "弧光", "阿列什", "艾维文娜", "大潘", "埃特拉"
+      ],
+      "five_stars_en": [
+        "Snowshine", "Xaihi", "Wulfgard", "Perlica",
+        "Arclight", "Alesh", "Avywenna", "Da Pan", "Estella"
+      ],
+      "four_stars": [
+        "卡契尔", "安塔尔", "萤石", "秋栗"
+      ],
+      "four_stars_en": [
+        "Catcher", "Antal", "Fluorite", "Akekuri"
+      ]
+    },
+    {
+      "id": "char_up_20260312",
+      "name": "河流的女儿",
+      "name_en": "River's Daughter",
+      "is_archived": true,
+      "pool_type": "character_up",
+      "up_six": ["汤汤"],
+      "up_six_en": ["Tangtang"],
+      "up_rate": 0.5,
+      "prob_6_base": 0.008,
+      "prob_5_base": 0.08,
+      "prob_4_base": 0.912,
+      "soft_pity_start": 65,
+      "small_pity_guarantee": 80,
+      "big_pity_cumulative": 120,
+      "up_pity_soft": 0,
+      "five_star_pity": 10,
+      "always_5_star": false,
+      "big_pity_requires_not_up": true,
+      "six_stars": [
+        "汤汤", "伊冯", "洁尔佩塔", "余烬",
+        "黎风", "艾尔黛拉", "别礼", "骏卫"
+      ],
+      "six_stars_en": [
+        "Tangtang", "Yvonne", "Gilberta", "Ember",
+        "Lifeng", "Ardelia", "Last Rite", "Pogranichnik"
+      ],
+      "five_stars": [
+        "昼雪", "赛希", "狼卫", "佩丽卡",
+        "弧光", "阿列什", "艾维文娜", "大潘", "埃特拉"
+      ],
+      "five_stars_en": [
+        "Snowshine", "Xaihi", "Wulfgard", "Perlica",
+        "Arclight", "Alesh", "Avywenna", "Da Pan", "Estella"
+      ],
+      "four_stars": [
+        "卡契尔", "安塔尔", "萤石", "秋栗"
+      ],
+      "four_stars_en": [
+        "Catcher", "Antal", "Fluorite", "Akekuri"
+      ]
+    },
+    {
+      "id": "char_up_20260207",
+      "name": "轻飘飘的信使",
+      "name_en": "The Floaty Messenger",
+      "is_archived": true,
+      "pool_type": "character_up",
+      "up_six": ["洁尔佩塔"],
+      "up_six_en": ["Gilberta"],
+      "up_rate": 0.5,
+      "prob_6_base": 0.008,
+      "prob_5_base": 0.08,
+      "prob_4_base": 0.912,
+      "soft_pity_start": 65,
+      "small_pity_guarantee": 80,
+      "big_pity_cumulative": 120,
+      "up_pity_soft": 0,
+      "five_star_pity": 10,
+      "always_5_star": false,
+      "big_pity_requires_not_up": true,
+      "six_stars": [
+        "洁尔佩塔", "莱万汀", "伊冯", "余烬",
+        "黎风", "艾尔黛拉", "别礼", "骏卫"
+      ],
+      "six_stars_en": [
+        "Gilberta", "Laevatain", "Yvonne", "Ember",
+        "Lifeng", "Ardelia", "Last Rite", "Pogranichnik"
+      ],
+      "five_stars": [
+        "昼雪", "赛希", "狼卫", "佩丽卡",
+        "弧光", "阿列什", "艾维文娜", "大潘", "埃特拉"
+      ],
+      "five_stars_en": [
+        "Snowshine", "Xaihi", "Wulfgard", "Perlica",
+        "Arclight", "Alesh", "Avywenna", "Da Pan", "Estella"
+      ],
+      "four_stars": [
+        "卡契尔", "安塔尔", "萤石", "秋栗"
+      ],
+      "four_stars_en": [
+        "Catcher", "Antal", "Fluorite", "Akekuri"
+      ]
+    },
+    {
+      "id": "char_up_20260224",
+      "name": "热烈色彩",
+      "name_en": "Hues of Passion",
+      "is_archived": true,
+      "pool_type": "character_up",
+      "up_six": ["伊冯"],
+      "up_six_en": ["Yvonne"],
+      "up_rate": 0.5,
+      "prob_6_base": 0.008,
+      "prob_5_base": 0.08,
+      "prob_4_base": 0.912,
+      "soft_pity_start": 65,
+      "small_pity_guarantee": 80,
+      "big_pity_cumulative": 120,
+      "up_pity_soft": 0,
+      "five_star_pity": 10,
+      "always_5_star": false,
+      "big_pity_requires_not_up": true,
+      "six_stars": [
+        "洁尔佩塔", "莱万汀", "伊冯", "余烬",
+        "黎风", "艾尔黛拉", "别礼", "骏卫"
+      ],
+      "six_stars_en": [
+        "Gilberta", "Laevatain", "Yvonne", "Ember",
+        "Lifeng", "Ardelia", "Last Rite", "Pogranichnik"
+      ],
+      "five_stars": [
+        "昼雪", "赛希", "狼卫", "佩丽卡",
+        "弧光", "阿列什", "艾维文娜", "大潘", "埃特拉"
+      ],
+      "five_stars_en": [
+        "Snowshine", "Xaihi", "Wulfgard", "Perlica",
+        "Arclight", "Alesh", "Avywenna", "Da Pan", "Estella"
+      ],
+      "four_stars": [
+        "卡契尔", "安塔尔", "萤石", "秋栗"
+      ],
+      "four_stars_en": [
+        "Catcher", "Antal", "Fluorite", "Akekuri"
+      ]
+    },
+    {
+      "id": "weapon_up_20260224",
+      "name": "绘涂申领",
+      "name_en": "Graffiti Issue",
+      "is_archived": true,
+      "pool_type": "weapon_up",
+      "up_six": ["艺术暴君（手铳）"],
+      "up_six_en": ["Artzy Tyrannical (Handcannon)"],
+      "up_rate": 0.5,
+      "prob_6_base": 0.04,
+      "prob_5_base": 0.96,
+      "prob_4_base": 0.0,
+      "soft_pity_start": 40,
+      "small_pity_guarantee": 40,
+      "big_pity_cumulative": 180,
+      "up_pity_soft": 80,
+      "five_star_pity": 1,
+      "always_5_star": true,
+      "big_pity_requires_not_up": true,
+      "six_stars": [
+        "艺术暴君（手铳）", "骑士精神", "遗忘", "楔子",
+        "热熔切割器", "白夜新星", "典范"
+      ],
+      "six_stars_en": [
+        "Artzy Tyrannical (Handcannon)", "Chivalric Virtues", "Oblivion", "Wedge",
+        "Thermite Cutter", "White Night Nova", "Exemplar"
+      ],
+      "five_stars": [],
+      "four_stars": []
+    },
+    {
+      "id": "weapon_up_20260312",
+      "name": "新芽申领",
+      "name_en": "Budding Anew Issue",
+      "is_archived": true,
+      "pool_type": "weapon_up",
+      "up_six": ["落草（手铳）"],
+      "up_six_en": ["Brigand's Calling (Handcannon)"],
+      "up_rate": 0.5,
+      "prob_6_base": 0.04,
+      "prob_5_base": 0.96,
+      "prob_4_base": 0.0,
+      "soft_pity_start": 40,
+      "small_pity_guarantee": 40,
+      "big_pity_cumulative": 180,
+      "up_pity_soft": 80,
+      "five_star_pity": 1,
+      "always_5_star": true,
+      "big_pity_requires_not_up": true,
+      "six_stars": [
+        "落草（手铳）", "同类相食（手铳）", "楔子（手铳）", "骑士精神（施术单元）",
+        "热熔切割器（单手剑）", "破碎君王（双手剑）", "J.E.T.（长柄武器）"
+      ],
+      "six_stars_en": [
+        "Brigand's Calling (Handcannon)", "Clannibal (Handcannon)", "Wedge (Handcannon)", "Chivalric Virtues (Arts Unit)",
+        "Thermite Cutter (Sword)", "Sundered Prince (Greatsword)", "JET (Polearm)"
+      ],
+      "five_stars": [],
+      "four_stars": []
+    },
+    {
+      "id": "weapon_up_20260329",
+      "name": "绯珀申领",
+      "name_en": "Scarlet Pearl Issue",
+      "is_archived": true,
+      "pool_type": "weapon_up",
+      "up_six": ["狼之绯（单手剑）"],
+      "up_six_en": ["Lupine Scarlet (Sword)"],
+      "up_rate": 0.5,
+      "prob_6_base": 0.04,
+      "prob_5_base": 0.96,
+      "prob_4_base": 0.0,
+      "soft_pity_start": 40,
+      "small_pity_guarantee": 40,
+      "big_pity_cumulative": 180,
+      "up_pity_soft": 80,
+      "five_star_pity": 1,
+      "always_5_star": true,
+      "big_pity_requires_not_up": true,
+      "six_stars": [
+        "狼之绯（单手剑）", "扶摇（单手剑）", "显赫声名（单手剑）", "楔子（手铳）",
+        "昔日精品（双手剑）", "爆破单元（施术单元）", "骁勇（长柄武器）"
+      ],
+      "six_stars_en": [
+        "Lupine Scarlet (Sword)", "Rapid Ascent (Sword)", "Eminent Repute (Sword)", "Wedge (Handcannon)",
+        "Former Finery (Greatsword)", "Detonation Unit (Arts Unit)", "Valiant (Polearm)"
+      ],
+      "five_stars": [],
+      "four_stars": []
+    },
+    {
+      "id": "weapon_up_20260605",
+      "name": "绛结申领",
+      "name_en": "Jiangjie Issue",
+      "pool_type": "weapon_up",
+      "up_six": ["赤缎（双手剑）"],
+      "up_six_en": ["Chiduan (Greatsword)"],
+      "up_rate": 0.5,
+      "prob_6_base": 0.04,
+      "prob_5_base": 0.96,
+      "prob_4_base": 0.0,
+      "soft_pity_start": 40,
+      "small_pity_guarantee": 40,
+      "big_pity_cumulative": 180,
+      "up_pity_soft": 80,
+      "five_star_pity": 1,
+      "always_5_star": true,
+      "big_pity_requires_not_up": true,
+      "six_stars": [
+        "赤缎（双手剑）", "扶摇（单手剑）", "显赫声名（单手剑）", "楔子（手铳）",
+        "昔日精品（双手剑）", "爆破单元（施术单元）", "骁勇（长柄武器）"
+      ],
+      "six_stars_en": [
+        "Chiduan (Greatsword)", "Rapid Ascent (Sword)", "Eminent Repute (Sword)", "Wedge (Handcannon)",
+        "Former Finery (Greatsword)", "Detonation Unit (Arts Unit)", "Valiant (Polearm)"
+      ],
+      "five_stars": [],
+      "four_stars": []
+    },
+    {
+      "id": "weapon_up_20260626",
+      "name": "染赤申领",
+      "name_en": "Ranchi Issue",
+      "pool_type": "weapon_up",
+      "up_six": ["镀红祝祷（长柄武器）"],
+      "up_six_en": ["Duhong Zhudao (Polearm)"],
+      "up_rate": 0.5,
+      "prob_6_base": 0.04,
+      "prob_5_base": 0.96,
+      "prob_4_base": 0.0,
+      "soft_pity_start": 40,
+      "small_pity_guarantee": 40,
+      "big_pity_cumulative": 180,
+      "up_pity_soft": 80,
+      "five_star_pity": 1,
+      "always_5_star": true,
+      "big_pity_requires_not_up": true,
+      "six_stars": [
+        "镀红祝祷（长柄武器）", "扶摇（单手剑）", "显赫声名（单手剑）", "楔子（手铳）",
+        "昔日精品（双手剑）", "爆破单元（施术单元）", "骁勇（长柄武器）"
+      ],
+      "six_stars_en": [
+        "Duhong Zhudao (Polearm)", "Rapid Ascent (Sword)", "Eminent Repute (Sword)", "Wedge (Handcannon)",
+        "Former Finery (Greatsword)", "Detonation Unit (Arts Unit)", "Valiant (Polearm)"
+      ],
+      "five_stars": [],
+      "four_stars": []
+    },
+    {
+      "id": "standard_pool",
+      "name": "基础寻访",
+      "name_en": "Standard Headhunting",
+      "pool_type": "standard",
+      "up_six": [],
+      "up_rate": 0.0,
+      "prob_6_base": 0.008,
+      "prob_5_base": 0.08,
+      "prob_4_base": 0.912,
+      "soft_pity_start": 65,
+      "small_pity_guarantee": 80,
+      "big_pity_cumulative": 0,
+      "up_pity_soft": 0,
+      "five_star_pity": 10,
+      "always_5_star": false,
+      "big_pity_requires_not_up": false,
+      "six_stars": [
+        "余烬", "黎风", "艾尔黛拉", "别礼", "骏卫"
+      ],
+      "six_stars_en": [
+        "Ember", "Lifeng", "Ardelia", "Last Rite", "Pogranichnik"
+      ],
+      "five_stars": [
+        "昼雪", "赛希", "狼卫", "佩丽卡",
+        "弧光", "阿列什", "艾维文娜", "大潘", "埃特拉"
+      ],
+      "five_stars_en": [
+        "Snowshine", "Xaihi", "Wulfgard", "Perlica",
+        "Arclight", "Alesh", "Avywenna", "Da Pan", "Estella"
+      ],
+      "four_stars": [
+        "卡契尔", "安塔尔", "萤石", "秋栗"
+      ],
+      "four_stars_en": [
+        "Catcher", "Antal", "Fluorite", "Akekuri"
+      ]
+    },
+    {
+      "id": "starter_pool",
+      "name": "启程寻访",
+      "name_en": "New Horizon",
+      "pool_type": "beginner",
+      "up_six": [],
+      "up_rate": 0.0,
+      "prob_6_base": 0.008,
+      "prob_5_base": 0.08,
+      "prob_4_base": 0.912,
+      "soft_pity_start": 40,
+      "small_pity_guarantee": 40,
+      "big_pity_cumulative": 0,
+      "up_pity_soft": 0,
+      "five_star_pity": 10,
+      "always_5_star": false,
+      "big_pity_requires_not_up": false,
+      "six_stars": [
+        "余烬", "黎风", "艾尔黛拉", "别礼", "骏卫"
+      ],
+      "six_stars_en": [
+        "Ember", "Lifeng", "Ardelia", "Last Rite", "Pogranichnik"
+      ],
+      "five_stars": [
+        "昼雪", "赛希", "狼卫", "佩丽卡",
+        "弧光", "阿列什", "艾维文娜", "大潘", "埃特拉"
+      ],
+      "five_stars_en": [
+        "Snowshine", "Xaihi", "Wulfgard", "Perlica",
+        "Arclight", "Alesh", "Avywenna", "Da Pan", "Estella"
+      ],
+      "four_stars": [
+        "卡契尔", "安塔尔", "萤石", "秋栗"
+      ],
+      "four_stars_en": [
+        "Catcher", "Antal", "Fluorite", "Akekuri"
+      ]
+    }
+  ]
+}

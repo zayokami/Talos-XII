@@ -461,6 +461,7 @@ pub struct Config {
     pub four_stars: Vec<String>,
     pub pools: Vec<PoolConfig>,
     pub active_pool: Option<String>,
+    pub pools_path: String,
     pub luck_mode: LuckMode,
     pub use_calibrated: bool,
     pub calibrated_path: String,
@@ -536,6 +537,7 @@ impl Default for Config {
             four_stars: vec![],
             pools: vec![],
             active_pool: None,
+            pools_path: "data/pools.json".to_string(),
             luck_mode: LuckMode::Probability,
             use_calibrated: true,
             calibrated_path: "data/calibrated.json".to_string(),
@@ -661,68 +663,8 @@ impl Config {
 
         if let JsonValue::Object(ref map) = root {
             warn_unknown_fields(map);
-            if let Some(v) = map.get("pool_name") {
-                config.pool_name = v.as_str().unwrap_or("").to_string();
-            }
-            if let Some(v) = map.get("up_six") {
-                config.up_six = json_to_string_vec(v);
-            }
-            if let Some(v) = map.get("up_rate") {
-                config.up_rate = v.as_f64().unwrap_or(0.5);
-            }
-            if let Some(v) = map.get("prob_6_base") {
-                config.prob_6_base = v.as_f64().unwrap_or(0.008);
-            }
-            if let Some(v) = map.get("prob_5_base") {
-                config.prob_5_base = v.as_f64().unwrap_or(0.08);
-            }
-            if let Some(v) = map.get("prob_4_base") {
-                config.prob_4_base = v.as_f64().unwrap_or(0.912);
-            }
-            if let Some(v) = map.get("soft_pity_start") {
-                config.soft_pity_start = v.as_f64().unwrap_or(65.0).round() as usize;
-            }
-            if let Some(v) = map.get("soft_pity_slope") {
-                config.soft_pity_slope = v.as_f64().unwrap_or(0.05);
-            }
-            if let Some(v) = map.get("small_pity_guarantee") {
-                config.small_pity_guarantee = v.as_f64().unwrap_or(80.0).round() as usize;
-            }
-            if let Some(v) = map.get("big_pity_cumulative") {
-                config.big_pity_cumulative = v.as_f64().unwrap_or(120.0).round() as usize;
-            }
-            if let Some(v) = map.get("up_pity_soft") {
-                config.up_pity_soft = v.as_f64().unwrap_or(0.0).round() as usize;
-            }
-            if let Some(v) = map.get("five_star_pity") {
-                config.five_star_pity = v.as_f64().unwrap_or(10.0).round() as usize;
-            }
-            if let Some(v) = map.get("always_5_star") {
-                config.always_5_star = v.as_bool().unwrap_or(false);
-            }
-            if let Some(v) = map.get("big_pity_requires_not_up") {
-                config.big_pity_requires_not_up = v.as_bool().unwrap_or(true);
-            }
-            if let Some(v) = map.get("six_stars") {
-                config.six_stars = json_to_string_vec(v);
-            }
-            if let Some(v) = map.get("five_stars") {
-                config.five_stars = json_to_string_vec(v);
-            }
-            if let Some(v) = map.get("four_stars") {
-                config.four_stars = json_to_string_vec(v);
-            }
-            if let Some(v) = map.get("active_pool") {
-                config.active_pool = v.as_str().map(|s| s.to_string());
-            }
-            if let Some(JsonValue::Array(pools)) = map.get("pools") {
-                config.pools = pools
-                    .iter()
-                    .filter_map(|v| match v {
-                        JsonValue::Object(pool_map) => Some(parse_pool_config(pool_map)),
-                        _ => None,
-                    })
-                    .collect();
+            if let Some(v) = map.get("pools_path") {
+                config.pools_path = v.as_str().unwrap_or("data/pools.json").to_string();
             }
             if let Some(v) = map.get("luck_mode") {
                 config.luck_mode = LuckMode::from_str(v.as_str().unwrap_or("probability"));
@@ -993,6 +935,17 @@ impl Config {
             }
         }
 
+        // Pools live in a separate file (config.pools_path). For backward
+        // compatibility, if the main config still embeds a `pools` array we
+        // parse pools from there instead of loading the external file.
+        let pools_root: JsonValue = match &root {
+            JsonValue::Object(map) if map.contains_key("pools") => root.clone(),
+            _ => load_pools_root(&config.pools_path),
+        };
+        if let JsonValue::Object(ref pmap) = pools_root {
+            extract_pool_fields(&mut config, pmap);
+        }
+
         sanitize_pity_settings(
             &mut config.soft_pity_start,
             &mut config.small_pity_guarantee,
@@ -1071,7 +1024,7 @@ impl Config {
         }
 
         if config.language.as_deref() == Some("en") {
-            if let JsonValue::Object(ref map) = root {
+            if let JsonValue::Object(ref map) = pools_root {
                 if let Some(JsonValue::Array(pools_arr)) = map.get("pools") {
                     for (i, pool_val) in pools_arr.iter().enumerate() {
                         if let (JsonValue::Object(ref pm), Some(pool)) =
@@ -1136,6 +1089,126 @@ impl Config {
         self.four_stars = pool.four_stars;
         self.active_pool = Some(pool_id.to_string());
         true
+    }
+}
+
+/// Read and parse the external pools file (config.pools_path). Applies the
+/// same parent-directory fallback as the main config loader so it works from
+/// `target/**/exe` layouts. Returns `JsonValue::Null` if the file is missing
+/// or invalid (the caller then simply has no pools defined).
+fn load_pools_root(path: &str) -> JsonValue {
+    let mut file = match File::open(path) {
+        Ok(f) => Some(f),
+        Err(_) => {
+            let mut found = None;
+            for levels in [2, 3] {
+                if let Some(fallback) = fallback_parent_path(path, levels) {
+                    if let Ok(f) = File::open(&fallback) {
+                        println!(
+                            "[System] Pools file found in parent directory ({} levels up).",
+                            levels
+                        );
+                        found = Some(f);
+                        break;
+                    }
+                }
+            }
+            found
+        }
+    };
+
+    let Some(ref mut f) = file else {
+        eprintln!(
+            "\x1b[33m[Warning]\x1b[0m Pools file '{}' not found; no pools loaded.",
+            path
+        );
+        return JsonValue::Null;
+    };
+
+    let mut contents = String::new();
+    if f.read_to_string(&mut contents).is_err() {
+        log::error!("Failed to read pools file '{}'", path);
+        return JsonValue::Null;
+    }
+    let stripped = strip_json_comments(&contents);
+    match serde_json::from_str(&stripped) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!(
+                "\x1b[1;31m[Error]\x1b[0m Pools JSON parse error in '{}': {}",
+                path, err
+            );
+            JsonValue::Null
+        }
+    }
+}
+
+/// Populate the pool-related fields of `config` from a JSON object (either the
+/// external pools file root or, for backward compatibility, the main config
+/// root when it still embeds a `pools` array).
+fn extract_pool_fields(config: &mut Config, map: &serde_json::Map<String, JsonValue>) {
+    if let Some(v) = map.get("pool_name") {
+        config.pool_name = v.as_str().unwrap_or("").to_string();
+    }
+    if let Some(v) = map.get("up_six") {
+        config.up_six = json_to_string_vec(v);
+    }
+    if let Some(v) = map.get("up_rate") {
+        config.up_rate = v.as_f64().unwrap_or(0.5);
+    }
+    if let Some(v) = map.get("prob_6_base") {
+        config.prob_6_base = v.as_f64().unwrap_or(0.008);
+    }
+    if let Some(v) = map.get("prob_5_base") {
+        config.prob_5_base = v.as_f64().unwrap_or(0.08);
+    }
+    if let Some(v) = map.get("prob_4_base") {
+        config.prob_4_base = v.as_f64().unwrap_or(0.912);
+    }
+    if let Some(v) = map.get("soft_pity_start") {
+        config.soft_pity_start = v.as_f64().unwrap_or(65.0).round() as usize;
+    }
+    if let Some(v) = map.get("soft_pity_slope") {
+        config.soft_pity_slope = v.as_f64().unwrap_or(0.05);
+    }
+    if let Some(v) = map.get("small_pity_guarantee") {
+        config.small_pity_guarantee = v.as_f64().unwrap_or(80.0).round() as usize;
+    }
+    if let Some(v) = map.get("big_pity_cumulative") {
+        config.big_pity_cumulative = v.as_f64().unwrap_or(120.0).round() as usize;
+    }
+    if let Some(v) = map.get("up_pity_soft") {
+        config.up_pity_soft = v.as_f64().unwrap_or(0.0).round() as usize;
+    }
+    if let Some(v) = map.get("five_star_pity") {
+        config.five_star_pity = v.as_f64().unwrap_or(10.0).round() as usize;
+    }
+    if let Some(v) = map.get("always_5_star") {
+        config.always_5_star = v.as_bool().unwrap_or(false);
+    }
+    if let Some(v) = map.get("big_pity_requires_not_up") {
+        config.big_pity_requires_not_up = v.as_bool().unwrap_or(true);
+    }
+    if let Some(v) = map.get("six_stars") {
+        config.six_stars = json_to_string_vec(v);
+    }
+    if let Some(v) = map.get("five_stars") {
+        config.five_stars = json_to_string_vec(v);
+    }
+    if let Some(v) = map.get("four_stars") {
+        config.four_stars = json_to_string_vec(v);
+    }
+    if let Some(v) = map.get("active_pool") {
+        config.active_pool = v.as_str().map(|s| s.to_string());
+    }
+    if let Some(JsonValue::Array(pools)) = map.get("pools") {
+        config.pools = pools
+            .iter()
+            .filter_map(|v| match v {
+                JsonValue::Object(pool_map) => Some(parse_pool_config(pool_map)),
+                _ => None,
+            })
+            .collect();
     }
 }
 
@@ -1267,6 +1340,7 @@ fn warn_unknown_fields(map: &serde_json::Map<String, JsonValue>) {
         "four_stars",
         "pools",
         "active_pool",
+        "pools_path",
         "luck_mode",
         "fast_init",
         "ppo_mode",

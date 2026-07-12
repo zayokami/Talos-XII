@@ -86,11 +86,16 @@ See **[docs/USAGE.md](docs/USAGE.md)** for the full command reference — intera
 
 ## Pools & Configuration
 
-All configuration is centralized in [data/config.json](data/config.json). Field-level documentation is in the `_comment` entries.
+Configuration is split into two files, each with field-level documentation in its `_comment` entries:
+
+- **[data/config.json](data/config.json)** — model, training (PPO/DQN/luck-budget), worker, and ACHF parameters.
+- **[data/pools.json](data/pools.json)** — all gacha pool definitions. The path is set by `pools_path` in `config.json`.
+
+(For backward compatibility, a `pools` array embedded directly in `config.json` still takes precedence over the external file if present.)
 
 ### Pool System
 
-Talos-XII supports four pool types: **character UP** (limited rate-up), **weapon UP** (weapon rate-up), **standard** (regular banner), and **beginner**. Each pool has independent ID, name, UP targets, and probability parameters. The `active_pool` field selects the current pool; archived pools (`is_archived: true`) can still be switched to manually for retrospective analysis.
+Talos-XII supports four pool types: **character UP** (limited rate-up), **weapon UP** (weapon rate-up), **standard** (regular banner), and **beginner**. Each pool has independent ID, name, UP targets, and probability parameters. In `pools.json`, the `active_pool` field selects the current pool; archived pools (`is_archived: true`) can still be switched to manually for retrospective analysis.
 
 ### Probabilities & Pity
 
@@ -332,11 +337,16 @@ cargo run --release -- benchmark                  # 快速内置基准
 
 ## 卡池与配置
 
-所有配置集中在 [data/config.json](data/config.json)，`_comment` 字段有逐项说明。
+配置拆分为两个文件，各自的 `_comment` 字段有逐项说明：
+
+- **[data/config.json](data/config.json)** — 模型、训练（PPO/DQN/运势预算）、线程和 ACHF 参数。
+- **[data/pools.json](data/pools.json)** — 所有抽卡卡池定义，路径由 `config.json` 中的 `pools_path` 指定。
+
+（为向后兼容，若 `config.json` 里仍直接内嵌 `pools` 数组，则优先使用内嵌的，忽略外部文件。）
 
 ### 卡池系统
 
-四种卡池类型：**角色 UP 池**、**武器 UP 池**、**常驻池**和**新手池**。每个池有独立 ID、名称、UP 对象和概率参数。`active_pool` 决定当前激活的池，`pools` 数组包含所有可切换的池定义。已归档的池（`is_archived: true`）仍可在交互模式中手动切换用于回溯分析。
+四种卡池类型：**角色 UP 池**、**武器 UP 池**、**常驻池**和**新手池**。每个池有独立 ID、名称、UP 对象和概率参数。在 `pools.json` 中，`active_pool` 决定当前激活的池，`pools` 数组包含所有可切换的池定义。已归档的池（`is_archived: true`）仍可在交互模式中手动切换用于回溯分析。
 
 ### 概率与保底
 
