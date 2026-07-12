@@ -106,7 +106,7 @@
   "fast_init": false,
   "device": "auto",
   "ppo_mode": "balanced",
-  "ppo_total_steps": 2048,
+  "ppo_total_steps": 30000,
   "ppo_steps_per_update": 1024,
   "ppo_k_epochs": 3,
   "ppo_batch_size": 128,
