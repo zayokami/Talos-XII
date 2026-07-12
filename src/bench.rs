@@ -1183,7 +1183,13 @@ fn write_summary_txt(
             // percentages are comparable and sum to ~100%. Dividing the path
             // rates by only (sparse+dense) previously excluded cache hits,
             // making dense read 100% even when 45% of calls were cache hits.
-            let pct = |n: u64| if calls > 0.0 { n as f64 / calls * 100.0 } else { 0.0 };
+            let pct = |n: u64| {
+                if calls > 0.0 {
+                    n as f64 / calls * 100.0
+                } else {
+                    0.0
+                }
+            };
             let hit_pct = pct(stats.cache_hits);
             let sparse_pct = pct(stats.sparse_paths);
             let dense_pct = pct(stats.dense_paths);
