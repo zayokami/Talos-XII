@@ -23,62 +23,9 @@ Talos-XII 会在在模拟前先训练 DBN 建模环境噪声、DQN 和 PPO 学�
 
 ## System Requirements
 
-### Minimum & Recommended (CPU-only build)
+A CPU-only build runs out of the box on Windows 10+, macOS 11+, and Linux (x86_64 / ARM64, including Apple Silicon and Raspberry Pi). GPU acceleration is optional and requires an NVIDIA GPU (CC 7.5+) with CUDA Toolkit 12.0+.
 
-| Item | Minimum | Recommended |
-|---|---|---|
-| CPU | Any x86_64 or ARM64 (including Apple Silicon) | x86_64 with AVX2+FMA |
-| RAM | 1 GB free | 4 GB+ |
-| Disk | 700 MB (exe + config) | 750 MB (with cache files) |
-| OS | Windows 10+, macOS 11+, Linux kernel 4.0+ | — |
-
-### GPU Build — Additional Requirements
-
-| Item | Minimum | Recommended |
-|---|---|---|
-| GPU | NVIDIA GPU with Compute Capability 7.5+ | RTX 20 series / GTX 16 series or newer |
-| VRAM | 2 GB | 4 GB+ |
-| CUDA Toolkit | 12.0+ | 12.0+ |
-| NVIDIA Driver | 525+ | Latest stable |
-
-GPU builds are **optional**. The CPU-only binary runs on all supported platforms out of the box. GPU acceleration is enabled only when compiled with `--features cuda` and a compatible NVIDIA GPU is detected at runtime. If the GPU is unavailable, initialization fails gracefully and the program falls back to CPU automatically.
-
-### Platform Details
-
-**Windows (x86_64)**
-
-| Item | Details |
-|---|---|
-| OS | Windows 10 1809+ / Windows 11 |
-| Architecture | x86_64 (32-bit not supported) |
-| Runtime deps (CPU) | None — statically linked, no MSVC runtime required |
-| Runtime deps (GPU) | NVIDIA driver + CUDA Toolkit 12.0+ for compilation; `cudart.dll`/`cuda.dll`/`cublas.dll` required at runtime |
-| Terminal | Windows Terminal / PowerShell / CMD — Windows Terminal recommended for full color output |
-| SIMD | Auto-detected at runtime: AVX-512 → AVX2+FMA → Scalar |
-| Thread affinity | Automatic core pinning via `SetThreadAffinityMask` |
-
-**macOS (x86_64 / ARM64)**
-
-| Item | Details |
-|---|---|
-| OS | macOS 11 Big Sur+ |
-| Architecture | Apple Silicon (M1/M2/M3/M4) native ARM64, or Intel x86_64 |
-| Runtime deps | None for CPU build |
-| Terminal | Terminal.app / iTerm2 |
-| SIMD | NEON on Apple Silicon; AVX2 on Intel Mac |
-| Notes | Must compile from source (`cargo build --release`). GPU acceleration not available on macOS (no NVIDIA CUDA). |
-
-**Linux (x86_64 / ARM64)**
-
-| Item | Details |
-|---|---|
-| OS | Any mainstream distro (Ubuntu 18.04+, Debian 10+, CentOS 7+, Arch, etc.) |
-| Architecture | x86_64 or ARM64 (Raspberry Pi 4/5 supported) |
-| Runtime deps (CPU) | glibc 2.17+ (CentOS 7 level), or zero deps with musl static build |
-| Runtime deps (GPU) | NVIDIA driver + CUDA Toolkit 12.0+ for compilation; `libcudart.so`/`libcuda.so`/`libcublas.so` required at runtime |
-| Terminal | Any terminal with ANSI color support |
-| SIMD | Same as Windows — runtime auto-detection |
-| Notes | Must compile from source. GPU requires NVIDIA proprietary driver; Nouveau is not supported. |
+See **[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md)** for full minimum/recommended specs and per-platform details (runtime deps, SIMD, terminals).
 
 ---
 
@@ -124,138 +71,16 @@ When the binary is built without the `cuda` feature, `cuda`/`auto` fall back to 
 
 ## Usage
 
-All subcommands support `-c <path>` for config, `-s <seed>` for reproducible runs, and `-f` to force model retraining.
-
-### Interactive Mode
+All subcommands support `-c <path>` for config, `-s <seed>` for reproducible runs, and `-f` to force model retraining. Common entry points:
 
 ```bash
-cargo run --release
+cargo run --release                              # interactive mode
+cargo run --release -- simulate -n 1000 -p 100   # batch simulation
+cargo run --release -- f2p                        # F2P UP-probability analysis
+cargo run --release -- benchmark                  # quick built-in benchmark
 ```
 
-Enter numbers to pull. Commands:
-- `p <n>` / `s <n>` — set default pulls / simulation count
-- `w` — toggle welfare (free resources) mode
-- `ppo` — toggle PPO strategy assist
-- `pool list` / `pool <id>` / `pool all` — list/switch/simulate all pools
-- `status` / `info` / `history` — view state, pool details, pull history
-- `h` — help, `q` — quit
-
-### Batch Simulation
-
-```bash
-cargo run --release -- simulate -n 1000 -p 100
-```
-
-Runs 1000 simulations of 100 pulls each, outputting average 6-star counts, UP rates, etc.
-
-### F2P Analysis
-
-The core feature: "Can I get the UP character with free resources as a F2P player?"
-
-```bash
-cargo run --release -- f2p
-```
-
-Simulates massive free-resource scenarios (1M in release mode), outputting:
-- **F2P UP Probability** — percentage of simulations where UP was obtained without spending
-- **Expected UP Count** — average number of UP characters obtained
-- **Extra Jade Cost** — average additional paid currency needed if free resources weren't enough
-
-If "Avg Extra Jade Cost" is N/A, all simulations cleared UP within the free pull budget.
-
-### Python Scripting (Optional)
-
-Enable the optional PyO3 bridge to run a Python script inside the Talos-XII process:
-
-```bash
-cargo run --features python -- python <script.py> -- <args>
-```
-
-Example:
-
-```bash
-cargo run --features python -- python examples/python/autograd_minimal.py -- 1.0
-```
-
-The final `--` separates arguments passed to the script; inside Python they are available through `sys.argv[1:]`. The embedded interpreter exposes a built-in `talos_xii` module with `Tensor`, `tensor`, `full`, `zeros`, `ones`, `arange`, `eye`, `rand`, `randn`, dtype constants, scalar/Tensor arithmetic, and autograd operations such as `matmul`, `mse_loss`, `l2_loss`, `smooth_l1_loss`, cross-entropy losses, reductions, shape ops, normalization, pooling, convolution, `backward`, and `grad`.
-
-To write your own script, create a normal `.py` file, import `talos_xii`, build tensors, compute a scalar loss, then call `backward()`:
-
-```python
-# scripts/my_train.py
-import sys
-import talos_xii as tx
-
-target = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
-
-x = tx.tensor([1.0, 2.0], [1, 2])
-w = tx.tensor([0.25, -0.5], [2, 1])
-y = x.matmul(w) + 0.1
-loss = y.mse_loss(tx.tensor([target], [1, 1]))
-loss.backward()
-
-print("prediction:", y.item())
-print("loss:", loss.item())
-print("grad_w:", w.grad())
-```
-
-Run it from the project root:
-
-```bash
-cargo run --features python -- python scripts/my_train.py -- 1.0
-```
-
-Think of `talos_xii` as the small tensor/autograd module provided by this binary. Use `tx.tensor(...)` for your data, `tx.zeros/full/arange/eye/randn(...)` for common inputs, and normal Python operators like `x + 1.0`, `2.0 * x`, `x ** 2.0`, `x % 2.0`, and `abs(x)` for math. Tensor methods also cover common activation/special functions (`relu`, `gelu`, `relu6`, `elu`, `selu`, `softplus`, `softsign`, `sigmoid`, `tanh`, `sin`, `cos`, `acos`, `asin`, `atan`, `erf`, `erfc`, `sqrt`, `rsqrt`, `log1p`, `expm1`) plus `concat`, `split`, `strided_slice`, `l2_normalize`, `group_norm`, `instance_norm`, `batch_norm2d`, `avg_pool2d`, `max_pool2d`, `pooling`, `conv2d`, `conv2d_transpose`, `depthwise_conv2d`, `conv3d`, and `gemm`/`matmul`.
-
-Operator names with explicit `*Grad` or `*Backprop*` are handled through autograd: call `loss.backward()` and then read `tensor.grad()`. `SoftmaxV2`/`LogSoftmaxV2` map to `softmax(dim)` and `log_softmax(dim)`. `Conv2DCompress` is currently a compatibility alias for the standard `conv2d` math path; Talos-XII does not yet store a separate compressed convolution weight format.
-
-No NumPy or PyTorch installation is required for Talos-XII tensor/autograd scripts. The optional bridge links against a local Python runtime supported by PyO3. Scripts are arbitrary Python code and are not sandboxed: they run with the same OS permissions as the Talos-XII process, can read/write files, read environment variables, import local modules, start child processes, perform network access, and terminate the process. Run only scripts you trust. The Python tensor constructors and shape-producing bridge APIs enforce per-tensor allocation guards, and exporting tensors to Python lists has a separate size guard.
-Most tensor methods are also available as `tx.*` functional calls with the same names, so you can choose whichever style reads better in a script. Arithmetic is aligned too: `x.add(y)` / `tx.add(x, y)` match `x + y`, with the same pattern for `sub`, `mul`, `div`, and `neg`.
-
-### Data Collection & Model Calibration
-
-```bash
-cargo run -- collect add          # interactive single-record entry
-cargo run -- collect import data.json  # bulk import from JSON
-cargo run -- collect stats        # view collected data statistics
-cargo run -- train                # calibrate models with collected data
-```
-
-### Benchmarks
-
-```bash
-cargo run --release -- benchmark
-```
-
-Runs the quick built-in benchmark: 500 fast simulations and 100 detailed simulations, each with 100 pulls.
-
-### Paper-Grade ACHF Benchmark
-
-Generates complete experimental data and charts (SVG/PNG) for the ACHF paper:
-
-```bash
-cargo run --release -- benchmark paper                      # all 7 experiments, 3 trials
-cargo run --release -- benchmark paper --trials 5           # 5 independent trials w/ CI
-cargo run --release -- benchmark paper --only ablation      # ablation study only
-cargo run --release -- benchmark paper --format png         # PNG output
-cargo run --release -- benchmark paper --output-dir results # custom output dir
-```
-
-Each experiment runs 3 trials by default (`--trials N` to adjust), outputting mean ± std and 95% CI. Output includes charts (SVG/PNG), `summary.json` (structured data for LaTeX/matplotlib), raw CSVs, and human-readable `summary.txt`.
-
-7 experiments:
-
-| Experiment | Description |
-|---|---|
-| `ablation` | ACHF on/off throughput + reward curves |
-| `mode` | lite vs full mode comparison |
-| `path` | Cached / LowRank / Dense inference path latency (boxplot) |
-| `gate` | Training curves: gate, g_min, grad_ema, sparsity, adaptive_bias |
-| `scale` | Throughput vs rank (with ACHF-off baseline) |
-| `apply` | ACHF applied to different components (FFN/Attention/DQN) |
-| `convergence` | Training loss + reward convergence with ACHF on/off |
-
-Output goes to `bench_output/` (`--output-dir` to customize).
+See **[docs/USAGE.md](docs/USAGE.md)** for the full command reference — interactive commands, F2P output fields, the optional Python (PyO3) scripting bridge, data collection & model calibration, and the paper-grade ACHF benchmark suite.
 
 ---
 
@@ -299,17 +124,79 @@ Cached models are portable — they learn pity/probability mechanisms, not chara
 
 ### ACHF (Adaptive Cache-aware Hyper-Connections)
 
-A proprietary training and inference acceleration system. Core idea: low-rank projection reduces operator size, gating sparsity skips low-contribution channels, and runtime latency feedback dynamically adjusts gating/projection parameters, finding the balance between speed, stability, and accuracy.
+ACHF is Talos-XII's proprietary training/inference acceleration layer. It replaces a plain dense `Linear` with a self-tuning block that keeps two views of the same operator — a full **dense** weight and a pruned **sparse** weight — and decides at runtime how much of each to use, how often to re-project onto a low-rank manifold, and which physical execution path is actually fastest on the current machine. The goal is to cut the CPU matmul and cache-miss cost that dominates small-batch neural inference, without letting the approximation destabilize training.
 
-**Problems solved:** CPU-bound neural network matrix multiplication; cache misses degrading throughput; varying optimal sparsity/projection frequency across hardware.
+The block behaves differently in the two lifecycle phases. **During training** the weights keep changing, so ACHF focuses on the *gate* (how much sparsity to admit) and periodic *manifold projection* (row/column or Sinkhorn normalization + low-rank truncation) that keeps the operator well-conditioned. **After `freeze_for_inference()`** the weights are fixed, ACHF fuses the pruned operator into a cache-friendly form, and path selection switches from adaptive probing to the deterministic fused-cache path (see AMA below).
+
+```mermaid
+flowchart TD
+    X["input x"] --> G{"training or frozen?"}
+
+    subgraph TRAIN["Training path (weights changing)"]
+        direction TB
+        CG["compute_gate&nbsp;g&nbsp;∈&nbsp;[g_min,&nbsp;1]<br/>gate_mode: grad_ema / fim_trace"] --> DW["dense weight · g"]
+        SW["sparse weight · (1−g)"] --> BLEND["blend = dense·g + sparse·(1−g)"]
+        DW --> BLEND
+        BLEND --> BWD["backward → update_after_backward<br/>(EMA of grad RMS)"]
+        BWD --> PROJ{"step % proj_freq == 0?"}
+        PROJ -- yes --> MANI["project_weight:<br/>row/col or Sinkhorn normalize<br/>+ low-rank truncation (rank r)"]
+        MANI --> PRUNE["prune below threshold<br/>→ refresh sparse weight"]
+        PROJ -- no --> SKIP["keep operator"]
+    end
+
+    subgraph INFER["Frozen path (weights fixed)"]
+        direction TB
+        FUSE["fused cached operator<br/>(dense ⊕ sparse ⊕ bias)"] --> AMA["AMA path selection<br/>Cached / Sparse / Dense"]
+    end
+
+    G -- training --> TRAIN
+    G -- frozen --> INFER
+    TRAIN --> OUT["output"]
+    INFER --> OUT
+```
+
+**Problems solved:** CPU-bound neural-network matrix multiplication; cache misses degrading throughput; the fact that the optimal sparsity/projection frequency and even the fastest execution path differ across hardware.
 
 **Four mechanisms:**
-- **Low-rank Projection** — row/column/dual projection (`proj_mode`), low-rank approximation replaces original weight, reduces compute and cache pressure (`proj_freq` controls frequency)
-- **Gating Sparsity** — channels with gate values below threshold are skipped; `g_min` sets a floor to prevent output instability
-- **Adaptive Control** — runtime latency sampling with EMA smoothing feeds back into gating and caching policy, avoiding performance jitter
-- **Path-level Toggle** — independently enable/disable ACHF on Attention, FFN, and DQN paths to protect accuracy-sensitive pathways
+- **Low-rank Projection** — row/column or dual (Sinkhorn) projection (`proj_mode`), followed by rank-`r` truncation, replaces the operator with a low-rank approximation that reduces compute and cache pressure (`proj_freq` controls how often it runs; `0` disables it).
+- **Gating Sparsity** — a gate value `g ∈ [g_min, 1]` blends dense and pruned weights; channels below threshold are skipped. `g_min` sets a floor so aggressive sparsity can't destabilize the output. The gate is driven by an EMA of gradient RMS (`grad_ema`) or Fisher trace (`fim_trace`).
+- **Adaptive Control (AMA)** — runtime latency sampling with EMA smoothing decides which execution path to run, with hysteresis to avoid path thrashing (see below).
+- **Path-level Toggle** — independently enable/disable ACHF on Attention (`apply_attn`), FFN (`apply_ffn`), and DQN (`apply_dqn`) paths to protect accuracy-sensitive links.
 
-Recommended starting point: `mode=lite` + `apply_ffn=true`. If oscillation or slow convergence occurs, raise `g_min` or lower `proj_freq`. For accuracy-sensitive scenarios, enable only the FFN path.
+**Recommended starting point:** `mode=lite` + `apply_ffn=true`. If oscillation or slow convergence occurs, raise `g_min` or lower `proj_freq` (or set it to `0`). For accuracy-sensitive scenarios, enable only the FFN path.
+
+### AMA
+
+AMA is the runtime scheduler inside ACHF that answers a single question on every inference call: *which of the three mathematically-equivalent execution paths is fastest right now?*
+
+- **Cached** — the pre-fused low-rank/sparse operator; cheapest when the cache is valid.
+- **Sparse** — the pruned weight applied directly (skips zeroed channels).
+- **Dense** — the full weight; the always-correct fallback.
+
+Because the fastest path depends on batch shape, sparsity ratio, and the host CPU's cache behavior, AMA treats the three paths as arms of a multi-armed bandit. It measures each arm's latency (cold/warm split, EMA-smoothed), *probes* arms that have gone stale, and otherwise sticks with the current winner. A **hysteresis margin** keeps the previous path unless a challenger is meaningfully faster, so the scheduler doesn't flip-flop between two near-equal paths.
+
+A **frozen** layer short-circuits this entirely: its weights never change, so the fused Cached path is permanently valid and cheapest — AMA is skipped and Cached is used deterministically (falling back to Sparse/Dense only if the cache is shape/sparsity-invalid).
+
+```mermaid
+flowchart TD
+    CALL["inference call"] --> FROZEN{"layer frozen?"}
+    FROZEN -- yes --> CV{"cache valid?<br/>(shape · rows · sparsity)"}
+    CV -- yes --> USEC["use Cached (deterministic)"]
+    CV -- no --> FB["fall back: Sparse → Dense"]
+
+    FROZEN -- no --> PROBE{"any arm stale /<br/>never measured?"}
+    PROBE -- yes --> DOPROBE["probe that arm<br/>(force latency sample)"]
+    PROBE -- no --> SCORE["compare EMA latencies<br/>Cached vs Sparse vs Dense"]
+    SCORE --> HYST{"challenger faster<br/>beyond margin?"}
+    HYST -- no --> KEEP["keep previous path (hysteresis)"]
+    HYST -- yes --> SWITCH["switch to faster path"]
+    DOPROBE --> REC["record latency → update EMA"]
+    KEEP --> REC
+    SWITCH --> REC
+    USEC --> REC
+    FB --> REC
+    REC --> DONE["execute chosen path"]
+```
 
 ### SIMD Acceleration (`src/simd.rs`)
 
@@ -326,7 +213,7 @@ Runtime CPU capability detection with automatic dispatch: Scalar → AVX2 → AV
 
 ---
 
-## Testing (142 tests)
+## Testing (236 tests)
 
 ```bash
 cargo test
@@ -382,62 +269,9 @@ Contact: into@zayoka.com
 
 ## 系统要求
 
-### 最低 / 推荐配置（CPU 版）
+纯 CPU 版在 Windows 10+、macOS 11+、Linux（x86_64 / ARM64，含 Apple Silicon 与树莓派）上开箱即用。GPU 加速为可选项，需要计算能力 7.5+ 的 NVIDIA GPU 和 CUDA Toolkit 12.0+。
 
-| 项目 | 最低要求 | 推荐配置 |
-|---|---|---|
-| CPU | 任意 x86_64 或 ARM64（含 Apple Silicon） | 支持 AVX2+FMA 的 x86_64 |
-| 内存 | 1 GB 可用 | 4 GB + |
-| 磁盘 | 700 MB（exe + config） | 750 MB（含缓存文件） |
-| 操作系统 | Windows 10+、macOS 11+、Linux kernel 4.0+ | — |
-
-### GPU 版 — 附加要求
-
-| 项目 | 最低要求 | 推荐配置 |
-|---|---|---|
-| GPU | NVIDIA GPU，计算能力 7.5+ | RTX 20 系列 / GTX 16 系列或更新 |
-| 显存 | 2 GB | 4 GB+ |
-| CUDA Toolkit | 12.0+ | 12.0+ |
-| NVIDIA 驱动 | 525+ | 最新稳定版 |
-
-GPU 版是**可选**的。纯 CPU 二进制可在所有支持平台上开箱即用。只有在编译时启用 `--features cuda` 且运行时检测到兼容的 NVIDIA GPU 时才会启用 GPU 加速。如果 GPU 不可用，初始化会优雅失败并自动回退到 CPU。
-
-### 各平台详细说明
-
-**Windows (x86_64)**
-
-| 项目 | 说明 |
-|---|---|
-| 系统 | Windows 10 1809+ / Windows 11 |
-| 架构 | x86_64（不支持 32 位） |
-| 运行时依赖（CPU 版） | 无，静态链接，不需要 MSVC 运行库 |
-| 运行时依赖（GPU 版） | NVIDIA 驱动 + CUDA Toolkit 12.0+（编译时）；运行时需 `cudart.dll`/`cuda.dll`/`cublas.dll` |
-| 终端 | Windows Terminal / PowerShell / CMD 均可，推荐 Windows Terminal（彩色输出更完整） |
-| SIMD 加速 | 自动检测：有 AVX-512 走 AVX-512，有 AVX2+FMA 走 AVX2，都没有走标量 |
-| 线程亲和性 | 通过 `SetThreadAffinityMask` 自动绑核 |
-
-**macOS (x86_64 / ARM64)**
-
-| 项目 | 说明 |
-|---|---|
-| 系统 | macOS 11 Big Sur+ |
-| 架构 | Apple Silicon (M1/M2/M3/M4) 原生 ARM64，或 Intel Mac x86_64 |
-| 运行时依赖 | 无（CPU 版） |
-| 终端 | Terminal.app / iTerm2 |
-| SIMD 加速 | Apple Silicon 走 NEON；Intel Mac 走 AVX2 |
-| 注意事项 | 需自行编译（`cargo build --release`）。macOS 不支持 GPU 加速（无 NVIDIA CUDA）。 |
-
-**Linux (x86_64 / ARM64)**
-
-| 项目 | 说明 |
-|---|---|
-| 系统 | 任意主流发行版（Ubuntu 18.04+、Debian 10+、CentOS 7+、Arch 等） |
-| 架构 | x86_64 或 ARM64（树莓派 4/5 也能跑） |
-| 运行时依赖（CPU 版） | glibc 2.17+（CentOS 7 级别），或 musl 静态编译则零依赖 |
-| 运行时依赖（GPU 版） | NVIDIA 驱动 + CUDA Toolkit 12.0+（编译时）；运行时需 `libcudart.so`/`libcuda.so`/`libcublas.so` |
-| 终端 | 任意支持 ANSI 颜色的终端 |
-| SIMD 加速 | 同 Windows，运行时自动检测 CPU 特征 |
-| 注意事项 | 需自行编译。GPU 加速需要 NVIDIA 专有驱动；Nouveau 开源驱动暂不支持。 |
+完整的最低/推荐配置和各平台详细说明（运行时依赖、SIMD、终端）见 **[docs/REQUIREMENTS.md](docs/REQUIREMENTS.md)**。
 
 ---
 
@@ -483,138 +317,16 @@ CUDA_ARCH=sm_89 cargo build --release --features cuda
 
 ## 使用方法
 
-所有子命令支持 `-c <path>` 指定配置、`-s <seed>` 固定随机种子、`-f` 强制重训模型。
-
-### 交互模式
+所有子命令支持 `-c <path>` 指定配置、`-s <seed>` 固定随机种子、`-f` 强制重训模型。常用入口：
 
 ```bash
-cargo run --release
+cargo run --release                              # 交互模式
+cargo run --release -- simulate -n 1000 -p 100   # 批量模拟
+cargo run --release -- f2p                        # F2P 获取 UP 概率分析
+cargo run --release -- benchmark                  # 快速内置基准
 ```
 
-输入数字为本次抽卡数量，支持指令：
-- `p <n>` / `s <n>` — 设置默认抽数和模拟次数
-- `w` — 切换福利（免费资源）模式
-- `ppo` — 切换 PPO 策略辅助
-- `pool list` / `pool <id>` / `pool all` — 列出/切换/模拟全部卡池
-- `status` / `info` / `history` — 查看状态、卡池详情、历史记录
-- `h` — 帮助，`q` — 退出
-
-### 批量模拟
-
-```bash
-cargo run --release -- simulate -n 1000 -p 100
-```
-
-运行 1000 次模拟，每次 100 抽，输出平均 6 星数、UP 率等统计结果。
-
-### F2P 分析
-
-Talos-XII 的核心功能：回答"零氪/月卡玩家靠免费资源能不能拿到 UP"。
-
-```bash
-cargo run --release -- f2p
-```
-
-基于当前卡池配置模拟大量免费资源场景（release 模式默认百万次），输出：
-- **F2P 获取 UP 概率** — 仅靠免费抽获得 UP 角色的百分比
-- **期望 UP 数量** — 平均能获得多少个 UP
-- **额外嵌晶玉成本** — 免费资源不够时，平均还需多少额外投入
-
-"Avg Extra Jade Cost" 显示 N/A 表示所有模拟都在免费抽内出了 UP，无需额外付费。
-
-### Python 脚本支持（可选）
-
-启用可选 PyO3 桥接后，可在 Talos-XII 进程内执行 Python 脚本：
-
-```bash
-cargo run --features python -- python <script.py> -- <args>
-```
-
-示例：
-
-```bash
-cargo run --features python -- python examples/python/autograd_minimal.py -- 1.0
-```
-
-最后一个 `--` 用于分隔传给脚本的参数；在 Python 中可通过 `sys.argv[1:]` 读取。嵌入式解释器会提供内置 `talos_xii` 模块，包含 `Tensor`、`tensor`、`full`、`zeros`、`ones`、`arange`、`eye`、`rand`、`randn`、dtype 常量、标量/Tensor 混合运算，以及 `matmul`、`mse_loss`、`l2_loss`、`smooth_l1_loss`、交叉熵 loss、归约、shape 操作、归一化、池化、卷积、`backward`、`grad` 等 autograd 操作。
-
-自定义脚本就是普通 `.py` 文件。先 `import talos_xii as tx`，再创建 Tensor，算出一个标量 loss，最后调用 `backward()`：
-
-```python
-# scripts/my_train.py
-import sys
-import talos_xii as tx
-
-target = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
-
-x = tx.tensor([1.0, 2.0], [1, 2])
-w = tx.tensor([0.25, -0.5], [2, 1])
-y = x.matmul(w) + 0.1
-loss = y.mse_loss(tx.tensor([target], [1, 1]))
-loss.backward()
-
-print("prediction:", y.item())
-print("loss:", loss.item())
-print("grad_w:", w.grad())
-```
-
-在项目根目录运行：
-
-```bash
-cargo run --features python -- python scripts/my_train.py -- 1.0
-```
-
-可以把 `talos_xii` 理解成这个二进制自带的小型张量/autograd 模块。用 `tx.tensor(...)` 放入数据，用 `tx.zeros/full/arange/eye/randn(...)` 创建常见输入，也可以直接写 `x + 1.0`、`2.0 * x`、`x ** 2.0`、`x % 2.0`、`abs(x)` 这类普通 Python 数学表达式。Tensor 方法也覆盖常见激活/特殊函数（`relu`、`gelu`、`relu6`、`elu`、`selu`、`softplus`、`softsign`、`sigmoid`、`tanh`、`sin`、`cos`、`acos`、`asin`、`atan`、`erf`、`erfc`、`sqrt`、`rsqrt`、`log1p`、`expm1`），以及 `concat`、`split`、`strided_slice`、`l2_normalize`、`group_norm`、`instance_norm`、`batch_norm2d`、`avg_pool2d`、`max_pool2d`、`pooling`、`conv2d`、`conv2d_transpose`、`depthwise_conv2d`、`conv3d`、`gemm`/`matmul`。
-
-带 `*Grad` 或 `*Backprop*` 的算子通过 autograd 覆盖：调用 `loss.backward()` 后读取 `tensor.grad()`。`SoftmaxV2`/`LogSoftmaxV2` 对应 `softmax(dim)` 和 `log_softmax(dim)`。`Conv2DCompress` 目前是标准 `conv2d` 数学路径的兼容别名；Talos-XII 还没有单独的压缩卷积权重存储格式。
-
-编写 Talos-XII 张量/autograd 脚本不需要安装 NumPy 或 PyTorch。这个可选桥接会链接本机 PyO3 支持的 Python 运行时。脚本是任意 Python 代码，且不提供沙箱隔离：脚本会以 Talos-XII 进程相同的系统权限运行，可以读写文件、读取环境变量、导入本地模块、启动子进程、访问网络，也可以直接终止进程。请只运行可信脚本。Python Tensor 构造函数和会产生新 shape 的桥接 API 都加了单 Tensor 分配保护，导出到 Python list 也有单独的大小保护。
-大多数 Tensor 方法也提供同名 `tx.*` functional 调用，例如 `x.relu()` 和 `tx.relu(x)` 都可以用，脚本里按可读性选择即可。算术 API 也保持一致：`x.add(y)` / `tx.add(x, y)` 等价于 `x + y`，`sub`、`mul`、`div`、`neg` 也是同一套规则。
-
-### 数据采集与模型校准
-
-```bash
-cargo run -- collect add          # 交互式录入单条记录
-cargo run -- collect import data.json  # 从 JSON 批量导入
-cargo run -- collect stats        # 查看已采集数据统计
-cargo run -- train                # 用采集数据校准模型
-```
-
-### 性能基准测试
-
-```bash
-cargo run --release -- benchmark
-```
-
-运行快速内置基准：500 次快速模拟和 100 次详细模拟，每次 100 抽。
-
-### ACHF 论文级 Benchmark
-
-为 ACHF 技术论文生成完整实验数据和图表（SVG/PNG）：
-
-```bash
-cargo run --release -- benchmark paper                      # 全部 7 项实验，默认 3 次试验
-cargo run --release -- benchmark paper --trials 5           # 5 次独立试验，计算 mean/std/95%CI
-cargo run --release -- benchmark paper --only ablation      # 仅消融实验
-cargo run --release -- benchmark paper --format png         # PNG 格式输出
-cargo run --release -- benchmark paper --output-dir results # 指定输出目录
-```
-
-每项实验默认 3 次独立试验（`--trials N` 调整），输出 mean ± std 及 95% 置信区间。结果包含带 error bars 的柱状图、训练曲线、箱线图（SVG/PNG）、`summary.json`（结构化数据，可导入 LaTeX/matplotlib）、原始 CSV 和人类可读的 `summary.txt`。
-
-7 项实验：
-
-| 实验 | 说明 |
-|---|---|
-| `ablation` | ACHF 开/关消融对比（吞吐量 + 奖励曲线） |
-| `mode` | lite vs full 模式对比 |
-| `path` | Cached / LowRank / Dense 推理路径延迟分布（箱线图） |
-| `gate` | 训练过程中 gate、g_min、grad_ema、sparsity、adaptive_bias 曲线 |
-| `scale` | 不同 rank 下的吞吐量（含 ACHF 关闭基线） |
-| `apply` | ACHF 应用于不同组件（FFN/Attention/DQN）的组合效果 |
-| `convergence` | ACHF 开/关状态下的训练 loss + reward 收敛曲线 |
-
-图表输出到 `bench_output/`（`--output-dir` 自定义）。
+完整命令参考见 **[docs/USAGE.md](docs/USAGE.md)** —— 交互指令、F2P 输出字段、可选的 Python（PyO3）脚本桥接、数据采集与模型校准，以及论文级 ACHF Benchmark 套件。
 
 ---
 
@@ -658,17 +370,79 @@ cargo run --release -- benchmark paper --output-dir results # 指定输出目录
 
 ### ACHF（Adaptive Cache-aware Hyper-Connections）
 
-自研训练与推理加速机制：通过低秩投影缩减算子规模，通过门控稀疏化跳过贡献小的通道，通过缓存与延迟统计动态调整参数，在速度、稳定性、精度间找到平衡。
+ACHF 是 Talos-XII 自研的训练/推理加速层。它用一个自调节模块替换普通的稠密 `Linear`：同一个算子同时保留**稠密**权重和剪枝后的**稀疏**权重两个视图，在运行时决定二者各用多少、多久往低秩流形上重新投影一次、以及当前机器上哪条物理执行路径最快。目标是削减小 batch 神经推理中占主导的 CPU 矩阵乘法和缓存未命中开销，同时不让这种近似破坏训练稳定性。
 
-**解决的问题：** CPU 上神经网络大矩阵乘法的瓶颈；缓存未命中拖慢吞吐量；不同机器最佳稀疏度和投影频率各异，固定超参难以兼顾。
+模块在两个生命周期阶段行为不同。**训练期**权重不断变化，ACHF 关注**门控**（允许多少稀疏度）和周期性的**流形投影**（行/列或 Sinkhorn 归一化 + 低秩截断），保持算子良态。**调用 `freeze_for_inference()` 之后**权重固定，ACHF 把剪枝算子融合成缓存友好的形式，路径选择也从自适应探测切换为确定性的融合缓存路径（见下方 AMA）。
+
+```mermaid
+flowchart TD
+    X["输入 x"] --> G{"训练 or 冻结?"}
+
+    subgraph TRAIN["训练路径（权重变化中）"]
+        direction TB
+        CG["compute_gate&nbsp;g&nbsp;∈&nbsp;[g_min,&nbsp;1]<br/>gate_mode: grad_ema / fim_trace"] --> DW["稠密权重 · g"]
+        SW["稀疏权重 · (1−g)"] --> BLEND["混合 = 稠密·g + 稀疏·(1−g)"]
+        DW --> BLEND
+        BLEND --> BWD["反向 → update_after_backward<br/>(梯度 RMS 的 EMA)"]
+        BWD --> PROJ{"step % proj_freq == 0?"}
+        PROJ -- 是 --> MANI["project_weight:<br/>行/列 或 Sinkhorn 归一化<br/>+ 低秩截断 (rank r)"]
+        MANI --> PRUNE["按阈值剪枝<br/>→ 刷新稀疏权重"]
+        PROJ -- 否 --> SKIP["保持算子"]
+    end
+
+    subgraph INFER["冻结路径（权重固定）"]
+        direction TB
+        FUSE["融合缓存算子<br/>(稠密 ⊕ 稀疏 ⊕ bias)"] --> AMA["AMA 路径选择<br/>Cached / Sparse / Dense"]
+    end
+
+    G -- 训练 --> TRAIN
+    G -- 冻结 --> INFER
+    TRAIN --> OUT["输出"]
+    INFER --> OUT
+```
+
+**解决的问题：** CPU 上神经网络大矩阵乘法的瓶颈；缓存未命中拖慢吞吐量；不同机器上最佳稀疏度、投影频率、甚至最快的执行路径都各不相同，固定超参难以兼顾。
 
 **四个核心机制：**
-- **低秩投影** — 对权重矩阵做行/列/行列联合投影（`proj_mode`），低秩近似替代原矩阵，减少计算和缓存压力（`proj_freq` 控制频率）
-- **门控稀疏** — 通道门控值低于阈值的直接跳过计算，`g_min` 设定下限防止过度稀疏导致输出不稳定
-- **自适应调参** — 运行时采样延迟统计，EMA 平滑后反馈到门控和缓存策略，避免性能抖动
-- **路径级开关** — 可分别对 Attention、FFN、DQN 启用/关闭 ACHF，保护对精度敏感的链路
+- **低秩投影** — 对权重矩阵做行/列或双向（Sinkhorn）投影（`proj_mode`），再做 rank-`r` 截断，用低秩近似替代原矩阵，减少计算和缓存压力（`proj_freq` 控制频率，设为 `0` 关闭）。
+- **门控稀疏** — 门控值 `g ∈ [g_min, 1]` 在稠密与剪枝权重间混合，低于阈值的通道直接跳过。`g_min` 设定下限，防止激进稀疏导致输出不稳定。门控由梯度 RMS 的 EMA（`grad_ema`）或 Fisher 迹（`fim_trace`）驱动。
+- **自适应控制（AMA）** — 运行时采样延迟并 EMA 平滑，决定走哪条执行路径，并用滞回避免路径抖动（见下）。
+- **路径级开关** — 可分别对 Attention（`apply_attn`）、FFN（`apply_ffn`）、DQN（`apply_dqn`）启用/关闭 ACHF，保护对精度敏感的链路。
 
-推荐起步：`mode=lite` + `apply_ffn=true`。出现震荡或收敛变慢时，提高 `g_min` 或降低 `proj_freq`。精度敏感场景可只开 FFN 路径。
+**推荐起步：** `mode=lite` + `apply_ffn=true`。出现震荡或收敛变慢时，提高 `g_min` 或降低 `proj_freq`（或设为 `0`）。精度敏感场景可只开 FFN 路径。
+
+### AMA
+
+AMA 是 ACHF 内部的运行时调度器，每次推理只回答一个问题：*此刻三条数学等价的执行路径里哪条最快？*
+
+- **Cached** — 预融合的低秩/稀疏算子，缓存有效时最省。
+- **Sparse** — 直接用剪枝权重（跳过置零通道）。
+- **Dense** — 完整权重，永远正确的兜底路径。
+
+由于最快路径取决于 batch 形状、稀疏率和主机 CPU 的缓存行为，AMA 把三条路径当作多臂老虎机的三个臂：测量每个臂的延迟（冷/热分开，EMA 平滑），对"变陈旧"的臂做**探测（probe）**，其余时候维持当前赢家。一道**滞回边界（hysteresis margin）**让它保持上一条路径，除非挑战者明显更快，从而避免在两条接近的路径间反复横跳。
+
+**冻结**层会完全短路这套逻辑：权重不再变化，融合 Cached 路径永远有效且最省 —— 于是跳过 AMA、确定性地走 Cached（仅当缓存形状/稀疏度失配时才回退 Sparse/Dense）。
+
+```mermaid
+flowchart TD
+    CALL["推理调用"] --> FROZEN{"层已冻结?"}
+    FROZEN -- 是 --> CV{"缓存有效?<br/>(形状 · 行数 · 稀疏度)"}
+    CV -- 是 --> USEC["用 Cached（确定性）"]
+    CV -- 否 --> FB["回退: Sparse → Dense"]
+
+    FROZEN -- 否 --> PROBE{"有臂陈旧 /<br/>从未测量?"}
+    PROBE -- 是 --> DOPROBE["探测该臂<br/>(强制采样延迟)"]
+    PROBE -- 否 --> SCORE["比较 EMA 延迟<br/>Cached vs Sparse vs Dense"]
+    SCORE --> HYST{"挑战者超出<br/>滞回边界更快?"}
+    HYST -- 否 --> KEEP["保持上一路径（滞回）"]
+    HYST -- 是 --> SWITCH["切换到更快路径"]
+    DOPROBE --> REC["记录延迟 → 更新 EMA"]
+    KEEP --> REC
+    SWITCH --> REC
+    USEC --> REC
+    FB --> REC
+    REC --> DONE["执行选中路径"]
+```
 
 ### SIMD 加速（`src/simd.rs`）
 
@@ -685,7 +459,7 @@ cargo run --release -- benchmark paper --output-dir results # 指定输出目录
 
 ---
 
-## 测试（142 个测试）
+## 测试（236 个测试）
 
 ```bash
 cargo test
