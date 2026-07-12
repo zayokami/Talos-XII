@@ -21,6 +21,11 @@ pub struct StepSnapshot {
     pub sinkhorn_min_value: f64,
     pub sinkhorn_negative_ratio: f64,
     pub sinkhorn_warm_started: bool,
+    /// Rank actually applied by the low-rank truncation (0 = no truncation
+    /// happened, e.g. because the requested rank was >= the layer's smaller
+    /// dimension). Surfacing this makes degenerate rank sweeps visible instead
+    /// of hiding them behind an unchanged stored parameter count.
+    pub low_rank_applied_rank: usize,
 }
 
 impl StepSnapshot {
@@ -43,6 +48,7 @@ impl StepSnapshot {
             sinkhorn_min_value: achf.map_or(0.0, |s| s.sinkhorn_min_value),
             sinkhorn_negative_ratio: achf.map_or(0.0, |s| s.sinkhorn_negative_ratio),
             sinkhorn_warm_started: achf.is_some_and(|s| s.sinkhorn_warm_started),
+            low_rank_applied_rank: achf.map_or(0, |s| s.low_rank_applied_rank),
         }
     }
 }

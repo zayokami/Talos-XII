@@ -159,8 +159,11 @@ enum BenchAction {
         /// Chart format: svg or png
         #[arg(long, default_value = "svg")]
         format: String,
-        /// Number of independent trials per experiment for statistical significance
-        #[arg(long, default_value_t = 3)]
+        /// Number of independent trials per experiment for statistical significance.
+        /// Reward on the gacha env is high-variance; n=3 leaves per-condition std
+        /// (+/-1..2 on a mean of 3..6) large enough to swamp between-condition
+        /// differences. n=5 is the minimum that yields a usable std estimate.
+        #[arg(long, default_value_t = 5)]
         trials: usize,
     },
 }

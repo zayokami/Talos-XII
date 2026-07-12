@@ -513,20 +513,37 @@ fn run_path_comparison(base_config: &Config, seed: u64) -> Vec<(String, Vec<f64>
     let sample_input: Vec<f32> = (0..input_dim).map(|i| (i as f32) * 0.1 + 0.05).collect();
     let warmup_iterations = 100;
     let iterations = 2000;
+    // The per-call operator cost (~hundreds of ns) is below the platform clock
+    // granularity (Instant resolves to ~100ns on Windows), so timing a single
+    // call quantizes every sample to a multiple of 100ns. That collapses the
+    // latency distribution into ~5 discrete buckets, which in turn makes the
+    // box plot's IQR degenerate (q1==q2==q3, zero-height boxes) and hides the
+    // real spread between paths. Time a BATCH of calls per sample and divide by
+    // the batch size: the timed window becomes tens of microseconds (far above
+    // clock granularity) and the reported per-call latency regains sub-ns
+    // resolution. `black_box` prevents the optimizer from hoisting/eliding the
+    // repeated identical calls.
+    let batch = 64usize;
 
     let mut all_latencies: Vec<(String, Vec<f64>)> = Vec::new();
 
     // 0 = Cached, 1 = Sparse, 2 = Dense
     for (path_name, path_id) in [("Cached", 0u8), ("Sparse", 1), ("Dense", 2)] {
         for _ in 0..warmup_iterations {
-            let _ = achf.forward_inference_forced_path(&sample_input, path_id);
+            let _ = std::hint::black_box(
+                achf.forward_inference_forced_path(std::hint::black_box(&sample_input), path_id),
+            );
         }
 
         let mut latencies = Vec::with_capacity(iterations);
         for _ in 0..iterations {
             let start = Instant::now();
-            let _out = achf.forward_inference_forced_path(&sample_input, path_id);
-            let ns = start.elapsed().as_nanos() as f64;
+            for _ in 0..batch {
+                let out = achf
+                    .forward_inference_forced_path(std::hint::black_box(&sample_input), path_id);
+                std::hint::black_box(out);
+            }
+            let ns = start.elapsed().as_nanos() as f64 / batch as f64;
             latencies.push(ns);
         }
         println!(
@@ -546,6 +563,16 @@ fn run_gate_curve(base_config: &Config, seed: u64) -> BenchRunResult {
     let mut rng = Rng::from_seed(seed);
     let mut cfg = bench_sized_config(base_config);
     cfg.achf.enabled = true;
+    // The gate-curve experiment exists to exercise the adaptive path-selection
+    // (AMA) machinery: latency probing, EMA scoring, and re-selection across
+    // Cached/Sparse/Dense. A frozen layer's deterministic fast path only ever
+    // resolves to Cached-or-Dense (the fused cached operator is permanently
+    // cheapest, so Sparse is structurally unreachable and no latency samples are
+    // taken). Without this flag the summary reports latency_samples=0 and
+    // sparse_paths=0 — the very mechanism the experiment is meant to measure
+    // never runs. Enabling adaptive inference keeps the selector live after
+    // freeze (weights fixed, path adaptive).
+    cfg.achf.adaptive_inference = true;
     cfg.ppo_total_steps = cfg.ppo_total_steps.min(4000);
     cfg.ppo_steps_per_update = cfg.ppo_steps_per_update.min(256);
     cfg.ppo_k_epochs = cfg.ppo_k_epochs.min(2);
@@ -596,7 +623,20 @@ fn run_scale_test(base_config: &Config, seed: u64, nt: usize) -> Vec<AggregatedR
         let runs = run_multi_trial(label, &cfg, seed, nt);
         agg.push(aggregate_trials(&runs));
     }
-    for rank in [16, 32, 64, 128, 256] {
+    // The ACHF FFN in the bench-sized model is hidden_dim*2 -> hidden_dim, and
+    // bench_sized_config clamps hidden_dim to 64, so the layer's smaller
+    // dimension is 64. `effective_rank` only truncates when rank < 64, and the
+    // prune step only introduces row sparsity when rank*1.5 < 64 (rank < ~43).
+    // The previous sweep [16,32,64,128,256] therefore had THREE degenerate
+    // entries: rank 64/128/256 all resolve to "no truncation" and are identical
+    // to the dense baseline, so any reward/throughput difference among them was
+    // pure trial noise. This sweep spans the meaningful regime instead:
+    //   8, 16, 32  -> truncate AND sparsify
+    //   48         -> truncate only (rank < 64 but rank*1.5 > 64)
+    //   64         -> no-op boundary (kept intentionally to show the ceiling)
+    // The effective applied rank is reported per config (see print_agg_summary),
+    // so the no-op at 64 is visible rather than masquerading as a real setting.
+    for rank in [8, 16, 32, 48, 64] {
         let label = format!("rank={}", rank);
         println!("  [{}]", label);
         let mut cfg = bench_sized_config(base_config);
@@ -819,13 +859,21 @@ fn chart_path_latency(latencies: &[(String, Vec<f64>)], dir: &str, ext: &str) {
             let mut sorted = vals.clone();
             sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let n = sorted.len();
-            let q = [
-                sorted[0],
-                sorted[n / 4],
-                sorted[n / 2],
-                sorted[3 * n / 4],
-                sorted[n - 1],
-            ];
+            let q1 = sorted[n / 4];
+            let median = sorted[n / 2];
+            let q3 = sorted[3 * n / 4];
+            // Whiskers use Tukey fences (1.5*IQR) clamped to the observed data,
+            // NOT the absolute min/max. A single scheduling-spike sample (e.g. a
+            // 12us OS hiccup on a ~500ns operator) would otherwise set the axis
+            // range and compress every box — including a genuinely tight
+            // distribution like Cached (IQR ~10ns) — down to sub-pixel height,
+            // which reads as a broken/empty chart. Capping the whiskers keeps the
+            // box and IQR legible; extreme outliers beyond the fence are simply
+            // not drawn, which is standard box-plot practice.
+            let iqr = q3 - q1;
+            let lower_fence = (q1 - 1.5 * iqr).max(sorted[0]);
+            let upper_fence = (q3 + 1.5 * iqr).min(sorted[n - 1]);
+            let q = [lower_fence, q1, median, q3, upper_fence];
             (name.as_str(), q)
         })
         .collect();
@@ -1024,16 +1072,30 @@ fn chart_agg_reward_curve(
 
 // ── Output: summary, JSON, CSV ──────────────────────────────────────────
 
+/// Effective low-rank truncation actually applied by a config's ACHF layer,
+/// taken from its final snapshot. Returns None when the config produced no
+/// snapshots. A value of 0 means the requested rank was a no-op (>= the layer's
+/// smaller dimension), which is exactly the degenerate case worth surfacing.
+fn effective_applied_rank(a: &AggregatedResult) -> Option<usize> {
+    a.best_snapshots.last().map(|s| s.low_rank_applied_rank)
+}
+
 fn print_agg_summary(name: &str, agg: &[AggregatedResult]) {
     println!("[Bench] {} complete:", name);
     for a in agg {
+        let rank_note = match effective_applied_rank(a) {
+            Some(0) => " | applied_rank=0 (no-op)".to_string(),
+            Some(r) => format!(" | applied_rank={}", r),
+            None => String::new(),
+        };
         println!(
-            "  {:20} | tput: {:.0} +/- {:.0} | reward: {:.4} +/- {:.4} | loss: {:.4} +/- {:.4} | params: {}",
+            "  {:20} | tput: {:.0} +/- {:.0} | reward: {:.4} +/- {:.4} | loss: {:.4} +/- {:.4} | params: {}{}",
             a.label,
             a.throughput.mean, a.throughput.std_dev,
             a.reward.mean, a.reward.std_dev,
             a.loss.mean, a.loss.std_dev,
-            a.param_count
+            a.param_count,
+            rank_note
         );
     }
 }
@@ -1048,13 +1110,19 @@ fn write_summary_txt(
     for (name, agg) in all {
         lines.push(format!("=== {} ===", name));
         for a in agg {
+            let rank_note = match effective_applied_rank(a) {
+                Some(0) => " | applied_rank=0 (no-op)".to_string(),
+                Some(r) => format!(" | applied_rank={}", r),
+                None => String::new(),
+            };
             lines.push(format!(
-                "  {:20} | tput={:.0}+/-{:.0} | reward={:.4}+/-{:.4} | loss={:.4}+/-{:.4} | params={}",
+                "  {:20} | tput={:.0}+/-{:.0} | reward={:.4}+/-{:.4} | loss={:.4}+/-{:.4} | params={}{}",
                 a.label,
                 a.throughput.mean, a.throughput.std_dev,
                 a.reward.mean, a.reward.std_dev,
                 a.loss.mean, a.loss.std_dev,
-                a.param_count
+                a.param_count,
+                rank_note
             ));
             if let Some(ref stats) = a.cache_stats {
                 let calls = stats.calls as f64;
@@ -1111,22 +1179,14 @@ fn write_summary_txt(
         }
         if let Some(stats) = result.cache_stats {
             let calls = stats.calls as f64;
-            let path_total = (stats.sparse_paths + stats.dense_paths) as f64;
-            let hit_pct = if calls > 0.0 {
-                stats.cache_hits as f64 / calls * 100.0
-            } else {
-                0.0
-            };
-            let sparse_pct = if path_total > 0.0 {
-                stats.sparse_paths as f64 / path_total * 100.0
-            } else {
-                0.0
-            };
-            let dense_pct = if path_total > 0.0 {
-                stats.dense_paths as f64 / path_total * 100.0
-            } else {
-                0.0
-            };
+            // Share the denominator `calls` across hit/sparse/dense so the three
+            // percentages are comparable and sum to ~100%. Dividing the path
+            // rates by only (sparse+dense) previously excluded cache hits,
+            // making dense read 100% even when 45% of calls were cache hits.
+            let pct = |n: u64| if calls > 0.0 { n as f64 / calls * 100.0 } else { 0.0 };
+            let hit_pct = pct(stats.cache_hits);
+            let sparse_pct = pct(stats.sparse_paths);
+            let dense_pct = pct(stats.dense_paths);
             lines.push(format!(
                 "    ACHF inference: calls={} hit={:.1}% sparse={:.1}% dense={:.1}% latency_samples={} decision_ns={:.1}",
                 stats.calls,
@@ -1368,7 +1428,16 @@ fn step_snapshot_json(snapshot: &StepSnapshot) -> serde_json::Value {
 
 fn cache_stats_json(stats: AchfCacheStats) -> serde_json::Value {
     let calls = stats.calls as f64;
-    let path_total = (stats.sparse_paths + stats.dense_paths) as f64;
+    // Every call resolves to exactly one path: Cached (cache_hits), Sparse, or
+    // Dense. All three rates therefore share the SAME denominator (total calls)
+    // so they are directly comparable and sum to ~1.0. Previously hit_rate was
+    // divided by `calls` while the path rates were divided by only
+    // (sparse+dense), which excluded cache hits from the denominator — that is
+    // why a run could report hit_rate=0.45 alongside dense_path_rate=1.0 for the
+    // same data, an apparent contradiction that was purely a denominator
+    // mismatch. `cached_path_rate` is added so the three paths are reported on
+    // equal footing.
+    let rate = |n: u64| if calls > 0.0 { n as f64 / calls } else { 0.0 };
     serde_json::json!({
         "calls": stats.calls,
         "cache_hits": stats.cache_hits,
@@ -1376,9 +1445,10 @@ fn cache_stats_json(stats: AchfCacheStats) -> serde_json::Value {
         "cache_skips": stats.cache_skips,
         "sparse_paths": stats.sparse_paths,
         "dense_paths": stats.dense_paths,
-        "hit_rate": if calls > 0.0 { stats.cache_hits as f64 / calls } else { 0.0 },
-        "sparse_path_rate": if path_total > 0.0 { stats.sparse_paths as f64 / path_total } else { 0.0 },
-        "dense_path_rate": if path_total > 0.0 { stats.dense_paths as f64 / path_total } else { 0.0 },
+        "hit_rate": rate(stats.cache_hits),
+        "cached_path_rate": rate(stats.cache_hits),
+        "sparse_path_rate": rate(stats.sparse_paths),
+        "dense_path_rate": rate(stats.dense_paths),
         "ema_cached_ns": stats.ema_cached_ns,
         "ema_cached_long_ns": stats.ema_cached_long_ns,
         "ema_sparse_ns": stats.ema_sparse_ns,
@@ -1673,6 +1743,7 @@ mod tests {
                 sinkhorn_min_value: 0.01,
                 sinkhorn_negative_ratio: 0.0,
                 sinkhorn_warm_started: true,
+                low_rank_applied_rank: 0,
             }],
             cache_stats: Some(AchfCacheStats {
                 calls: 8,
@@ -1711,6 +1782,12 @@ mod tests {
             20
         );
         assert_eq!(json["gate_curve"]["cache_stats"]["hit_rate"], 0.25);
+        // All path rates share the denominator `calls` (=8) and are mutually
+        // consistent: cached 2/8, sparse 3/8, dense 1/8. This guards against the
+        // former denominator mismatch where path rates excluded cache hits.
+        assert_eq!(json["gate_curve"]["cache_stats"]["cached_path_rate"], 0.25);
+        assert_eq!(json["gate_curve"]["cache_stats"]["sparse_path_rate"], 0.375);
+        assert_eq!(json["gate_curve"]["cache_stats"]["dense_path_rate"], 0.125);
         let summary: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.join("gate_curve_summary.json")).unwrap(),
         )
