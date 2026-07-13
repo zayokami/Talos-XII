@@ -11,6 +11,18 @@ use std::time::Instant;
 
 const AMA_SPARSE_DENSE_ENABLE_MARGIN: f64 = 0.98;
 
+/// Upper bound on how far a consistently-losing path's re-probe interval can be
+/// stretched, as a multiple of the base stale limit. A path that is ~Nx slower
+/// than the current winner is re-probed every `min(N, this) * base` calls
+/// instead of on the fixed base cadence. This is the fix for the steady-state
+/// exploration tax: the old fixed cadence re-probed every loser every `base`
+/// calls forever, capping even a 10x winner near 60% selection. With backoff a
+/// clear winner is selected ~>95% of the time, while a loser whose score
+/// approaches the winner's (a regime shift) snaps its interval back to `base`
+/// and is tracked tightly again. 16 keeps worst-case re-probe latency bounded
+/// (<=128 calls at base 8) so genuine regime changes are still caught quickly.
+const AMA_MAX_REPROBE_MULT: u64 = 16;
+
 thread_local! {
     // Reused per-thread accumulator row for the fused frozen-inference residual
     // add-into path, avoiding a heap allocation per call.
@@ -2204,21 +2216,62 @@ impl AchfLayer {
         }
     }
 
+    /// Re-probe interval for one path, given its current effective score and the
+    /// best (lowest) score among the warm paths. A path that scores ~Nx worse
+    /// than the winner is re-probed every `min(N, AMA_MAX_REPROBE_MULT) * base`
+    /// calls instead of every `base`; a path scoring at/near the winner keeps
+    /// the tight base cadence. This is a pure function of the live scores, so a
+    /// regime shift that improves a loser's score immediately shortens its
+    /// interval and restores tight tracking — no persisted backoff state.
+    fn ama_reprobe_interval(base: u64, score: f64, best: f64) -> u64 {
+        if !score.is_finite() || !best.is_finite() || best <= 0.0 || score <= best {
+            return base;
+        }
+        let mult = (score / best)
+            .round()
+            .clamp(1.0, AMA_MAX_REPROBE_MULT as f64) as u64;
+        base.saturating_mul(mult)
+    }
+
     fn ama_select_guarded_path(&self, cache: &mut AchfCache) -> InferencePath {
         let warmup_samples = self.ama_warmup_samples();
         let cached_warmness = Self::ama_warmness(cache.ama_cached_warm_count, warmup_samples);
         let sparse_warmness = Self::ama_warmness(cache.ama_sparse_warm_count, warmup_samples);
         let dense_warmness = Self::ama_warmness(cache.ama_dense_warm_count, warmup_samples);
-        let stale_limit = self.ama_stale_limit();
+        let base_stale = self.ama_stale_limit();
+
+        // Live scores drive the per-path re-probe cadence. A path that loses by
+        // a wide margin is re-probed exponentially less often (bounded), which
+        // removes the fixed-cadence exploration tax while still catching regime
+        // shifts (a newly-competitive loser's interval collapses back to base).
+        let cached_score = self.ama_effective_latency(cache, InferencePath::Cached);
+        let sparse_score = self.ama_effective_latency(cache, InferencePath::Sparse);
+        let dense_score = self.ama_effective_latency(cache, InferencePath::Dense);
+        let sparse_allowed = self.ama_sparse_beats_dense(cache);
+        // Best score among paths currently eligible to win (sparse only if it
+        // beats dense). Used only to scale re-probe intervals.
+        let mut best_score = f64::INFINITY;
+        for (allowed, score) in [
+            (true, cached_score),
+            (sparse_allowed, sparse_score),
+            (true, dense_score),
+        ] {
+            if allowed && score.is_finite() && score < best_score {
+                best_score = score;
+            }
+        }
+        let cached_interval = Self::ama_reprobe_interval(base_stale, cached_score, best_score);
+        let sparse_interval = Self::ama_reprobe_interval(base_stale, sparse_score, best_score);
+        let dense_interval = Self::ama_reprobe_interval(base_stale, dense_score, best_score);
 
         let cached_needs_probe = cache.ema_cached_ns <= 0.0
-            || cache.ama_cached_stale >= stale_limit
+            || cache.ama_cached_stale >= cached_interval
             || cached_warmness < 1.0;
         let sparse_needs_probe = cache.ema_sparse_ns <= 0.0
-            || cache.ama_sparse_stale >= stale_limit
+            || cache.ama_sparse_stale >= sparse_interval
             || sparse_warmness < 1.0;
         let dense_needs_probe = cache.ema_dense_ns <= 0.0
-            || cache.ama_dense_stale >= stale_limit
+            || cache.ama_dense_stale >= dense_interval
             || dense_warmness < 1.0;
 
         if cached_needs_probe || sparse_needs_probe || dense_needs_probe {
@@ -2232,10 +2285,6 @@ impl AchfLayer {
             return path;
         }
 
-        let cached_score = self.ama_effective_latency(cache, InferencePath::Cached);
-        let sparse_score = self.ama_effective_latency(cache, InferencePath::Sparse);
-        let dense_score = self.ama_effective_latency(cache, InferencePath::Dense);
-        let sparse_allowed = self.ama_sparse_beats_dense(cache);
         let mut selected = InferencePath::Dense;
         let mut selected_score = dense_score;
         if cached_score < selected_score {
@@ -2330,17 +2379,25 @@ impl AchfLayer {
             }
         }
 
-        if cache.ama_prev_path == Some(path) {
-            cache.ama_dwell = cache.ama_dwell.saturating_add(1);
-        } else {
-            if cache.ama_prev_path.is_some() {
-                cache.ama_switches = cache.ama_switches.saturating_add(1);
+        // A probe is a one-shot measurement, NOT an exploitation choice, so it
+        // must not disturb the hysteresis state (prev_path / dwell). Previously
+        // a probe reset prev_path to the (losing) probed arm and zeroed dwell,
+        // which made the very next exploit call trip the `dwell < min_dwell`
+        // gate and stay on the loser for an extra call — doubling the probe tax
+        // and dragging a clear winner's selection share down to ~60%. Now only
+        // genuine exploit selections advance dwell / count switches; a probe
+        // leaves the committed winner intact so exploitation resumes next call.
+        if !is_probe {
+            if cache.ama_prev_path == Some(path) {
+                cache.ama_dwell = cache.ama_dwell.saturating_add(1);
+            } else {
+                if cache.ama_prev_path.is_some() {
+                    cache.ama_switches = cache.ama_switches.saturating_add(1);
+                }
+                cache.ama_prev_path = Some(path);
+                cache.ama_dwell = 0;
             }
-            cache.ama_prev_path = Some(path);
-            cache.ama_dwell = 0;
-        }
-
-        if is_probe {
+        } else {
             cache.ama_probes = cache.ama_probes.saturating_add(1);
             cache.ama_force_latency_sample = true;
         }
@@ -3791,6 +3848,145 @@ mod tests {
         layer.record_path_latency(InferencePath::Cached, 50.0, 1);
         let cache = layer.cache.read().unwrap();
         assert!(cache.adaptive_bias < 1.0);
+    }
+
+    #[test]
+    fn achf_ama_steady_state_exploration_tax_is_bounded() {
+        // ROOT-CAUSE PROBE: with a clear winner already warmed, how large is
+        // the forced re-probe tax in steady state? Seed sparse as the obvious
+        // best (10ns vs cached 100ns, dense 200ns), fully warmed, then drive the
+        // selector many times WITHOUT recording new latencies (fixed input =
+        // one bucket, EMAs frozen at the seeded values). The winner's selection
+        // fraction is then determined purely by the probe cadence.
+        let cfg = AchfConfig {
+            enabled: true,
+            cache_min_reuse: 1,
+            cache_latency_sample_every: 1,
+            cache_cost_bias: 1.0,
+            ..Default::default()
+        };
+        let mut layer = AchfLayer::new_square(4, cfg, 91);
+        layer.prune(0.01);
+        layer.freeze_for_inference();
+        {
+            let mut cache = layer.cache.write().unwrap();
+            cache.ema_sparse_ns = 10.0;
+            cache.ema_sparse_long_ns = 10.0;
+            cache.ema_cached_ns = 100.0;
+            cache.ema_cached_long_ns = 100.0;
+            cache.ema_dense_ns = 200.0;
+            cache.ema_dense_long_ns = 200.0;
+            cache.ama_sparse_warm_count = 100;
+            cache.ama_cached_warm_count = 100;
+            cache.ama_dense_warm_count = 100;
+            cache.ama_prev_path = Some(InferencePath::Sparse);
+            cache.ama_dwell = 100;
+        }
+        let x = vec![0.1f32, -0.2, 0.3, 0.4];
+        let n = 900usize;
+        let mut sparse = 0usize;
+        for _ in 0..n {
+            if layer.select_ama_path(&x).path == InferencePath::Sparse {
+                sparse += 1;
+            }
+        }
+        let frac = sparse as f64 / n as f64;
+        println!("steady-state sparse fraction (clear 10x winner) = {frac:.3}");
+        // With exploration backoff, a clear 10x winner is now exploited the
+        // overwhelming majority of the time: the two losers (10x and 20x worse)
+        // are re-probed on stretched intervals, not the fixed base cadence. The
+        // old fixed-cadence code pinned this at ~0.60; anything below ~0.9 means
+        // the backoff or the probe/dwell decoupling regressed.
+        assert!(
+            frac >= 0.9,
+            "expected clear winner exploited >=90% with backoff, got {frac:.3}"
+        );
+    }
+
+    #[test]
+    fn achf_ama_backoff_still_detects_regime_shift() {
+        // SAFETY OF THE FIX: exploration backoff must not blind the selector to
+        // a loser that becomes the winner. Seed sparse as the settled winner,
+        // let it back off cached/dense, then flip the regime — make cached the
+        // clear winner by rewriting its EMA (as a real latency sample would) on
+        // every call — and assert the selector re-probes cached, discovers the
+        // shift, and commits to it within a bounded number of calls.
+        let cfg = AchfConfig {
+            enabled: true,
+            cache_min_reuse: 1,
+            cache_latency_sample_every: 1,
+            cache_cost_bias: 1.0,
+            cache_adapt_rate: 0.0,
+            cache_adapt_blend: 0.0,
+            ..Default::default()
+        };
+        let mut layer = AchfLayer::new_square(4, cfg, 92);
+        layer.prune(0.01);
+        layer.freeze_for_inference();
+        {
+            let mut cache = layer.cache.write().unwrap();
+            cache.ema_sparse_ns = 10.0;
+            cache.ema_sparse_long_ns = 10.0;
+            cache.ema_cached_ns = 100.0;
+            cache.ema_cached_long_ns = 100.0;
+            cache.ema_dense_ns = 200.0;
+            cache.ema_dense_long_ns = 200.0;
+            cache.ama_sparse_warm_count = 100;
+            cache.ama_cached_warm_count = 100;
+            cache.ama_dense_warm_count = 100;
+            cache.ama_prev_path = Some(InferencePath::Sparse);
+            cache.ama_dwell = 100;
+        }
+        let x = vec![0.1f32, -0.2, 0.3, 0.4];
+        // True per-path latency the hardware would report RIGHT NOW. Before the
+        // flip sparse is fastest; after it cached is the clear 10x winner. The
+        // selector only learns a path's latency when it actually runs (probes)
+        // that path, exactly like production.
+        let true_ns = |path: InferencePath, flipped: bool| -> f64 {
+            match (path, flipped) {
+                (InferencePath::Sparse, false) => 10.0,
+                (InferencePath::Cached, false) => 100.0,
+                (InferencePath::Cached, true) => 10.0,
+                (InferencePath::Sparse, true) => 100.0,
+                (InferencePath::Dense, _) => 200.0,
+            }
+        };
+        // Phase 1: drive real selections + measurements so sparse settles and
+        // the losers' re-probe intervals stretch out.
+        for _ in 0..200 {
+            let path = layer.select_ama_path(&x).path;
+            layer.record_path_latency(path, true_ns(path, false), 1);
+        }
+        // Phase 2: regime flips. Crucially we do NOT touch any EMA directly —
+        // the selector must DISCOVER the shift by re-probing cached on its
+        // (stretched) interval and measuring the new latency itself. This is the
+        // real test of whether backoff blinds the selector to a shift.
+        let mut calls_to_commit = None;
+        let mut cached_streak = 0u32;
+        for i in 0..600 {
+            let path = layer.select_ama_path(&x).path;
+            layer.record_path_latency(path, true_ns(path, true), 1);
+            // "Committed" = the selector is now consistently exploiting cached,
+            // not just probing it once. Require a short run to rule out a lone
+            // probe being mistaken for detection.
+            if path == InferencePath::Cached {
+                cached_streak += 1;
+                if cached_streak >= 5 && calls_to_commit.is_none() {
+                    calls_to_commit = Some(i + 1);
+                    break;
+                }
+            } else {
+                cached_streak = 0;
+            }
+        }
+        let calls = calls_to_commit.expect("selector never committed to cached after regime shift");
+        println!("regime shift discovered + committed to cached in {calls} calls");
+        // Worst-case re-probe interval is AMA_MAX_REPROBE_MULT * base = 16*8 =
+        // 128; add the EMA settle + dwell/margin. Must be far below "never".
+        assert!(
+            calls <= 200,
+            "backoff delayed regime-shift detection too long: {calls} calls"
+        );
     }
 
     #[test]
