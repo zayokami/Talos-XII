@@ -1037,11 +1037,7 @@ impl AchfLayer {
             (out, 0.0)
         };
         if elapsed_ns > 0.0 {
-            let num_rows = if self.weight.in_features > 0 {
-                x.len() / self.weight.in_features
-            } else {
-                1
-            };
+            let num_rows = x.len().checked_div(self.weight.in_features).unwrap_or(1);
             self.record_path_latency(path, elapsed_ns, num_rows);
         }
 
