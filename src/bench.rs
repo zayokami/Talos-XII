@@ -759,7 +759,9 @@ fn run_regime_adaptation() -> Vec<RegimeRow> {
 /// live adaptive selector, time each forced fixed path, and record the sparse
 /// selection fraction over a fresh measurement window.
 fn measure_regime(layer: &AchfLayer, dim: usize, batch: usize) -> RegimeLatency {
-    let x: Vec<f32> = (0..dim * batch).map(|i| ((i % 7) as f32) * 0.1 + 0.05).collect();
+    let x: Vec<f32> = (0..dim * batch)
+        .map(|i| ((i % 7) as f32) * 0.1 + 0.05)
+        .collect();
     let warm = 300usize;
     let iters = 600usize;
     // Warm the adaptive selector's bucket for this batch, then time it live.
@@ -783,15 +785,19 @@ fn measure_regime(layer: &AchfLayer, dim: usize, batch: usize) -> RegimeLatency 
     let cached_ns = time_forced_path(layer, &x, 0, 40, iters);
     let sparse_ns = time_forced_path(layer, &x, 1, 40, iters);
     let dense_ns = time_forced_path(layer, &x, 2, 40, iters);
-    let (oracle_ns, oracle_path) = [(cached_ns, "Cached"), (sparse_ns, "Sparse"), (dense_ns, "Dense")]
-        .into_iter()
-        .fold((f64::INFINITY, "Cached"), |acc, (ns, name)| {
-            if ns < acc.0 {
-                (ns, name)
-            } else {
-                acc
-            }
-        });
+    let (oracle_ns, oracle_path) = [
+        (cached_ns, "Cached"),
+        (sparse_ns, "Sparse"),
+        (dense_ns, "Dense"),
+    ]
+    .into_iter()
+    .fold((f64::INFINITY, "Cached"), |acc, (ns, name)| {
+        if ns < acc.0 {
+            (ns, name)
+        } else {
+            acc
+        }
+    });
     RegimeLatency {
         batch,
         adaptive_ns,
@@ -1252,15 +1258,27 @@ fn chart_regime(rows: &[RegimeRow], dir: &str, ext: &str) {
         .iter()
         .flat_map(|r| {
             [
-                format!("wsp{:.2} b{}={}", r.weight_sparsity, r.small.batch, r.small.oracle_path),
-                format!("wsp{:.2} b{}={}", r.weight_sparsity, r.large.batch, r.large.oracle_path),
+                format!(
+                    "wsp{:.2} b{}={}",
+                    r.weight_sparsity, r.small.batch, r.small.oracle_path
+                ),
+                format!(
+                    "wsp{:.2} b{}={}",
+                    r.weight_sparsity, r.large.batch, r.large.oracle_path
+                ),
             ]
         })
         .collect();
     let mut bars: Vec<(&str, f64)> = Vec::with_capacity(labels.len());
     for (i, r) in rows.iter().enumerate() {
-        bars.push((labels[2 * i].as_str(), r.small.adaptive_ns / r.small.oracle_ns.max(1.0)));
-        bars.push((labels[2 * i + 1].as_str(), r.large.adaptive_ns / r.large.oracle_ns.max(1.0)));
+        bars.push((
+            labels[2 * i].as_str(),
+            r.small.adaptive_ns / r.small.oracle_ns.max(1.0),
+        ));
+        bars.push((
+            labels[2 * i + 1].as_str(),
+            r.large.adaptive_ns / r.large.oracle_ns.max(1.0),
+        ));
     }
     let path = format!("{}/regime_adaptation.{}", dir, ext);
     write_chart(
@@ -1642,8 +1660,7 @@ fn write_path_latency_outputs(latencies: &[(String, Vec<f64>)], dir: &str) {
 }
 
 fn write_crossover_outputs(cells: &[CrossoverCell], dir: &str) {
-    let mut csv =
-        String::from("dim,weight_sparsity,cached_ns,sparse_ns,dense_ns,winner\n");
+    let mut csv = String::from("dim,weight_sparsity,cached_ns,sparse_ns,dense_ns,winner\n");
     for c in cells {
         csv.push_str(&format!(
             "{},{:.4},{:.3},{:.3},{:.3},{}\n",
@@ -1715,7 +1732,12 @@ fn write_regime_outputs(rows: &[RegimeRow], dir: &str) {
     };
     let arr: Vec<serde_json::Value> = rows
         .iter()
-        .flat_map(|r| [cell(r.weight_sparsity, &r.small), cell(r.weight_sparsity, &r.large)])
+        .flat_map(|r| {
+            [
+                cell(r.weight_sparsity, &r.small),
+                cell(r.weight_sparsity, &r.large),
+            ]
+        })
         .collect();
     let json = serde_json::to_string_pretty(&serde_json::Value::Array(arr))
         .expect("regime summary JSON should be serializable");
@@ -2145,8 +2167,14 @@ mod tests {
         assert_eq!(cached.len(), dense.len());
         assert_eq!(sparse.len(), dense.len());
         for i in 0..dense.len() {
-            assert!((cached[i] - dense[i]).abs() < 1e-4, "cached vs dense at {i}");
-            assert!((sparse[i] - dense[i]).abs() < 1e-4, "sparse vs dense at {i}");
+            assert!(
+                (cached[i] - dense[i]).abs() < 1e-4,
+                "cached vs dense at {i}"
+            );
+            assert!(
+                (sparse[i] - dense[i]).abs() < 1e-4,
+                "sparse vs dense at {i}"
+            );
         }
     }
 

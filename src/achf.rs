@@ -3479,7 +3479,9 @@ mod tests {
         layer.freeze_for_inference();
 
         let x1: Vec<f32> = (0..dim).map(|i| ((i % 7) as f32) * 0.1 + 0.05).collect();
-        let x64: Vec<f32> = (0..dim * 64).map(|i| ((i % 7) as f32) * 0.1 + 0.05).collect();
+        let x64: Vec<f32> = (0..dim * 64)
+            .map(|i| ((i % 7) as f32) * 0.1 + 0.05)
+            .collect();
         let run = |x: &[f32], n: usize| {
             for _ in 0..n {
                 let _ = layer.forward_inference_residual(x);
@@ -4053,7 +4055,9 @@ mod tests {
     fn adaptive_switch_probe() {
         let dim = 1024usize;
         let make_x = |batch: usize| -> Vec<f32> {
-            (0..dim * batch).map(|i| ((i % 7) as f32) * 0.1 + 0.05).collect()
+            (0..dim * batch)
+                .map(|i| ((i % 7) as f32) * 0.1 + 0.05)
+                .collect()
         };
         let phase = |layer: &AchfLayer, batch: usize, n: usize| -> (u64, u64, u64) {
             let x = make_x(batch);
@@ -4078,7 +4082,9 @@ mod tests {
             }
         };
 
-        println!("\n[bucketed] dim={dim}, adaptive on; do batch=1 and batch=64 pick DIFFERENT paths?");
+        println!(
+            "\n[bucketed] dim={dim}, adaptive on; do batch=1 and batch=64 pick DIFFERENT paths?"
+        );
         for &weight_sparsity in &[0.8f32, 0.9, 0.95, 0.98] {
             let cfg = AchfConfig {
                 enabled: true,
@@ -4171,8 +4177,9 @@ mod tests {
         println!("in_sparsity  batch  cached_ns  sparse_ns  dense_ns   oracle");
         for &in_sp in &input_sparsities {
             for &batch in &batches {
-                let mut x: Vec<f32> =
-                    (0..dim * batch).map(|i| ((i % 7) as f32) * 0.1 + 0.05).collect();
+                let mut x: Vec<f32> = (0..dim * batch)
+                    .map(|i| ((i % 7) as f32) * 0.1 + 0.05)
+                    .collect();
                 // Zero out an `in_sp` fraction of each input row.
                 let zeros = (dim as f32 * in_sp) as usize;
                 for row in 0..batch {
@@ -4259,17 +4266,15 @@ mod tests {
                 let x: Vec<f32> = (0..dim * batch).map(|i| ((i % 7) as f32) * 0.1).collect();
                 let time_path = |pid: u8| -> f64 {
                     for _ in 0..warmup {
-                        std::hint::black_box(layer.forward_inference_forced_path(
-                            std::hint::black_box(&x),
-                            pid,
-                        ));
+                        std::hint::black_box(
+                            layer.forward_inference_forced_path(std::hint::black_box(&x), pid),
+                        );
                     }
                     let start = Instant::now();
                     for _ in 0..iters {
-                        std::hint::black_box(layer.forward_inference_forced_path(
-                            std::hint::black_box(&x),
-                            pid,
-                        ));
+                        std::hint::black_box(
+                            layer.forward_inference_forced_path(std::hint::black_box(&x), pid),
+                        );
                     }
                     start.elapsed().as_nanos() as f64 / iters as f64
                 };
