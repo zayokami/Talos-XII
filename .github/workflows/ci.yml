@@ -31,7 +31,7 @@ jobs:
       - run: cargo check --verbose
 
   # ─────────────────────────────────────────────────
-  #  Test: run all 52+ tests on all platforms
+  #  Test: run the default test suite on all platforms
   # ─────────────────────────────────────────────────
   test:
     name: Test (${{ matrix.os }})

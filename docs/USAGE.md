@@ -2,7 +2,7 @@
 
 > Split out from the main [README](../README.md). Full command reference for every Talos-XII subcommand.
 
-All subcommands support `-c <path>` for config, `-s <seed>` for reproducible runs, and `-f` to force model retraining.
+All subcommands support `-c <path>` for config, `-s <seed>` for repeatable runs with a fixed config and worker topology, and `-f` to force model retraining.
 
 ## Interactive Mode
 
@@ -96,7 +96,7 @@ Most tensor methods are also available as `tx.*` functional calls with the same 
 cargo run -- collect add          # interactive single-record entry
 cargo run -- collect import data.json  # bulk import from JSON
 cargo run -- collect stats        # view collected data statistics
-cargo run -- train                # calibrate models with collected data
+cargo run -- train                # estimate and save calibrated pool parameters
 ```
 
 ## Benchmarks
@@ -112,14 +112,16 @@ Runs the quick built-in benchmark: 500 fast simulations and 100 detailed simulat
 Generates complete experimental data and charts (SVG/PNG) for the ACHF paper:
 
 ```bash
-cargo run --release -- benchmark paper                      # all 7 experiments, 3 trials
+cargo run --release -- benchmark paper                      # all 7 experiments, 5 trials
 cargo run --release -- benchmark paper --trials 5           # 5 independent trials w/ CI
 cargo run --release -- benchmark paper --only ablation      # ablation study only
 cargo run --release -- benchmark paper --format png         # PNG output
 cargo run --release -- benchmark paper --output-dir results # custom output dir
 ```
 
-Each experiment runs 3 trials by default (`--trials N` to adjust), outputting mean ± std and 95% CI. Output includes charts (SVG/PNG), `summary.json` (structured data for LaTeX/matplotlib), raw CSVs, and human-readable `summary.txt`.
+Each experiment runs 5 trials by default (`--trials N` to adjust), outputting mean ± std and 95% CI. Output includes charts (SVG/PNG), `summary.json` (structured data for LaTeX/matplotlib), raw CSVs, and human-readable `summary.txt`.
+
+Saved calibration overrides are validated and merged into the complete pool catalog before model cache selection, training, or inference on the next model-using startup.
 
 7 experiments:
 
@@ -137,7 +139,7 @@ Output goes to `bench_output/` (`--output-dir` to customize).
 
 ---
 
-所有子命令支持 `-c <path>` 指定配置、`-s <seed>` 固定随机种子、`-f` 强制重训模型。
+所有子命令支持 `-c <path>` 指定配置、`-s <seed>` 在配置和 worker 拓扑不变时复现实验、`-f` 强制重训模型。
 
 ## 交互模式
 
@@ -231,7 +233,7 @@ cargo run --features python -- python scripts/my_train.py -- 1.0
 cargo run -- collect add          # 交互式录入单条记录
 cargo run -- collect import data.json  # 从 JSON 批量导入
 cargo run -- collect stats        # 查看已采集数据统计
-cargo run -- train                # 用采集数据校准模型
+cargo run -- train                # 估计并保存校准后的卡池参数
 ```
 
 ## 性能基准测试
@@ -247,14 +249,16 @@ cargo run --release -- benchmark
 为 ACHF 技术论文生成完整实验数据和图表（SVG/PNG）：
 
 ```bash
-cargo run --release -- benchmark paper                      # 全部 7 项实验，默认 3 次试验
+cargo run --release -- benchmark paper                      # 全部 7 项实验，默认 5 次试验
 cargo run --release -- benchmark paper --trials 5           # 5 次独立试验，计算 mean/std/95%CI
 cargo run --release -- benchmark paper --only ablation      # 仅消融实验
 cargo run --release -- benchmark paper --format png         # PNG 格式输出
 cargo run --release -- benchmark paper --output-dir results # 指定输出目录
 ```
 
-每项实验默认 3 次独立试验（`--trials N` 调整），输出 mean ± std 及 95% 置信区间。结果包含带 error bars 的柱状图、训练曲线、箱线图（SVG/PNG）、`summary.json`（结构化数据，可导入 LaTeX/matplotlib）、原始 CSV 和人类可读的 `summary.txt`。
+每项实验默认 5 次独立试验（`--trials N` 调整），输出 mean ± std 及 95% 置信区间。结果包含带 error bars 的柱状图、训练曲线、箱线图（SVG/PNG）、`summary.json`（结构化数据，可导入 LaTeX/matplotlib）、原始 CSV 和人类可读的 `summary.txt`。
+
+保存的校准覆盖值会先经过合法性检查，并在下一次需要模型的启动中，于缓存选择、训练和推理之前合并到完整卡池目录。
 
 7 项实验：
 

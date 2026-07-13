@@ -1,3 +1,4 @@
+use crate::calibrate::{apply_calibration, CalibrationData};
 use crate::config::{ComputeDevice, Config};
 use crate::dqn::{train_dqn, DuelingQNetwork};
 use crate::env_net::EnvNet;
@@ -45,7 +46,7 @@ pub fn initialize_system(
     GoodJobWorker,
     Rng,
 ) {
-    let mut config = Config::load(config_path);
+    let mut config = resolve_runtime_config(config_path);
     apply_compute_device_policy(&mut config);
     if config.model_hidden_dim >= 8192 {
         warn!(
@@ -99,6 +100,33 @@ pub fn initialize_system(
         worker,
         rng,
     )
+}
+
+fn resolve_runtime_config(config_path: &str) -> Config {
+    let config = Config::load(config_path);
+    if !config.use_calibrated {
+        return config;
+    }
+
+    let calibration = CalibrationData::load(&config.calibrated_path);
+    apply_runtime_calibration(config, calibration)
+}
+
+fn apply_runtime_calibration(mut config: Config, calibration: CalibrationData) -> Config {
+    if calibration.pools.is_empty() {
+        return config;
+    }
+
+    let applied_pools = apply_calibration(&mut config, &calibration);
+    if applied_pools > 0 {
+        info!(
+            "[Calibration] Applied calibrated parameters to {} pool(s) before model initialization.",
+            applied_pools
+        );
+    } else {
+        warn!("[Calibration] No valid overrides matched the configured pools.");
+    }
+    config
 }
 
 fn build_rng(seed: Option<u64>) -> Rng {
@@ -567,10 +595,45 @@ pub(crate) fn ppo_training_quality(config: &Config) -> CacheQualitySummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::calibrate::PoolCalibration;
+    use crate::model_io::env_net_cache_manifest;
 
     #[test]
     fn resolve_env_net_pretrain_counts_uses_fast_init_schedule() {
         assert_eq!(resolve_env_net_pretrain_counts(true), (256, 10));
         assert_eq!(resolve_env_net_pretrain_counts(false), (1024, 50));
+    }
+
+    #[test]
+    fn runtime_calibration_precedes_model_cache_fingerprinting() {
+        let config = Config {
+            active_pool: Some("pool-a".to_string()),
+            use_calibrated: true,
+            prob_6_base: 0.008,
+            soft_pity_slope: 0.05,
+            up_rate: 0.5,
+            ..Config::default()
+        };
+        let uncalibrated_fingerprint = env_net_cache_manifest(&config).config_fingerprint;
+        let mut calibration = CalibrationData::default();
+        calibration.pools.insert(
+            "pool-a".to_string(),
+            PoolCalibration {
+                pool_id: "pool-a".to_string(),
+                prob_6_base: Some(0.009),
+                soft_pity_slope: Some(0.06),
+                up_rate: Some(0.6),
+                sample_pulls: 10_000,
+                sample_six_stars: 100,
+            },
+        );
+
+        let resolved = apply_runtime_calibration(config, calibration);
+        let calibrated_fingerprint = env_net_cache_manifest(&resolved).config_fingerprint;
+
+        assert_eq!(resolved.prob_6_base, 0.009);
+        assert_eq!(resolved.soft_pity_slope, 0.06);
+        assert_eq!(resolved.up_rate, 0.6);
+        assert_ne!(uncalibrated_fingerprint, calibrated_fingerprint);
     }
 }

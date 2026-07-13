@@ -38,7 +38,7 @@ mod utils;
 mod worker;
 
 use autograd::Tensor as AutoTensor;
-use calibrate::{apply_calibration, run_calibration, CalibrationData};
+use calibrate::run_calibration;
 use clap::{Parser, Subcommand};
 use collect::{add_session_interactive, import_from_json, print_stats, PlayerDatabase};
 use colored::Colorize;
@@ -74,6 +74,8 @@ use sim::{
     COST_PER_PULL, FREE_PULLS_WELFARE,
 };
 use trainer::OnlineNeuralTrainer;
+
+const DEFAULT_BENCH_TRIALS: usize = 5;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -163,7 +165,7 @@ enum BenchAction {
         /// Reward on the gacha env is high-variance; n=3 leaves per-condition std
         /// (+/-1..2 on a mean of 3..6) large enough to swamp between-condition
         /// differences. n=5 is the minimum that yields a usable std estimate.
-        #[arg(long, default_value_t = 5)]
+        #[arg(long, default_value_t = DEFAULT_BENCH_TRIALS)]
         trials: usize,
     },
 }
@@ -765,23 +767,9 @@ fn main() {
         force: args.force,
         allow_online_bootstrap: matches!(command, Commands::Interactive),
     };
-    let (mut config, env_net, trained_neural_opt, dqn_policy, ppo_policy, worker, mut rng) =
+    let (config, env_net, trained_neural_opt, dqn_policy, ppo_policy, worker, mut rng) =
         initialize_system(&args.config, args.seed, init_options);
     let lang = Language::from_config(&config);
-
-    // Auto-load calibrated parameters if available
-    let calibration = if config.use_calibrated {
-        let cal = CalibrationData::load(&config.calibrated_path);
-        if !cal.pools.is_empty() {
-            apply_calibration(&mut config, &cal);
-            info!("[Calibration] Loaded calibrated parameters.");
-            Some(cal)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
 
     match command {
         Commands::Interactive => {
@@ -794,7 +782,6 @@ fn main() {
                 worker,
                 rng,
                 lang,
-                calibration,
             });
         }
         Commands::Simulate { count, pulls } => {
@@ -920,7 +907,6 @@ struct RunInteractiveArgs {
     worker: GoodJobWorker,
     rng: Rng,
     lang: Language,
-    calibration: Option<CalibrationData>,
 }
 
 fn run_interactive(args: RunInteractiveArgs) {
@@ -933,7 +919,6 @@ fn run_interactive(args: RunInteractiveArgs) {
         worker,
         mut rng,
         lang,
-        calibration,
     } = args;
     let dqn_shared = Arc::new(RwLock::new(dqn_policy.clone()));
     let neural_shared = Arc::new(RwLock::new(trained_neural_opt.clone()));
@@ -1263,9 +1248,6 @@ fn run_interactive(args: RunInteractiveArgs) {
         if pool_input.eq_ignore_ascii_case("all") {
             let all_ids: Vec<String> = config.pools.iter().map(|p| p.id.clone()).collect();
             if !all_ids.is_empty() && config.apply_pool(&all_ids[0]) {
-                if let Some(cal) = &calibration {
-                    apply_calibration(&mut config, cal);
-                }
                 selected_pool_ids = all_ids;
             }
         } else {
@@ -1294,9 +1276,6 @@ fn run_interactive(args: RunInteractiveArgs) {
                     }
                 }
                 if !ids.is_empty() && config.apply_pool(&ids[0]) {
-                    if let Some(cal) = &calibration {
-                        apply_calibration(&mut config, cal);
-                    }
                     selected_pool_ids = ids;
                 }
             }
@@ -1551,7 +1530,7 @@ fn run_interactive(args: RunInteractiveArgs) {
                 }
                 "paper" | "p" => {
                     let mut only_filter: Option<Vec<String>> = None;
-                    let mut trials = 3usize;
+                    let mut trials = DEFAULT_BENCH_TRIALS;
                     let mut format_str = "svg".to_string();
                     let mut output_dir = "bench_output".to_string();
 
@@ -1614,7 +1593,7 @@ fn run_interactive(args: RunInteractiveArgs) {
                         "bench_output".to_string(),
                         "svg",
                         Some(vec![sub_lower]),
-                        3,
+                        DEFAULT_BENCH_TRIALS,
                     ) {
                         Ok(cfg) => cfg,
                         Err(err) => {
@@ -1690,9 +1669,6 @@ fn run_interactive(args: RunInteractiveArgs) {
                 } else {
                     let first = valid_ids[0].clone();
                     if config.apply_pool(&first) {
-                        if let Some(cal) = &calibration {
-                            apply_calibration(&mut config, cal);
-                        }
                         selected_pool_ids = valid_ids;
                         println!(
                             "{}",
@@ -1707,9 +1683,6 @@ fn run_interactive(args: RunInteractiveArgs) {
                 if !all_ids.is_empty() {
                     let first = all_ids[0].clone();
                     if config.apply_pool(&first) {
-                        if let Some(cal) = &calibration {
-                            apply_calibration(&mut config, cal);
-                        }
                         selected_pool_ids = all_ids;
                         println!("{}", I18n::get(lang, "cmd_pool_all_set"));
                         print_pool_header(&config, lang);
@@ -1742,9 +1715,6 @@ fn run_interactive(args: RunInteractiveArgs) {
                 } else if is_multi_like || resolved_ids.len() > 1 {
                     let first = resolved_ids[0].clone();
                     if config.apply_pool(&first) {
-                        if let Some(cal) = &calibration {
-                            apply_calibration(&mut config, cal);
-                        }
                         selected_pool_ids = resolved_ids;
                         println!(
                             "{}",
@@ -1756,9 +1726,6 @@ fn run_interactive(args: RunInteractiveArgs) {
                 } else {
                     let selected_id = resolved_ids[0].clone();
                     if config.apply_pool(&selected_id) {
-                        if let Some(cal) = &calibration {
-                            apply_calibration(&mut config, cal);
-                        }
                         selected_pool_ids = vec![selected_id];
                         println!(
                             "{}",
@@ -1916,9 +1883,6 @@ fn run_interactive(args: RunInteractiveArgs) {
                     if !pool_config.apply_pool(pool_id) {
                         continue;
                     }
-                    if let Some(cal) = &calibration {
-                        apply_calibration(&mut pool_config, cal);
-                    }
                     println!(
                         "{}",
                         I18n::get(lang, "sim_pool_header").replace("{}", &pool_config.pool_name)
@@ -2008,9 +1972,6 @@ fn run_interactive(args: RunInteractiveArgs) {
                     let mut pool_config = config.clone();
                     if !pool_config.apply_pool(pool_id) {
                         continue;
-                    }
-                    if let Some(cal) = &calibration {
-                        apply_calibration(&mut pool_config, cal);
                     }
                     println!(
                         "{}",
@@ -2316,6 +2277,17 @@ mod tests {
             1
         )
         .is_err());
+    }
+
+    #[test]
+    fn benchmark_paper_uses_one_default_trial_count() {
+        let args = Args::try_parse_from(["talos_xii", "benchmark", "paper"]).unwrap();
+        match args.command {
+            Some(Commands::Benchmark {
+                action: Some(BenchAction::Achf { trials, .. }),
+            }) => assert_eq!(trials, DEFAULT_BENCH_TRIALS),
+            _ => panic!("expected benchmark paper command"),
+        }
     }
 
     #[test]

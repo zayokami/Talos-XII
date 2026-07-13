@@ -534,21 +534,87 @@ fn print_estimate_row(name: &str, est: &BayesianEstimate, as_percent: bool, lang
     );
 }
 
-/// Apply calibration data to a Config, overriding pool parameters where calibrated.
-pub fn apply_calibration(config: &mut Config, cal: &CalibrationData) {
-    if let Some(active) = &config.active_pool {
-        if let Some(pool_cal) = cal.pools.get(active) {
-            if let Some(base) = pool_cal.prob_6_base {
-                config.prob_6_base = base;
-            }
-            if let Some(slope) = pool_cal.soft_pity_slope {
-                config.soft_pity_slope = slope;
-            }
-            if let Some(up) = pool_cal.up_rate {
-                config.up_rate = up;
+fn apply_probability_override(target: &mut f64, value: f64, field: &str, pool_id: &str) -> bool {
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        *target = value;
+        true
+    } else {
+        log::warn!(
+            "[Calibration] Ignoring invalid {}={} for pool {}.",
+            field,
+            value,
+            pool_id
+        );
+        false
+    }
+}
+
+fn apply_slope_override(target: &mut f64, value: f64, pool_id: &str) -> bool {
+    if value.is_finite() && value >= 0.0 {
+        *target = value;
+        true
+    } else {
+        log::warn!(
+            "[Calibration] Ignoring invalid soft_pity_slope={} for pool {}.",
+            value,
+            pool_id
+        );
+        false
+    }
+}
+
+fn apply_pool_calibration(
+    prob_6_base: &mut f64,
+    soft_pity_slope: &mut f64,
+    up_rate: &mut f64,
+    pool_cal: &PoolCalibration,
+) -> bool {
+    let mut applied = false;
+    if let Some(base) = pool_cal.prob_6_base {
+        applied |= apply_probability_override(prob_6_base, base, "prob_6_base", &pool_cal.pool_id);
+    }
+    if let Some(slope) = pool_cal.soft_pity_slope {
+        applied |= apply_slope_override(soft_pity_slope, slope, &pool_cal.pool_id);
+    }
+    if let Some(up) = pool_cal.up_rate {
+        applied |= apply_probability_override(up_rate, up, "up_rate", &pool_cal.pool_id);
+    }
+    applied
+}
+
+/// Merge calibrated values into the pool catalog and active root fields.
+/// Returns the number of pool definitions that received at least one valid override.
+pub fn apply_calibration(config: &mut Config, cal: &CalibrationData) -> usize {
+    let mut applied_pools = 0usize;
+    for pool in &mut config.pools {
+        if let Some(pool_cal) = cal.pools.get(&pool.id) {
+            if apply_pool_calibration(
+                &mut pool.prob_6_base,
+                &mut pool.soft_pity_slope,
+                &mut pool.up_rate,
+                pool_cal,
+            ) {
+                applied_pools += 1;
             }
         }
     }
+
+    if let Some(active_pool) = config.active_pool.clone() {
+        if config.pools.iter().any(|pool| pool.id == active_pool) {
+            let _ = config.apply_pool(&active_pool);
+        } else if let Some(pool_cal) = cal.pools.get(&active_pool) {
+            if apply_pool_calibration(
+                &mut config.prob_6_base,
+                &mut config.soft_pity_slope,
+                &mut config.up_rate,
+                pool_cal,
+            ) {
+                applied_pools += 1;
+            }
+        }
+    }
+
+    applied_pools
 }
 
 #[cfg(test)]
@@ -618,5 +684,74 @@ mod tests {
         let est = estimate_base_rate(&stats, 0.8, 5);
         assert!(est.ci_lower >= 0.0);
         assert!(est.ci_upper <= 1.0);
+    }
+
+    #[test]
+    fn calibration_updates_pool_catalog_before_runtime_switches() {
+        let mut config = Config::load("data/config.json");
+        let first_id = config.pools[0].id.clone();
+        let second_id = config.pools[1].id.clone();
+        let mut calibration = CalibrationData::default();
+        calibration.pools.insert(
+            first_id.clone(),
+            PoolCalibration {
+                pool_id: first_id.clone(),
+                prob_6_base: Some(0.009),
+                soft_pity_slope: Some(0.051),
+                up_rate: Some(0.6),
+                sample_pulls: 10_000,
+                sample_six_stars: 100,
+            },
+        );
+        calibration.pools.insert(
+            second_id.clone(),
+            PoolCalibration {
+                pool_id: second_id.clone(),
+                prob_6_base: Some(0.01),
+                soft_pity_slope: Some(0.052),
+                up_rate: Some(0.7),
+                sample_pulls: 10_000,
+                sample_six_stars: 100,
+            },
+        );
+
+        assert_eq!(apply_calibration(&mut config, &calibration), 2);
+        assert_eq!(config.prob_6_base, 0.009);
+        assert_eq!(config.soft_pity_slope, 0.051);
+        assert_eq!(config.up_rate, 0.6);
+
+        assert!(config.apply_pool(&second_id));
+        assert_eq!(config.prob_6_base, 0.01);
+        assert_eq!(config.soft_pity_slope, 0.052);
+        assert_eq!(config.up_rate, 0.7);
+    }
+
+    #[test]
+    fn calibration_rejects_invalid_runtime_values() {
+        let mut config = Config {
+            active_pool: Some("pool-a".to_string()),
+            pools: vec![],
+            prob_6_base: 0.008,
+            soft_pity_slope: 0.05,
+            up_rate: 0.5,
+            ..Config::default()
+        };
+        let mut calibration = CalibrationData::default();
+        calibration.pools.insert(
+            "pool-a".to_string(),
+            PoolCalibration {
+                pool_id: "pool-a".to_string(),
+                prob_6_base: Some(f64::NAN),
+                soft_pity_slope: Some(-0.1),
+                up_rate: Some(1.5),
+                sample_pulls: 10_000,
+                sample_six_stars: 100,
+            },
+        );
+
+        assert_eq!(apply_calibration(&mut config, &calibration), 0);
+        assert_eq!(config.prob_6_base, 0.008);
+        assert_eq!(config.soft_pity_slope, 0.05);
+        assert_eq!(config.up_rate, 0.5);
     }
 }

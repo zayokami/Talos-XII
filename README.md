@@ -8,16 +8,16 @@
 
 ---
 
-Most gacha simulators just roll dice according to a probability table. Talos-XII doesn't.
+Most gacha simulators only roll dice according to a probability table. Talos-XII can additionally run policy-adjusted experiments.
 
-Before each simulation, it trains a set of neural networks to model the uncertainty of the gacha environment: a DBN (Deep Belief Network) fits the environment noise distribution, while DQN (Dueling Q-Network) and PPO (Proximal Policy Optimization) learn discrete decisions and continuous strategy respectively. Based on this, the simulator can answer questions like "what's my probability of getting the UP character as a F2P player?" or "given my current pity progress, should I keep pulling or wait for the next banner?"
+Before a model-driven simulation, Talos-XII loads or trains EnvNet, NeuralLuckOptimizer, DQN, and PPO. EnvNet derives synthetic environment features, while DQN and PPO select one of five discrete luck modifiers under a bounded luck budget. These models do not decide whether to pull or wait; they redistribute the configured per-pull probability inside the simulator. Results therefore describe the selected simulation policy, not undisclosed in-game mechanics.
 
 Technically, Talos-XII is a single Rust binary. It accelerates matrix operations via SIMD (AVX2/AVX-512/NEON) and parallelizes simulation tasks using Rayon, achieving over 10,000 simulations per second on mainstream hardware while maintaining statistical reliability.
 
 ---
 
-**由深度学习为基础开发的《明日方舟：终末地》抽卡模拟框架。** 
-Talos-XII 会在在模拟前先训练 DBN 建模环境噪声、DQN 和 PPO 学习决策策略，能回答"零氪靠免费资源抽到 UP 的概率"这类更有价值的问题。
+**由深度学习为基础开发的《明日方舟：终末地》抽卡模拟框架。**
+Talos-XII 在模型驱动模拟前加载或训练 EnvNet、NeuralLuckOptimizer、DQN 和 PPO。EnvNet 生成合成环境特征，DQN 与 PPO 在受限运势预算内选择五种离散概率修正动作。模型不会决定是否抽卡，而是在模拟器内部重新分配逐抽概率；结果表示所选模拟策略，不代表未公开的游戏机制。
 
 ---
 
@@ -40,7 +40,7 @@ cargo build --release
 ./target/release/talos_xii
 ```
 
-On first launch, the program trains EnvNet, NeuralLuckOptimizer, DQN (50k steps), and PPO (20k steps by default), taking ~30–45 seconds. Models are cached beside the running executable as `env_net.cache`, `neural.cache`, `dqn.cache.bin`, and `ppo.cache.bin`; BF16 inference caches are written to `dqn.cache.bf16.bin` and `ppo.cache.bf16.bin`. Subsequent launches complete in under 1 second.
+On first launch, the program trains EnvNet, NeuralLuckOptimizer, DQN, and PPO using the schedules in `data/config.json`, taking ~30–45 seconds with the shipped configuration. Models are cached beside the running executable as `env_net.cache`, `neural.cache`, `dqn.cache.bin`, and `ppo.cache.bin`; BF16 inference caches are written to `dqn.cache.bf16.bin` and `ppo.cache.bf16.bin`. Subsequent launches complete in under 1 second.
 
 ### CUDA Support (Optional)
 
@@ -71,7 +71,7 @@ When the binary is built without the `cuda` feature, `cuda`/`auto` fall back to 
 
 ## Usage
 
-All subcommands support `-c <path>` for config, `-s <seed>` for reproducible runs, and `-f` to force model retraining. Common entry points:
+All subcommands support `-c <path>` for config, `-s <seed>` for repeatable runs with a fixed config and worker topology, and `-f` to force model retraining. Common entry points:
 
 ```bash
 cargo run --release                              # interactive mode
@@ -99,7 +99,9 @@ Talos-XII supports four pool types: **character UP** (limited rate-up), **weapon
 
 ### Probabilities & Pity
 
-Character UP pool: 0.8% base 6-star rate, soft pity at 65 (rate gradually increases), hard pity at 80 (guaranteed 6-star), mega pity at 120 (guaranteed UP character). UP rate within 6-star is 75%.
+Pool rules are data-driven. `data/pools.json` is the canonical source; individual pools may override every probability and pity field.
+
+Shipped active pool contract: `char_up_20260605` uses **50%** (`up_rate = 0.5`). This active character UP pool has a 0.8% base 6-star rate, soft pity at 65, hard pity at 80, and cumulative UP guarantee at 120. Special or archived pools may use different values.
 
 Weapon UP pool: 4% base 6-star rate, hard pity at 40, mega pity at 180, UP weapon rate 50%.
 
@@ -110,9 +112,9 @@ Weapon UP pool: 4% base 6-star rate, hard pity at 40, mega pity at 180, UP weapo
 ### Simulation Engine (`src/sim.rs`)
 
 Each simulation constructs a 32-dimensional feature vector (pity progress, env noise, consecutive non-UP count, engineered interaction terms, etc.) and feeds it to the neural network for decision guidance. Three modes:
-- **probability** — pure dice roll per config probability table
-- **dqn** — Dueling Q-Network provides discrete action suggestions
-- **ppo** — Actor-Critic network provides continuous pull strategy optimization
+- **probability** — historical name for the NeuralLuckOptimizer path; it predicts a bounded luck modifier and is not an unmodified probability baseline
+- **dqn** — Dueling Q-Network selects one of five discrete luck modifiers
+- **ppo** — Actor-Critic with sequence context selects from the same discrete modifier set
 
 The engine also supports a fast inference path (`fast_inference`) that skips full Tensor construction during batch simulation, using precompiled prediction functions and KV caching to minimize overhead.
 
@@ -122,10 +124,10 @@ On first run, four components are trained or loaded sequentially:
 
 1. **EnvNet** (5→64→32→16→2) — models gacha environment noise/bias from RNG, pity, pull count, streak, and loss streak inputs; samples (env_noise, env_bias) per simulation as environment parameters
 2. **NeuralLuckOptimizer** — evolutionary training + linear regression + manifold RL on EnvNet-provided environment; learns 32-dim → "luck value" mapping
-3. **DQN** (Dueling, 50k steps) — maps state to discrete action Q-values; decides "pull or wait"
-4. **PPO** (Actor-Critic + MLA Transformer, 20k steps by default) — learns continuous pull strategy distribution; the heaviest and most expressive model
+3. **DQN** (Dueling, 50k steps) — maps state to Q-values over five discrete luck modifiers
+4. **PPO** (Actor-Critic + MLA Transformer) — learns a categorical policy over the same five modifiers with sequence context; its schedule is controlled by `ppo_total_steps`
 
-Cached models are portable — they learn pity/probability mechanisms, not character names — so no retraining is usually needed after pool updates. Use `-f` to force retraining, or delete the relevant cache files when model architecture, feature construction, or training configuration changes.
+Model cache manifests fingerprint probability, pity, luck-budget, architecture, training, and ACHF settings. Calibrated parameters are applied before this fingerprint is computed. Character-name-only updates can reuse a cache; probability, pity, calibration, feature, architecture, or training changes rebuild incompatible caches on the next initialization. Use `-f` to force retraining.
 
 ### ACHF (Adaptive Cache-aware Hyper-Connections)
 
@@ -212,13 +214,13 @@ Runtime CPU capability detection with automatic dispatch: Scalar → AVX2 → AV
 - **Rust** — language and core framework
 - **Rayon** — data parallelism
 - **Portable SIMD** — AVX2 / AVX-512 / NEON hardware acceleration
-- **Custom Neural Networks** — DBN, PPO (MLA Transformer), DQN (Dueling), NeuralLuckOptimizer
+- **Custom Neural Networks** — EnvNet, PPO (MLA Transformer), DQN (Dueling), NeuralLuckOptimizer
 - **Custom Autograd** — automatic differentiation engine supporting matmul, conv2d, pool
 - **Mmap Tensor I/O** — memory-mapped high-performance tensor I/O
 
 ---
 
-## Testing (236 tests)
+## Testing
 
 ```bash
 cargo test
@@ -291,7 +293,7 @@ cargo build --release
 ./target/release/talos_xii
 ```
 
-首次启动会训练 EnvNet、NeuralLuckOptimizer、DQN（50k 步）和 PPO（默认 20k 步），约 30～45 秒。模型默认缓存到运行中的 exe 所在目录，文件名为 `env_net.cache`、`neural.cache`、`dqn.cache.bin`、`ppo.cache.bin`；BF16 推理缓存写入 `dqn.cache.bf16.bin` 和 `ppo.cache.bf16.bin`，之后启动不到 1 秒。
+首次启动会按 `data/config.json` 中的训练计划训练 EnvNet、NeuralLuckOptimizer、DQN 和 PPO；随附配置约需 30～45 秒。模型默认缓存到运行中的 exe 所在目录，文件名为 `env_net.cache`、`neural.cache`、`dqn.cache.bin`、`ppo.cache.bin`；BF16 推理缓存写入 `dqn.cache.bf16.bin` 和 `ppo.cache.bf16.bin`，之后启动不到 1 秒。
 
 ### CUDA 支持（可选）
 
@@ -322,7 +324,7 @@ CUDA_ARCH=sm_89 cargo build --release --features cuda
 
 ## 使用方法
 
-所有子命令支持 `-c <path>` 指定配置、`-s <seed>` 固定随机种子、`-f` 强制重训模型。常用入口：
+所有子命令支持 `-c <path>` 指定配置、`-s <seed>` 在配置和 worker 拓扑不变时复现实验、`-f` 强制重训模型。常用入口：
 
 ```bash
 cargo run --release                              # 交互模式
@@ -350,7 +352,9 @@ cargo run --release -- benchmark                  # 快速内置基准
 
 ### 概率与保底
 
-角色 UP 池：基础 6 星概率 0.8%，65 抽起软保底（概率逐步提升），80 抽硬保底，120 抽大保底必出 UP 角色，UP 在 6 星中占 75%。
+卡池规则完全由数据驱动，`data/pools.json` 是权威来源；每个卡池都可以覆盖全部概率和保底字段。
+
+随附激活卡池约定：`char_up_20260605` 使用 **50%**（`up_rate = 0.5`）。该激活角色 UP 池的基础 6 星概率为 0.8%，65 抽起软保底，80 抽硬保底，120 抽累计保底必出 UP；特殊或归档卡池可以使用不同数值。
 
 武器 UP 池：基础 6 星概率 4%，40 抽硬保底，180 抽大保底，UP 武器占 50%。
 
@@ -361,9 +365,9 @@ cargo run --release -- benchmark                  # 快速内置基准
 ### 模拟引擎（`src/sim.rs`）
 
 每次模拟构建 32 维特征向量（保底进度、环境噪声、连续未出 UP 次数以及工程化交互特征等），送入神经网络获取决策建议。三种模式：
-- **probability** — 纯概率，按配置的概率表投骰
-- **dqn** — Dueling Q-Network 提供离散动作建议
-- **ppo** — Actor-Critic 网络提供连续抽卡策略优化
+- **probability** — NeuralLuckOptimizer 路径的历史名称；它会预测受运势预算约束的概率修正值，并非不加修正的纯概率基线
+- **dqn** — Dueling Q-Network 从五种离散运势修正动作中选择
+- **ppo** — 带序列上下文的 Actor-Critic 从同一组离散修正动作中选择
 
 引擎还支持快速推理路径（`fast_inference`），批量模拟时跳过完整 Tensor 构建，使用预编译快速预测函数和 KV 缓存压缩推理开销。
 
@@ -373,10 +377,10 @@ cargo run --release -- benchmark                  # 快速内置基准
 
 1. **EnvNet**（5→64→32→16→2）— 基于 RNG、保底、总抽数、连抽星级和歪 UP 次数建模环境噪声/偏置，每次模拟采样一组 (env_noise, env_bias) 作为环境参数
 2. **NeuralLuckOptimizer** — 在 EnvNet 提供的环境上做进化训练、线性回归与流形 RL 优化，学习 32 维特征到"运气值"的映射
-3. **DQN**（Dueling，50k 步）— 将状态映射为离散动作 Q 值，决定"抽还是不抽"
-4. **PPO**（Actor-Critic + MLA Transformer，默认 20k 步）— 学习连续抽卡策略分布，是最重也是最有表达力的模型
+3. **DQN**（Dueling，50k 步）— 将状态映射为五种离散运势修正动作的 Q 值
+4. **PPO**（Actor-Critic + MLA Transformer）— 利用序列上下文学习同一组五种修正动作上的分类策略，训练计划由 `ppo_total_steps` 控制
 
-训练完成后缓存到磁盘。缓存是通用的——它们学习的是保底/概率机制，不依赖角色名，因此卡池更新后通常无需重训。需要强制重训时使用 `-f`，模型结构、特征构造或训练配置变化时建议删除对应缓存。
+模型缓存清单会对概率、保底、运势预算、模型结构、训练参数和 ACHF 设置生成指纹，校准参数会在计算该指纹前应用。仅修改角色名称可以复用缓存；概率、保底、校准、特征、模型结构或训练参数变化时，下次初始化会重建不兼容缓存。使用 `-f` 可强制重训。
 
 ### ACHF（Adaptive Cache-aware Hyper-Connections）
 
@@ -463,13 +467,13 @@ flowchart TD
 - **Rust** — 语言与核心框架
 - **Rayon** — 数据并行
 - **Portable SIMD** — AVX2 / AVX-512 / NEON 硬件加速
-- **自研神经网络** — DBN、PPO（MLA Transformer）、DQN（Dueling）、NeuralLuckOptimizer
+- **自研神经网络** — EnvNet、PPO（MLA Transformer）、DQN（Dueling）、NeuralLuckOptimizer
 - **自研 Autograd** — 支持 matmul、conv2d、pool 的自动微分引擎
 - **Mmap Tensor I/O** — 内存映射的高性能张量读写
 
 ---
 
-## 测试（236 个测试）
+## 测试
 
 ```bash
 cargo test

@@ -365,10 +365,11 @@ pub fn prob_6(pity_6: usize, config: &Config) -> f64 {
 pub fn expected_pulls_per_six(config: &Config) -> f64 {
     let mut survival = 1.0;
     let mut expected = 0.0;
-    for k in 1..=config.small_pity_guarantee {
-        let p6 = prob_6(k, config);
+    for pull_number in 1..=config.small_pity_guarantee {
+        let pity_before_pull = pull_number - 1;
+        let p6 = prob_6(pity_before_pull, config);
         let prob_k = survival * p6;
-        expected += k as f64 * prob_k;
+        expected += pull_number as f64 * prob_k;
         survival *= 1.0 - p6;
         if p6 >= 1.0 {
             break;
@@ -1780,6 +1781,32 @@ mod tests {
 
         assert_eq!(prob_6(1, &config), 0.0);
         assert_eq!(prob_6(3, &config), 1.0);
+    }
+
+    #[test]
+    fn expected_pulls_uses_pre_pull_pity_state() {
+        let config = Config {
+            prob_6_base: 0.0,
+            soft_pity_start: 1,
+            soft_pity_slope: 0.0,
+            small_pity_guarantee: 3,
+            ..Config::default()
+        };
+
+        assert_eq!(expected_pulls_per_six(&config), 3.0);
+    }
+
+    #[test]
+    fn expected_pulls_matches_survival_identity() {
+        let config = Config::load("data/config.json");
+        let mut survival_before_pull = 1.0;
+        let mut expected_from_survival = 0.0;
+        for pity_before_pull in 0..config.small_pity_guarantee {
+            expected_from_survival += survival_before_pull;
+            survival_before_pull *= 1.0 - prob_6(pity_before_pull, &config);
+        }
+
+        assert!((expected_pulls_per_six(&config) - expected_from_survival).abs() < 1e-12);
     }
 
     #[test]
