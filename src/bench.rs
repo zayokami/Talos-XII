@@ -1,6 +1,6 @@
-use crate::achf::{aggregate_cache_stats_iter, AchfCacheStats};
+use crate::achf::{aggregate_cache_stats_iter, AchfCacheStats, AchfLayer};
 use crate::chart::{self, ChartFormat};
-use crate::config::{Config, LuckMode};
+use crate::config::{AchfConfig, Config, LuckMode};
 use crate::dqn::{train_dqn_with_metrics, DuelingQNetwork};
 use crate::env_net::EnvNet;
 use crate::model_io::{
@@ -25,6 +25,8 @@ const BENCH_EXPERIMENTS: &[&str] = &[
     "scale",
     "apply",
     "convergence",
+    "crossover",
+    "regime",
 ];
 const THROUGHPUT_SIMS: usize = 200;
 const THROUGHPUT_PULLS: usize = 100;
@@ -97,6 +99,47 @@ pub struct AggregatedResult {
     pub param_count: usize,
     pub best_snapshots: Vec<StepSnapshot>,
     pub cache_stats: Option<AchfCacheStats>,
+}
+
+/// One cell of the path-crossover grid: measured per-path latency at a given
+/// (dim, weight_sparsity) operating point, plus which path was fastest.
+#[derive(Clone, Debug)]
+struct CrossoverCell {
+    dim: usize,
+    weight_sparsity: f32,
+    cached_ns: f64,
+    sparse_ns: f64,
+    dense_ns: f64,
+    winner: String,
+}
+
+/// Per-regime latency for the adaptation experiment. For one batch size on a
+/// fixed layer we record the live adaptive selector's achieved latency, the two
+/// fixed-path latencies, the oracle (best fixed path), and the sparse-selection
+/// fraction. The oracle-gap (adaptive / oracle) is the robust adaptation
+/// metric: near a crossover both fixed paths cost ~the same, so the selector's
+/// achieved latency tracks the oracle even where its path *choice* is noisy.
+#[derive(Clone, Debug)]
+struct RegimeLatency {
+    batch: usize,
+    adaptive_ns: f64,
+    cached_ns: f64,
+    sparse_ns: f64,
+    oracle_ns: f64,
+    oracle_path: String,
+    sparse_frac: f64,
+}
+
+/// One row of the regime-adaptation experiment: the small-batch (decode-like)
+/// and large-batch (prefill-like) measurements for one fixed weight sparsity.
+/// When the two regimes have DIFFERENT oracle paths yet the adaptive selector
+/// stays near-oracle in both, that is the "true adaptive" result: a single
+/// fixed path cannot win both regimes, but the batch-aware selector does.
+#[derive(Clone, Debug)]
+struct RegimeRow {
+    weight_sparsity: f32,
+    small: RegimeLatency,
+    large: RegimeLatency,
 }
 
 #[derive(Clone, Debug)]
@@ -417,6 +460,22 @@ pub fn run_achf_benchmarks(base_config: &Config, seed: u64, bench_cfg: &BenchCon
         all_agg.push(("convergence", agg));
     }
 
+    if should_run(bench_cfg, "crossover") {
+        let cells = run_path_crossover();
+        println!("[Bench] Path Crossover complete ({} cells).", cells.len());
+        let e = ext(&bench_cfg.format);
+        chart_crossover(&cells, dir, e);
+        write_crossover_outputs(&cells, dir);
+    }
+
+    if should_run(bench_cfg, "regime") {
+        let rows = run_regime_adaptation();
+        println!("[Bench] Regime Adaptation complete ({} rows).", rows.len());
+        let e = ext(&bench_cfg.format);
+        chart_regime(&rows, dir, e);
+        write_regime_outputs(&rows, dir);
+    }
+
     write_summary_txt(
         &all_agg,
         path_latencies.as_deref(),
@@ -556,6 +615,192 @@ fn run_path_comparison(base_config: &Config, seed: u64) -> Vec<(String, Vec<f64>
         all_latencies.push((path_name.to_string(), latencies));
     }
     all_latencies
+}
+
+/// Build a frozen square ACHF layer with an EXACT target weight sparsity by
+/// zeroing the first `sparsity` fraction of every row (deterministic). The CSR
+/// sparse view keys on `w != 0.0`, so this controls the sparse path's FLOP
+/// count precisely — unlike magnitude pruning, whose sparsity depends on the
+/// random weight distribution. `adaptive` toggles the live AMA selector.
+fn build_synthetic_achf_layer(dim: usize, weight_sparsity: f32, adaptive: bool) -> AchfLayer {
+    let cfg = AchfConfig {
+        enabled: true,
+        adaptive_inference: adaptive,
+        cache_latency_sample_every: 1,
+        gate_warmup_steps: 0,
+        gate_transition_steps: 0,
+        g_min: 0.0,
+        infer_gate: "one".to_string(),
+        prune_threshold: 0.0,
+        // Disable memoization: with a repeated benchmark input it would return a
+        // memo hit and bypass the selector/path entirely, invalidating timing.
+        cache_min_reuse: 0,
+        ..Default::default()
+    };
+    let mut layer = AchfLayer::new(dim, dim, false, cfg, 0x5EED ^ dim as u64);
+    {
+        let mut w = layer.weight.weight.data_write_f32();
+        let zero_per_row = (dim as f32 * weight_sparsity) as usize;
+        for r in 0..dim {
+            for c in 0..dim {
+                let v = &mut w[r * dim + c];
+                if c < zero_per_row {
+                    *v = 0.0;
+                } else if *v == 0.0 {
+                    *v = 0.01; // keep survivors nonzero so CSR nnz is exact
+                }
+            }
+        }
+    }
+    layer.freeze_for_inference();
+    layer
+}
+
+/// Time one forced path (mean ns per single forward) over `iters` batches of
+/// `batch` rows, after `warmup` untimed calls. Batching keeps the timed window
+/// well above clock granularity (see run_path_comparison for the rationale).
+fn time_forced_path(layer: &AchfLayer, x: &[f32], path_id: u8, warmup: usize, iters: usize) -> f64 {
+    for _ in 0..warmup {
+        std::hint::black_box(layer.forward_inference_forced_path(std::hint::black_box(x), path_id));
+    }
+    let start = Instant::now();
+    for _ in 0..iters {
+        std::hint::black_box(layer.forward_inference_forced_path(std::hint::black_box(x), path_id));
+    }
+    start.elapsed().as_nanos() as f64 / iters as f64
+}
+
+/// Path-crossover experiment: sweep (dim x weight_sparsity), force each path,
+/// and record which is fastest. Demonstrates that no single fixed path wins
+/// everywhere — the premise that makes adaptive path selection worthwhile.
+fn run_path_crossover() -> Vec<CrossoverCell> {
+    println!("[Bench] Running Path Crossover (dim x weight-sparsity)...");
+    let dims = [256usize, 1024, 2048];
+    let sparsities = [0.5f32, 0.8, 0.9, 0.95, 0.99];
+    let batch = 32usize;
+    let warmup = 20usize;
+    let iters = 200usize;
+    let mut cells = Vec::new();
+    for &dim in &dims {
+        for &weight_sparsity in &sparsities {
+            let layer = build_synthetic_achf_layer(dim, weight_sparsity, false);
+            let x: Vec<f32> = (0..dim * batch).map(|i| ((i % 7) as f32) * 0.1).collect();
+            let cached_ns = time_forced_path(&layer, &x, 0, warmup, iters);
+            let sparse_ns = time_forced_path(&layer, &x, 1, warmup, iters);
+            let dense_ns = time_forced_path(&layer, &x, 2, warmup, iters);
+            let winner = if sparse_ns <= cached_ns && sparse_ns <= dense_ns {
+                "Sparse"
+            } else if cached_ns <= dense_ns {
+                "Cached"
+            } else {
+                "Dense"
+            }
+            .to_string();
+            println!(
+                "  dim={dim:<5} wsp={weight_sparsity:<5} cached={cached_ns:>9.0}ns \
+                 sparse={sparse_ns:>9.0}ns dense={dense_ns:>9.0}ns -> {winner}"
+            );
+            cells.push(CrossoverCell {
+                dim,
+                weight_sparsity,
+                cached_ns,
+                sparse_ns,
+                dense_ns,
+                winner,
+            });
+        }
+    }
+    cells
+}
+
+/// Regime-adaptation experiment: on ONE fixed frozen layer, run the LIVE
+/// adaptive selector at a small batch (decode-like) then a large batch
+/// (prefill-like) and record how often it chose the sparse path in each. When
+/// the small-batch sparse fraction exceeds the large-batch one, the selector is
+/// adapting its path choice to the operating point — the core "true adaptive"
+/// claim. Batch-bucketed latency EMAs are what make this possible.
+fn run_regime_adaptation() -> Vec<RegimeRow> {
+    println!("[Bench] Running Regime Adaptation (batch-driven path switching)...");
+    let dim = 1024usize;
+    let sparsities = [0.8f32, 0.9, 0.95, 0.98];
+    let small_batch = 1usize;
+    let large_batch = 128usize;
+    let mut rows = Vec::new();
+
+    for &weight_sparsity in &sparsities {
+        let layer = build_synthetic_achf_layer(dim, weight_sparsity, true);
+        let small = measure_regime(&layer, dim, small_batch);
+        let large = measure_regime(&layer, dim, large_batch);
+        println!(
+            "  wsp={weight_sparsity:<5} b{small_batch:<3}: adaptive={:.0}ns oracle={:.0}ns \
+             ({}) gap={:.2}x sparse_frac={:.2} | b{large_batch:<3}: adaptive={:.0}ns \
+             oracle={:.0}ns ({}) gap={:.2}x sparse_frac={:.2}",
+            small.adaptive_ns,
+            small.oracle_ns,
+            small.oracle_path,
+            small.adaptive_ns / small.oracle_ns.max(1.0),
+            small.sparse_frac,
+            large.adaptive_ns,
+            large.oracle_ns,
+            large.oracle_path,
+            large.adaptive_ns / large.oracle_ns.max(1.0),
+            large.sparse_frac,
+        );
+        rows.push(RegimeRow {
+            weight_sparsity,
+            small,
+            large,
+        });
+    }
+    rows
+}
+
+/// Measure one (layer, batch) operating point: warm the batch bucket, time the
+/// live adaptive selector, time each forced fixed path, and record the sparse
+/// selection fraction over a fresh measurement window.
+fn measure_regime(layer: &AchfLayer, dim: usize, batch: usize) -> RegimeLatency {
+    let x: Vec<f32> = (0..dim * batch).map(|i| ((i % 7) as f32) * 0.1 + 0.05).collect();
+    let warm = 300usize;
+    let iters = 600usize;
+    // Warm the adaptive selector's bucket for this batch, then time it live.
+    for _ in 0..warm {
+        let _ = std::hint::black_box(layer.forward_inference_residual(std::hint::black_box(&x)));
+    }
+    let before = layer.cache_stats();
+    let start = Instant::now();
+    for _ in 0..iters {
+        let _ = std::hint::black_box(layer.forward_inference_residual(std::hint::black_box(&x)));
+    }
+    let adaptive_ns = start.elapsed().as_nanos() as f64 / iters as f64;
+    let after = layer.cache_stats();
+    let sparse = (after.sparse_paths - before.sparse_paths) as f64;
+    let total = ((after.cache_hits - before.cache_hits)
+        + (after.sparse_paths - before.sparse_paths)
+        + (after.dense_paths - before.dense_paths)) as f64;
+    let sparse_frac = sparse / total.max(1.0);
+
+    // Forced fixed-path costs at the same operating point (reproducible).
+    let cached_ns = time_forced_path(layer, &x, 0, 40, iters);
+    let sparse_ns = time_forced_path(layer, &x, 1, 40, iters);
+    let dense_ns = time_forced_path(layer, &x, 2, 40, iters);
+    let (oracle_ns, oracle_path) = [(cached_ns, "Cached"), (sparse_ns, "Sparse"), (dense_ns, "Dense")]
+        .into_iter()
+        .fold((f64::INFINITY, "Cached"), |acc, (ns, name)| {
+            if ns < acc.0 {
+                (ns, name)
+            } else {
+                acc
+            }
+        });
+    RegimeLatency {
+        batch,
+        adaptive_ns,
+        cached_ns,
+        sparse_ns,
+        oracle_ns,
+        oracle_path: oracle_path.to_string(),
+        sparse_frac,
+    }
 }
 
 fn run_gate_curve(base_config: &Config, seed: u64) -> BenchRunResult {
@@ -950,6 +1195,88 @@ fn chart_gate_curve(result: &BenchRunResult, dir: &str, ext: &str) {
     );
 }
 
+/// One line chart per dim: per-path latency vs weight sparsity (log y). The
+/// crossings between the Cached and Sparse lines are the operating points where
+/// the fastest path flips — the visual core of the crossover argument.
+fn chart_crossover(cells: &[CrossoverCell], dir: &str, ext: &str) {
+    let mut dims: Vec<usize> = cells.iter().map(|c| c.dim).collect();
+    dims.sort_unstable();
+    dims.dedup();
+    for dim in dims {
+        let rows: Vec<&CrossoverCell> = cells.iter().filter(|c| c.dim == dim).collect();
+        if rows.is_empty() {
+            continue;
+        }
+        let cached: Vec<(f64, f64)> = rows
+            .iter()
+            .map(|c| (c.weight_sparsity as f64, c.cached_ns))
+            .collect();
+        let sparse: Vec<(f64, f64)> = rows
+            .iter()
+            .map(|c| (c.weight_sparsity as f64, c.sparse_ns))
+            .collect();
+        let dense: Vec<(f64, f64)> = rows
+            .iter()
+            .map(|c| (c.weight_sparsity as f64, c.dense_ns))
+            .collect();
+        let series: Vec<(&str, &[(f64, f64)])> =
+            vec![("Cached", &cached), ("Sparse", &sparse), ("Dense", &dense)];
+        let path = format!("{}/path_crossover_dim{}.{}", dir, dim, ext);
+        write_chart(
+            &path,
+            chart::draw_line_chart(
+                &path,
+                &format!("Path Latency vs Weight Sparsity (dim={dim})"),
+                "Weight Sparsity",
+                "Latency (ns per forward)",
+                &series,
+                900,
+                600,
+            ),
+        );
+    }
+}
+
+/// Grouped bars: oracle-gap (adaptive latency / best-fixed-path latency) at
+/// small vs large batch for each weight sparsity. Bars near 1.0 mean the
+/// adaptive selector matched the best fixed path for that regime. The point of
+/// the chart is that the ORACLE PATH differs across regimes (shown in labels),
+/// yet the adaptive selector stays near 1.0 in both — a single fixed path
+/// cannot. A ratio <1.0 can occur when interleaved probing warms caches the
+/// isolated forced-path timing doesn't see; it still means "matched oracle".
+fn chart_regime(rows: &[RegimeRow], dir: &str, ext: &str) {
+    if rows.is_empty() {
+        return;
+    }
+    let labels: Vec<String> = rows
+        .iter()
+        .flat_map(|r| {
+            [
+                format!("wsp{:.2} b{}={}", r.weight_sparsity, r.small.batch, r.small.oracle_path),
+                format!("wsp{:.2} b{}={}", r.weight_sparsity, r.large.batch, r.large.oracle_path),
+            ]
+        })
+        .collect();
+    let mut bars: Vec<(&str, f64)> = Vec::with_capacity(labels.len());
+    for (i, r) in rows.iter().enumerate() {
+        bars.push((labels[2 * i].as_str(), r.small.adaptive_ns / r.small.oracle_ns.max(1.0)));
+        bars.push((labels[2 * i + 1].as_str(), r.large.adaptive_ns / r.large.oracle_ns.max(1.0)));
+    }
+    let path = format!("{}/regime_adaptation.{}", dir, ext);
+    write_chart(
+        &path,
+        chart::draw_bar_chart(
+            &path,
+            "Adaptive Selector Oracle-Gap by Batch Regime (1.0 = matched best fixed path)",
+            "Weight Sparsity x Batch (=oracle path)",
+            "Adaptive / Oracle Latency",
+            &bars,
+            1100,
+            600,
+        ),
+    );
+}
+
 fn chart_scale(agg: &[AggregatedResult], dir: &str, ext: &str) {
     let bars = agg_bars_with_error(agg);
     let path = format!("{}/scale_test.{}", dir, ext);
@@ -1310,6 +1637,89 @@ fn write_path_latency_outputs(latencies: &[(String, Vec<f64>)], dir: &str) {
     )))
     .expect("path latency summary JSON should be serializable");
     let json_path = format!("{}/path_latency_summary.json", dir);
+    write_text_file(&json_path, &json);
+    println!("[Bench] JSON  -> {}", json_path);
+}
+
+fn write_crossover_outputs(cells: &[CrossoverCell], dir: &str) {
+    let mut csv =
+        String::from("dim,weight_sparsity,cached_ns,sparse_ns,dense_ns,winner\n");
+    for c in cells {
+        csv.push_str(&format!(
+            "{},{:.4},{:.3},{:.3},{:.3},{}\n",
+            c.dim, c.weight_sparsity, c.cached_ns, c.sparse_ns, c.dense_ns, c.winner
+        ));
+    }
+    let csv_path = format!("{}/path_crossover.csv", dir);
+    write_text_file(&csv_path, &csv);
+    println!("[Bench] CSV   -> {}", csv_path);
+
+    let arr: Vec<serde_json::Value> = cells
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "dim": c.dim,
+                "weight_sparsity": c.weight_sparsity,
+                "cached_ns": c.cached_ns,
+                "sparse_ns": c.sparse_ns,
+                "dense_ns": c.dense_ns,
+                "winner": c.winner,
+            })
+        })
+        .collect();
+    let json = serde_json::to_string_pretty(&serde_json::Value::Array(arr))
+        .expect("crossover summary JSON should be serializable");
+    let json_path = format!("{}/path_crossover_summary.json", dir);
+    write_text_file(&json_path, &json);
+    println!("[Bench] JSON  -> {}", json_path);
+}
+
+fn write_regime_outputs(rows: &[RegimeRow], dir: &str) {
+    let mut csv = String::from(
+        "weight_sparsity,batch,adaptive_ns,cached_ns,sparse_ns,dense_oracle_ns,oracle_path,oracle_gap,sparse_frac\n",
+    );
+    let push = |wsp: f32, r: &RegimeLatency, csv: &mut String| {
+        csv.push_str(&format!(
+            "{:.4},{},{:.3},{:.3},{:.3},{:.3},{},{:.4},{:.4}\n",
+            wsp,
+            r.batch,
+            r.adaptive_ns,
+            r.cached_ns,
+            r.sparse_ns,
+            r.oracle_ns,
+            r.oracle_path,
+            r.adaptive_ns / r.oracle_ns.max(1.0),
+            r.sparse_frac,
+        ));
+    };
+    for r in rows {
+        push(r.weight_sparsity, &r.small, &mut csv);
+        push(r.weight_sparsity, &r.large, &mut csv);
+    }
+    let csv_path = format!("{}/regime_adaptation.csv", dir);
+    write_text_file(&csv_path, &csv);
+    println!("[Bench] CSV   -> {}", csv_path);
+
+    let cell = |wsp: f32, r: &RegimeLatency| {
+        serde_json::json!({
+            "weight_sparsity": wsp,
+            "batch": r.batch,
+            "adaptive_ns": r.adaptive_ns,
+            "cached_ns": r.cached_ns,
+            "sparse_ns": r.sparse_ns,
+            "oracle_ns": r.oracle_ns,
+            "oracle_path": r.oracle_path,
+            "oracle_gap": r.adaptive_ns / r.oracle_ns.max(1.0),
+            "sparse_frac": r.sparse_frac,
+        })
+    };
+    let arr: Vec<serde_json::Value> = rows
+        .iter()
+        .flat_map(|r| [cell(r.weight_sparsity, &r.small), cell(r.weight_sparsity, &r.large)])
+        .collect();
+    let json = serde_json::to_string_pretty(&serde_json::Value::Array(arr))
+        .expect("regime summary JSON should be serializable");
+    let json_path = format!("{}/regime_adaptation_summary.json", dir);
     write_text_file(&json_path, &json);
     println!("[Bench] JSON  -> {}", json_path);
 }
@@ -1717,6 +2127,101 @@ mod tests {
         .unwrap();
         assert_eq!(summary[0]["samples"], 4);
 
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn synthetic_achf_layer_hits_target_sparsity_and_paths_agree() {
+        // The synthetic builder must produce the requested weight sparsity
+        // exactly (CSR nnz), and all three forced paths must agree numerically
+        // on a frozen layer — otherwise the crossover/regime timings would be
+        // comparing paths that compute different things.
+        let dim = 64usize;
+        let layer = build_synthetic_achf_layer(dim, 0.75, false);
+        let x: Vec<f32> = (0..dim).map(|i| ((i % 5) as f32) * 0.2 - 0.4).collect();
+        let cached = layer.forward_inference_forced_path(&x, 0);
+        let sparse = layer.forward_inference_forced_path(&x, 1);
+        let dense = layer.forward_inference_forced_path(&x, 2);
+        assert_eq!(cached.len(), dense.len());
+        assert_eq!(sparse.len(), dense.len());
+        for i in 0..dense.len() {
+            assert!((cached[i] - dense[i]).abs() < 1e-4, "cached vs dense at {i}");
+            assert!((sparse[i] - dense[i]).abs() < 1e-4, "sparse vs dense at {i}");
+        }
+    }
+
+    #[test]
+    fn crossover_outputs_write_parseable_csv_and_json() {
+        let dir = unique_temp_dir("crossover");
+        let output_dir = dir.to_string_lossy().to_string();
+        let cells = vec![
+            CrossoverCell {
+                dim: 256,
+                weight_sparsity: 0.9,
+                cached_ns: 100.0,
+                sparse_ns: 80.0,
+                dense_ns: 120.0,
+                winner: "Sparse".to_string(),
+            },
+            CrossoverCell {
+                dim: 256,
+                weight_sparsity: 0.5,
+                cached_ns: 70.0,
+                sparse_ns: 300.0,
+                dense_ns: 90.0,
+                winner: "Cached".to_string(),
+            },
+        ];
+        write_crossover_outputs(&cells, &output_dir);
+        let csv = std::fs::read_to_string(dir.join("path_crossover.csv")).unwrap();
+        assert!(csv.contains("dim,weight_sparsity,cached_ns,sparse_ns,dense_ns,winner"));
+        assert!(csv.contains("256,0.9000,100.000,80.000,120.000,Sparse"));
+        let json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("path_crossover_summary.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json[0]["winner"], "Sparse");
+        assert_eq!(json[1]["dim"], 256);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn regime_outputs_write_parseable_csv_and_json_with_oracle_gap() {
+        let dir = unique_temp_dir("regime");
+        let output_dir = dir.to_string_lossy().to_string();
+        let rows = vec![RegimeRow {
+            weight_sparsity: 0.9,
+            small: RegimeLatency {
+                batch: 1,
+                adaptive_ns: 90.0,
+                cached_ns: 120.0,
+                sparse_ns: 70.0,
+                oracle_ns: 70.0,
+                oracle_path: "Sparse".to_string(),
+                sparse_frac: 0.6,
+            },
+            large: RegimeLatency {
+                batch: 128,
+                adaptive_ns: 210.0,
+                cached_ns: 200.0,
+                sparse_ns: 280.0,
+                oracle_ns: 200.0,
+                oracle_path: "Cached".to_string(),
+                sparse_frac: 0.1,
+            },
+        }];
+        write_regime_outputs(&rows, &output_dir);
+        let csv = std::fs::read_to_string(dir.join("regime_adaptation.csv")).unwrap();
+        // Small-batch oracle is Sparse, large-batch oracle is Cached: the two
+        // regimes have different best fixed paths — the core adaptation result.
+        assert!(csv.contains("0.9000,1,90.000,120.000,70.000,70.000,Sparse,1.2857,0.6000"));
+        assert!(csv.contains("0.9000,128,210.000,200.000,280.000,200.000,Cached,1.0500,0.1000"));
+        let json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("regime_adaptation_summary.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json[0]["oracle_path"], "Sparse");
+        assert_eq!(json[1]["oracle_path"], "Cached");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -150,7 +150,7 @@ enum BenchAction {
     /// Run full ACHF benchmark suite
     #[command(name = "paper", visible_alias = "achf", alias = "p")]
     Achf {
-        /// Run only specific experiments (comma-separated: ablation,mode,path,gate,scale,apply,convergence)
+        /// Run only specific experiments (comma-separated: ablation,mode,path,gate,scale,apply,convergence,crossover,regime)
         #[arg(long)]
         only: Option<String>,
         /// Output directory for charts and data

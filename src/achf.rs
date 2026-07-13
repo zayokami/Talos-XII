@@ -137,12 +137,64 @@ fn default_metrics() -> Arc<AchfMetrics> {
     Arc::new(AchfMetrics::default())
 }
 
+/// Number of latency buckets keyed by input row count (batch size). Bucket
+/// index is floor(log2(num_rows)) clamped to [0, AMA_NUM_BUCKETS). This groups
+/// operating points of similar cost (batch 1, 2-3, 4-7, 8-15, ...) so the
+/// selector never compares a path measured at batch=1 (~tens of µs) against one
+/// measured at batch=64 (~ms). Global (unbucketed) EMAs blend those regimes and
+/// make the selector unable to tell which regime it is in — the root cause of
+/// the cross-regime thrash A is meant to fix. 16 buckets covers 1..=32768 rows.
+const AMA_NUM_BUCKETS: usize = 16;
+
+/// Per-(batch-bucket) snapshot of the AMA selector's latency/selection state.
+/// The live selector reads/writes the flat `ama_*` / `ema_*` fields on
+/// AchfCache; `switch_ama_bucket` swaps this snapshot in and out of those flat
+/// fields when the input's batch bucket changes. Keeping the flat fields lets
+/// all existing selector code stay untouched.
+#[derive(Clone, Default)]
+struct PathBucket {
+    ema_cached_ns: f64,
+    ema_cached_long_ns: f64,
+    ema_sparse_ns: f64,
+    ema_sparse_long_ns: f64,
+    ema_dense_ns: f64,
+    ema_dense_long_ns: f64,
+    ama_cached_cold_ns: f64,
+    ama_cached_warm_ns: f64,
+    ama_sparse_cold_ns: f64,
+    ama_sparse_warm_ns: f64,
+    ama_dense_cold_ns: f64,
+    ama_dense_warm_ns: f64,
+    ama_cached_warm_count: u64,
+    ama_sparse_warm_count: u64,
+    ama_dense_warm_count: u64,
+    ama_cached_stale: u64,
+    ama_sparse_stale: u64,
+    ama_dense_stale: u64,
+    ama_prev_path: Option<InferencePath>,
+    ama_dwell: u64,
+    adaptive_bias: f64,
+    initialized: bool,
+}
+
 #[derive(Clone)]
 pub struct AchfCache {
     pub dense: Option<Vec<f32>>,
     pub bias: Option<Vec<f32>>,
     pub in_dim: usize,
     pub out_dim: usize,
+    /// CSR-style sparse operator for the pruned weight, indexed by INPUT
+    /// dimension (the layout is input-stationary: for input dim `i`, the
+    /// nonzero output columns and their weights live in
+    /// `csr_cols[csr_row_ptr[i]..csr_row_ptr[i+1]]` /
+    /// `csr_vals[...]`). This is what makes the Sparse path genuinely skip
+    /// pruned weights instead of multiplying by stored zeros — it trades fewer
+    /// FMAs (win at high sparsity) for scattered output writes and no
+    /// contiguous SIMD (loss at low sparsity), which is the exact
+    /// locality-vs-FLOPs crossover ACHF's path selector exists to navigate.
+    pub csr_row_ptr: Option<Vec<u32>>,
+    pub csr_cols: Option<Vec<u32>>,
+    pub csr_vals: Option<Vec<f32>>,
     pub ema_cached_ns: f64,
     pub ema_cached_long_ns: f64,
     pub ema_sparse_ns: f64,
@@ -169,6 +221,11 @@ pub struct AchfCache {
     ama_probes: u64,
     ama_force_latency_sample: bool,
     pub adaptive_bias: f64,
+    /// Per-batch-bucket selector state. Empty until the first adaptive call
+    /// lazily initializes it. The flat `ama_*`/`ema_*` fields above mirror
+    /// `ama_buckets[ama_active_bucket]`; `switch_ama_bucket` keeps them in sync.
+    ama_buckets: Vec<PathBucket>,
+    ama_active_bucket: usize,
     pub last_input_hash: Option<u64>,
     pub last_output: Option<Vec<f32>>,
     pub last_input_count: u64,
@@ -206,6 +263,9 @@ fn default_cache() -> Arc<RwLock<AchfCache>> {
         bias: None,
         in_dim: 0,
         out_dim: 0,
+        csr_row_ptr: None,
+        csr_cols: None,
+        csr_vals: None,
         ema_cached_ns: 0.0,
         ema_cached_long_ns: 0.0,
         ema_sparse_ns: 0.0,
@@ -232,6 +292,8 @@ fn default_cache() -> Arc<RwLock<AchfCache>> {
         ama_probes: 0,
         ama_force_latency_sample: false,
         adaptive_bias: 0.0,
+        ama_buckets: Vec::new(),
+        ama_active_bucket: 0,
         last_input_hash: None,
         last_output: None,
         last_input_count: 0,
@@ -240,6 +302,107 @@ fn default_cache() -> Arc<RwLock<AchfCache>> {
         #[cfg(cuda)]
         sparse_mask_cuda: None,
     }))
+}
+
+/// Map an input row count (batch size) to a latency bucket index:
+/// floor(log2(num_rows)) clamped to [0, AMA_NUM_BUCKETS).
+fn ama_bucket_index(num_rows: usize) -> usize {
+    if num_rows <= 1 {
+        return 0;
+    }
+    // ilog2(num_rows) is the index of the highest set bit; e.g. 1->0, 2->1,
+    // 3->1, 4->2, ... which is exactly the "batch 2-3, 4-7, ..." grouping.
+    (num_rows.ilog2() as usize).min(AMA_NUM_BUCKETS - 1)
+}
+
+impl AchfCache {
+    /// Copy the flat `ama_*`/`ema_*` fields into the given bucket snapshot.
+    fn store_active_bucket(&self, b: &mut PathBucket) {
+        b.ema_cached_ns = self.ema_cached_ns;
+        b.ema_cached_long_ns = self.ema_cached_long_ns;
+        b.ema_sparse_ns = self.ema_sparse_ns;
+        b.ema_sparse_long_ns = self.ema_sparse_long_ns;
+        b.ema_dense_ns = self.ema_dense_ns;
+        b.ema_dense_long_ns = self.ema_dense_long_ns;
+        b.ama_cached_cold_ns = self.ama_cached_cold_ns;
+        b.ama_cached_warm_ns = self.ama_cached_warm_ns;
+        b.ama_sparse_cold_ns = self.ama_sparse_cold_ns;
+        b.ama_sparse_warm_ns = self.ama_sparse_warm_ns;
+        b.ama_dense_cold_ns = self.ama_dense_cold_ns;
+        b.ama_dense_warm_ns = self.ama_dense_warm_ns;
+        b.ama_cached_warm_count = self.ama_cached_warm_count;
+        b.ama_sparse_warm_count = self.ama_sparse_warm_count;
+        b.ama_dense_warm_count = self.ama_dense_warm_count;
+        b.ama_cached_stale = self.ama_cached_stale;
+        b.ama_sparse_stale = self.ama_sparse_stale;
+        b.ama_dense_stale = self.ama_dense_stale;
+        b.ama_prev_path = self.ama_prev_path;
+        b.ama_dwell = self.ama_dwell;
+        b.adaptive_bias = self.adaptive_bias;
+        b.initialized = true;
+    }
+
+    /// Load a bucket snapshot into the flat `ama_*`/`ema_*` fields.
+    fn load_active_bucket(&mut self, b: &PathBucket) {
+        self.ema_cached_ns = b.ema_cached_ns;
+        self.ema_cached_long_ns = b.ema_cached_long_ns;
+        self.ema_sparse_ns = b.ema_sparse_ns;
+        self.ema_sparse_long_ns = b.ema_sparse_long_ns;
+        self.ema_dense_ns = b.ema_dense_ns;
+        self.ema_dense_long_ns = b.ema_dense_long_ns;
+        self.ama_cached_cold_ns = b.ama_cached_cold_ns;
+        self.ama_cached_warm_ns = b.ama_cached_warm_ns;
+        self.ama_sparse_cold_ns = b.ama_sparse_cold_ns;
+        self.ama_sparse_warm_ns = b.ama_sparse_warm_ns;
+        self.ama_dense_cold_ns = b.ama_dense_cold_ns;
+        self.ama_dense_warm_ns = b.ama_dense_warm_ns;
+        self.ama_cached_warm_count = b.ama_cached_warm_count;
+        self.ama_sparse_warm_count = b.ama_sparse_warm_count;
+        self.ama_dense_warm_count = b.ama_dense_warm_count;
+        self.ama_cached_stale = b.ama_cached_stale;
+        self.ama_sparse_stale = b.ama_sparse_stale;
+        self.ama_dense_stale = b.ama_dense_stale;
+        self.ama_prev_path = b.ama_prev_path;
+        self.ama_dwell = b.ama_dwell;
+        self.adaptive_bias = b.adaptive_bias;
+    }
+
+    /// Ensure the flat fields reflect the bucket for `num_rows`. If the target
+    /// bucket differs from the active one, save the active bucket and load the
+    /// target (initializing it with the configured cost bias on first use).
+    /// Called at the start of both selection and latency recording with the
+    /// same `num_rows`, so the two always agree on the active bucket.
+    fn switch_ama_bucket(&mut self, num_rows: usize, cost_bias: f64) {
+        if self.ama_buckets.is_empty() {
+            let mut init = PathBucket {
+                adaptive_bias: cost_bias,
+                ..Default::default()
+            };
+            // Seed bucket 0 from whatever the flat fields already hold.
+            self.store_active_bucket(&mut init);
+            self.ama_buckets = vec![init; AMA_NUM_BUCKETS];
+            self.ama_active_bucket = ama_bucket_index(num_rows);
+            // Loading the (possibly different) target bucket; all buckets start
+            // identical here, so this just sets the active index consistently.
+            let target = self.ama_buckets[self.ama_active_bucket].clone();
+            self.load_active_bucket(&target);
+            return;
+        }
+        let target = ama_bucket_index(num_rows);
+        if target == self.ama_active_bucket {
+            return;
+        }
+        let mut prev = std::mem::take(&mut self.ama_buckets[self.ama_active_bucket]);
+        self.store_active_bucket(&mut prev);
+        self.ama_buckets[self.ama_active_bucket] = prev;
+        self.ama_active_bucket = target;
+        let mut next = self.ama_buckets[target].clone();
+        if !next.initialized {
+            next.adaptive_bias = cost_bias;
+            next.initialized = true;
+        }
+        self.load_active_bucket(&next);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -859,22 +1022,7 @@ impl AchfLayer {
                 InferencePath::Cached => self
                     .forward_inference_cached(x)
                     .unwrap_or_else(|| self.weight.forward_inference(x)),
-                InferencePath::Sparse => {
-                    #[cfg(cuda)]
-                    if let Some(out) = self.forward_sparse_inference_cuda(x) {
-                        out
-                    } else if let Some(sparse) = self.valid_sparse_weight() {
-                        sparse.forward_inference(x)
-                    } else {
-                        self.weight.forward_inference(x)
-                    }
-                    #[cfg(not(cuda))]
-                    {
-                        self.valid_sparse_weight()
-                            .unwrap_or(&self.weight)
-                            .forward_inference(x)
-                    }
-                }
+                InferencePath::Sparse => self.forward_inference_sparse(x),
                 InferencePath::Dense => self.weight.forward_inference(x),
             };
             (out, start.elapsed().as_nanos() as f64)
@@ -883,28 +1031,18 @@ impl AchfLayer {
                 InferencePath::Cached => self
                     .forward_inference_cached(x)
                     .unwrap_or_else(|| self.weight.forward_inference(x)),
-                InferencePath::Sparse => {
-                    #[cfg(cuda)]
-                    if let Some(out) = self.forward_sparse_inference_cuda(x) {
-                        out
-                    } else if let Some(sparse) = self.valid_sparse_weight() {
-                        sparse.forward_inference(x)
-                    } else {
-                        self.weight.forward_inference(x)
-                    }
-                    #[cfg(not(cuda))]
-                    {
-                        self.valid_sparse_weight()
-                            .unwrap_or(&self.weight)
-                            .forward_inference(x)
-                    }
-                }
+                InferencePath::Sparse => self.forward_inference_sparse(x),
                 InferencePath::Dense => self.weight.forward_inference(x),
             };
             (out, 0.0)
         };
         if elapsed_ns > 0.0 {
-            self.record_path_latency(path, elapsed_ns);
+            let num_rows = if self.weight.in_features > 0 {
+                x.len() / self.weight.in_features
+            } else {
+                1
+            };
+            self.record_path_latency(path, elapsed_ns, num_rows);
         }
 
         let mut out = raw_out.clone();
@@ -1096,22 +1234,7 @@ impl AchfLayer {
             0 => self
                 .forward_inference_cached(x)
                 .unwrap_or_else(|| self.weight.forward_inference(x)),
-            1 if self.has_valid_sparse_state() => {
-                #[cfg(cuda)]
-                if let Some(out) = self.forward_sparse_inference_cuda(x) {
-                    out
-                } else if let Some(sparse) = self.valid_sparse_weight() {
-                    sparse.forward_inference(x)
-                } else {
-                    self.weight.forward_inference(x)
-                }
-                #[cfg(not(cuda))]
-                {
-                    self.valid_sparse_weight()
-                        .unwrap_or(&self.weight)
-                        .forward_inference(x)
-                }
-            }
+            1 if self.has_valid_sparse_state() => self.forward_inference_sparse(x),
             _ => self.weight.forward_inference(x),
         };
         for v in out.iter_mut() {
@@ -1702,6 +1825,9 @@ impl AchfLayer {
         cache.bias = None;
         cache.in_dim = 0;
         cache.out_dim = 0;
+        cache.csr_row_ptr = None;
+        cache.csr_cols = None;
+        cache.csr_vals = None;
         cache.ema_cached_ns = 0.0;
         cache.ema_cached_long_ns = 0.0;
         cache.ema_sparse_ns = 0.0;
@@ -1728,6 +1854,8 @@ impl AchfLayer {
         cache.ama_probes = 0;
         cache.ama_force_latency_sample = false;
         cache.adaptive_bias = self.config.cache_cost_bias;
+        cache.ama_buckets = Vec::new();
+        cache.ama_active_bucket = 0;
         cache.last_input_hash = None;
         cache.last_output = None;
         cache.last_input_count = 0;
@@ -1795,11 +1923,37 @@ impl AchfLayer {
         let out_dim = sparse.out_features;
         let dense: Vec<f32> = sparse.weight.data_to_f32_vec();
         let bias = sparse.bias.as_ref().map(|b| b.data_to_f32_vec());
+
+        // Build the input-stationary CSR view of the pruned weight so the Sparse
+        // path can skip zero weights. Row `i` (input dim) holds the (col, val)
+        // pairs for every output column whose weight survived pruning. We build
+        // it from the materialized dense buffer (not the mask) so a weight that
+        // is exactly 0.0 but "kept" by the mask still contributes no work —
+        // multiplying by it is wasted, and CSR is precisely about not doing
+        // that. row_ptr has in_dim+1 entries (standard CSR prefix-sum layout).
+        let mut csr_row_ptr: Vec<u32> = Vec::with_capacity(in_dim + 1);
+        let mut csr_cols: Vec<u32> = Vec::new();
+        let mut csr_vals: Vec<f32> = Vec::new();
+        csr_row_ptr.push(0);
+        for i in 0..in_dim {
+            let w_row = &dense[i * out_dim..(i + 1) * out_dim];
+            for (j, &w) in w_row.iter().enumerate() {
+                if w != 0.0 {
+                    csr_cols.push(j as u32);
+                    csr_vals.push(w);
+                }
+            }
+            csr_row_ptr.push(csr_cols.len() as u32);
+        }
+
         let mut cache = self.cache.write().unwrap();
         cache.dense = Some(dense);
         cache.bias = bias;
         cache.in_dim = in_dim;
         cache.out_dim = out_dim;
+        cache.csr_row_ptr = Some(csr_row_ptr);
+        cache.csr_cols = Some(csr_cols);
+        cache.csr_vals = Some(csr_vals);
     }
 
     fn forward_inference_cached(&self, x: &[f32]) -> Option<Vec<f32>> {
@@ -1843,6 +1997,76 @@ impl AchfLayer {
             }
         }
         Some(out)
+    }
+
+    /// True sparse (CSR SpMV) inference path: for each nonzero input, scatter
+    /// only the surviving (pruned) weights into the output. Unlike the Cached
+    /// and Dense paths this does NOT touch every output column per input — it
+    /// does one FMA-equivalent per stored nonzero. That is the whole point: at
+    /// high weight sparsity it does far less arithmetic than Dense/Cached; at
+    /// low sparsity the scattered writes and lack of contiguous SIMD make it
+    /// lose. Returns None (caller falls back to a dense path) when the CSR view
+    /// is absent or the input shape is incompatible, so correctness never
+    /// depends on the sparse view being present.
+    fn forward_inference_sparse_csr(&self, x: &[f32]) -> Option<Vec<f32>> {
+        let cache = self.cache.read().unwrap();
+        let row_ptr = cache.csr_row_ptr.as_ref()?;
+        let cols = cache.csr_cols.as_ref()?;
+        let vals = cache.csr_vals.as_ref()?;
+        let bias = cache.bias.as_ref();
+        let in_dim = cache.in_dim;
+        let out_dim = cache.out_dim;
+        if in_dim == 0 || out_dim == 0 || row_ptr.len() != in_dim + 1 {
+            return None;
+        }
+        if bias.is_some_and(|b| b.len() != out_dim) {
+            return None;
+        }
+        if !x.len().is_multiple_of(in_dim) {
+            return None;
+        }
+        let num_rows = x.len() / in_dim;
+        let mut out = vec![0.0f32; num_rows * out_dim];
+        for r in 0..num_rows {
+            let row_offset_in = r * in_dim;
+            let out_row = &mut out[r * out_dim..(r + 1) * out_dim];
+            if let Some(bias) = bias {
+                out_row.copy_from_slice(bias);
+            }
+            for i in 0..in_dim {
+                let scale = x[row_offset_in + i];
+                if scale == 0.0 {
+                    continue;
+                }
+                let start = row_ptr[i] as usize;
+                let end = row_ptr[i + 1] as usize;
+                // Scatter: only the surviving weights of input dim `i`.
+                for k in start..end {
+                    let col = cols[k] as usize;
+                    out_row[col] += scale * vals[k];
+                }
+            }
+        }
+        Some(out)
+    }
+
+    /// Dispatch for the Sparse inference path. Prefers the CUDA masked kernel
+    /// when built with CUDA, then the CPU CSR SpMV, and finally falls back to a
+    /// dense forward on the pruned weight if no sparse view is available. This
+    /// centralizes what used to be three copy-pasted match arms.
+    fn forward_inference_sparse(&self, x: &[f32]) -> Vec<f32> {
+        #[cfg(cuda)]
+        {
+            if let Some(out) = self.forward_sparse_inference_cuda(x) {
+                return out;
+            }
+        }
+        if let Some(out) = self.forward_inference_sparse_csr(x) {
+            return out;
+        }
+        self.valid_sparse_weight()
+            .unwrap_or(&self.weight)
+            .forward_inference(x)
     }
 
     fn choose_inference_path(&self, x: &[f32]) -> InferencePath {
@@ -1972,6 +2196,10 @@ impl AchfLayer {
             };
         }
 
+        // Select within the latency bucket for this batch size so we never
+        // compare a path measured at one batch against another. record_path_
+        // latency switches to the same bucket (same num_rows) before recording.
+        cache.switch_ama_bucket(num_rows, self.config.cache_cost_bias);
         let path = self.ama_select_guarded_path(&mut cache);
         AmaPathDecision {
             path,
@@ -2148,7 +2376,20 @@ impl AchfLayer {
                 cache.ama_sparse_warm_ns,
                 cache.ama_sparse_warm_count,
             ),
-            InferencePath::Dense => return f64::INFINITY,
+            // Dense is a genuine, measured competitor (its EMA is recorded in
+            // record_path_latency). It used to be hardcoded to INFINITY here,
+            // which contradicted the probe machinery (which kept probing dense
+            // because its EMA was never set) and pinned selection to dense ~90%
+            // of the time even when Cached was empirically fastest. Now dense is
+            // scored on its measurements like the other paths; INFINITY survives
+            // only as the cold-start prior below, before any measurement exists.
+            InferencePath::Dense => (
+                cache.ema_dense_ns,
+                cache.ema_dense_long_ns,
+                cache.ama_dense_cold_ns,
+                cache.ama_dense_warm_ns,
+                cache.ama_dense_warm_count,
+            ),
         };
 
         let base = match (short > 0.0, long > 0.0) {
@@ -2156,6 +2397,11 @@ impl AchfLayer {
             (true, false) => short,
             (false, true) => long,
             (false, false) => {
+                // No measurement yet: use a cold-start prior. Cached is biased
+                // by its configured cost, Sparse gets a neutral unit prior, and
+                // Dense is treated as worst (INFINITY) so the selector prefers to
+                // probe the cheaper candidates first rather than commit to the
+                // full dense matmul before it has any data.
                 return match path {
                     InferencePath::Cached => self.config.cache_cost_bias.max(0.0),
                     InferencePath::Sparse => 1.0,
@@ -2296,17 +2542,26 @@ impl AchfLayer {
                 }
                 cache.ama_sparse_warm_count = cache.ama_sparse_warm_count.saturating_add(1);
             }
-            InferencePath::Dense => {}
+            InferencePath::Dense => {
+                if cache.ama_dense_warm_count < warmup_samples {
+                    Self::update_ema(&mut cache.ama_dense_cold_ns, elapsed_ns, ema);
+                } else {
+                    Self::update_ema(&mut cache.ama_dense_warm_ns, elapsed_ns, ema);
+                }
+                cache.ama_dense_warm_count = cache.ama_dense_warm_count.saturating_add(1);
+            }
         }
     }
 
-    fn record_path_latency(&self, path: InferencePath, elapsed_ns: f64) {
+    fn record_path_latency(&self, path: InferencePath, elapsed_ns: f64, num_rows: usize) {
         if elapsed_ns <= 0.0 {
             return;
         }
         let Ok(mut cache) = self.cache.try_write() else {
             return;
         };
+        // Record into the same batch bucket the selector chose for this call.
+        cache.switch_ama_bucket(num_rows, self.config.cache_cost_bias);
         let ema = self.config.cache_latency_ema;
         let ema_long = self.config.cache_latency_long_ema;
         Self::record_ama_latency(&mut cache, path, elapsed_ns, self.ama_warmup_samples(), ema);
@@ -2319,7 +2574,10 @@ impl AchfLayer {
                 Self::update_ema(&mut cache.ema_sparse_ns, elapsed_ns, ema);
                 Self::update_ema(&mut cache.ema_sparse_long_ns, elapsed_ns, ema_long);
             }
-            InferencePath::Dense => {}
+            InferencePath::Dense => {
+                Self::update_ema(&mut cache.ema_dense_ns, elapsed_ns, ema);
+                Self::update_ema(&mut cache.ema_dense_long_ns, elapsed_ns, ema_long);
+            }
         }
         self.metrics.latency_samples.fetch_add(1, Ordering::Relaxed);
         if self.config.cache_adapt_rate > 0.0
@@ -3108,6 +3366,148 @@ mod tests {
     }
 
     #[test]
+    fn achf_adaptive_selector_converges_to_fastest_path() {
+        // Regression for the selector bug where dense latency was never recorded
+        // (ema_dense_ns stuck at 0), which forced perpetual probing and pinned
+        // selection to dense ~90% of the time even when Cached was fastest.
+        // Here we build a low-sparsity layer so the CSR sparse path is the WORST
+        // (scatter writes, no SIMD) and the fused Cached path is fastest. After
+        // warmup the adaptive selector must pick Cached for the clear majority
+        // of calls — NOT dense. This asserts the fix end to end.
+        let cfg = AchfConfig {
+            enabled: true,
+            adaptive_inference: true,
+            cache_latency_sample_every: 1,
+            gate_warmup_steps: 0,
+            gate_transition_steps: 0,
+            g_min: 0.0,
+            infer_gate: "one".to_string(),
+            prune_threshold: 0.0,
+            cache_min_reuse: 8,
+            ..Default::default()
+        };
+        // 256-wide, dense weights (no zeros) => sparse path is strictly worse.
+        let dim = 256usize;
+        let mut layer = AchfLayer::new(dim, dim, false, cfg, 909);
+        {
+            let mut w = layer.weight.weight.data_write_f32();
+            for (i, v) in w.iter_mut().enumerate() {
+                // All nonzero, moderate magnitude: nothing gets pruned at
+                // threshold 0, so CSR is fully dense => sparse path is slowest.
+                *v = (((i % 13) as f32) - 6.0) * 0.05 + 0.01;
+            }
+        }
+        layer.freeze_for_inference();
+
+        // Dense (nonzero) input so cached's zero-input skip doesn't distort.
+        let x: Vec<f32> = (0..dim).map(|i| ((i % 5) as f32) * 0.2 + 0.1).collect();
+
+        // Warm up all three paths, then measure the selected distribution.
+        for _ in 0..200 {
+            let _ = layer.forward_inference_residual(&x);
+        }
+        let before = layer.cache_stats();
+        for _ in 0..2000 {
+            let _ = layer.forward_inference_residual(&x);
+        }
+        let after = layer.cache_stats();
+
+        let cached = (after.cache_hits - before.cache_hits) as f64;
+        let dense = (after.dense_paths - before.dense_paths) as f64;
+        let sparse = (after.sparse_paths - before.sparse_paths) as f64;
+        let total = cached + dense + sparse;
+        assert!(total > 0.0, "no path selections recorded");
+        let cached_frac = cached / total;
+        // The pre-fix code sat around cached ~5% / dense ~90%. Post-fix, Cached
+        // must dominate. We assert a conservative majority to stay robust to
+        // periodic re-probing of the other paths.
+        assert!(
+            cached_frac > 0.6,
+            "adaptive selector should converge to Cached (fastest); got \
+             cached={cached_frac:.2} dense={:.2} sparse={:.2}",
+            dense / total,
+            sparse / total
+        );
+    }
+
+    #[test]
+    // The batch-dependent latency crossover this asserts only manifests in
+    // optimized builds (debug leaves the cached SIMD and CSR skip un-vectorized,
+    // collapsing the margin). Runs under `cargo test --release`; shown as
+    // ignored in debug rather than silently compiled out.
+    #[cfg_attr(debug_assertions, ignore)]
+    fn achf_adaptive_selector_adapts_across_batch_regimes() {
+        // True cross-regime adaptation: on ONE fixed frozen layer, a small batch
+        // (batch=1) should favor the CSR sparse path (fewer FLOPs win when the
+        // per-row scatter cost isn't amortized), while a large batch (batch=64)
+        // should favor the fused Cached path (contiguous SIMD amortizes). This
+        // is only possible because latency EMAs are keyed by batch bucket; with
+        // global EMAs the two regimes blended and the selector thrashed. We
+        // assert the DIRECTION (batch=1 picks sparse more than batch=64 does),
+        // which is robust to absolute timing noise across machines.
+        let dim = 1024usize;
+        // weight_sparsity ~0.9 sits between the batch=1 and batch=64 crossover,
+        // so the two buckets settle on opposite paths.
+        let weight_sparsity = 0.9f32;
+        let cfg = AchfConfig {
+            enabled: true,
+            adaptive_inference: true,
+            cache_latency_sample_every: 1,
+            gate_warmup_steps: 0,
+            gate_transition_steps: 0,
+            g_min: 0.0,
+            infer_gate: "one".to_string(),
+            prune_threshold: 0.0,
+            cache_min_reuse: 0,
+            ..Default::default()
+        };
+        let mut layer = AchfLayer::new(dim, dim, false, cfg, 77);
+        {
+            let mut w = layer.weight.weight.data_write_f32();
+            let zero_per_row = (dim as f32 * weight_sparsity) as usize;
+            for r in 0..dim {
+                for c in 0..dim {
+                    let v = &mut w[r * dim + c];
+                    if c < zero_per_row {
+                        *v = 0.0;
+                    } else if *v == 0.0 {
+                        *v = 0.01;
+                    }
+                }
+            }
+        }
+        layer.freeze_for_inference();
+
+        let x1: Vec<f32> = (0..dim).map(|i| ((i % 7) as f32) * 0.1 + 0.05).collect();
+        let x64: Vec<f32> = (0..dim * 64).map(|i| ((i % 7) as f32) * 0.1 + 0.05).collect();
+        let run = |x: &[f32], n: usize| {
+            for _ in 0..n {
+                let _ = layer.forward_inference_residual(x);
+            }
+        };
+        // Warm both buckets first, then measure settled selection per regime.
+        run(&x1, 300);
+        run(&x64, 300);
+
+        let b1 = layer.cache_stats();
+        run(&x1, 600);
+        let a1 = layer.cache_stats();
+        let sparse_frac_b1 = (a1.sparse_paths - b1.sparse_paths) as f64 / 600.0;
+
+        let b64 = layer.cache_stats();
+        run(&x64, 600);
+        let a64 = layer.cache_stats();
+        let sparse_frac_b64 = (a64.sparse_paths - b64.sparse_paths) as f64 / 600.0;
+
+        assert!(
+            sparse_frac_b1 > sparse_frac_b64 + 0.2,
+            "expected batch=1 to select sparse markedly more than batch=64 \
+             (adaptation across regimes); got sparse_frac batch1={sparse_frac_b1:.2} \
+             batch64={sparse_frac_b64:.2}"
+        );
+    }
+
+    #[test]
     fn achf_residual_add_into_matches_residual() {
         // The fused frozen add-into path must equal `forward_inference_residual`
         // added onto an existing accumulator, element for element.
@@ -3389,8 +3789,8 @@ mod tests {
         };
         let mut layer = AchfLayer::new_square(4, cfg, 71);
         layer.prune(0.01);
-        layer.record_path_latency(InferencePath::Sparse, 100.0);
-        layer.record_path_latency(InferencePath::Cached, 50.0);
+        layer.record_path_latency(InferencePath::Sparse, 100.0, 1);
+        layer.record_path_latency(InferencePath::Cached, 50.0, 1);
         let cache = layer.cache.read().unwrap();
         assert!(cache.adaptive_bias < 1.0);
     }
@@ -3407,8 +3807,8 @@ mod tests {
         layer.prune(0.01);
         layer.freeze_for_inference();
 
-        layer.record_path_latency(InferencePath::Cached, 120.0);
-        layer.record_path_latency(InferencePath::Cached, 40.0);
+        layer.record_path_latency(InferencePath::Cached, 120.0, 1);
+        layer.record_path_latency(InferencePath::Cached, 40.0, 1);
 
         let cache = layer.cache.read().unwrap();
         assert_eq!(cache.ama_cached_warm_count, 2);
@@ -3588,6 +3988,306 @@ mod tests {
         assert_eq!(dense_out.len(), sparse_out.len());
         // Outputs differ because pruning changes weights, but shapes match
         assert_eq!(dense_out.len(), x.len());
+    }
+
+    #[test]
+    fn achf_csr_sparse_path_matches_cached_dense_pruned() {
+        // The CSR SpMV path (forced_path=1) scatters only surviving weights,
+        // while the Cached path (forced_path=0) does a dense forward over the
+        // materialized pruned weight. After freeze both operate on the SAME
+        // pruned weight with the SAME gate, so their outputs MUST be bit-close.
+        // This is the numerical anchor for the scatter-write kernel — the old
+        // test only checked shapes and would not have caught an indexing bug.
+        let cfg = AchfConfig {
+            enabled: true,
+            gate_warmup_steps: 0,
+            gate_transition_steps: 0,
+            g_min: 0.0,
+            infer_gate: "one".to_string(),
+            prune_threshold: 0.15,
+            ..Default::default()
+        };
+        let mut layer = AchfLayer::new_square(6, cfg, 4242);
+        {
+            let mut w = layer.weight.weight.data_write_f32();
+            for (i, v) in w.iter_mut().enumerate() {
+                // Mix of large and small magnitudes so pruning actually zeros
+                // some entries and the CSR view is genuinely sparse.
+                *v = (((i * 7) % 11) as f32 - 5.0) * 0.08;
+            }
+        }
+        layer.freeze_for_inference();
+
+        // Two input rows, including zeros to exercise the scale==0 skip.
+        let x = vec![
+            0.3, -0.2, 0.0, 0.5, -0.4, 0.1, // row 0
+            0.0, 0.25, -0.15, 0.0, 0.35, -0.05, // row 1
+        ];
+        let cached = layer.forward_inference_forced_path(&x, 0);
+        let sparse = layer.forward_inference_forced_path(&x, 1);
+        assert_eq!(cached.len(), sparse.len());
+        for (c, s) in cached.iter().zip(sparse.iter()) {
+            assert!(
+                (c - s).abs() < 1e-5,
+                "CSR sparse output {s} diverged from cached dense-pruned {c}"
+            );
+        }
+        // Sanity: the CSR view must actually be sparser than dense (pruning
+        // removed entries), otherwise the test proves nothing about skipping.
+        let cache = layer.cache.read().unwrap();
+        let nnz = cache.csr_vals.as_ref().expect("csr built on freeze").len();
+        let dense_entries = cache.in_dim * cache.out_dim;
+        assert!(
+            nnz < dense_entries,
+            "expected CSR nnz {nnz} < dense entries {dense_entries}"
+        );
+    }
+
+    // Confirms the adaptive selector actually SWITCHES paths when a phased
+    // workload changes regime (batch=1 decode-like vs batch=64 prefill-like) on
+    // ONE fixed frozen layer. This is the crux of the "true adaptive" claim.
+    // Run with:
+    //   cargo test --release --bin talos_xii adaptive_switch_probe -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn adaptive_switch_probe() {
+        let dim = 1024usize;
+        let make_x = |batch: usize| -> Vec<f32> {
+            (0..dim * batch).map(|i| ((i % 7) as f32) * 0.1 + 0.05).collect()
+        };
+        let phase = |layer: &AchfLayer, batch: usize, n: usize| -> (u64, u64, u64) {
+            let x = make_x(batch);
+            let before = layer.cache_stats();
+            for _ in 0..n {
+                let _ = layer.forward_inference_residual(&x);
+            }
+            let after = layer.cache_stats();
+            (
+                after.cache_hits - before.cache_hits,
+                after.sparse_paths - before.sparse_paths,
+                after.dense_paths - before.dense_paths,
+            )
+        };
+        let winner = |c: u64, s: u64, d: u64| -> &'static str {
+            if s >= c && s >= d {
+                "SPARSE"
+            } else if c >= d {
+                "cached"
+            } else {
+                "dense"
+            }
+        };
+
+        println!("\n[bucketed] dim={dim}, adaptive on; do batch=1 and batch=64 pick DIFFERENT paths?");
+        for &weight_sparsity in &[0.8f32, 0.9, 0.95, 0.98] {
+            let cfg = AchfConfig {
+                enabled: true,
+                adaptive_inference: true,
+                cache_latency_sample_every: 1,
+                gate_warmup_steps: 0,
+                gate_transition_steps: 0,
+                g_min: 0.0,
+                infer_gate: "one".to_string(),
+                prune_threshold: 0.0,
+                cache_min_reuse: 0, // force every call through the selector
+                ..Default::default()
+            };
+            let mut layer = AchfLayer::new(dim, dim, false, cfg, 77);
+            {
+                let mut w = layer.weight.weight.data_write_f32();
+                let zero_per_row = (dim as f32 * weight_sparsity) as usize;
+                for r in 0..dim {
+                    for c in 0..dim {
+                        let v = &mut w[r * dim + c];
+                        if c < zero_per_row {
+                            *v = 0.0;
+                        } else if *v == 0.0 {
+                            *v = 0.01;
+                        }
+                    }
+                }
+            }
+            layer.freeze_for_inference();
+
+            // Warm each bucket, then measure the settled selection.
+            phase(&layer, 1, 300);
+            phase(&layer, 64, 300);
+            let (c1, s1, d1) = phase(&layer, 1, 600);
+            let (c64, s64, d64) = phase(&layer, 64, 600);
+            println!(
+                "  wsp={weight_sparsity}: batch=1 -> {} (c={c1} s={s1} d={d1}) | \
+                 batch=64 -> {} (c={c64} s={s64} d={d64})",
+                winner(c1, s1, d1),
+                winner(c64, s64, d64)
+            );
+        }
+    }
+
+    // Premise probe for "true adaptive": at a FIXED frozen layer (fixed weight
+    // sparsity), does varying INPUT sparsity or BATCH size flip which path is
+    // fastest? If it does, per-call adaptation is justified. If not, the honest
+    // adaptive story is per-layer/per-hardware convergence, not mid-run flips.
+    // Run with:
+    //   cargo test --release --bin talos_xii adaptive_premise_probe -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn adaptive_premise_probe() {
+        use std::time::Instant;
+        let dim = 1024usize; // near the cached/sparse crossover band
+        let weight_sparsity = 0.92f32;
+        let input_sparsities = [0.0f32, 0.5, 0.9];
+        let batches = [1usize, 8, 64];
+        let warmup = 20usize;
+        let iters = 200usize;
+
+        // One fixed frozen layer for the whole sweep.
+        let cfg = AchfConfig {
+            enabled: true,
+            gate_warmup_steps: 0,
+            gate_transition_steps: 0,
+            g_min: 0.0,
+            infer_gate: "one".to_string(),
+            prune_threshold: 0.0,
+            ..Default::default()
+        };
+        let mut layer = AchfLayer::new(dim, dim, false, cfg, 1234);
+        {
+            let mut w = layer.weight.weight.data_write_f32();
+            let zero_per_row = (dim as f32 * weight_sparsity) as usize;
+            for r in 0..dim {
+                for c in 0..dim {
+                    let v = &mut w[r * dim + c];
+                    if c < zero_per_row {
+                        *v = 0.0;
+                    } else if *v == 0.0 {
+                        *v = 0.01;
+                    }
+                }
+            }
+        }
+        layer.freeze_for_inference();
+
+        println!("\n(fixed layer: dim={dim} weight_sparsity={weight_sparsity})");
+        println!("in_sparsity  batch  cached_ns  sparse_ns  dense_ns   oracle");
+        for &in_sp in &input_sparsities {
+            for &batch in &batches {
+                let mut x: Vec<f32> =
+                    (0..dim * batch).map(|i| ((i % 7) as f32) * 0.1 + 0.05).collect();
+                // Zero out an `in_sp` fraction of each input row.
+                let zeros = (dim as f32 * in_sp) as usize;
+                for row in 0..batch {
+                    for c in 0..zeros {
+                        x[row * dim + c] = 0.0;
+                    }
+                }
+                let time_path = |pid: u8| -> f64 {
+                    for _ in 0..warmup {
+                        std::hint::black_box(
+                            layer.forward_inference_forced_path(std::hint::black_box(&x), pid),
+                        );
+                    }
+                    let start = Instant::now();
+                    for _ in 0..iters {
+                        std::hint::black_box(
+                            layer.forward_inference_forced_path(std::hint::black_box(&x), pid),
+                        );
+                    }
+                    start.elapsed().as_nanos() as f64 / iters as f64
+                };
+                let cached = time_path(0);
+                let sparse = time_path(1);
+                let dense = time_path(2);
+                let oracle = if sparse <= cached && sparse <= dense {
+                    "SPARSE"
+                } else if cached <= dense {
+                    "cached"
+                } else {
+                    "dense"
+                };
+                println!(
+                    "{in_sp:<12} {batch:<6} {cached:>9.0} {sparse:>10.0} {dense:>9.0}   {oracle}"
+                );
+            }
+        }
+    }
+
+    // Exploratory probe (not a pass/fail assertion): prints per-path latency
+    // across a dims x sparsity grid so we can see WHERE the CSR sparse path
+    // actually beats the dense/cached paths. Run with:
+    //   cargo test --release --bin talos_xii csr_crossover_probe -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn csr_crossover_probe() {
+        use std::time::Instant;
+        let dims = [64usize, 256, 1024, 2048];
+        let sparsities = [0.5f32, 0.8, 0.9, 0.95, 0.99];
+        let batch = 32usize;
+        let warmup = 20usize;
+        let iters = 200usize;
+
+        println!("\ndim   sparsity  cached_ns  sparse_ns  dense_ns   winner");
+        for &dim in &dims {
+            for &sparsity in &sparsities {
+                let cfg = AchfConfig {
+                    enabled: true,
+                    gate_warmup_steps: 0,
+                    gate_transition_steps: 0,
+                    g_min: 0.0,
+                    infer_gate: "one".to_string(),
+                    prune_threshold: 0.0,
+                    ..Default::default()
+                };
+                let mut layer = AchfLayer::new(dim, dim, false, cfg, 7 + dim as u64);
+                // Force an EXACT target sparsity by zeroing the first `sparsity`
+                // fraction of each row (deterministic, no RNG needed for a probe).
+                {
+                    let mut w = layer.weight.weight.data_write_f32();
+                    let zero_per_row = (dim as f32 * sparsity) as usize;
+                    for r in 0..dim {
+                        for c in 0..dim {
+                            let v = &mut w[r * dim + c];
+                            if c < zero_per_row {
+                                *v = 0.0;
+                            } else if *v == 0.0 {
+                                *v = 0.01; // keep survivors nonzero
+                            }
+                        }
+                    }
+                }
+                layer.freeze_for_inference();
+
+                let x: Vec<f32> = (0..dim * batch).map(|i| ((i % 7) as f32) * 0.1).collect();
+                let time_path = |pid: u8| -> f64 {
+                    for _ in 0..warmup {
+                        std::hint::black_box(layer.forward_inference_forced_path(
+                            std::hint::black_box(&x),
+                            pid,
+                        ));
+                    }
+                    let start = Instant::now();
+                    for _ in 0..iters {
+                        std::hint::black_box(layer.forward_inference_forced_path(
+                            std::hint::black_box(&x),
+                            pid,
+                        ));
+                    }
+                    start.elapsed().as_nanos() as f64 / iters as f64
+                };
+                let cached = time_path(0);
+                let sparse = time_path(1);
+                let dense = time_path(2);
+                let winner = if sparse < cached && sparse < dense {
+                    "SPARSE"
+                } else if cached < dense {
+                    "cached"
+                } else {
+                    "dense"
+                };
+                println!(
+                    "{dim:<5} {sparsity:<8} {cached:>9.0} {sparse:>10.0} {dense:>9.0}   {winner}"
+                );
+            }
+        }
     }
 
     #[cfg(cuda)]
