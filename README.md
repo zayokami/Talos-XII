@@ -101,7 +101,7 @@ Talos-XII supports four pool types: **character UP** (limited rate-up), **weapon
 
 Pool rules are data-driven. `data/pools.json` is the canonical source; individual pools may override every probability and pity field.
 
-Shipped active pool contract: `char_up_20260605` uses **50%** (`up_rate = 0.5`). This active character UP pool has a 0.8% base 6-star rate, soft pity at 65, hard pity at 80, and cumulative UP guarantee at 120. Special or archived pools may use different values.
+Shipped active pool contract: `char_up_20260716` uses **50%** (`up_rate = 0.5`). This active character UP pool has a 0.8% base 6-star rate, soft pity at 65, hard pity at 80, and cumulative UP guarantee at 120. Special or archived pools may use different values.
 
 Weapon UP pool: 4% base 6-star rate, hard pity at 40, mega pity at 180, UP weapon rate 50%.
 
@@ -356,7 +356,7 @@ cargo run --release -- benchmark                  # 快速内置基准
 
 卡池规则完全由数据驱动，`data/pools.json` 是权威来源；每个卡池都可以覆盖全部概率和保底字段。
 
-随附激活卡池约定：`char_up_20260605` 使用 **50%**（`up_rate = 0.5`）。该激活角色 UP 池的基础 6 星概率为 0.8%，65 抽起软保底，80 抽硬保底，120 抽累计保底必出 UP；特殊或归档卡池可以使用不同数值。
+随附激活卡池约定：`char_up_20260716` 使用 **50%**（`up_rate = 0.5`）。该激活角色 UP 池的基础 6 星概率为 0.8%，65 抽起软保底，80 抽硬保底，120 抽累计保底必出 UP；特殊或归档卡池可以使用不同数值。
 
 武器 UP 池：基础 6 星概率 4%，40 抽硬保底，180 抽大保底，UP 武器占 50%。
 

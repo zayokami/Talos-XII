@@ -1,4 +1,4 @@
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
 fn repo_path(relative: &str) -> PathBuf {
@@ -14,18 +14,22 @@ fn shipped_pool_data() -> Value {
     serde_json::from_str(&read("data/pools.json")).expect("data/pools.json must be valid JSON")
 }
 
+fn pool_by_id<'a>(pools: &'a Value, id: &str) -> &'a Value {
+    pools["pools"]
+        .as_array()
+        .expect("pools must be an array")
+        .iter()
+        .find(|pool| pool["id"].as_str() == Some(id))
+        .unwrap_or_else(|| panic!("pool {id} must exist"))
+}
+
 #[test]
 fn product_docs_match_the_shipped_active_pool_contract() {
     let pools = shipped_pool_data();
     let active_id = pools["active_pool"]
         .as_str()
         .expect("active_pool must be a string");
-    let active_pool = pools["pools"]
-        .as_array()
-        .expect("pools must be an array")
-        .iter()
-        .find(|pool| pool["id"].as_str() == Some(active_id))
-        .expect("active_pool must reference an existing pool");
+    let active_pool = pool_by_id(&pools, active_id);
     let up_rate = active_pool["up_rate"]
         .as_f64()
         .expect("active pool up_rate must be numeric");
@@ -47,6 +51,141 @@ fn product_docs_match_the_shipped_active_pool_contract() {
         readme.contains(&chinese_contract),
         "README must state the active pool value derived from data/pools.json: {chinese_contract}"
     );
+}
+
+#[test]
+fn shipped_v1_4_pools_match_announced_rosters() {
+    let pools = shipped_pool_data();
+    assert_eq!(pools["active_pool"].as_str(), Some("char_up_20260716"));
+
+    let phase_one = pool_by_id(&pools, "char_up_20260716");
+    assert_eq!(phase_one["name"].as_str(), Some("临渊望北"));
+    assert_eq!(
+        phase_one["name_en"].as_str(),
+        Some("North Yearns The Rift Vigile")
+    );
+    assert_eq!(phase_one["up_six"], json!(["诀"]));
+    assert_eq!(phase_one["up_six_en"], json!(["Arcane"]));
+    assert_eq!(
+        phase_one["six_stars"],
+        json!([
+            "诀",
+            "卡缪",
+            "弭弗",
+            "余烬",
+            "黎风",
+            "艾尔黛拉",
+            "别礼",
+            "骏卫"
+        ])
+    );
+
+    let phase_two = pool_by_id(&pools, "char_up_20260809");
+    assert_eq!(phase_two["name"].as_str(), Some("晨星于此闪耀"));
+    assert_eq!(
+        phase_two["name_en"].as_str(),
+        Some("Good Morning From Your Dawnstar")
+    );
+    assert_eq!(phase_two["up_six"], json!(["梨诺"]));
+    assert_eq!(phase_two["up_six_en"], json!(["Liino"]));
+    assert_eq!(
+        phase_two["six_stars"],
+        json!([
+            "梨诺",
+            "诀",
+            "卡缪",
+            "弭弗",
+            "余烬",
+            "黎风",
+            "艾尔黛拉",
+            "别礼",
+            "骏卫"
+        ])
+    );
+
+    let weapon_phase_one = pool_by_id(&pools, "weapon_up_20260716");
+    assert_eq!(weapon_phase_one["name"].as_str(), Some("军列申领"));
+    assert_eq!(
+        weapon_phase_one["name_en"].as_str(),
+        Some("Military Grade Issue")
+    );
+    assert_eq!(
+        weapon_phase_one["up_six"],
+        json!(["四二式·肃阵（施术单元）"])
+    );
+    assert_eq!(
+        weapon_phase_one["up_six_en"],
+        json!(["Type 42: Solemn Phalanx (Arts Unit)"])
+    );
+    assert_eq!(
+        weapon_phase_one["six_stars"],
+        json!([
+            "四二式·肃阵（施术单元）",
+            "昔日精品（双手剑）",
+            "楔子（手铳）",
+            "显赫声名（单手剑）",
+            "J.E.T.（长柄武器）",
+            "爆破单元（施术单元）",
+            "遗忘（施术单元）"
+        ])
+    );
+
+    let weapon_phase_two = pool_by_id(&pools, "weapon_up_20260809");
+    assert_eq!(weapon_phase_two["name"].as_str(), Some("明耀申领"));
+    assert_eq!(
+        weapon_phase_two["name_en"].as_str(),
+        Some("Bedazzled Issue")
+    );
+    assert_eq!(
+        weapon_phase_two["up_six"],
+        json!(["曜夜的首演（长柄武器）"])
+    );
+    assert_eq!(
+        weapon_phase_two["up_six_en"],
+        json!(["Bedazzling Night Debut (Polearm)"])
+    );
+    assert_eq!(
+        weapon_phase_two["six_stars"],
+        json!([
+            "曜夜的首演（长柄武器）",
+            "破碎君王（双手剑）",
+            "同类相食（手铳）",
+            "骁勇（长柄武器）",
+            "J.E.T.（长柄武器）",
+            "爆破单元（施术单元）",
+            "热熔切割器（单手剑）"
+        ])
+    );
+
+    for pool in [phase_one, phase_two] {
+        assert_eq!(pool["up_rate"].as_f64(), Some(0.5));
+        assert_eq!(pool["small_pity_guarantee"].as_u64(), Some(80));
+        assert_eq!(pool["big_pity_cumulative"].as_u64(), Some(120));
+        assert_ne!(pool["is_archived"].as_bool(), Some(true));
+    }
+
+    for pool in [weapon_phase_one, weapon_phase_two] {
+        assert_eq!(pool["up_rate"].as_f64(), Some(0.5));
+        assert_eq!(pool["prob_6_base"].as_f64(), Some(0.04));
+        assert_eq!(pool["small_pity_guarantee"].as_u64(), Some(40));
+        assert_eq!(pool["big_pity_cumulative"].as_u64(), Some(180));
+        assert_eq!(pool["up_pity_soft"].as_u64(), Some(80));
+        assert_eq!(pool["always_5_star"].as_bool(), Some(true));
+        assert_ne!(pool["is_archived"].as_bool(), Some(true));
+    }
+
+    for id in [
+        "char_up_20260605",
+        "char_up_20260626",
+        "weapon_up_20260605",
+        "weapon_up_20260626",
+    ] {
+        assert_eq!(
+            pool_by_id(&pools, id)["is_archived"].as_bool(),
+            Some(true),
+            "previous-version pool {id} must be archived"
+        );
+    }
 }
 
 #[test]
