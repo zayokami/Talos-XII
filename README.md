@@ -131,9 +131,9 @@ Model cache manifests fingerprint probability, pity, luck-budget, architecture, 
 
 ### ACHF (Adaptive Cache-aware Hyper-Connections)
 
-ACHF is Talos-XII's proprietary training/inference acceleration layer. It replaces a plain dense `Linear` with a self-tuning block that keeps two views of the same operator — a full **dense** weight and a pruned **sparse** weight — and decides at runtime how much of each to use, how often to re-project onto a low-rank manifold, and which physical execution path is actually fastest on the current machine. The goal is to cut the CPU matmul and cache-miss cost that dominates small-batch neural inference, without letting the approximation destabilize training.
+ACHF is Talos-XII's proprietary training/inference acceleration layer. It replaces a plain dense `Linear` with a gated block that trains a dense reference weight, materializes a pruned candidate at freeze time, and then chooses the fastest numerically equivalent physical execution path for that candidate. The gate scales the active operator; it does not interpolate Cached/Sparse/Dense, because those names are execution strategies for the same frozen candidate. The goal is to cut the CPU matmul and cache-miss cost that dominates small-batch neural inference while keeping approximation error observable.
 
-The block behaves differently in the two lifecycle phases. **During training** the weights keep changing, so ACHF focuses on the *gate* (how much sparsity to admit) and periodic *manifold projection* (row/column or Sinkhorn normalization + low-rank truncation) that keeps the operator well-conditioned. **After `freeze_for_inference()`** the weights are fixed and ACHF fuses the pruned operator into a cache-friendly form. In `lite` mode inference uses the deterministic frozen fast path; in `full` mode the weights remain frozen but AMA keeps measuring and adapting the physical execution path (see AMA below).
+The block behaves differently in the two lifecycle phases. **During training** the dense reference is scaled by the live gate and periodically projected (row/column or Sinkhorn normalization + low-rank truncation). **After `freeze_for_inference()`** the projected weight is pruned, the same gate scale is applied to the frozen candidate, and ACHF prepares Cached/Sparse/Dense execution views. In `lite` mode inference uses the deterministic frozen fast path; in `full` mode the weights remain frozen but AMA keeps measuring and adapting the physical execution path (see AMA below).
 
 ```mermaid
 flowchart TD
@@ -388,7 +388,7 @@ cargo run --release -- benchmark                  # 快速内置基准
 
 ACHF 是 Talos-XII 自研的训练/推理加速层。它用一个自调节模块替换普通的稠密 `Linear`：同一个算子同时保留**稠密**权重和剪枝后的**稀疏**权重两个视图，在运行时决定二者各用多少、多久往低秩流形上重新投影一次、以及当前机器上哪条物理执行路径最快。目标是削减小 batch 神经推理中占主导的 CPU 矩阵乘法和缓存未命中开销，同时不让这种近似破坏训练稳定性。
 
-模块在两个生命周期阶段行为不同。**训练期**权重不断变化，ACHF 关注**门控**（允许多少稀疏度）和周期性的**流形投影**（行/列或 Sinkhorn 归一化 + 低秩截断），保持算子良态。**调用 `freeze_for_inference()` 之后**权重固定，ACHF 把剪枝算子融合成缓存友好的形式。`lite` 模式使用确定性的冻结快速路径；`full` 模式保持权重冻结，但 AMA 继续测量并自适应选择物理执行路径（见下方 AMA）。
+模块在两个生命周期阶段行为不同。**训练期**门控会真实缩放稠密参考算子的输出，并周期性执行**流形投影**（行/列或 Sinkhorn 归一化 + 低秩截断）。**调用 `freeze_for_inference()` 之后**，投影后的权重被剪枝，同一门控缩放继续作用于冻结候选算子，同时生成 Cached/Sparse/Dense 三种数值等价的物理执行视图。`lite` 模式使用确定性的冻结快速路径；`full` 模式保持权重冻结，但 AMA 继续测量并自适应选择物理执行路径（见下方 AMA）。
 
 ```mermaid
 flowchart TD

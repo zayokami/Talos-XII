@@ -395,6 +395,10 @@ impl ActorCritic {
         self.backbone.achf_cache_stats_aggregate()
     }
 
+    pub fn achf_memory_stats_aggregate(&self) -> crate::achf::AchfMemoryStats {
+        self.backbone.achf_memory_stats_aggregate()
+    }
+
     pub fn snapshot_achf(&self) -> Option<crate::achf::AchfStateSnapshot> {
         self.backbone.snapshot_achf()
     }

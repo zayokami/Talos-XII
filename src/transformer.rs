@@ -1,4 +1,7 @@
-use crate::achf::{aggregate_cache_stats_iter, AchfCacheStats, AchfLayer};
+use crate::achf::{
+    aggregate_cache_stats_iter, aggregate_memory_stats_iter, AchfCacheStats, AchfLayer,
+    AchfMemoryStats,
+};
 use crate::autograd::{Context, Tensor};
 use crate::config::{AchfConfig, Config};
 #[cfg(cuda)]
@@ -348,14 +351,19 @@ pub struct TransformerBlock {
 
 impl TransformerBlock {
     pub fn to_inference_bf16(&self) -> Self {
+        let achf_ffn = self.achf_ffn.as_ref().map(AchfLayer::to_inference_bf16);
+        let ffn_2 = achf_ffn.as_ref().map_or_else(
+            || self.ffn_2.to_inference_bf16(),
+            |achf| achf.weight.clone(),
+        );
         Self {
             norm_1: self.norm_1.to_inference_bf16(),
             mla_layer: self.mla_layer.to_inference_bf16(),
             mhc: self.mhc.as_ref().map(MhcResidual::to_inference_bf16),
             norm_2: self.norm_2.to_inference_bf16(),
             ffn_1: self.ffn_1.to_inference_bf16(),
-            ffn_2: self.ffn_2.to_inference_bf16(),
-            achf_ffn: self.achf_ffn.as_ref().map(AchfLayer::to_inference_bf16),
+            ffn_2,
+            achf_ffn,
         }
     }
 
@@ -367,9 +375,11 @@ impl TransformerBlock {
         }
         self.norm_2.load_state_dict(&other.norm_2);
         self.ffn_1.load_state_dict(&other.ffn_1);
-        self.ffn_2.load_state_dict(&other.ffn_2);
         if let (Some(dst), Some(src)) = (&mut self.achf_ffn, &other.achf_ffn) {
             dst.load_state_dict(src);
+            self.ffn_2 = dst.weight.clone();
+        } else {
+            self.ffn_2.load_state_dict(&other.ffn_2);
         }
     }
 }
@@ -424,14 +434,9 @@ impl LuckTransformer {
             } else {
                 None
             };
+            let ffn_2 = Linear::new(hidden_dim * 2, hidden_dim, true, layer_seed + 30);
             let achf_ffn = if achf.enabled && achf.apply_ffn {
-                Some(AchfLayer::new(
-                    hidden_dim * 2,
-                    hidden_dim,
-                    true,
-                    achf.clone(),
-                    layer_seed.wrapping_add(1100),
-                ))
+                Some(AchfLayer::from_linear(ffn_2.clone(), achf.clone()))
             } else {
                 None
             };
@@ -445,7 +450,7 @@ impl LuckTransformer {
                 mhc,
                 norm_2: RMSNorm::new(hidden_dim, 1e-5, layer_seed + 15),
                 ffn_1: Linear::new(hidden_dim, hidden_dim * 2, true, layer_seed + 20),
-                ffn_2: Linear::new(hidden_dim * 2, hidden_dim, true, layer_seed + 30),
+                ffn_2,
                 achf_ffn,
             });
         }
@@ -517,9 +522,11 @@ impl LuckTransformer {
             }
             block.norm_2.to_cuda();
             block.ffn_1.to_cuda();
-            block.ffn_2.to_cuda();
             if let Some(ref mut achf) = block.achf_ffn {
                 achf.to_cuda();
+                block.ffn_2 = achf.weight.clone();
+            } else {
+                block.ffn_2.to_cuda();
             }
         }
         self.norm_final.to_cuda();
@@ -699,6 +706,23 @@ impl LuckTransformer {
         aggregate_cache_stats_iter(self.achf_cache_stats_iter())
     }
 
+    pub fn achf_memory_stats_aggregate(&self) -> AchfMemoryStats {
+        aggregate_memory_stats_iter(self.blocks.iter().flat_map(|block| {
+            block
+                .achf_ffn
+                .as_ref()
+                .map(AchfLayer::memory_stats)
+                .into_iter()
+                .chain(
+                    block
+                        .mla_layer
+                        .achf_wo
+                        .as_ref()
+                        .map(AchfLayer::memory_stats),
+                )
+        }))
+    }
+
     pub fn achf_orthogonal_penalty(&self) -> Option<Tensor> {
         let mut reg: Option<Tensor> = None;
         for block in &self.blocks {
@@ -860,9 +884,10 @@ impl Module for LuckTransformer {
             }
             p.extend(block.norm_2.parameters());
             p.extend(block.ffn_1.parameters());
-            p.extend(block.ffn_2.parameters());
             if let Some(achf) = &block.achf_ffn {
                 p.extend(achf.parameters());
+            } else {
+                p.extend(block.ffn_2.parameters());
             }
         }
         p.extend(self.norm_final.parameters());
@@ -1202,13 +1227,7 @@ impl MultiHeadLatentAttention {
             if cfg.enabled && cfg.apply_attn {
                 // Same seed as w_o (seed + 6) so the ACHF dense weight starts
                 // identical to the plain w_o initialization.
-                mla.achf_wo = Some(AchfLayer::new(
-                    mla.w_o.in_features,
-                    mla.w_o.out_features,
-                    false,
-                    cfg.clone(),
-                    seed + 6,
-                ));
+                mla.achf_wo = Some(AchfLayer::from_linear(mla.w_o.clone(), cfg.clone()));
             }
         }
         mla
@@ -1222,9 +1241,10 @@ impl MultiHeadLatentAttention {
         p.extend(self.w_q.parameters());
         p.extend(self.w_kr.parameters());
         p.extend(self.w_qr.parameters());
-        p.extend(self.w_o.parameters());
         if let Some(achf) = &self.achf_wo {
             p.extend(achf.parameters());
+        } else {
+            p.extend(self.w_o.parameters());
         }
         p
     }
@@ -1237,13 +1257,19 @@ impl MultiHeadLatentAttention {
         self.w_q.to_cuda();
         self.w_kr.to_cuda();
         self.w_qr.to_cuda();
-        self.w_o.to_cuda();
         if let Some(ref mut achf) = self.achf_wo {
             achf.to_cuda();
+            self.w_o = achf.weight.clone();
+        } else {
+            self.w_o.to_cuda();
         }
     }
 
     pub fn to_inference_bf16(&self) -> Self {
+        let achf_wo = self.achf_wo.as_ref().map(AchfLayer::to_inference_bf16);
+        let w_o = achf_wo
+            .as_ref()
+            .map_or_else(|| self.w_o.to_inference_bf16(), |achf| achf.weight.clone());
         Self {
             config: self.config.clone(),
             w_dkv: self.w_dkv.to_inference_bf16(),
@@ -1252,8 +1278,8 @@ impl MultiHeadLatentAttention {
             w_q: self.w_q.to_inference_bf16(),
             w_kr: self.w_kr.to_inference_bf16(),
             w_qr: self.w_qr.to_inference_bf16(),
-            w_o: self.w_o.to_inference_bf16(),
-            achf_wo: self.achf_wo.as_ref().map(AchfLayer::to_inference_bf16),
+            w_o,
+            achf_wo,
             rope: self.rope.clone(),
         }
     }
@@ -1265,9 +1291,11 @@ impl MultiHeadLatentAttention {
         self.w_q.load_state_dict(&other.w_q);
         self.w_kr.load_state_dict(&other.w_kr);
         self.w_qr.load_state_dict(&other.w_qr);
-        self.w_o.load_state_dict(&other.w_o);
         if let (Some(dst), Some(src)) = (&mut self.achf_wo, &other.achf_wo) {
             dst.load_state_dict(src);
+            self.w_o = dst.weight.clone();
+        } else {
+            self.w_o.load_state_dict(&other.w_o);
         }
     }
 
@@ -3332,6 +3360,74 @@ mod tests {
         for (a, b) in out_on.iter().zip(out_off.iter()) {
             assert!((a - b).abs() < 1e-4, "achf-on={a} achf-off={b}");
         }
+    }
+
+    #[test]
+    fn test_luck_transformer_apply_ffn_is_fair_drop_in_replacement() {
+        let achf_on = AchfConfig {
+            enabled: true,
+            apply_attn: false,
+            apply_ffn: true,
+            proj_mode: "none".to_string(),
+            proj_freq: 0,
+            lambda_ortho: 0.0,
+            rank: 0,
+            prune_threshold: 0.0,
+            gate_warmup_steps: 0,
+            gate_transition_steps: 0,
+            gate_alpha: 50.0,
+            gate_beta: 0.0,
+            g_min: 1.0,
+            infer_gate: "one".to_string(),
+            ..Default::default()
+        };
+        let achf_off = AchfConfig::default();
+        let model_on = LuckTransformer::new_compat(8, 16, true, 2, 42, &achf_on);
+        let model_off = LuckTransformer::new_compat(8, 16, true, 2, 42, &achf_off);
+
+        assert_eq!(
+            model_on
+                .parameters()
+                .iter()
+                .map(Tensor::numel)
+                .sum::<usize>(),
+            model_off
+                .parameters()
+                .iter()
+                .map(Tensor::numel)
+                .sum::<usize>(),
+            "a replacement layer must not leave the unused dense layer in the optimizer"
+        );
+        assert_eq!(
+            model_on.blocks[0]
+                .achf_ffn
+                .as_ref()
+                .unwrap()
+                .weight
+                .weight
+                .data_to_f32_vec(),
+            model_off.blocks[0].ffn_2.weight.data_to_f32_vec(),
+            "paired ACHF on/off runs must start from identical replacement weights"
+        );
+
+        let input = Tensor::rand(vec![1, 2, 8], -0.1, 0.1, 808);
+        let output_on = model_on.forward(&input, &[]).data_to_f32_vec();
+        let output_off = model_off.forward(&input, &[]).data_to_f32_vec();
+        assert_eq!(output_on.len(), output_off.len());
+        for (left, right) in output_on.iter().zip(output_off.iter()) {
+            assert!((left - right).abs() < 1e-5, "{left} != {right}");
+        }
+        {
+            let mut weight = model_on.blocks[0]
+                .achf_ffn
+                .as_ref()
+                .unwrap()
+                .weight
+                .weight
+                .data_write_f32();
+            weight[0] = 123.0;
+        }
+        assert_eq!(model_on.blocks[0].ffn_2.weight.data_f32()[0], 123.0);
     }
 
     #[test]

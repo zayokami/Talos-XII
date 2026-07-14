@@ -69,8 +69,11 @@ pub struct AchfState {
     pub step: usize,
     pub gate_step: usize,
     pub grad_ema: f64,
+    pub gradient_cosine: f64,
+    pub previous_gradient: Vec<f32>,
     pub fim_ema: f64,
     pub last_gate: f64,
+    pub gate_velocity: f64,
     pub g_min_ema: f64,
     pub freeze_projection: bool,
     pub sinkhorn_iterations: usize,
@@ -82,6 +85,9 @@ pub struct AchfState {
     /// Relative Frobenius error of the last rank-r truncation:
     /// ||W - W_r||_F / ||W||_F. Zero when no truncation was applied.
     pub low_rank_rel_err: f64,
+    /// Relative Frobenius discrepancy introduced by the final pruning mask,
+    /// measured against the projected dense reference weight.
+    pub prune_rel_err: f64,
     /// Rank actually used by the last truncation (0 = truncation inactive).
     pub low_rank_applied_rank: usize,
 }
@@ -254,8 +260,11 @@ fn default_state() -> Arc<RwLock<AchfState>> {
         step: 0,
         gate_step: 0,
         grad_ema: 0.0,
+        gradient_cosine: 0.0,
+        previous_gradient: Vec::new(),
         fim_ema: 0.0,
         last_gate: 1.0,
+        gate_velocity: 0.0,
         g_min_ema: 0.0,
         freeze_projection: false,
         sinkhorn_iterations: 0,
@@ -265,6 +274,7 @@ fn default_state() -> Arc<RwLock<AchfState>> {
         sinkhorn_negative_ratio: 0.0,
         sinkhorn_warm_started: false,
         low_rank_rel_err: 0.0,
+        prune_rel_err: 0.0,
         low_rank_applied_rank: 0,
     }))
 }
@@ -417,7 +427,7 @@ impl AchfCache {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct AchfCacheStats {
     pub calls: u64,
     pub cache_hits: u64,
@@ -433,6 +443,20 @@ pub struct AchfCacheStats {
     pub ema_dense_long_ns: f64,
     pub decision_ema_ns: f64,
     pub decision_ema_long_ns: f64,
+    pub cached_cold_ema_ns: f64,
+    pub cached_warm_ema_ns: f64,
+    pub sparse_cold_ema_ns: f64,
+    pub sparse_warm_ema_ns: f64,
+    pub dense_cold_ema_ns: f64,
+    pub dense_warm_ema_ns: f64,
+    pub cached_warmness: f64,
+    pub sparse_warmness: f64,
+    pub dense_warmness: f64,
+    pub cached_stale_age: u64,
+    pub sparse_stale_age: u64,
+    pub dense_stale_age: u64,
+    pub path_switches: u64,
+    pub path_probes: u64,
     pub adaptive_bias: f64,
     pub latency_samples: u64,
     pub dense_latency_samples: u64,
@@ -445,6 +469,48 @@ pub struct AchfSparsityStats {
     pub nonzero_weights: usize,
     pub zero_weights: usize,
     pub sparsity: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct AchfMemoryStats {
+    pub layers: usize,
+    pub candidate_total_weights: usize,
+    pub candidate_nonzero_weights: usize,
+    pub reference_parameter_bytes: usize,
+    pub candidate_dense_bytes: usize,
+    pub sparse_mask_bytes: usize,
+    pub cached_dense_bytes: usize,
+    pub cached_bias_bytes: usize,
+    pub csr_row_ptr_bytes: usize,
+    pub csr_column_bytes: usize,
+    pub csr_value_bytes: usize,
+    pub memoized_output_bytes: usize,
+    pub sinkhorn_state_bytes: usize,
+    pub total_materialized_bytes: usize,
+}
+
+pub fn aggregate_memory_stats_iter<I>(iter: I) -> AchfMemoryStats
+where
+    I: IntoIterator<Item = AchfMemoryStats>,
+{
+    let mut out = AchfMemoryStats::default();
+    for stats in iter {
+        out.layers += stats.layers;
+        out.candidate_total_weights += stats.candidate_total_weights;
+        out.candidate_nonzero_weights += stats.candidate_nonzero_weights;
+        out.reference_parameter_bytes += stats.reference_parameter_bytes;
+        out.candidate_dense_bytes += stats.candidate_dense_bytes;
+        out.sparse_mask_bytes += stats.sparse_mask_bytes;
+        out.cached_dense_bytes += stats.cached_dense_bytes;
+        out.cached_bias_bytes += stats.cached_bias_bytes;
+        out.csr_row_ptr_bytes += stats.csr_row_ptr_bytes;
+        out.csr_column_bytes += stats.csr_column_bytes;
+        out.csr_value_bytes += stats.csr_value_bytes;
+        out.memoized_output_bytes += stats.memoized_output_bytes;
+        out.sinkhorn_state_bytes += stats.sinkhorn_state_bytes;
+        out.total_materialized_bytes += stats.total_materialized_bytes;
+    }
+    out
 }
 
 impl AchfCacheStats {
@@ -482,8 +548,10 @@ impl AchfCacheStats {
 #[derive(Clone, Copy, Debug)]
 pub struct AchfStateSnapshot {
     pub gate: f64,
+    pub gate_velocity: f64,
     pub g_min: f64,
     pub grad_ema: f64,
+    pub gradient_cosine: f64,
     pub cache_hit_rate: f64,
     pub low_rank_ratio: f64,
     pub ema_cached_ns: f64,
@@ -497,6 +565,8 @@ pub struct AchfStateSnapshot {
     pub sinkhorn_warm_started: bool,
     /// Relative Frobenius error of the last rank-r truncation (0 when inactive).
     pub low_rank_rel_err: f64,
+    /// Relative Frobenius discrepancy introduced by final magnitude pruning.
+    pub prune_rel_err: f64,
     /// Rank actually applied by the last truncation (0 when inactive).
     pub low_rank_applied_rank: usize,
 }
@@ -515,26 +585,7 @@ pub fn aggregate_cache_stats_iter<I>(iter: I) -> AchfCacheStats
 where
     I: IntoIterator<Item = AchfCacheStats>,
 {
-    let mut out = AchfCacheStats {
-        calls: 0,
-        cache_hits: 0,
-        cache_misses: 0,
-        cache_skips: 0,
-        sparse_paths: 0,
-        dense_paths: 0,
-        ema_cached_ns: 0.0,
-        ema_cached_long_ns: 0.0,
-        ema_sparse_ns: 0.0,
-        ema_sparse_long_ns: 0.0,
-        ema_dense_ns: 0.0,
-        ema_dense_long_ns: 0.0,
-        decision_ema_ns: 0.0,
-        decision_ema_long_ns: 0.0,
-        adaptive_bias: 0.0,
-        latency_samples: 0,
-        dense_latency_samples: 0,
-        decision_samples: 0,
-    };
+    let mut out = AchfCacheStats::default();
     let mut count_cached = 0usize;
     let mut count_low_rank = 0usize;
     let mut count_dense = 0usize;
@@ -544,6 +595,13 @@ where
     let mut count_decision = 0usize;
     let mut count_decision_long = 0usize;
     let mut count_bias = 0usize;
+    let mut count_cached_cold = 0usize;
+    let mut count_cached_warm = 0usize;
+    let mut count_sparse_cold = 0usize;
+    let mut count_sparse_warm = 0usize;
+    let mut count_dense_cold = 0usize;
+    let mut count_dense_warm = 0usize;
+    let mut count_warmness = 0usize;
     for s in iter {
         out.calls += s.calls;
         out.cache_hits += s.cache_hits;
@@ -554,6 +612,11 @@ where
         out.latency_samples += s.latency_samples;
         out.dense_latency_samples += s.dense_latency_samples;
         out.decision_samples += s.decision_samples;
+        out.path_switches += s.path_switches;
+        out.path_probes += s.path_probes;
+        out.cached_stale_age = out.cached_stale_age.max(s.cached_stale_age);
+        out.sparse_stale_age = out.sparse_stale_age.max(s.sparse_stale_age);
+        out.dense_stale_age = out.dense_stale_age.max(s.dense_stale_age);
         if s.ema_cached_ns > 0.0 {
             out.ema_cached_ns += s.ema_cached_ns;
             count_cached += 1;
@@ -590,6 +653,34 @@ where
             out.adaptive_bias += s.adaptive_bias;
             count_bias += 1;
         }
+        if s.cached_cold_ema_ns > 0.0 {
+            out.cached_cold_ema_ns += s.cached_cold_ema_ns;
+            count_cached_cold += 1;
+        }
+        if s.cached_warm_ema_ns > 0.0 {
+            out.cached_warm_ema_ns += s.cached_warm_ema_ns;
+            count_cached_warm += 1;
+        }
+        if s.sparse_cold_ema_ns > 0.0 {
+            out.sparse_cold_ema_ns += s.sparse_cold_ema_ns;
+            count_sparse_cold += 1;
+        }
+        if s.sparse_warm_ema_ns > 0.0 {
+            out.sparse_warm_ema_ns += s.sparse_warm_ema_ns;
+            count_sparse_warm += 1;
+        }
+        if s.dense_cold_ema_ns > 0.0 {
+            out.dense_cold_ema_ns += s.dense_cold_ema_ns;
+            count_dense_cold += 1;
+        }
+        if s.dense_warm_ema_ns > 0.0 {
+            out.dense_warm_ema_ns += s.dense_warm_ema_ns;
+            count_dense_warm += 1;
+        }
+        out.cached_warmness += s.cached_warmness;
+        out.sparse_warmness += s.sparse_warmness;
+        out.dense_warmness += s.dense_warmness;
+        count_warmness += 1;
     }
     if count_cached > 0 {
         out.ema_cached_ns /= count_cached as f64;
@@ -615,6 +706,29 @@ where
     if count_decision_long > 0 {
         out.decision_ema_long_ns /= count_decision_long as f64;
     }
+    if count_cached_cold > 0 {
+        out.cached_cold_ema_ns /= count_cached_cold as f64;
+    }
+    if count_cached_warm > 0 {
+        out.cached_warm_ema_ns /= count_cached_warm as f64;
+    }
+    if count_sparse_cold > 0 {
+        out.sparse_cold_ema_ns /= count_sparse_cold as f64;
+    }
+    if count_sparse_warm > 0 {
+        out.sparse_warm_ema_ns /= count_sparse_warm as f64;
+    }
+    if count_dense_cold > 0 {
+        out.dense_cold_ema_ns /= count_dense_cold as f64;
+    }
+    if count_dense_warm > 0 {
+        out.dense_warm_ema_ns /= count_dense_warm as f64;
+    }
+    if count_warmness > 0 {
+        out.cached_warmness /= count_warmness as f64;
+        out.sparse_warmness /= count_warmness as f64;
+        out.dense_warmness /= count_warmness as f64;
+    }
     if count_bias > 0 {
         out.adaptive_bias /= count_bias as f64;
     } else {
@@ -631,7 +745,10 @@ impl AchfLayer {
         config: AchfConfig,
         seed: u64,
     ) -> Self {
-        let weight = Linear::new(in_features, out_features, bias, seed);
+        Self::from_linear(Linear::new(in_features, out_features, bias, seed), config)
+    }
+
+    pub fn from_linear(weight: Linear, config: AchfConfig) -> Self {
         let layer = Self {
             weight,
             sparse_weight: None,
@@ -661,8 +778,10 @@ impl AchfLayer {
         let sparse_paths = self.metrics.sparse_paths.load(Ordering::Relaxed) as f64;
         AchfStateSnapshot {
             gate: state.last_gate,
+            gate_velocity: state.gate_velocity,
             g_min: state.g_min_ema,
             grad_ema: state.grad_ema,
+            gradient_cosine: state.gradient_cosine,
             cache_hit_rate: if calls > 0.0 { cache_hits / calls } else { 0.0 },
             low_rank_ratio: if calls > 0.0 {
                 sparse_paths / calls
@@ -679,7 +798,88 @@ impl AchfLayer {
             sinkhorn_negative_ratio: state.sinkhorn_negative_ratio,
             sinkhorn_warm_started: state.sinkhorn_warm_started,
             low_rank_rel_err: state.low_rank_rel_err,
+            prune_rel_err: state.prune_rel_err,
             low_rank_applied_rank: state.low_rank_applied_rank,
+        }
+    }
+
+    pub fn memory_stats(&self) -> AchfMemoryStats {
+        let dtype_bytes = |dtype: Dtype| match dtype {
+            Dtype::F64 => std::mem::size_of::<f64>(),
+            Dtype::F32 => std::mem::size_of::<f32>(),
+            Dtype::BF16 => std::mem::size_of::<bf16>(),
+            Dtype::I8 => std::mem::size_of::<i8>(),
+        };
+        let reference_parameter_bytes = self.weight.weight.numel()
+            * dtype_bytes(self.weight.weight.dtype)
+            + self
+                .weight
+                .bias
+                .as_ref()
+                .map_or(0, |bias| bias.numel() * dtype_bytes(bias.dtype));
+        let candidate_dense_bytes = self.sparse_weight.as_ref().map_or(0, |candidate| {
+            candidate.weight.numel() * dtype_bytes(candidate.weight.dtype)
+        });
+        let sparsity = self.inference_sparsity_stats();
+        let sparse_mask_bytes = self.sparse_mask.as_ref().map_or(0, Vec::len);
+        let cache = self.cache.read().unwrap();
+        let cached_dense_bytes = cache
+            .dense
+            .as_ref()
+            .map_or(0, |values| values.len() * std::mem::size_of::<f32>());
+        let cached_bias_bytes = cache
+            .bias
+            .as_ref()
+            .map_or(0, |values| values.len() * std::mem::size_of::<f32>());
+        let csr_row_ptr_bytes = cache
+            .csr_row_ptr
+            .as_ref()
+            .map_or(0, |values| values.len() * std::mem::size_of::<u32>());
+        let csr_column_bytes = cache
+            .csr_cols
+            .as_ref()
+            .map_or(0, |values| values.len() * std::mem::size_of::<u32>());
+        let csr_value_bytes = cache
+            .csr_vals
+            .as_ref()
+            .map_or(0, |values| values.len() * std::mem::size_of::<f32>());
+        let memoized_output_bytes = cache
+            .last_output
+            .as_ref()
+            .map_or(0, |values| values.len() * std::mem::size_of::<f32>());
+        let sinkhorn_state_bytes = cache
+            .sinkhorn_row_scales
+            .as_ref()
+            .map_or(0, |values| values.len() * std::mem::size_of::<f64>())
+            + cache
+                .sinkhorn_col_scales
+                .as_ref()
+                .map_or(0, |values| values.len() * std::mem::size_of::<f64>());
+        let total_materialized_bytes = reference_parameter_bytes
+            + candidate_dense_bytes
+            + sparse_mask_bytes
+            + cached_dense_bytes
+            + cached_bias_bytes
+            + csr_row_ptr_bytes
+            + csr_column_bytes
+            + csr_value_bytes
+            + memoized_output_bytes
+            + sinkhorn_state_bytes;
+        AchfMemoryStats {
+            layers: 1,
+            candidate_total_weights: sparsity.map_or(0, |stats| stats.total_weights),
+            candidate_nonzero_weights: sparsity.map_or(0, |stats| stats.nonzero_weights),
+            reference_parameter_bytes,
+            candidate_dense_bytes,
+            sparse_mask_bytes,
+            cached_dense_bytes,
+            cached_bias_bytes,
+            csr_row_ptr_bytes,
+            csr_column_bytes,
+            csr_value_bytes,
+            memoized_output_bytes,
+            sinkhorn_state_bytes,
+            total_materialized_bytes,
         }
     }
 
@@ -718,17 +918,12 @@ impl AchfLayer {
         })
     }
 
-    fn forward_blend(&self, input: &Tensor, g: f64) -> Tensor {
-        let dense_out = self.weight.forward(input);
-        let Some(sparse) = self.valid_sparse_weight() else {
-            return dense_out;
-        };
-        let sparse_out = sparse.forward(input);
-        let g_t = Tensor::with_dtype(vec![g], vec![1], dense_out.dtype)
-            .broadcast(dense_out.shape.clone());
-        let og_t = Tensor::with_dtype(vec![1.0 - g], vec![1], sparse_out.dtype)
-            .broadcast(sparse_out.shape.clone());
-        &(&dense_out * &g_t) + &(&sparse_out * &og_t)
+    fn forward_gated_candidate(&self, input: &Tensor, gate: f64) -> Tensor {
+        let output = self.valid_sparse_weight().map_or_else(
+            || self.weight.forward(input),
+            |sparse| sparse.forward(input),
+        );
+        self.scale_tensor_output(output, gate)
     }
 
     #[cfg(cuda)]
@@ -953,22 +1148,19 @@ impl Module for AchfLayer {
             return self.weight.forward(input);
         }
         if self.is_training_mode() {
-            let _ = self.compute_gate();
-            return self.weight.forward(input);
+            let gate = self.compute_gate();
+            return self.scale_tensor_output(self.weight.forward(input), gate);
         }
         let g = self.infer_gate_value();
         #[cfg(cuda)]
         if self.has_valid_sparse_state() && input.device == Device::Cuda {
             if let Some(sparse_out) = self.forward_sparse_tensor_cuda(input) {
-                let dense_out = self.weight.forward(input);
-                if let (Some(dense_scaled), Some(sparse_scaled)) =
-                    (dense_out.scale_cuda(g), sparse_out.scale_cuda(1.0 - g))
-                {
-                    return &dense_scaled + &sparse_scaled;
+                if let Some(sparse_scaled) = sparse_out.scale_cuda(g) {
+                    return sparse_scaled;
                 }
             }
         }
-        self.forward_blend(input, g)
+        self.forward_gated_candidate(input, g)
     }
 
     fn parameters(&self) -> Vec<Tensor> {
@@ -992,13 +1184,13 @@ impl AchfLayer {
             if g <= 0.001 {
                 return self.zero_tensor_output(x);
             }
-            return self.weight.forward(x);
+            return self.scale_tensor_output(self.weight.forward(x), g);
         }
         let g = self.infer_gate_value();
         if g <= 0.001 {
             return self.zero_tensor_output(x);
         }
-        self.forward_blend(x, g)
+        self.forward_gated_candidate(x, g)
     }
 
     pub fn forward_inference_residual(&self, x: &[f32]) -> Vec<f32> {
@@ -1010,7 +1202,8 @@ impl AchfLayer {
         // the general path below when the frozen selector would pick Cached.
         // Disabled in full mode, which deliberately routes through the full
         // path so the AMA selector and latency sampling stay live.
-        if self.metrics.frozen.load(Ordering::Relaxed) && !self.config.uses_adaptive_inference() {
+        if self.metrics.frozen.load(Ordering::Relaxed) && self.config.uses_frozen_cached_fast_path()
+        {
             if let Some(out) = self.try_frozen_cached_scaled(x) {
                 return out;
             }
@@ -1124,7 +1317,7 @@ impl AchfLayer {
     /// results are identical to `forward_inference_residual` in every case.
     pub fn forward_inference_residual_add_into(&self, x: &[f32], out: &mut [f32]) {
         if self.metrics.frozen.load(Ordering::Relaxed)
-            && !self.config.uses_adaptive_inference()
+            && self.config.uses_frozen_cached_fast_path()
             && self.config.enabled
             && self.try_frozen_cached_add_into(x, out)
         {
@@ -1298,6 +1491,10 @@ impl AchfLayer {
             {
                 if let Some(mean_sq) = crate::cuda::achf::grad_mean_sq(&self.weight.weight) {
                     let grad_rms = mean_sq.sqrt();
+                    let diagnostic_gradient = self
+                        .config
+                        .diagnostics_enabled
+                        .then(|| self.weight.weight.grad_to_f32_vec());
                     let mut state = self.state.write().unwrap();
                     match self.gate_mode() {
                         GateMode::GradEma => {
@@ -1309,19 +1506,20 @@ impl AchfLayer {
                                 + (1.0 - self.config.gate_momentum) * mean_sq;
                         }
                     }
+                    if let Some(gradient) = diagnostic_gradient.as_deref() {
+                        Self::update_gradient_cosine(&mut state, gradient);
+                    }
                     return;
                 }
             }
         }
         let mut sum_sq = 0.0;
         let mut count = 0usize;
-        {
-            let grad = self.weight.weight.grad_to_f32_vec();
-            for &v in grad.iter() {
-                sum_sq += (v * v) as f64;
-            }
-            count += grad.len();
+        let gradient = self.weight.weight.grad_to_f32_vec();
+        for &value in &gradient {
+            sum_sq += (value * value) as f64;
         }
+        count += gradient.len();
         if count == 0 {
             return;
         }
@@ -1338,6 +1536,34 @@ impl AchfLayer {
                     + (1.0 - self.config.gate_momentum) * mean_sq;
             }
         }
+        if self.config.diagnostics_enabled {
+            Self::update_gradient_cosine(&mut state, &gradient);
+        }
+    }
+
+    fn update_gradient_cosine(state: &mut AchfState, gradient: &[f32]) {
+        if state.previous_gradient.len() == gradient.len() && !gradient.is_empty() {
+            let mut dot = 0.0;
+            let mut previous_norm_sq = 0.0;
+            let mut current_norm_sq = 0.0;
+            for (&previous, &current) in state.previous_gradient.iter().zip(gradient.iter()) {
+                let previous = previous as f64;
+                let current = current as f64;
+                dot += previous * current;
+                previous_norm_sq += previous * previous;
+                current_norm_sq += current * current;
+            }
+            let denominator = (previous_norm_sq * current_norm_sq).sqrt();
+            state.gradient_cosine = if denominator > 0.0 {
+                (dot / denominator).clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+        } else {
+            state.gradient_cosine = 0.0;
+        }
+        state.previous_gradient.clear();
+        state.previous_gradient.extend_from_slice(gradient);
     }
 
     /// Run periodic manifold projection after an optimizer step (not during forward).
@@ -1380,6 +1606,7 @@ impl AchfLayer {
 
     pub fn cache_stats(&self) -> AchfCacheStats {
         let cache = self.cache.read().unwrap();
+        let warmup_samples = self.ama_warmup_samples();
         AchfCacheStats {
             calls: self.metrics.calls.load(Ordering::Relaxed),
             cache_hits: self.metrics.cache_hits.load(Ordering::Relaxed),
@@ -1395,6 +1622,20 @@ impl AchfLayer {
             ema_dense_long_ns: cache.ema_dense_long_ns,
             decision_ema_ns: cache.decision_ema_ns,
             decision_ema_long_ns: cache.decision_ema_long_ns,
+            cached_cold_ema_ns: cache.ama_cached_cold_ns,
+            cached_warm_ema_ns: cache.ama_cached_warm_ns,
+            sparse_cold_ema_ns: cache.ama_sparse_cold_ns,
+            sparse_warm_ema_ns: cache.ama_sparse_warm_ns,
+            dense_cold_ema_ns: cache.ama_dense_cold_ns,
+            dense_warm_ema_ns: cache.ama_dense_warm_ns,
+            cached_warmness: Self::ama_warmness(cache.ama_cached_warm_count, warmup_samples),
+            sparse_warmness: Self::ama_warmness(cache.ama_sparse_warm_count, warmup_samples),
+            dense_warmness: Self::ama_warmness(cache.ama_dense_warm_count, warmup_samples),
+            cached_stale_age: cache.ama_cached_stale,
+            sparse_stale_age: cache.ama_sparse_stale,
+            dense_stale_age: cache.ama_dense_stale,
+            path_switches: cache.ama_switches,
+            path_probes: cache.ama_probes,
             adaptive_bias: cache.adaptive_bias,
             latency_samples: self.metrics.latency_samples.load(Ordering::Relaxed),
             dense_latency_samples: self.metrics.dense_latency_samples.load(Ordering::Relaxed),
@@ -1419,6 +1660,7 @@ impl AchfLayer {
         let mut state = self.state.write().unwrap();
         state.freeze_projection = true;
         state.g_min_ema = self.config.g_min;
+        state.previous_gradient.clear();
         drop(state);
         self.metrics.frozen.store(true, Ordering::Release);
     }
@@ -1440,6 +1682,7 @@ impl AchfLayer {
 
     fn compute_gate(&self) -> f64 {
         let mut state = self.state.write().unwrap();
+        let previous_gate = state.last_gate;
         state.gate_step += 1;
         let warmup = self.config.gate_warmup_steps;
         let transition = self.config.gate_transition_steps;
@@ -1447,6 +1690,7 @@ impl AchfLayer {
 
         if warmup > 0 && state.gate_step <= warmup {
             state.last_gate = 1.0;
+            state.gate_velocity = state.last_gate - previous_gate;
             state.g_min_ema = self.config.g_min;
             return 1.0;
         }
@@ -1457,12 +1701,14 @@ impl AchfLayer {
             let t = (state.gate_step - warmup) as f64 / transition as f64;
             let g = 1.0 * (1.0 - t) + target * t;
             state.last_gate = g;
+            state.gate_velocity = state.last_gate - previous_gate;
             state.g_min_ema = self.config.g_min_momentum * state.g_min_ema
                 + (1.0 - self.config.g_min_momentum) * self.config.g_min;
             return g;
         }
 
         state.last_gate = target;
+        state.gate_velocity = state.last_gate - previous_gate;
         state.g_min_ema = self.config.g_min_momentum * state.g_min_ema
             + (1.0 - self.config.g_min_momentum) * self.config.g_min;
         target
@@ -1788,6 +2034,15 @@ impl AchfLayer {
         Tensor::zeros_with_dtype(out_shape, input.dtype)
     }
 
+    fn scale_tensor_output(&self, output: Tensor, gate: f64) -> Tensor {
+        if (gate - 1.0).abs() <= f64::EPSILON {
+            return output;
+        }
+        let gate_tensor =
+            Tensor::with_dtype(vec![gate], vec![1], output.dtype).broadcast(output.shape.clone());
+        &output * &gate_tensor
+    }
+
     fn zero_inference_output(&self, input: &[f32]) -> Vec<f32> {
         let out_len =
             if self.weight.in_features > 0 && input.len().is_multiple_of(self.weight.in_features) {
@@ -1841,6 +2096,20 @@ impl AchfLayer {
             }
         }
 
+        let reference_norm_sq = w_data
+            .iter()
+            .map(|value| (*value as f64).powi(2))
+            .sum::<f64>();
+        let prune_diff_sq = w_data
+            .iter()
+            .zip(keep.iter())
+            .filter_map(|(&value, &is_kept)| (!is_kept).then_some((value as f64).powi(2)))
+            .sum::<f64>();
+        let prune_rel_err = if reference_norm_sq > 0.0 {
+            (prune_diff_sq / reference_norm_sq).sqrt()
+        } else {
+            0.0
+        };
         let pruned: Vec<f64> = w_data
             .iter()
             .zip(keep.iter())
@@ -1859,6 +2128,7 @@ impl AchfLayer {
             out_features: self.weight.out_features,
         });
         self.sparse_mask = Some(mask);
+        self.state.write().unwrap().prune_rel_err = prune_rel_err;
         self.clear_cache();
     }
 
@@ -2141,10 +2411,19 @@ impl AchfLayer {
         //   * Frozen deterministic: a frozen layer's fused cached operator is
         //     permanently valid and cheapest, so skip probing and use it. This is
         //     the peak-throughput default once weights stop changing.
-        let decision = if self.is_training_mode() || self.config.uses_adaptive_inference() {
+        let mode = self.config.mode.trim().to_ascii_lowercase();
+        let decision = if self.is_training_mode() {
             self.select_ama_path(x)
         } else {
-            self.select_frozen_path(x)
+            match mode.as_str() {
+                "fixed_cached" => self.select_fixed_path(x, InferencePath::Cached),
+                "fixed_sparse" => self.select_fixed_path(x, InferencePath::Sparse),
+                "fixed_dense" => self.select_fixed_path(x, InferencePath::Dense),
+                "plain_ema" => self.select_plain_ema_path(x),
+                "full" if self.config.uses_adaptive_inference() => self.select_ama_path(x),
+                _ if self.config.adaptive_inference => self.select_ama_path(x),
+                _ => self.select_frozen_path(x),
+            }
         };
         self.metrics.calls.fetch_add(1, Ordering::Relaxed);
         match decision.path {
@@ -2212,7 +2491,57 @@ impl AchfLayer {
         }
     }
 
+    fn select_fixed_path(&self, x: &[f32], requested: InferencePath) -> AmaPathDecision {
+        let Ok(cache) = self.cache.try_read() else {
+            return AmaPathDecision {
+                path: if requested == InferencePath::Dense {
+                    InferencePath::Dense
+                } else {
+                    InferencePath::Sparse
+                },
+                has_cache: false,
+                cache_skipped: requested == InferencePath::Cached,
+            };
+        };
+        let has_cache = cache.dense.is_some();
+        let in_dim = cache.in_dim;
+        let out_dim = cache.out_dim;
+        let cache_shape_ok =
+            has_cache && in_dim > 0 && out_dim > 0 && x.len().is_multiple_of(in_dim);
+        let num_rows = if cache_shape_ok { x.len() / in_dim } else { 0 };
+        let min_rows_ok = self.config.cache_min_rows == 0 || num_rows >= self.config.cache_min_rows;
+        let nonzero_ratio = if cache_shape_ok && min_rows_ok {
+            self.estimate_nonzero_ratio(x, in_dim, num_rows)
+        } else {
+            1.0
+        };
+        let sparsity_ok = self.config.cache_min_nonzero_ratio <= 0.0
+            || nonzero_ratio >= self.config.cache_min_nonzero_ratio;
+        let cache_valid = cache_shape_ok && min_rows_ok && sparsity_ok;
+        let cache_skipped = requested == InferencePath::Cached && has_cache && !cache_valid;
+        let path = match requested {
+            InferencePath::Cached if cache_valid => InferencePath::Cached,
+            InferencePath::Cached | InferencePath::Sparse if self.has_valid_sparse_state() => {
+                InferencePath::Sparse
+            }
+            _ => InferencePath::Dense,
+        };
+        AmaPathDecision {
+            path,
+            has_cache,
+            cache_skipped,
+        }
+    }
+
     fn select_ama_path(&self, x: &[f32]) -> AmaPathDecision {
+        self.select_dynamic_path(x, true)
+    }
+
+    fn select_plain_ema_path(&self, x: &[f32]) -> AmaPathDecision {
+        self.select_dynamic_path(x, false)
+    }
+
+    fn select_dynamic_path(&self, x: &[f32], guarded: bool) -> AmaPathDecision {
         let Ok(mut cache) = self.cache.try_write() else {
             return AmaPathDecision {
                 path: InferencePath::Sparse,
@@ -2256,12 +2585,50 @@ impl AchfLayer {
         // compare a path measured at one batch against another. record_path_
         // latency switches to the same bucket (same num_rows) before recording.
         cache.switch_ama_bucket(num_rows, self.config.cache_cost_bias);
-        let path = self.ama_select_guarded_path(&mut cache);
+        let path = if guarded {
+            self.ama_select_guarded_path(&mut cache)
+        } else {
+            self.ama_select_plain_ema_path(&mut cache)
+        };
         AmaPathDecision {
             path,
             has_cache,
             cache_skipped,
         }
+    }
+
+    fn ama_select_plain_ema_path(&self, cache: &mut AchfCache) -> InferencePath {
+        let stale_limit = self.ama_stale_limit();
+        let cached_needs_probe =
+            cache.ema_cached_ns <= 0.0 || cache.ama_cached_stale >= stale_limit;
+        let sparse_needs_probe =
+            cache.ema_sparse_ns <= 0.0 || cache.ama_sparse_stale >= stale_limit;
+        let dense_needs_probe = cache.ema_dense_ns <= 0.0 || cache.ama_dense_stale >= stale_limit;
+        if cached_needs_probe || sparse_needs_probe || dense_needs_probe {
+            let path = self.ama_probe_path(
+                cache,
+                cached_needs_probe,
+                sparse_needs_probe,
+                dense_needs_probe,
+            );
+            Self::ama_commit_path(cache, path, true, 0);
+            return path;
+        }
+
+        let path = [
+            (InferencePath::Cached, cache.ema_cached_ns),
+            (InferencePath::Sparse, cache.ema_sparse_ns),
+            (InferencePath::Dense, cache.ema_dense_ns),
+        ]
+        .into_iter()
+        .min_by(|left, right| {
+            left.1
+                .partial_cmp(&right.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map_or(InferencePath::Dense, |(path, _)| path);
+        Self::ama_commit_path(cache, path, false, 0);
+        path
     }
 
     /// Re-probe interval for one path, given its current effective score and the
@@ -3262,6 +3629,51 @@ mod tests {
     }
 
     #[test]
+    fn achf_training_gate_scales_the_forward_output() {
+        let cfg = AchfConfig {
+            enabled: true,
+            proj_mode: "none".to_string(),
+            proj_freq: 0,
+            gate_warmup_steps: 0,
+            gate_transition_steps: 0,
+            gate_alpha: 0.0,
+            gate_beta: 0.0,
+            g_min: 0.0,
+            ..Default::default()
+        };
+        let layer = AchfLayer::new_square(4, cfg, 99);
+        let input = Tensor::rand(vec![2, 4], -0.1, 0.1, 100);
+        let expected = layer.weight.forward(&input).data_to_f32_vec();
+        let actual = layer.forward(&input).data_to_f32_vec();
+        assert!((layer.last_gate() - 0.5).abs() < 1e-12);
+        for (actual, expected) in actual.iter().zip(expected.iter()) {
+            assert!((actual - expected * 0.5).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn achf_diagnostics_report_gradient_cosine() {
+        let cfg = AchfConfig {
+            enabled: true,
+            diagnostics_enabled: true,
+            ..Default::default()
+        };
+        let mut layer = AchfLayer::new_square(2, cfg, 101);
+        layer.weight.weight.grad_write_compat().fill(1.0);
+        layer.update_after_backward();
+        assert_eq!(layer.snapshot_state().gradient_cosine, 0.0);
+
+        layer.weight.weight.zero_grad();
+        layer.weight.weight.grad_write_compat().fill(-1.0);
+        layer.update_after_backward();
+        let cosine = layer.snapshot_state().gradient_cosine;
+        assert!((cosine + 1.0).abs() < 1e-6, "cosine={cosine}");
+
+        layer.freeze_for_inference();
+        assert!(layer.state.read().unwrap().previous_gradient.is_empty());
+    }
+
+    #[test]
     fn achf_rowcol_projection_normalizes_rows() {
         let cfg = AchfConfig {
             enabled: true,
@@ -3398,6 +3810,45 @@ mod tests {
         assert_eq!(stats.cache_hits, 1);
         assert_eq!(stats.dense_paths, 0);
         assert_eq!(stats.sparse_paths, 0);
+    }
+
+    #[test]
+    fn achf_freeze_reports_pruning_discrepancy_and_materialized_memory() {
+        let cfg = AchfConfig {
+            enabled: true,
+            proj_mode: "none".to_string(),
+            proj_freq: 0,
+            rank: 0,
+            prune_threshold: 0.5,
+            infer_gate: "one".to_string(),
+            ..Default::default()
+        };
+        let mut layer = AchfLayer::new(2, 2, false, cfg, 31);
+        {
+            let mut weights = layer.weight.weight.data_write_f32();
+            *weights = vec![0.1, 1.0, -0.2, -2.0];
+        }
+        layer.freeze_for_inference();
+
+        let snapshot = layer.snapshot_state();
+        assert!(snapshot.prune_rel_err > 0.0);
+        let memory = layer.memory_stats();
+        assert_eq!(memory.layers, 1);
+        assert_eq!(memory.candidate_total_weights, 4);
+        assert_eq!(memory.candidate_nonzero_weights, 2);
+        assert_eq!(
+            memory.total_materialized_bytes,
+            memory.reference_parameter_bytes
+                + memory.candidate_dense_bytes
+                + memory.sparse_mask_bytes
+                + memory.cached_dense_bytes
+                + memory.cached_bias_bytes
+                + memory.csr_row_ptr_bytes
+                + memory.csr_column_bytes
+                + memory.csr_value_bytes
+                + memory.memoized_output_bytes
+                + memory.sinkhorn_state_bytes
+        );
     }
 
     #[test]
@@ -4618,6 +5069,7 @@ mod tests {
             latency_samples: 0,
             dense_latency_samples: 0,
             decision_samples: 0,
+            ..Default::default()
         };
         let s2 = AchfCacheStats {
             adaptive_bias: 4.0,

@@ -570,7 +570,9 @@ impl Module for DuelingQNetwork {
         let mut p = Vec::new();
         p.extend(self.l1.parameters());
         p.extend(self.l2.parameters());
-        p.extend(self.l3.parameters());
+        if self.achf.is_none() {
+            p.extend(self.l3.parameters());
+        }
         p.extend(self.val_head.parameters());
         p.extend(self.adv_head.parameters());
         if let Some(achf) = &self.achf {
@@ -589,13 +591,7 @@ impl DuelingQNetwork {
         let val_head = Linear::new(hidden, 1, true, seed.wrapping_add(3));
         let adv_head = Linear::new(hidden, ACTION_SPACE, true, seed.wrapping_add(4));
         let achf_layer = if config.achf.enabled && config.achf.apply_dqn {
-            Some(AchfLayer::new(
-                hidden,
-                hidden,
-                true,
-                config.achf.clone(),
-                seed.wrapping_add(500),
-            ))
+            Some(AchfLayer::from_linear(l3.clone(), config.achf.clone()))
         } else {
             None
         };
@@ -628,13 +624,7 @@ impl DuelingQNetwork {
         let val_head = Linear::new(DEFAULT_DQN_HIDDEN, 1, true, seed.wrapping_add(3));
         let adv_head = Linear::new(DEFAULT_DQN_HIDDEN, ACTION_SPACE, true, seed.wrapping_add(4));
         let achf_layer = if achf.enabled && achf.apply_dqn {
-            Some(AchfLayer::new(
-                DEFAULT_DQN_HIDDEN,
-                DEFAULT_DQN_HIDDEN,
-                true,
-                achf.clone(),
-                seed.wrapping_add(500),
-            ))
+            Some(AchfLayer::from_linear(l3.clone(), achf.clone()))
         } else {
             None
         };
@@ -718,11 +708,13 @@ impl DuelingQNetwork {
     pub fn to_cuda(&mut self) {
         self.l1.to_cuda();
         self.l2.to_cuda();
-        self.l3.to_cuda();
         self.val_head.to_cuda();
         self.adv_head.to_cuda();
         if let Some(ref mut achf) = self.achf {
             achf.to_cuda();
+            self.l3 = achf.weight.clone();
+        } else {
+            self.l3.to_cuda();
         }
     }
 
@@ -752,6 +744,10 @@ impl DuelingQNetwork {
 
     pub fn achf_cache_stats(&self) -> Option<crate::achf::AchfCacheStats> {
         self.achf.as_ref().map(|achf| achf.cache_stats())
+    }
+
+    pub fn achf_memory_stats(&self) -> Option<crate::achf::AchfMemoryStats> {
+        self.achf.as_ref().map(AchfLayer::memory_stats)
     }
 
     pub fn snapshot_achf(&self) -> Option<crate::achf::AchfStateSnapshot> {
@@ -797,10 +793,14 @@ impl DuelingQNetwork {
         let mut out = self.clone();
         out.l1 = self.l1.to_inference_bf16();
         out.l2 = self.l2.to_inference_bf16();
-        out.l3 = self.l3.to_inference_bf16();
         out.val_head = self.val_head.to_inference_bf16();
         out.adv_head = self.adv_head.to_inference_bf16();
         out.achf = self.achf.as_ref().map(AchfLayer::to_inference_bf16);
+        if let Some(achf) = &out.achf {
+            out.l3 = achf.weight.clone();
+        } else {
+            out.l3 = self.l3.to_inference_bf16();
+        }
         out
     }
 
@@ -928,11 +928,13 @@ impl DuelingQNetwork {
 
         copy_linear(&mut self.l1, &other.l1);
         copy_linear(&mut self.l2, &other.l2);
-        copy_linear(&mut self.l3, &other.l3);
         copy_linear(&mut self.val_head, &other.val_head);
         copy_linear(&mut self.adv_head, &other.adv_head);
         if let (Some(dst), Some(src)) = (&mut self.achf, &other.achf) {
             dst.load_state_dict(src);
+            self.l3 = dst.weight.clone();
+        } else {
+            copy_linear(&mut self.l3, &other.l3);
         }
     }
 
@@ -1002,11 +1004,13 @@ impl DuelingQNetwork {
 
         update_linear(&mut self.l1, &source.l1);
         update_linear(&mut self.l2, &source.l2);
-        update_linear(&mut self.l3, &source.l3);
         update_linear(&mut self.val_head, &source.val_head);
         update_linear(&mut self.adv_head, &source.adv_head);
         if let (Some(dst), Some(src)) = (&mut self.achf, &source.achf) {
             dst.soft_update(src, tau);
+            self.l3 = dst.weight.clone();
+        } else {
+            update_linear(&mut self.l3, &source.l3);
         }
     }
 
@@ -2659,6 +2663,102 @@ mod tests {
 
         achf.lambda_ortho = 0.0;
         assert_eq!(dqn_achf_orthogonal_penalty_interval(&achf), usize::MAX);
+    }
+
+    #[test]
+    fn dqn_achf_replacement_preserves_initialization_and_parameter_count() {
+        let off = small_dqn_config();
+        let mut on = small_dqn_config();
+        on.achf = AchfConfig {
+            enabled: true,
+            apply_dqn: true,
+            proj_mode: "none".to_string(),
+            proj_freq: 0,
+            lambda_ortho: 0.0,
+            rank: 0,
+            prune_threshold: 0.0,
+            gate_warmup_steps: 0,
+            gate_transition_steps: 0,
+            gate_alpha: 50.0,
+            gate_beta: 0.0,
+            g_min: 1.0,
+            infer_gate: "one".to_string(),
+            ..Default::default()
+        };
+        let dqn_off = DuelingQNetwork::new_with_config(&off, 123);
+        let dqn_on = DuelingQNetwork::new_with_config(&on, 123);
+        assert_eq!(dqn_on.param_count(), dqn_off.param_count());
+        assert_eq!(
+            dqn_on
+                .achf
+                .as_ref()
+                .unwrap()
+                .weight
+                .weight
+                .data_to_f32_vec(),
+            dqn_off.l3.weight.data_to_f32_vec()
+        );
+        let state = Tensor::rand(vec![2, DIM], -0.1, 0.1, 456);
+        let output_on = dqn_on.forward(&state).data_to_f32_vec();
+        let output_off = dqn_off.forward(&state).data_to_f32_vec();
+        for (left, right) in output_on.iter().zip(output_off.iter()) {
+            assert!((left - right).abs() < 1e-5, "{left} != {right}");
+        }
+        {
+            let mut weight = dqn_on.achf.as_ref().unwrap().weight.weight.data_write_f32();
+            weight[0] = 123.0;
+        }
+        assert_eq!(dqn_on.l3.weight.data_f32()[0], 123.0);
+    }
+
+    #[test]
+    fn dqn_achf_soft_update_updates_shared_replacement_once() {
+        let mut config = small_dqn_config();
+        config.achf = AchfConfig {
+            enabled: true,
+            apply_dqn: true,
+            ..Default::default()
+        };
+        let mut target = DuelingQNetwork::new_with_config(&config, 1);
+        let source = DuelingQNetwork::new_with_config(&config, 2);
+        target
+            .achf
+            .as_ref()
+            .unwrap()
+            .weight
+            .weight
+            .data_write_f32()
+            .fill(0.0);
+        source
+            .achf
+            .as_ref()
+            .unwrap()
+            .weight
+            .weight
+            .data_write_f32()
+            .fill(1.0);
+
+        target.soft_update(&source, 0.5);
+
+        assert!(target
+            .achf
+            .as_ref()
+            .unwrap()
+            .weight
+            .weight
+            .data_f32()
+            .iter()
+            .all(|value| (*value - 0.5).abs() < f32::EPSILON));
+        assert_eq!(
+            target.l3.weight.data_to_f32_vec(),
+            target
+                .achf
+                .as_ref()
+                .unwrap()
+                .weight
+                .weight
+                .data_to_f32_vec()
+        );
     }
 
     #[test]

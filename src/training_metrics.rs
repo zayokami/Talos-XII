@@ -6,8 +6,10 @@ use std::sync::mpsc::Sender;
 pub struct StepSnapshot {
     pub step: usize,
     pub gate_value: f64,
+    pub gate_velocity: f64,
     pub g_min: f64,
     pub grad_ema: f64,
+    pub gradient_cosine: f64,
     pub loss: f64,
     pub reward: f64,
     pub cache_hit_rate: f64,
@@ -33,8 +35,10 @@ impl StepSnapshot {
         Self {
             step,
             gate_value: achf.map_or(1.0, |s| s.gate),
+            gate_velocity: achf.map_or(0.0, |s| s.gate_velocity),
             g_min: achf.map_or(0.0, |s| s.g_min),
             grad_ema: achf.map_or(0.0, |s| s.grad_ema),
+            gradient_cosine: achf.map_or(0.0, |s| s.gradient_cosine),
             loss,
             reward,
             cache_hit_rate: achf.map_or(0.0, |s| s.cache_hit_rate),
@@ -196,8 +200,10 @@ mod tests {
 
         assert_eq!(snapshot.step, 7);
         assert_eq!(snapshot.gate_value, 1.0);
+        assert_eq!(snapshot.gate_velocity, 0.0);
         assert_eq!(snapshot.g_min, 0.0);
         assert_eq!(snapshot.grad_ema, 0.0);
+        assert_eq!(snapshot.gradient_cosine, 0.0);
         assert_eq!(snapshot.loss, 0.5);
         assert_eq!(snapshot.reward, 3.0);
         assert_eq!(snapshot.cache_hit_rate, 0.0);

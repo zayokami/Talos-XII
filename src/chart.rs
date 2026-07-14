@@ -17,10 +17,14 @@ const PALETTE: &[RGBColor] = &[
     RGBColor(127, 127, 127),
 ];
 
+pub type CiPoint = (f64, f64, f64, f64);
+pub type CiSeries<'a> = (&'a str, &'a [CiPoint]);
+
 fn color(idx: usize) -> RGBColor {
     PALETTE[idx % PALETTE.len()]
 }
 
+#[allow(dead_code)]
 pub fn draw_line_chart(
     path: &str,
     title: &str,
@@ -53,6 +57,7 @@ pub fn draw_line_chart(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn draw_line_chart_on<DB: DrawingBackend>(
     root: &DrawingArea<DB, plotters::coord::Shift>,
     title: &str,
@@ -101,6 +106,119 @@ where
         .label_font(("sans-serif", 12))
         .draw()?;
 
+    Ok(())
+}
+
+pub fn draw_line_chart_with_ci(
+    path: &str,
+    title: &str,
+    x_label: &str,
+    y_label: &str,
+    series: &[CiSeries<'_>],
+    width: u32,
+    height: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if series.is_empty() || series.iter().all(|(_, data)| data.is_empty()) {
+        return Ok(());
+    }
+    let mut x_min = f64::INFINITY;
+    let mut x_max = f64::NEG_INFINITY;
+    let mut y_min = f64::INFINITY;
+    let mut y_max = f64::NEG_INFINITY;
+    for (_, data) in series {
+        for &(x, mean, low, high) in *data {
+            if x.is_finite() && mean.is_finite() && low.is_finite() && high.is_finite() {
+                x_min = x_min.min(x);
+                x_max = x_max.max(x);
+                y_min = y_min.min(low.min(mean));
+                y_max = y_max.max(high.max(mean));
+            }
+        }
+    }
+    if !x_min.is_finite() || !x_max.is_finite() || !y_min.is_finite() || !y_max.is_finite() {
+        return Ok(());
+    }
+    if x_min == x_max {
+        x_max = x_min + 1.0;
+    }
+    if y_min == y_max {
+        y_max = y_min + 1.0;
+    }
+    let y_margin = (y_max - y_min) * 0.05;
+    y_min -= y_margin;
+    y_max += y_margin;
+
+    if path.ends_with(".svg") {
+        let root = SVGBackend::new(path, (width, height)).into_drawing_area();
+        draw_line_chart_with_ci_on(
+            &root, title, x_label, y_label, series, x_min, x_max, y_min, y_max,
+        )?;
+        root.present()?;
+    } else {
+        let root = BitMapBackend::new(path, (width, height)).into_drawing_area();
+        draw_line_chart_with_ci_on(
+            &root, title, x_label, y_label, series, x_min, x_max, y_min, y_max,
+        )?;
+        root.present()?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_line_chart_with_ci_on<DB: DrawingBackend>(
+    root: &DrawingArea<DB, plotters::coord::Shift>,
+    title: &str,
+    x_label: &str,
+    y_label: &str,
+    series: &[CiSeries<'_>],
+    x_min: f64,
+    x_max: f64,
+    y_min: f64,
+    y_max: f64,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    DB::ErrorType: 'static,
+{
+    root.fill(&WHITE)?;
+    let mut chart = ChartBuilder::on(root)
+        .caption(title, ("sans-serif", 20))
+        .margin(15)
+        .x_label_area_size(40)
+        .y_label_area_size(60)
+        .build_cartesian_2d(x_min..x_max, y_min..y_max)?;
+    chart
+        .configure_mesh()
+        .x_desc(x_label)
+        .y_desc(y_label)
+        .label_style(("sans-serif", 12))
+        .draw()?;
+
+    for (index, (name, data)) in series.iter().enumerate() {
+        let series_color = color(index);
+        chart.draw_series(data.iter().filter(|&&(_, _, low, high)| high > low).map(
+            |&(x, _, low, high)| {
+                PathElement::new(
+                    vec![(x, low), (x, high)],
+                    series_color.mix(0.35).stroke_width(1),
+                )
+            },
+        ))?;
+        chart
+            .draw_series(LineSeries::new(
+                data.iter().map(|&(x, mean, _, _)| (x, mean)),
+                series_color.stroke_width(2),
+            ))?
+            .label(*name)
+            .legend(move |(x, y)| {
+                PathElement::new(vec![(x, y), (x + 20, y)], series_color.stroke_width(2))
+            });
+    }
+    chart
+        .configure_series_labels()
+        .background_style(WHITE.mix(0.8))
+        .border_style(BLACK)
+        .label_font(("sans-serif", 12))
+        .draw()?;
     Ok(())
 }
 
@@ -200,12 +318,12 @@ where
     Ok(())
 }
 
-pub fn draw_bar_chart_with_error(
+pub fn draw_bar_chart_with_ci(
     path: &str,
     title: &str,
     x_label: &str,
     y_label: &str,
-    bars: &[(&str, f64, f64)], // (label, mean, std_dev)
+    bars: &[(&str, f64, f64, f64)], // (label, mean, ci_low, ci_high)
     width: u32,
     height: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -214,7 +332,7 @@ pub fn draw_bar_chart_with_error(
     }
     let y_max = bars
         .iter()
-        .map(|(_, m, s)| m + s)
+        .map(|(_, _, _, high)| *high)
         .filter(|v| v.is_finite())
         .fold(0.0_f64, f64::max)
         * 1.20;
@@ -223,23 +341,23 @@ pub fn draw_bar_chart_with_error(
 
     if path.ends_with(".svg") {
         let root = SVGBackend::new(path, (width, height)).into_drawing_area();
-        draw_bar_chart_with_error_on(&root, title, x_label, y_label, bars, y_max, n)?;
+        draw_bar_chart_with_ci_on(&root, title, x_label, y_label, bars, y_max, n)?;
         root.present()?;
     } else {
         let root = BitMapBackend::new(path, (width, height)).into_drawing_area();
-        draw_bar_chart_with_error_on(&root, title, x_label, y_label, bars, y_max, n)?;
+        draw_bar_chart_with_ci_on(&root, title, x_label, y_label, bars, y_max, n)?;
         root.present()?;
     }
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn draw_bar_chart_with_error_on<DB: DrawingBackend>(
+fn draw_bar_chart_with_ci_on<DB: DrawingBackend>(
     root: &DrawingArea<DB, plotters::coord::Shift>,
     title: &str,
     x_label: &str,
     y_label: &str,
-    bars: &[(&str, f64, f64)],
+    bars: &[(&str, f64, f64, f64)],
     y_max: f64,
     n: usize,
 ) -> Result<(), Box<dyn std::error::Error>>
@@ -284,21 +402,21 @@ where
     }))?;
 
     // Draw error bars and value labels
-    for (i, (_, mean, std)) in bars.iter().enumerate() {
+    for (i, (_, mean, ci_low, ci_high)) in bars.iter().enumerate() {
         let x_pos = SegmentValue::CenterOf(i);
-        // Error bar (vertical line: mean-std to mean+std)
-        if *std > 0.0 {
-            let lo = (mean - std).max(0.0);
-            let hi = mean + std;
+        if ci_high > ci_low {
             chart.draw_series(std::iter::once(PathElement::new(
-                vec![(x_pos.clone(), lo), (x_pos.clone(), hi)],
+                vec![
+                    (x_pos.clone(), (*ci_low).max(0.0)),
+                    (x_pos.clone(), *ci_high),
+                ],
                 BLACK.stroke_width(2),
             )))?;
         }
         // Value label
         chart.draw_series(std::iter::once(Text::new(
             format!("{:.0}", mean),
-            (x_pos, mean + std + y_max * 0.02),
+            (x_pos, ci_high.max(*mean) + y_max * 0.02),
             ("sans-serif", 10).into_font().color(&BLACK),
         )))?;
     }

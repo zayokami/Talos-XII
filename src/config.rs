@@ -175,7 +175,9 @@ fn sanitize_achf_config(achf: &mut AchfConfig) {
     let defaults = AchfConfig::default();
     let normalized_mode = achf.mode.trim().to_ascii_lowercase();
     match normalized_mode.as_str() {
-        "lite" | "full" => achf.mode = normalized_mode,
+        "lite" | "full" | "fixed_cached" | "fixed_sparse" | "fixed_dense" | "plain_ema" => {
+            achf.mode = normalized_mode
+        }
         _ => {
             eprintln!(
                 "[Config Warning] ACHF mode '{}' is unsupported, fallback to '{}'",
@@ -281,7 +283,7 @@ fn sanitize_achf_config(achf: &mut AchfConfig) {
     );
 }
 /// Determines which policy drives the luck factor during simulation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum LuckMode {
     /// Default mode: neural network probability adjustment.
     Probability,
@@ -313,7 +315,7 @@ impl LuckMode {
 }
 
 /// Compute device for neural network operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ComputeDevice {
     /// CPU (default).
     Cpu,
@@ -381,6 +383,7 @@ pub struct AchfConfig {
     pub cache_latency_sample_every: u64,
     pub cache_log_interval_steps: usize,
     pub cache_log_per_layer: bool,
+    pub diagnostics_enabled: bool,
     pub rank: usize,
     pub prune_threshold: f64,
     pub apply_attn: bool,
@@ -428,6 +431,7 @@ impl Default for AchfConfig {
             cache_latency_sample_every: 1,
             cache_log_interval_steps: 0,
             cache_log_per_layer: false,
+            diagnostics_enabled: false,
             rank: 128,
             prune_threshold: 0.01,
             apply_attn: true,
@@ -445,12 +449,22 @@ impl AchfConfig {
     /// constructed by older callers; sanitized configs canonicalize it to
     /// `mode = "full"`.
     pub fn uses_adaptive_inference(&self) -> bool {
-        self.mode.trim().eq_ignore_ascii_case("full") || self.adaptive_inference
+        matches!(
+            self.mode.trim().to_ascii_lowercase().as_str(),
+            "full" | "plain_ema"
+        ) || self.adaptive_inference
+    }
+
+    pub fn uses_frozen_cached_fast_path(&self) -> bool {
+        matches!(
+            self.mode.trim().to_ascii_lowercase().as_str(),
+            "lite" | "fixed_cached"
+        ) && !self.adaptive_inference
     }
 }
 
 /// Per-pool configuration defining gacha rules and operator rosters.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct PoolConfig {
     pub id: String,
     pub name: String,
@@ -475,7 +489,7 @@ pub struct PoolConfig {
 }
 
 /// Configuration for the gacha simulation, loaded from JSON.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Config {
     pub pool_name: String,
     pub up_six: Vec<String>,
@@ -947,6 +961,9 @@ impl Config {
                 }
                 if let Some(v) = achf_map.get("cache_log_per_layer") {
                     config.achf.cache_log_per_layer = v.as_bool().unwrap_or(false);
+                }
+                if let Some(v) = achf_map.get("diagnostics_enabled") {
+                    config.achf.diagnostics_enabled = v.as_bool().unwrap_or(false);
                 }
                 if let Some(v) = achf_map.get("rank") {
                     let r = v.as_f64().unwrap_or(128.0).round() as usize;
@@ -1593,6 +1610,15 @@ mod tests {
         assert_eq!(full.mode, "full");
         assert!(!full.adaptive_inference);
         assert!(full.uses_adaptive_inference());
+
+        for mode in ["fixed_cached", "fixed_sparse", "fixed_dense", "plain_ema"] {
+            let mut config = AchfConfig {
+                mode: mode.to_string(),
+                ..Default::default()
+            };
+            sanitize_achf_config(&mut config);
+            assert_eq!(config.mode, mode);
+        }
 
         let mut invalid = AchfConfig {
             mode: "turbo".to_string(),
