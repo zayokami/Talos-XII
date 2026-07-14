@@ -736,12 +736,6 @@ impl DuelingQNetwork {
         }
     }
 
-    pub fn prune_achf(&mut self, threshold: f64) {
-        if let Some(achf) = &mut self.achf {
-            achf.prune(threshold);
-        }
-    }
-
     pub fn achf_cache_stats(&self) -> Option<crate::achf::AchfCacheStats> {
         self.achf.as_ref().map(|achf| achf.cache_stats())
     }
@@ -2344,7 +2338,6 @@ fn train_dqn_impl(
         }
     }
     pb.finish_with_message("DQN Training Complete.");
-    policy_net.prune_achf(config.achf.prune_threshold);
     policy_net.freeze_achf_for_inference();
     policy_net
 }

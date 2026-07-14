@@ -476,6 +476,9 @@ pub struct AchfMemoryStats {
     pub layers: usize,
     pub candidate_total_weights: usize,
     pub candidate_nonzero_weights: usize,
+    pub candidate_reference_norm_sq: f64,
+    pub candidate_error_norm_sq: f64,
+    pub max_layer_prune_rel_err: f64,
     pub reference_parameter_bytes: usize,
     pub candidate_dense_bytes: usize,
     pub sparse_mask_bytes: usize,
@@ -498,6 +501,11 @@ where
         out.layers += stats.layers;
         out.candidate_total_weights += stats.candidate_total_weights;
         out.candidate_nonzero_weights += stats.candidate_nonzero_weights;
+        out.candidate_reference_norm_sq += stats.candidate_reference_norm_sq;
+        out.candidate_error_norm_sq += stats.candidate_error_norm_sq;
+        out.max_layer_prune_rel_err = out
+            .max_layer_prune_rel_err
+            .max(stats.max_layer_prune_rel_err);
         out.reference_parameter_bytes += stats.reference_parameter_bytes;
         out.candidate_dense_bytes += stats.candidate_dense_bytes;
         out.sparse_mask_bytes += stats.sparse_mask_bytes;
@@ -511,6 +519,18 @@ where
         out.total_materialized_bytes += stats.total_materialized_bytes;
     }
     out
+}
+
+impl AchfMemoryStats {
+    pub fn candidate_prune_rel_err(&self) -> Option<f64> {
+        if self.layers == 0 || self.candidate_total_weights == 0 {
+            return None;
+        }
+        if self.candidate_reference_norm_sq > 0.0 {
+            return Some((self.candidate_error_norm_sq / self.candidate_reference_norm_sq).sqrt());
+        }
+        (self.candidate_error_norm_sq == 0.0).then_some(0.0)
+    }
 }
 
 impl AchfCacheStats {
@@ -820,6 +840,27 @@ impl AchfLayer {
         let candidate_dense_bytes = self.sparse_weight.as_ref().map_or(0, |candidate| {
             candidate.weight.numel() * dtype_bytes(candidate.weight.dtype)
         });
+        let (candidate_reference_norm_sq, candidate_error_norm_sq, max_layer_prune_rel_err) = self
+            .valid_sparse_weight()
+            .map_or((0.0, 0.0, 0.0), |candidate| {
+                let reference = self.weight.weight.data_to_f32_vec();
+                let candidate = candidate.weight.data_to_f32_vec();
+                let reference_norm_sq = reference
+                    .iter()
+                    .map(|value| (*value as f64).powi(2))
+                    .sum::<f64>();
+                let error_norm_sq = reference
+                    .iter()
+                    .zip(candidate.iter())
+                    .map(|(&reference, &candidate)| (reference as f64 - candidate as f64).powi(2))
+                    .sum::<f64>();
+                let relative_error = if reference_norm_sq > 0.0 {
+                    (error_norm_sq / reference_norm_sq).sqrt()
+                } else {
+                    0.0
+                };
+                (reference_norm_sq, error_norm_sq, relative_error)
+            });
         let sparsity = self.inference_sparsity_stats();
         let sparse_mask_bytes = self.sparse_mask.as_ref().map_or(0, Vec::len);
         let cache = self.cache.read().unwrap();
@@ -869,6 +910,9 @@ impl AchfLayer {
             layers: 1,
             candidate_total_weights: sparsity.map_or(0, |stats| stats.total_weights),
             candidate_nonzero_weights: sparsity.map_or(0, |stats| stats.nonzero_weights),
+            candidate_reference_norm_sq,
+            candidate_error_norm_sq,
+            max_layer_prune_rel_err,
             reference_parameter_bytes,
             candidate_dense_bytes,
             sparse_mask_bytes,
@@ -881,6 +925,46 @@ impl AchfLayer {
             sinkhorn_state_bytes,
             total_materialized_bytes,
         }
+    }
+
+    pub fn fork_inference_runtime(&self) -> Self {
+        let mut state = self.state.read().unwrap().clone();
+        state.freeze_projection = true;
+        state.previous_gradient.clear();
+        let cache = default_cache();
+        {
+            let mut cache = cache.write().unwrap();
+            cache.adaptive_bias = self.config.cache_cost_bias;
+        }
+        let metrics = default_metrics();
+        metrics.frozen.store(true, Ordering::Release);
+        let layer = Self {
+            weight: self.weight.clone(),
+            sparse_weight: self.sparse_weight.clone(),
+            sparse_mask: self.sparse_mask.clone(),
+            config: self.config.clone(),
+            state: Arc::new(RwLock::new(state)),
+            cache,
+            metrics,
+        };
+        layer.prepare_inference_cache();
+        layer
+    }
+
+    pub fn set_inference_mode(&mut self, mode: &str, sample_every: u64) {
+        self.config.mode = mode.to_string();
+        self.config.adaptive_inference = false;
+        self.config.cache_latency_sample_every = sample_every;
+        self.clear_cache();
+        self.prepare_inference_cache();
+    }
+
+    pub fn rebuild_inference_candidate(&mut self, threshold: f64) {
+        self.config.prune_threshold = threshold;
+        self.prune(threshold);
+        self.prepare_inference_cache();
+        self.state.write().unwrap().freeze_projection = true;
+        self.metrics.frozen.store(true, Ordering::Release);
     }
 
     pub fn parameters(&self) -> Vec<Tensor> {
@@ -1652,7 +1736,7 @@ impl AchfLayer {
                 .sparse_weight
                 .as_ref()
                 .is_some_and(|s| s.weight.dtype == Dtype::BF16);
-        if !already_bf16 {
+        if !already_bf16 && self.config.proj_freq > 0 {
             self.project_weight();
         }
         self.prune(self.config.prune_threshold);
@@ -2054,47 +2138,14 @@ impl AchfLayer {
     }
 
     /// Post-training magnitude pruning: create sparse_weight by zeroing
-    /// elements below threshold. Idempotent (re-pruning overwrites).
-    ///
-    /// When `config.rank > 0`, the parameter count of a rank-r factorization,
-    /// `r * (rows + cols)`, acts as an nnz budget for the sparse path. The
-    /// budget is distributed per row (each row keeps at most
-    /// `floor(budget / rows)` of its largest-magnitude entries) and intersects
-    /// with the magnitude threshold — whichever is sparser wins. With
-    /// `rank == 0` (or a rank large enough that the budget exceeds the dense
-    /// size) this degenerates to pure threshold pruning, the historic behavior.
+    /// elements below threshold. Idempotent (re-pruning overwrites). Rank
+    /// controls low-rank projection only; it is not reused as an unrelated
+    /// nonzero budget that can silently destroy the projected operator.
     #[allow(dead_code)]
     pub fn prune(&mut self, threshold: f64) {
-        let rows = self.weight.in_features;
-        let cols = self.weight.out_features;
         let w_data = self.weight.weight.data_to_f32_vec();
         let threshold_f32 = threshold as f32;
-        let mut keep: Vec<bool> = w_data.iter().map(|&v| v.abs() >= threshold_f32).collect();
-
-        if self.config.rank > 0 && rows > 0 && cols > 0 && w_data.len() == rows * cols {
-            let budget = self.config.rank.saturating_mul(rows + cols);
-            // rank >= 1 implies budget >= rows + cols > rows, so per_row >= 1.
-            let per_row = (budget / rows).min(cols);
-            if per_row < cols {
-                let mut row_indices: Vec<usize> = Vec::with_capacity(cols);
-                for r in 0..rows {
-                    let row = &w_data[r * cols..(r + 1) * cols];
-                    row_indices.clear();
-                    row_indices.extend((0..cols).filter(|&c| keep[r * cols + c]));
-                    if row_indices.len() > per_row {
-                        row_indices.sort_unstable_by(|&a, &b| {
-                            row[b]
-                                .abs()
-                                .partial_cmp(&row[a].abs())
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        });
-                        for &c in &row_indices[per_row..] {
-                            keep[r * cols + c] = false;
-                        }
-                    }
-                }
-            }
-        }
+        let keep: Vec<bool> = w_data.iter().map(|&v| v.abs() >= threshold_f32).collect();
 
         let reference_norm_sq = w_data
             .iter()
@@ -3833,6 +3884,8 @@ mod tests {
         let snapshot = layer.snapshot_state();
         assert!(snapshot.prune_rel_err > 0.0);
         let memory = layer.memory_stats();
+        assert!((memory.candidate_prune_rel_err().unwrap() - snapshot.prune_rel_err).abs() < 1e-12);
+        assert_eq!(memory.max_layer_prune_rel_err, snapshot.prune_rel_err);
         assert_eq!(memory.layers, 1);
         assert_eq!(memory.candidate_total_weights, 4);
         assert_eq!(memory.candidate_nonzero_weights, 2);
@@ -5139,7 +5192,7 @@ mod tests {
         let cfg = AchfConfig {
             enabled: true,
             proj_mode: "none".to_string(),
-            proj_freq: 0,
+            proj_freq: 1,
             rank: 2,
             prune_threshold: 0.0,
             ..Default::default()
@@ -5159,11 +5212,32 @@ mod tests {
     }
 
     #[test]
+    fn achf_projection_frequency_zero_disables_freeze_projection() {
+        let cfg = AchfConfig {
+            enabled: true,
+            proj_mode: "sinkhorn".to_string(),
+            proj_freq: 0,
+            rank: 2,
+            prune_threshold: 0.0,
+            ..Default::default()
+        };
+        let mut layer = AchfLayer::new(8, 8, false, cfg, 79);
+        let before = layer.weight.weight.data_f32().clone();
+        layer.freeze_for_inference();
+
+        assert_eq!(layer.weight.weight.data_f32().as_slice(), before.as_slice());
+        let snapshot = layer.snapshot_state();
+        assert_eq!(snapshot.low_rank_applied_rank, 0);
+        assert_eq!(snapshot.low_rank_rel_err, 0.0);
+        assert_eq!(snapshot.sinkhorn_iterations, 0);
+    }
+
+    #[test]
     fn achf_rank_zero_skips_truncation() {
         let cfg = AchfConfig {
             enabled: true,
             proj_mode: "none".to_string(),
-            proj_freq: 0,
+            proj_freq: 1,
             rank: 0,
             prune_threshold: 0.0,
             ..Default::default()
@@ -5179,44 +5253,17 @@ mod tests {
     }
 
     #[test]
-    fn achf_prune_respects_rank_budget() {
-        let rows = 8;
-        let cols = 8;
+    fn achf_prune_does_not_reuse_rank_as_an_nnz_budget() {
         let cfg = AchfConfig {
             enabled: true,
             rank: 1,
             ..Default::default()
         };
-        let mut layer = AchfLayer::new(rows, cols, false, cfg, 200);
-        // Threshold 0.0 alone would keep everything; the rank budget must cap nnz.
+        let mut layer = AchfLayer::new(8, 8, false, cfg, 200);
         layer.prune(0.0);
         let mask = layer.sparse_mask.as_ref().unwrap();
-        let nnz: usize = mask.iter().map(|&m| m as usize).sum();
-        let budget = rows + cols; // rank = 1
-        assert!(nnz <= budget, "nnz={nnz} exceeds budget={budget}");
-        // Sparse weight must agree with the mask.
-        let sparse = layer.sparse_weight.as_ref().unwrap().weight.data_f32();
-        for (v, &m) in sparse.iter().zip(mask.iter()) {
-            if m == 0 {
-                assert_eq!(*v, 0.0);
-            }
-        }
-        // Each row keeps its largest-magnitude entries.
-        let dense = layer.weight.weight.data_f32();
-        for r in 0..rows {
-            let kept_min = (0..cols)
-                .filter(|&c| mask[r * cols + c] == 1)
-                .map(|c| dense[r * cols + c].abs())
-                .fold(f32::INFINITY, f32::min);
-            let dropped_max = (0..cols)
-                .filter(|&c| mask[r * cols + c] == 0)
-                .map(|c| dense[r * cols + c].abs())
-                .fold(0.0f32, f32::max);
-            assert!(
-                kept_min >= dropped_max,
-                "row {r}: kept_min={kept_min} < dropped_max={dropped_max}"
-            );
-        }
+        assert!(mask.iter().all(|&value| value == 1));
+        assert_eq!(layer.snapshot_state().prune_rel_err, 0.0);
     }
 
     #[test]
@@ -5235,6 +5282,32 @@ mod tests {
         assert_eq!(stats.nonzero_weights, 16);
         assert_eq!(stats.zero_weights, 0);
         assert_eq!(stats.sparsity, 0.0);
+    }
+
+    #[test]
+    fn achf_inference_runtime_fork_is_frozen_and_has_independent_metrics() {
+        let cfg = AchfConfig {
+            enabled: true,
+            mode: "fixed_cached".to_string(),
+            proj_mode: "none".to_string(),
+            proj_freq: 0,
+            prune_threshold: 0.0,
+            infer_gate: "one".to_string(),
+            ..Default::default()
+        };
+        let mut source = AchfLayer::new(4, 3, true, cfg, 203);
+        source.freeze_for_inference();
+        let fork = source.fork_inference_runtime();
+
+        assert!(fork.metrics.frozen.load(Ordering::Acquire));
+        assert!(fork.state.read().unwrap().freeze_projection);
+        let input = vec![0.2, -0.1, 0.5, 0.7];
+        let source_before = source.cache_stats();
+        let fork_output = fork.forward_inference_residual(&input);
+        let source_output = source.forward_inference_residual(&input);
+        assert_eq!(fork_output, source_output);
+        assert_eq!(source_before.calls + 1, source.cache_stats().calls);
+        assert_eq!(fork.cache_stats().calls, 1);
     }
 
     #[test]

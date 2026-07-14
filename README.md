@@ -141,19 +141,17 @@ flowchart TD
 
     subgraph TRAIN["Training path (weights changing)"]
         direction TB
-        CG["compute_gate&nbsp;g&nbsp;∈&nbsp;[g_min,&nbsp;1]<br/>gate_mode: grad_ema / fim_trace"] --> DW["dense weight · g"]
-        SW["sparse weight · (1−g)"] --> BLEND["blend = dense·g + sparse·(1−g)"]
-        DW --> BLEND
-        BLEND --> BWD["backward → update_after_backward<br/>(EMA of grad RMS)"]
+        CG["compute_gate&nbsp;g&nbsp;∈&nbsp;[g_min,&nbsp;1]<br/>gate_mode: grad_ema / fim_trace"] --> ACTIVE["dense reference · g"]
+        ACTIVE --> BWD["backward → update_after_backward<br/>(EMA of grad RMS)"]
         BWD --> PROJ{"step % proj_freq == 0?"}
         PROJ -- yes --> MANI["project_weight:<br/>row/col or Sinkhorn normalize<br/>+ low-rank truncation (rank r)"]
-        MANI --> PRUNE["prune below threshold<br/>→ refresh sparse weight"]
+        MANI --> KEEP["keep projected dense reference"]
         PROJ -- no --> SKIP["keep operator"]
     end
 
     subgraph INFER["Frozen path (weights fixed)"]
         direction TB
-        FUSE["fused cached operator<br/>(dense ⊕ sparse ⊕ bias)"] --> AMA["AMA path selection<br/>Cached / Sparse / Dense"]
+        FUSE["frozen pruned candidate<br/>+ prepared cache/CSR views"] --> AMA["AMA path selection<br/>Cached / Sparse / Dense"]
     end
 
     G -- training --> TRAIN
@@ -165,8 +163,8 @@ flowchart TD
 **Problems solved:** CPU-bound neural-network matrix multiplication; cache misses degrading throughput; the fact that the optimal sparsity/projection frequency and even the fastest execution path differ across hardware.
 
 **Four mechanisms:**
-- **Low-rank Projection** — row/column or dual (Sinkhorn) projection (`proj_mode`), followed by rank-`r` truncation, replaces the operator with a low-rank approximation that reduces compute and cache pressure (`proj_freq` controls how often it runs; `0` disables it).
-- **Gating Sparsity** — a gate value `g ∈ [g_min, 1]` blends dense and pruned weights; channels below threshold are skipped. `g_min` sets a floor so aggressive sparsity can't destabilize the output. The gate is driven by an EMA of gradient RMS (`grad_ema`) or Fisher trace (`fim_trace`).
+- **Low-rank Projection** — row/column or dual (Sinkhorn) projection (`proj_mode`), followed by rank-`r` truncation, constrains the operator (`proj_freq` controls how often it runs; `0` disables it). The current rank-r result is materialized densely, so rank alone is not claimed as storage or kernel compression.
+- **Gate and Pruning** — the live gate `g ∈ [g_min, 1]` multiplicatively scales the active operator. Magnitude pruning is a separate freeze-time step controlled only by `prune_threshold`; it does not reuse rank as an nnz budget.
 - **Adaptive Control (AMA)** — runtime latency sampling with EMA smoothing decides which execution path to run, with hysteresis to avoid path thrashing (see below).
 - **Path-level Toggle** — independently enable/disable ACHF on Attention (`apply_attn`), FFN (`apply_ffn`), and DQN (`apply_dqn`) paths to protect accuracy-sensitive links.
 
@@ -386,7 +384,7 @@ cargo run --release -- benchmark                  # 快速内置基准
 
 ### ACHF（Adaptive Cache-aware Hyper-Connections）
 
-ACHF 是 Talos-XII 自研的训练/推理加速层。它用一个自调节模块替换普通的稠密 `Linear`：同一个算子同时保留**稠密**权重和剪枝后的**稀疏**权重两个视图，在运行时决定二者各用多少、多久往低秩流形上重新投影一次、以及当前机器上哪条物理执行路径最快。目标是削减小 batch 神经推理中占主导的 CPU 矩阵乘法和缓存未命中开销，同时不让这种近似破坏训练稳定性。
+ACHF 是 Talos-XII 自研的训练/推理加速层。它用一个自调节模块替换普通的稠密 `Linear`：训练期维护稠密参考权重，冻结时生成剪枝候选，并在运行时选择该候选最快的物理执行路径。门控只缩放当前活跃算子，不在 Dense/Sparse/Cached 之间插值。目标是削减小 batch 神经推理中占主导的 CPU 矩阵乘法和缓存未命中开销，同时让近似误差保持可观测。
 
 模块在两个生命周期阶段行为不同。**训练期**门控会真实缩放稠密参考算子的输出，并周期性执行**流形投影**（行/列或 Sinkhorn 归一化 + 低秩截断）。**调用 `freeze_for_inference()` 之后**，投影后的权重被剪枝，同一门控缩放继续作用于冻结候选算子，同时生成 Cached/Sparse/Dense 三种数值等价的物理执行视图。`lite` 模式使用确定性的冻结快速路径；`full` 模式保持权重冻结，但 AMA 继续测量并自适应选择物理执行路径（见下方 AMA）。
 
@@ -396,19 +394,17 @@ flowchart TD
 
     subgraph TRAIN["训练路径（权重变化中）"]
         direction TB
-        CG["compute_gate&nbsp;g&nbsp;∈&nbsp;[g_min,&nbsp;1]<br/>gate_mode: grad_ema / fim_trace"] --> DW["稠密权重 · g"]
-        SW["稀疏权重 · (1−g)"] --> BLEND["混合 = 稠密·g + 稀疏·(1−g)"]
-        DW --> BLEND
-        BLEND --> BWD["反向 → update_after_backward<br/>(梯度 RMS 的 EMA)"]
+        CG["compute_gate&nbsp;g&nbsp;∈&nbsp;[g_min,&nbsp;1]<br/>gate_mode: grad_ema / fim_trace"] --> ACTIVE["稠密参考算子 · g"]
+        ACTIVE --> BWD["反向 → update_after_backward<br/>(梯度 RMS 的 EMA)"]
         BWD --> PROJ{"step % proj_freq == 0?"}
         PROJ -- 是 --> MANI["project_weight:<br/>行/列 或 Sinkhorn 归一化<br/>+ 低秩截断 (rank r)"]
-        MANI --> PRUNE["按阈值剪枝<br/>→ 刷新稀疏权重"]
+        MANI --> KEEP["保留投影后的稠密参考"]
         PROJ -- 否 --> SKIP["保持算子"]
     end
 
     subgraph INFER["冻结路径（权重固定）"]
         direction TB
-        FUSE["融合缓存算子<br/>(稠密 ⊕ 稀疏 ⊕ bias)"] --> AMA["AMA 路径选择<br/>Cached / Sparse / Dense"]
+        FUSE["冻结剪枝候选<br/>+ Cache/CSR 执行视图"] --> AMA["AMA 路径选择<br/>Cached / Sparse / Dense"]
     end
 
     G -- 训练 --> TRAIN
@@ -420,8 +416,8 @@ flowchart TD
 **解决的问题：** CPU 上神经网络大矩阵乘法的瓶颈；缓存未命中拖慢吞吐量；不同机器上最佳稀疏度、投影频率、甚至最快的执行路径都各不相同，固定超参难以兼顾。
 
 **四个核心机制：**
-- **低秩投影** — 对权重矩阵做行/列或双向（Sinkhorn）投影（`proj_mode`），再做 rank-`r` 截断，用低秩近似替代原矩阵，减少计算和缓存压力（`proj_freq` 控制频率，设为 `0` 关闭）。
-- **门控稀疏** — 门控值 `g ∈ [g_min, 1]` 在稠密与剪枝权重间混合，低于阈值的通道直接跳过。`g_min` 设定下限，防止激进稀疏导致输出不稳定。门控由梯度 RMS 的 EMA（`grad_ema`）或 Fisher 迹（`fim_trace`）驱动。
+- **低秩投影** — 对权重矩阵做行/列或双向（Sinkhorn）投影（`proj_mode`），再做 rank-`r` 截断以约束算子（`proj_freq` 控制频率，设为 `0` 关闭）。当前 rank-r 结果仍以稠密矩阵物化，因此不能把 rank 本身宣称为存储或内核压缩。
+- **门控与剪枝** — 门控值 `g ∈ [g_min, 1]` 乘法缩放当前活跃算子；幅度剪枝是冻结阶段的独立步骤，仅由 `prune_threshold` 控制，不再把 rank 偷换成 nnz 预算。
 - **自适应控制（AMA）** — 运行时采样延迟并 EMA 平滑，决定走哪条执行路径，并用滞回避免路径抖动（见下）。
 - **路径级开关** — 可分别对 Attention（`apply_attn`）、FFN（`apply_ffn`）、DQN（`apply_dqn`）启用/关闭 ACHF，保护对精度敏感的链路。
 

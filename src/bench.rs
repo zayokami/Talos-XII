@@ -38,7 +38,7 @@ const PATH_WARMUP_ROUNDS: usize = 100;
 const PATH_SAMPLES: usize = 1000;
 const PATH_CALLS_PER_SAMPLE: usize = 64;
 const PATH_RANK: usize = 16;
-const PATH_PRUNE_THRESHOLD: f64 = 0.0;
+const PATH_PRUNE_THRESHOLD: f64 = 0.005;
 const CROSSOVER_DIMS: [usize; 3] = [256, 1024, 2048];
 const CROSSOVER_SPARSITIES: [f64; 5] = [0.5, 0.8, 0.9, 0.95, 0.99];
 const CROSSOVER_BATCH: usize = 32;
@@ -488,7 +488,30 @@ fn bench_sized_config(base_config: &Config) -> Config {
         cfg.model_qk_rope_dim -= 1;
     }
     cfg.multi_stream_factor = cfg.multi_stream_factor.clamp(1, 2);
+    cfg.achf.prune_threshold = cfg.achf.prune_threshold.min(0.005);
     cfg
+}
+
+fn validate_candidate_memory(label: &str, memory: Option<AchfMemoryStats>) {
+    if let Some(memory) = memory {
+        assert!(
+            memory.layers > 0
+                && memory.candidate_total_weights > 0
+                && memory.candidate_nonzero_weights > 0,
+            "benchmark condition '{label}' produced an absent or all-zero ACHF candidate; lower prune_threshold or fix projection/pruning before using the data"
+        );
+        let relative_error = memory.candidate_prune_rel_err().unwrap_or_else(|| {
+            panic!("benchmark condition '{label}' has no aggregate candidate-error diagnostic")
+        });
+        assert!(
+            relative_error.is_finite()
+                && relative_error <= 1.0 + f64::EPSILON
+                && memory.max_layer_prune_rel_err.is_finite()
+                && memory.max_layer_prune_rel_err <= 1.0 + f64::EPSILON,
+            "benchmark condition '{label}' has invalid candidate error: aggregate={relative_error}, max_layer={}",
+            memory.max_layer_prune_rel_err
+        );
+    }
 }
 
 struct ThroughputParams<'a> {
@@ -794,20 +817,71 @@ fn find_repo_root() -> Option<PathBuf> {
     None
 }
 
+#[cfg(target_os = "windows")]
+fn total_physical_memory_bytes() -> Option<u64> {
+    #[repr(C)]
+    struct MemoryStatusEx {
+        length: u32,
+        memory_load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        total_page_file: u64,
+        avail_page_file: u64,
+        total_virtual: u64,
+        avail_virtual: u64,
+        avail_extended_virtual: u64,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
+    }
+
+    let mut status = MemoryStatusEx {
+        length: std::mem::size_of::<MemoryStatusEx>() as u32,
+        memory_load: 0,
+        total_phys: 0,
+        avail_phys: 0,
+        total_page_file: 0,
+        avail_page_file: 0,
+        total_virtual: 0,
+        avail_virtual: 0,
+        avail_extended_virtual: 0,
+    };
+    let success = unsafe { GlobalMemoryStatusEx(&mut status) };
+    (success != 0 && status.total_phys > 0).then_some(status.total_phys)
+}
+
 fn hardware_snapshot() -> serde_json::Value {
     #[cfg(target_os = "windows")]
     {
+        let memory_bytes = total_physical_memory_bytes();
         let script = "$cpuKey=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0');$cvKey=[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion');[ordered]@{cpu_name=([string]$cpuKey.GetValue('ProcessorNameString')).Trim();logical_processors=[Environment]::ProcessorCount;memory_bytes=[GC]::GetGCMemoryInfo().TotalAvailableMemoryBytes;os_product_name=[string]$cvKey.GetValue('ProductName');os_display_version=[string]$cvKey.GetValue('DisplayVersion');os_build=('{0}.{1}' -f $cvKey.GetValue('CurrentBuildNumber'),$cvKey.GetValue('UBR'))}|ConvertTo-Json -Compress";
+        let script = script.replace(
+            "memory_bytes=[GC]::GetGCMemoryInfo().TotalAvailableMemoryBytes;",
+            "",
+        );
         if let Some(output) = command_output(
             "powershell.exe",
-            &["-NoProfile", "-NonInteractive", "-Command", script],
+            &["-NoProfile", "-NonInteractive", "-Command", &script],
             None,
         ) {
-            if let Ok(value) = serde_json::from_str(&output) {
+            if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&output) {
+                value["memory_bytes"] = serde_json::json!(memory_bytes);
+                value["memory_source"] = serde_json::json!("GlobalMemoryStatusEx");
                 return value;
             }
         }
+        serde_json::json!({
+            "cpu_name": std::env::var("PROCESSOR_IDENTIFIER").ok(),
+            "logical_processors": std::thread::available_parallelism().map_or(1, usize::from),
+            "memory_bytes": memory_bytes,
+            "memory_source": "GlobalMemoryStatusEx",
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+        })
     }
+    #[cfg(not(target_os = "windows"))]
     serde_json::json!({
         "cpu_name": std::env::var("PROCESSOR_IDENTIFIER").ok(),
         "logical_processors": std::thread::available_parallelism().map_or(1, usize::from),
@@ -1080,7 +1154,7 @@ pub fn run_achf_benchmarks(base_config: &Config, seed: u64, bench_cfg: &BenchCon
 
     if should_run(bench_cfg, "ablation") {
         let agg = run_ablation(base_config, seed, nt);
-        print_agg_summary("Ablation (dense/pruning/selector controls)", &agg);
+        print_agg_summary("Ablation (dense/static pruning/full ACHF)", &agg);
         let e = ext(&bench_cfg.format);
         chart_ablation(&agg, dir, e);
         all_agg.push(("ablation", agg));
@@ -1285,8 +1359,75 @@ fn cap_ppo_training(config: &mut Config, max_steps: usize) {
     config.ppo_k_epochs = config.ppo_k_epochs.min(2);
 }
 
+fn run_static_pruning_pair(
+    training_config: &Config,
+    dense_config: &Config,
+    static_config: &Config,
+    trial_seed: u64,
+    trial: usize,
+    num_trials: usize,
+) -> [BenchRunResult; 2] {
+    let (env_net, neural_opt, _worker) =
+        build_base_models(training_config, derive_seed(trial_seed, SEED_BASE_MODELS));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut train_rng = Rng::from_seed(derive_seed(trial_seed, SEED_PPO_TRAIN));
+    let train_start = Instant::now();
+    let trained_policy =
+        train_ppo_with_metrics(&mut train_rng, &env_net, training_config, Some(tx));
+    let train_time_ms = train_start.elapsed().as_secs_f64() * 1000.0;
+    let snapshots: Vec<StepSnapshot> = rx.try_iter().collect();
+    assert!(
+        !snapshots.is_empty(),
+        "shared dense/static PPO benchmark emitted no training snapshots"
+    );
+
+    let mut results: [Option<BenchRunResult>; 2] = [None, None];
+    let start = trial % results.len();
+    for offset in 0..results.len() {
+        let condition_index = (start + offset) % results.len();
+        let (label, config, policy) = if condition_index == 0 {
+            let mut policy = trained_policy.fork_inference_runtime();
+            policy.disable_achf_runtime();
+            ("Dense reference", dense_config, policy)
+        } else {
+            let mut policy = trained_policy.fork_inference_runtime();
+            policy.rebuild_achf_inference_candidates(static_config.achf.prune_threshold);
+            policy.set_achf_inference_mode("fixed_sparse", u64::MAX);
+            ("Static magnitude pruning", static_config, policy)
+        };
+        println!(
+            "  [{label}] trial {}/{} (shared trained policy)",
+            trial + 1,
+            num_trials
+        );
+        let result = measure_trained_ppo(TrainedPpoParams {
+            label,
+            policy: &policy,
+            env_net: &env_net,
+            neural_opt: &neural_opt,
+            training_config,
+            config,
+            trial_seed,
+            train_time_ms,
+            snapshots: &snapshots,
+        });
+        println!(
+            "    shared_train={:.1}s | {:.0} sims/sec | eval reward: {:.3} | train loss: {:.4}",
+            train_time_ms / 1000.0,
+            result.throughput_sims_per_sec,
+            result.eval_reward,
+            result.train_loss
+        );
+        results[condition_index] = Some(result);
+    }
+    [
+        results[0].take().expect("dense result missing"),
+        results[1].take().expect("static pruning result missing"),
+    ]
+}
+
 fn run_ablation(base_config: &Config, seed: u64, nt: usize) -> Vec<AggregatedResult> {
-    println!("[Bench] Running Ablation Experiment (dense/pruning/selector controls)...");
+    println!("[Bench] Running Ablation Experiment (dense/static pruning/full ACHF)...");
     let mut dense = bench_sized_config(base_config);
     dense.achf.enabled = false;
     cap_ppo_training(&mut dense, 2000);
@@ -1307,17 +1448,9 @@ fn run_ablation(base_config: &Config, seed: u64, nt: usize) -> Vec<AggregatedRes
     static_pruned.achf.cache_latency_sample_every = u64::MAX;
     cap_ppo_training(&mut static_pruned, 2000);
 
-    let mut no_selector = bench_sized_config(base_config);
-    no_selector.achf.enabled = true;
-    no_selector.achf.mode = "fixed_cached".to_string();
-    no_selector.achf.cache_latency_sample_every = u64::MAX;
-    cap_ppo_training(&mut no_selector, 2000);
-
-    let mut plain_ema = bench_sized_config(base_config);
-    plain_ema.achf.enabled = true;
-    plain_ema.achf.mode = "plain_ema".to_string();
-    plain_ema.achf.adaptive_inference = false;
-    cap_ppo_training(&mut plain_ema, 2000);
+    let mut shared_training = static_pruned.clone();
+    shared_training.achf.prune_threshold = 0.0;
+    shared_training.achf.mode = "fixed_dense".to_string();
 
     let mut guarded_ama = bench_sized_config(base_config);
     guarded_ama.achf.enabled = true;
@@ -1325,40 +1458,123 @@ fn run_ablation(base_config: &Config, seed: u64, nt: usize) -> Vec<AggregatedRes
     guarded_ama.achf.adaptive_inference = false;
     cap_ppo_training(&mut guarded_ama, 2000);
 
-    let conditions = vec![
-        ("Dense reference".to_string(), dense),
-        ("Static magnitude pruning".to_string(), static_pruned),
-        ("ACHF fixed cached (no selector)".to_string(), no_selector),
-        ("ACHF plain EMA".to_string(), plain_ema),
-        ("ACHF guarded AMA".to_string(), guarded_ama),
-    ];
-    let runs = run_interleaved_conditions(&conditions, seed, nt);
-    aggregate_conditions(&runs, &[0, 0, 0, 0, 0])
+    let mut runs: Vec<Vec<BenchRunResult>> = (0..3).map(|_| Vec::with_capacity(nt)).collect();
+    for trial in 0..nt {
+        let trial_seed = benchmark_trial_seed(seed, trial);
+        let (pair, full) = if trial.is_multiple_of(2) {
+            let pair = run_static_pruning_pair(
+                &shared_training,
+                &dense,
+                &static_pruned,
+                trial_seed,
+                trial,
+                nt,
+            );
+            println!("  [Full ACHF (guarded AMA)] trial {}/{}", trial + 1, nt);
+            let full = train_and_measure("Full ACHF (guarded AMA)", &guarded_ama, trial_seed);
+            (pair, full)
+        } else {
+            println!("  [Full ACHF (guarded AMA)] trial {}/{}", trial + 1, nt);
+            let full = train_and_measure("Full ACHF (guarded AMA)", &guarded_ama, trial_seed);
+            let pair = run_static_pruning_pair(
+                &shared_training,
+                &dense,
+                &static_pruned,
+                trial_seed,
+                trial,
+                nt,
+            );
+            (pair, full)
+        };
+        println!(
+            "    {:.1}s | {:.0} sims/sec | eval reward: {:.3} | train loss: {:.4}",
+            full.train_time_ms / 1000.0,
+            full.throughput_sims_per_sec,
+            full.eval_reward,
+            full.train_loss
+        );
+        runs[0].push(pair[0].clone());
+        runs[1].push(pair[1].clone());
+        runs[2].push(full);
+    }
+    aggregate_conditions(&runs, &[0, 0, 0])
 }
 
 fn run_mode_comparison(base_config: &Config, seed: u64, nt: usize) -> Vec<AggregatedResult> {
     println!("[Bench] Running Mode Comparison (fixed paths/plain EMA/guarded AMA)...");
-    let conditions: Vec<(String, Config)> = [
+    let modes = [
         ("Fixed Cached", "fixed_cached"),
         ("Fixed Sparse", "fixed_sparse"),
         ("Fixed Dense", "fixed_dense"),
         ("Plain EMA", "plain_ema"),
         ("Guarded AMA", "full"),
-    ]
-    .into_iter()
-    .map(|(label, mode)| {
-        let mut cfg = bench_sized_config(base_config);
-        cfg.achf.enabled = true;
-        cfg.achf.mode = mode.to_string();
-        cfg.achf.adaptive_inference = false;
-        if mode.starts_with("fixed_") {
-            cfg.achf.cache_latency_sample_every = u64::MAX;
+    ];
+    let mut runs: Vec<Vec<BenchRunResult>> = modes.iter().map(|_| Vec::with_capacity(nt)).collect();
+
+    for trial in 0..nt {
+        let trial_seed = benchmark_trial_seed(seed, trial);
+        let mut training_cfg = bench_sized_config(base_config);
+        training_cfg.achf.enabled = true;
+        training_cfg.achf.mode = "full".to_string();
+        training_cfg.achf.adaptive_inference = false;
+        cap_ppo_training(&mut training_cfg, 2000);
+        let (env_net, neural_opt, _worker) =
+            build_base_models(&training_cfg, derive_seed(trial_seed, SEED_BASE_MODELS));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut train_rng = Rng::from_seed(derive_seed(trial_seed, SEED_PPO_TRAIN));
+        let train_start = Instant::now();
+        let trained_policy =
+            train_ppo_with_metrics(&mut train_rng, &env_net, &training_cfg, Some(tx));
+        let train_time_ms = train_start.elapsed().as_secs_f64() * 1000.0;
+        let snapshots: Vec<StepSnapshot> = rx.try_iter().collect();
+        assert!(
+            !snapshots.is_empty(),
+            "shared PPO mode benchmark emitted no training snapshots"
+        );
+        validate_candidate_memory(
+            "shared mode policy",
+            Some(trained_policy.achf_memory_stats_aggregate()),
+        );
+
+        let start = trial % modes.len();
+        for offset in 0..modes.len() {
+            let mode_index = (start + offset) % modes.len();
+            let (label, mode) = modes[mode_index];
+            println!(
+                "  [{label}] trial {}/{} (shared trained policy)",
+                trial + 1,
+                nt
+            );
+            let sample_every = if mode.starts_with("fixed_") {
+                u64::MAX
+            } else {
+                training_cfg.achf.cache_latency_sample_every
+            };
+            let mut cfg = training_cfg.clone();
+            cfg.achf.mode = mode.to_string();
+            cfg.achf.cache_latency_sample_every = sample_every;
+            let mut policy = trained_policy.fork_inference_runtime();
+            policy.set_achf_inference_mode(mode, sample_every);
+            let result = measure_trained_ppo(TrainedPpoParams {
+                label,
+                policy: &policy,
+                env_net: &env_net,
+                neural_opt: &neural_opt,
+                training_config: &training_cfg,
+                config: &cfg,
+                trial_seed,
+                train_time_ms,
+                snapshots: &snapshots,
+            });
+            println!(
+                "    shared_train={:.1}s | {:.0} sims/sec | eval reward: {:.3}",
+                train_time_ms / 1000.0,
+                result.throughput_sims_per_sec,
+                result.eval_reward
+            );
+            runs[mode_index].push(result);
         }
-        cap_ppo_training(&mut cfg, 2000);
-        (label.to_string(), cfg)
-    })
-    .collect();
-    let runs = run_interleaved_conditions(&conditions, seed, nt);
+    }
     aggregate_conditions(&runs, &[0, 0, 0, 0, 0])
 }
 
@@ -1397,8 +1613,8 @@ fn run_path_comparison(
             .inference_sparsity_stats()
             .expect("path comparison ACHF layer must expose frozen sparsity");
         assert!(
-            sparsity.nonzero_weights > 0 && sparsity.nonzero_weights < sparsity.total_weights,
-            "path comparison requires a non-degenerate frozen operator, got nnz={}/{}",
+            sparsity.nonzero_weights > 0,
+            "path comparison requires a nonzero frozen operator, got nnz={}/{}",
             sparsity.nonzero_weights,
             sparsity.total_weights,
         );
@@ -1967,15 +2183,11 @@ fn run_scale_test(base_config: &Config, seed: u64, nt: usize) -> Vec<AggregatedR
     conditions.push(("No ACHF".to_string(), baseline));
     // The ACHF FFN in the bench-sized model is hidden_dim*2 -> hidden_dim, and
     // bench_sized_config clamps hidden_dim to 64, so the layer's smaller
-    // dimension is 64. `effective_rank` only truncates when rank < 64, and the
-    // prune step only introduces row sparsity when rank*1.5 < 64 (rank < ~43).
+    // dimension is 64. `effective_rank` only truncates when rank < 64.
     // The previous sweep [16,32,64,128,256] therefore had THREE degenerate
-    // entries: rank 64/128/256 all resolve to "no truncation" and are identical
-    // to the dense baseline, so any reward/throughput difference among them was
-    // pure trial noise. This sweep spans the meaningful regime instead:
-    //   8, 16, 32  -> truncate AND sparsify
-    //   48         -> truncate only (rank < 64 but rank*1.5 > 64)
-    //   64         -> no-op boundary (kept intentionally to show the ceiling)
+    // entries: rank 64/128/256 all resolve to "no truncation". This sweep spans
+    // the meaningful low-rank regime and keeps rank 64 as an explicit no-op
+    // boundary. Magnitude pruning remains controlled solely by its threshold.
     // The effective applied rank is reported per config (see print_agg_summary),
     // so the no-op at 64 is visible rather than masquerading as a real setting.
     for rank in [8, 16, 32, 48, 64] {
@@ -2066,6 +2278,98 @@ fn condition_config_snapshot(config: &Config) -> serde_json::Value {
     })
 }
 
+struct TrainedPpoParams<'a> {
+    label: &'a str,
+    policy: &'a ActorCritic,
+    env_net: &'a EnvNet,
+    neural_opt: &'a NeuralLuckOptimizer,
+    training_config: &'a Config,
+    config: &'a Config,
+    trial_seed: u64,
+    train_time_ms: f64,
+    snapshots: &'a [StepSnapshot],
+}
+
+fn measure_trained_ppo(params: TrainedPpoParams<'_>) -> BenchRunResult {
+    let TrainedPpoParams {
+        label,
+        policy,
+        env_net,
+        neural_opt,
+        training_config,
+        config,
+        trial_seed,
+        train_time_ms,
+        snapshots,
+    } = params;
+    let condition_config = serde_json::json!({
+        "shared_trained_policy": true,
+        "training": condition_config_snapshot(training_config),
+        "inference": condition_config_snapshot(config),
+    });
+    let config_fingerprint = sha256_hex(
+        &serde_json::to_vec(&condition_config).expect("PPO condition configuration must serialize"),
+    );
+    let train_loss = snapshots
+        .last()
+        .expect("shared PPO benchmark emitted no training snapshots")
+        .loss;
+    let before = aggregate_model_cache_stats(config, None, Some(policy));
+    let context_len = if config.ppo_context_len > 0 {
+        config.ppo_context_len
+    } else if config.fast_init {
+        6
+    } else {
+        8
+    };
+    let eval = evaluate_ppo_policy(
+        policy,
+        env_net,
+        config,
+        context_len,
+        BENCH_EVAL_EPISODES,
+        derive_seed(trial_seed, SEED_POLICY_EVAL),
+    );
+    let throughput = measure_inference_throughput(
+        derive_seed(trial_seed, SEED_THROUGHPUT),
+        &ThroughputParams {
+            neural_opt,
+            dqn: None,
+            ppo: Some(policy),
+            env_net,
+            config,
+            sims: THROUGHPUT_SIMS,
+            pulls: THROUGHPUT_PULLS,
+        },
+    );
+    let after = aggregate_model_cache_stats(config, None, Some(policy));
+    let cache_stats = before
+        .zip(after)
+        .map(|(before, after)| cache_stats_delta(before, after));
+    let achf = policy.snapshot_achf();
+    let memory_stats = config
+        .achf
+        .enabled
+        .then(|| policy.achf_memory_stats_aggregate());
+    validate_candidate_memory(label, memory_stats);
+    BenchRunResult {
+        label: label.to_string(),
+        policy: "PPO".to_string(),
+        config_fingerprint,
+        condition_config,
+        train_time_ms,
+        throughput_sims_per_sec: throughput,
+        eval_reward: eval.avg_reward,
+        train_loss,
+        param_count: policy.param_count(),
+        applied_rank: achf.map(|snapshot| snapshot.low_rank_applied_rank),
+        prune_rel_err: memory_stats.and_then(|stats| stats.candidate_prune_rel_err()),
+        memory_stats,
+        snapshots: snapshots.to_vec(),
+        cache_stats,
+    }
+}
+
 fn train_and_measure(label: &str, config: &Config, seed: u64) -> BenchRunResult {
     let cfg = config.clone();
     let condition_config = condition_config_snapshot(&cfg);
@@ -2112,6 +2416,8 @@ fn train_and_measure(label: &str, config: &Config, seed: u64) -> BenchRunResult 
             });
             let achf = dqn.snapshot_achf();
             let memory_stats = dqn.achf_memory_stats();
+            validate_candidate_memory(label, memory_stats);
+            let prune_rel_err = memory_stats.and_then(|stats| stats.candidate_prune_rel_err());
             log_applied_rank(achf);
             BenchRunResult {
                 label: label.to_string(),
@@ -2124,7 +2430,7 @@ fn train_and_measure(label: &str, config: &Config, seed: u64) -> BenchRunResult 
                 train_loss,
                 param_count: dqn.param_count(),
                 applied_rank: achf.map(|snapshot| snapshot.low_rank_applied_rank),
-                prune_rel_err: achf.map(|snapshot| snapshot.prune_rel_err),
+                prune_rel_err,
                 memory_stats,
                 snapshots,
                 cache_stats,
@@ -2177,6 +2483,8 @@ fn train_and_measure(label: &str, config: &Config, seed: u64) -> BenchRunResult 
             });
             let achf = ppo.snapshot_achf();
             let memory_stats = cfg.achf.enabled.then(|| ppo.achf_memory_stats_aggregate());
+            validate_candidate_memory(label, memory_stats);
+            let prune_rel_err = memory_stats.and_then(|stats| stats.candidate_prune_rel_err());
             log_applied_rank(achf);
             BenchRunResult {
                 label: label.to_string(),
@@ -2189,7 +2497,7 @@ fn train_and_measure(label: &str, config: &Config, seed: u64) -> BenchRunResult 
                 train_loss,
                 param_count: ppo.param_count(),
                 applied_rank: achf.map(|snapshot| snapshot.low_rank_applied_rank),
-                prune_rel_err: achf.map(|snapshot| snapshot.prune_rel_err),
+                prune_rel_err,
                 memory_stats,
                 snapshots,
                 cache_stats,
@@ -2741,6 +3049,48 @@ fn print_agg_summary(name: &str, agg: &[AggregatedResult]) {
     }
 }
 
+fn has_unpruned_candidate(all: &[(&str, Vec<AggregatedResult>)]) -> bool {
+    all.iter().any(|(_, results)| {
+        results.iter().any(|result| {
+            result.memory_stats.iter().any(|stats| {
+                stats.candidate_total_weights > 0
+                    && stats.candidate_nonzero_weights == stats.candidate_total_weights
+            })
+        })
+    })
+}
+
+fn path_has_unpruned_candidate(path_latencies: Option<&[PathLatencyResult]>) -> bool {
+    path_latencies.is_some_and(|results| {
+        results.iter().any(|result| {
+            result.trial_sparsity.iter().any(|stats| {
+                stats.total_weights > 0 && stats.nonzero_weights == stats.total_weights
+            })
+        })
+    })
+}
+
+fn missing_benchmark_experiments(
+    all: &[(&str, Vec<AggregatedResult>)],
+    path_latencies: Option<&[PathLatencyResult]>,
+    gate_curve: Option<&AggregatedResult>,
+    crossover: Option<&[CrossoverCell]>,
+    regime: Option<&[RegimeRow]>,
+) -> Vec<&'static str> {
+    BENCH_EXPERIMENTS
+        .iter()
+        .copied()
+        .filter(|name| {
+            let completed = all.iter().any(|(completed, _)| completed == name)
+                || (*name == "path" && path_latencies.is_some())
+                || (*name == "gate" && gate_curve.is_some())
+                || (*name == "crossover" && crossover.is_some())
+                || (*name == "regime" && regime.is_some());
+            !completed
+        })
+        .collect()
+}
+
 fn write_summary_txt(
     all: &[(&str, Vec<AggregatedResult>)],
     path_latencies: Option<&[PathLatencyResult]>,
@@ -2750,6 +3100,8 @@ fn write_summary_txt(
     num_trials: usize,
     dir: &str,
 ) {
+    let missing_experiments =
+        missing_benchmark_experiments(all, path_latencies, gate_curve, crossover, regime);
     let mut lines = Vec::new();
     for (name, agg) in all {
         lines.push(format!("=== {} ===", name));
@@ -2982,6 +3334,18 @@ fn write_summary_txt(
     if num_trials < 5 {
         lines.push("  blocker: fewer than 5 seeded trials".to_string());
     }
+    if !missing_experiments.is_empty() {
+        lines.push(format!(
+            "  blocker: partial benchmark suite; missing={}",
+            missing_experiments.join(",")
+        ));
+    }
+    if has_unpruned_candidate(all) || path_has_unpruned_candidate(path_latencies) {
+        lines.push(
+            "  blocker: at least one real ACHF candidate has zero realized sparsity; do not claim sparse-candidate speedup"
+                .to_string(),
+        );
+    }
     lines.push("  blocker: only one operating-system process repetition".to_string());
     lines.push("  blocker: only one hardware/software environment".to_string());
     lines.push(
@@ -3086,7 +3450,8 @@ fn write_summary_json(
                 "train_loss": "last training snapshot from the active policy using that policy's native loss; compare only within the same active_policy",
                 "policy_train_time_ms": "active policy training only; base-model preparation excluded",
                 "param_count": "active policy trainable parameters; derived sparse inference copies excluded",
-                "rank": "rank constrains the projected operator and sparse nnz budget; the operator remains materialized densely, so rank is not reported as factorized storage compression",
+                "rank": "rank constrains low-rank projection only; magnitude pruning is controlled independently by prune_threshold, and the projected operator remains materialized densely",
+                "training_curve_scope": "ACHF state snapshots come from the first FFN ACHF layer, or the first attention ACHF layer when no FFN layer is active; final prune error is recomputed over every active ACHF layer",
                 "gate": "the gate multiplicatively scales the active operator in both training and frozen inference; Cached/Sparse/Dense are numerically equivalent execution paths, not interpolation branches",
             },
         }),
@@ -3124,11 +3489,8 @@ fn write_summary_json(
         .chain(crossover.is_some().then_some("crossover"))
         .chain(regime.is_some().then_some("regime"))
         .collect();
-    let missing_experiments: Vec<&str> = BENCH_EXPERIMENTS
-        .iter()
-        .copied()
-        .filter(|name| !completed.contains(name))
-        .collect();
+    let missing_experiments =
+        missing_benchmark_experiments(all, path_latencies, gate_curve, crossover, regime);
     let significant_crossover_cells = crossover.map_or(0, |cells| {
         cells
             .iter()
@@ -3144,6 +3506,11 @@ fn write_summary_json(
     }
     if !missing_experiments.is_empty() {
         blockers.push("partial benchmark suite");
+    }
+    if has_unpruned_candidate(all) || path_has_unpruned_candidate(path_latencies) {
+        blockers.push(
+            "at least one real ACHF candidate has zero realized sparsity; sparse-candidate speedup claims are ineligible",
+        );
     }
     blockers.push("only one operating-system process repetition");
     blockers.push("only one hardware/software environment");
@@ -3255,6 +3622,12 @@ fn memory_stats_json(values: &[AchfMemoryStats]) -> serde_json::Value {
                 1.0 - entry.candidate_nonzero_weights as f64
                     / entry.candidate_total_weights as f64
             }
+        })),
+        "candidate_prune_relative_frobenius_error": trial_stats_json(&ratios(|entry| {
+            entry.candidate_prune_rel_err().unwrap_or(0.0)
+        })),
+        "max_layer_prune_relative_frobenius_error": trial_stats_json(&ratios(|entry| {
+            entry.max_layer_prune_rel_err
         })),
         "reference_parameter_bytes": trial_stats_json(&stats(|entry| entry.reference_parameter_bytes)),
         "candidate_dense_bytes": trial_stats_json(&stats(|entry| entry.candidate_dense_bytes)),
@@ -3836,6 +4209,19 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_hardware_snapshot_reports_physical_memory() {
+        let snapshot = hardware_snapshot();
+        assert!(
+            snapshot["memory_bytes"]
+                .as_u64()
+                .is_some_and(|bytes| bytes > 0),
+            "hardware snapshot must record physical memory: {snapshot}"
+        );
+        assert_eq!(snapshot["memory_source"], "GlobalMemoryStatusEx");
+    }
+
     #[test]
     fn output_preparation_removes_only_known_stale_artifacts() {
         let dir = unique_temp_dir("prepare_output");
@@ -4058,6 +4444,23 @@ mod tests {
         std::fs::remove_dir(&dir).unwrap();
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn summary_text_marks_partial_suite() {
+        let dir = unique_temp_dir("partial_summary");
+        let output_dir = dir.to_string_lossy().to_string();
+
+        write_summary_txt(&[], None, None, None, None, 5, &output_dir);
+
+        let summary_path = dir.join("summary.txt");
+        let summary = std::fs::read_to_string(&summary_path).unwrap();
+        assert!(summary.contains("blocker: partial benchmark suite"));
+        assert!(summary
+            .contains("missing=ablation,mode,path,gate,scale,apply,convergence,crossover,regime"));
+
+        std::fs::remove_file(summary_path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]

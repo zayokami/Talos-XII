@@ -643,17 +643,6 @@ impl LuckTransformer {
         }
     }
 
-    pub fn prune_achf(&mut self, threshold: f64) {
-        for block in &mut self.blocks {
-            if let Some(achf) = &mut block.achf_ffn {
-                achf.prune(threshold);
-            }
-            if let Some(achf) = &mut block.mla_layer.achf_wo {
-                achf.prune(threshold);
-            }
-        }
-    }
-
     pub fn snapshot_achf(&self) -> Option<crate::achf::AchfStateSnapshot> {
         for block in &self.blocks {
             if let Some(achf) = &block.achf_ffn {
@@ -721,6 +710,56 @@ impl LuckTransformer {
                         .map(AchfLayer::memory_stats),
                 )
         }))
+    }
+
+    pub fn fork_inference_runtime(&self) -> Self {
+        let mut out = self.clone();
+        for (target, source) in out.blocks.iter_mut().zip(self.blocks.iter()) {
+            if let Some(achf) = &source.achf_ffn {
+                let runtime = achf.fork_inference_runtime();
+                target.ffn_2 = runtime.weight.clone();
+                target.achf_ffn = Some(runtime);
+            }
+            if let Some(achf) = &source.mla_layer.achf_wo {
+                let runtime = achf.fork_inference_runtime();
+                target.mla_layer.w_o = runtime.weight.clone();
+                target.mla_layer.achf_wo = Some(runtime);
+            }
+        }
+        out
+    }
+
+    pub fn set_achf_inference_mode(&mut self, mode: &str, sample_every: u64) {
+        for block in &mut self.blocks {
+            if let Some(achf) = &mut block.achf_ffn {
+                achf.set_inference_mode(mode, sample_every);
+            }
+            if let Some(achf) = &mut block.mla_layer.achf_wo {
+                achf.set_inference_mode(mode, sample_every);
+            }
+        }
+    }
+
+    pub fn rebuild_achf_inference_candidates(&mut self, threshold: f64) {
+        for block in &mut self.blocks {
+            if let Some(achf) = &mut block.achf_ffn {
+                achf.rebuild_inference_candidate(threshold);
+            }
+            if let Some(achf) = &mut block.mla_layer.achf_wo {
+                achf.rebuild_inference_candidate(threshold);
+            }
+        }
+    }
+
+    pub fn disable_achf_runtime(&mut self) {
+        for block in &mut self.blocks {
+            if let Some(achf) = block.achf_ffn.take() {
+                block.ffn_2 = achf.weight;
+            }
+            if let Some(achf) = block.mla_layer.achf_wo.take() {
+                block.mla_layer.w_o = achf.weight;
+            }
+        }
     }
 
     pub fn achf_orthogonal_penalty(&self) -> Option<Tensor> {
@@ -3428,6 +3467,43 @@ mod tests {
             weight[0] = 123.0;
         }
         assert_eq!(model_on.blocks[0].ffn_2.weight.data_f32()[0], 123.0);
+    }
+
+    #[test]
+    fn test_disable_achf_runtime_restores_the_shared_dense_operator() {
+        let achf = AchfConfig {
+            enabled: true,
+            apply_attn: true,
+            apply_ffn: true,
+            proj_mode: "none".to_string(),
+            proj_freq: 0,
+            lambda_ortho: 0.0,
+            rank: 0,
+            prune_threshold: 0.0,
+            gate_warmup_steps: 0,
+            gate_transition_steps: 0,
+            gate_alpha: 50.0,
+            gate_beta: 0.0,
+            g_min: 1.0,
+            infer_gate: "one".to_string(),
+            ..Default::default()
+        };
+        let mut model = LuckTransformer::new_compat(8, 16, true, 2, 42, &achf);
+        model.freeze_achf_for_inference();
+        let input: Vec<f32> = Tensor::rand(vec![16], -0.1, 0.1, 809).data_to_f32_vec();
+        let achf_output = model.forward_inference(&input);
+
+        let mut dense = model.fork_inference_runtime();
+        dense.disable_achf_runtime();
+        assert!(dense
+            .blocks
+            .iter()
+            .all(|block| block.achf_ffn.is_none() && block.mla_layer.achf_wo.is_none()));
+        let dense_output = dense.forward_inference(&input);
+        assert_eq!(achf_output.len(), dense_output.len());
+        for (left, right) in achf_output.iter().zip(dense_output.iter()) {
+            assert!((left - right).abs() < 1e-5, "{left} != {right}");
+        }
     }
 
     #[test]

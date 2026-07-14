@@ -264,10 +264,6 @@ impl ActorCritic {
         self.backbone.freeze_achf_for_inference();
     }
 
-    pub fn prune_achf(&mut self, threshold: f64) {
-        self.backbone.prune_achf(threshold);
-    }
-
     pub fn achf_orthogonal_penalty(&self) -> Option<Tensor> {
         self.backbone.achf_orthogonal_penalty()
     }
@@ -397,6 +393,24 @@ impl ActorCritic {
 
     pub fn achf_memory_stats_aggregate(&self) -> crate::achf::AchfMemoryStats {
         self.backbone.achf_memory_stats_aggregate()
+    }
+
+    pub fn fork_inference_runtime(&self) -> Self {
+        let mut out = self.clone();
+        out.backbone = self.backbone.fork_inference_runtime();
+        out
+    }
+
+    pub fn set_achf_inference_mode(&mut self, mode: &str, sample_every: u64) {
+        self.backbone.set_achf_inference_mode(mode, sample_every);
+    }
+
+    pub fn rebuild_achf_inference_candidates(&mut self, threshold: f64) {
+        self.backbone.rebuild_achf_inference_candidates(threshold);
+    }
+
+    pub fn disable_achf_runtime(&mut self) {
+        self.backbone.disable_achf_runtime();
     }
 
     pub fn snapshot_achf(&self) -> Option<crate::achf::AchfStateSnapshot> {
@@ -1878,7 +1892,6 @@ fn train_ppo_impl(
         }
     }
     pb.finish_with_message("PPO Training Complete.");
-    ppo.policy.prune_achf(config.achf.prune_threshold);
     ppo.policy.freeze_achf_for_inference();
     ppo.policy
 }

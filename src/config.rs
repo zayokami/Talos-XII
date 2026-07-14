@@ -966,8 +966,7 @@ impl Config {
                     config.achf.diagnostics_enabled = v.as_bool().unwrap_or(false);
                 }
                 if let Some(v) = achf_map.get("rank") {
-                    let r = v.as_f64().unwrap_or(128.0).round() as usize;
-                    config.achf.rank = if r == 0 { 128 } else { r };
+                    config.achf.rank = v.as_f64().unwrap_or(128.0).round() as usize;
                 }
                 if let Some(v) = achf_map.get("prune_threshold") {
                     config.achf.prune_threshold = v.as_f64().unwrap_or(0.01);
@@ -1536,6 +1535,17 @@ mod tests {
         assert_eq!(config.model_qk_rope_dim, 64);
         assert_eq!(config.multi_stream_factor, 2);
         assert_eq!(config.achf.rank, 128);
+    }
+
+    #[test]
+    fn config_load_preserves_zero_achf_rank() {
+        let path =
+            std::env::temp_dir().join(format!("talos_xii_rank_zero_{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"achf":{"rank":0}}"#).unwrap();
+        let config = Config::load(path.to_str().unwrap());
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(config.achf.rank, 0);
     }
 
     #[test]

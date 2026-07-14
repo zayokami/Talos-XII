@@ -359,7 +359,6 @@ fn build_dqn_master(
             config,
             &dqn_master_manifest,
         ) {
-            cached.prune_achf(config.achf.prune_threshold);
             cached.freeze_achf_for_inference();
             info!("[DQN] Cached model loaded.");
             return (cached, false);
@@ -451,7 +450,6 @@ fn prepare_dqn_inference_cache(
             config,
             &expected_manifest,
         ) {
-            cached.prune_achf(config.achf.prune_threshold);
             cached.freeze_achf_for_inference();
             info!("[DQN] BF16 inference cache loaded.");
             return cached;
@@ -459,7 +457,6 @@ fn prepare_dqn_inference_cache(
     }
 
     let mut bf16 = master.to_inference_bf16();
-    bf16.prune_achf(config.achf.prune_threshold);
     bf16.freeze_achf_for_inference();
     let _ = save_model_with_manifest(
         &bf16,
@@ -486,7 +483,6 @@ fn build_ppo_master(
             config,
             &ppo_master_manifest,
         ) {
-            cached.prune_achf(config.achf.prune_threshold);
             cached.freeze_achf_for_inference();
             info!("[PPO] Cached model loaded.");
             return (cached, false);
@@ -557,7 +553,6 @@ fn prepare_ppo_inference_cache(
             config,
             &expected_manifest,
         ) {
-            cached.prune_achf(config.achf.prune_threshold);
             cached.freeze_achf_for_inference();
             info!("[PPO] BF16 inference cache loaded.");
             return cached;
@@ -565,7 +560,6 @@ fn prepare_ppo_inference_cache(
     }
 
     let mut bf16 = master.to_inference_bf16();
-    bf16.prune_achf(config.achf.prune_threshold);
     bf16.freeze_achf_for_inference();
     let _ = save_model_with_manifest(
         &bf16,
