@@ -133,7 +133,7 @@ Model cache manifests fingerprint probability, pity, luck-budget, architecture, 
 
 ACHF is Talos-XII's proprietary training/inference acceleration layer. It replaces a plain dense `Linear` with a self-tuning block that keeps two views of the same operator — a full **dense** weight and a pruned **sparse** weight — and decides at runtime how much of each to use, how often to re-project onto a low-rank manifold, and which physical execution path is actually fastest on the current machine. The goal is to cut the CPU matmul and cache-miss cost that dominates small-batch neural inference, without letting the approximation destabilize training.
 
-The block behaves differently in the two lifecycle phases. **During training** the weights keep changing, so ACHF focuses on the *gate* (how much sparsity to admit) and periodic *manifold projection* (row/column or Sinkhorn normalization + low-rank truncation) that keeps the operator well-conditioned. **After `freeze_for_inference()`** the weights are fixed, ACHF fuses the pruned operator into a cache-friendly form, and path selection switches from adaptive probing to the deterministic fused-cache path (see AMA below).
+The block behaves differently in the two lifecycle phases. **During training** the weights keep changing, so ACHF focuses on the *gate* (how much sparsity to admit) and periodic *manifold projection* (row/column or Sinkhorn normalization + low-rank truncation) that keeps the operator well-conditioned. **After `freeze_for_inference()`** the weights are fixed and ACHF fuses the pruned operator into a cache-friendly form. In `lite` mode inference uses the deterministic frozen fast path; in `full` mode the weights remain frozen but AMA keeps measuring and adapting the physical execution path (see AMA below).
 
 ```mermaid
 flowchart TD
@@ -178,16 +178,18 @@ AMA is the runtime scheduler inside ACHF that answers a single question on every
 
 - **Cached** — the pre-fused low-rank/sparse operator; cheapest when the cache is valid.
 - **Sparse** — the pruned weight applied directly (skips zeroed channels).
-- **Dense** — the full weight; the always-correct fallback.
+- **Dense** — the same frozen pruned operator through an ordinary dense kernel; if sparse state is invalid, it safely falls back to the original trainable weight.
 
 Because the fastest path depends on batch shape, sparsity ratio, and the host CPU's cache behavior, AMA treats the three paths as arms of a multi-armed bandit. It measures each arm's latency (cold/warm split, EMA-smoothed), *probes* arms that have gone stale, and otherwise sticks with the current winner. A **hysteresis margin** keeps the previous path unless a challenger is meaningfully faster, so the scheduler doesn't flip-flop between two near-equal paths.
 
-A **frozen** layer short-circuits this entirely: its weights never change, so the fused Cached path is permanently valid and cheapest — AMA is skipped and Cached is used deterministically (falling back to Sparse/Dense only if the cache is shape/sparsity-invalid).
+A **lite-mode frozen** layer short-circuits this entirely: its weights never change, so the fused Cached path is permanently valid and cheapest — AMA is skipped and Cached is used deterministically (falling back to Sparse/Dense only if the cache is shape/sparsity-invalid). A **full-mode frozen** layer keeps AMA active while leaving all weights immutable.
 
 ```mermaid
 flowchart TD
     CALL["inference call"] --> FROZEN{"layer frozen?"}
-    FROZEN -- yes --> CV{"cache valid?<br/>(shape · rows · sparsity)"}
+    FROZEN -- yes --> MODE{"mode = full?"}
+    MODE -- no --> CV{"cache valid?<br/>(shape · rows · sparsity)"}
+    MODE -- yes --> PROBE
     CV -- yes --> USEC["use Cached (deterministic)"]
     CV -- no --> FB["fall back: Sparse → Dense"]
 
@@ -386,7 +388,7 @@ cargo run --release -- benchmark                  # 快速内置基准
 
 ACHF 是 Talos-XII 自研的训练/推理加速层。它用一个自调节模块替换普通的稠密 `Linear`：同一个算子同时保留**稠密**权重和剪枝后的**稀疏**权重两个视图，在运行时决定二者各用多少、多久往低秩流形上重新投影一次、以及当前机器上哪条物理执行路径最快。目标是削减小 batch 神经推理中占主导的 CPU 矩阵乘法和缓存未命中开销，同时不让这种近似破坏训练稳定性。
 
-模块在两个生命周期阶段行为不同。**训练期**权重不断变化，ACHF 关注**门控**（允许多少稀疏度）和周期性的**流形投影**（行/列或 Sinkhorn 归一化 + 低秩截断），保持算子良态。**调用 `freeze_for_inference()` 之后**权重固定，ACHF 把剪枝算子融合成缓存友好的形式，路径选择也从自适应探测切换为确定性的融合缓存路径（见下方 AMA）。
+模块在两个生命周期阶段行为不同。**训练期**权重不断变化，ACHF 关注**门控**（允许多少稀疏度）和周期性的**流形投影**（行/列或 Sinkhorn 归一化 + 低秩截断），保持算子良态。**调用 `freeze_for_inference()` 之后**权重固定，ACHF 把剪枝算子融合成缓存友好的形式。`lite` 模式使用确定性的冻结快速路径；`full` 模式保持权重冻结，但 AMA 继续测量并自适应选择物理执行路径（见下方 AMA）。
 
 ```mermaid
 flowchart TD
@@ -431,16 +433,18 @@ AMA 是 ACHF 内部的运行时调度器，每次推理只回答一个问题：*
 
 - **Cached** — 预融合的低秩/稀疏算子，缓存有效时最省。
 - **Sparse** — 直接用剪枝权重（跳过置零通道）。
-- **Dense** — 完整权重，永远正确的兜底路径。
+- **Dense** — 对同一个冻结剪枝算子使用普通稠密核；仅当稀疏状态无效时安全回退到原始可训练权重。
 
 由于最快路径取决于 batch 形状、稀疏率和主机 CPU 的缓存行为，AMA 把三条路径当作多臂老虎机的三个臂：测量每个臂的延迟（冷/热分开，EMA 平滑），对"变陈旧"的臂做**探测（probe）**，其余时候维持当前赢家。一道**滞回边界（hysteresis margin）**让它保持上一条路径，除非挑战者明显更快，从而避免在两条接近的路径间反复横跳。
 
-**冻结**层会完全短路这套逻辑：权重不再变化，融合 Cached 路径永远有效且最省 —— 于是跳过 AMA、确定性地走 Cached（仅当缓存形状/稀疏度失配时才回退 Sparse/Dense）。
+**lite 模式的冻结层**会完全短路这套逻辑：权重不再变化，融合 Cached 路径永远有效且最省 —— 于是跳过 AMA、确定性地走 Cached（仅当缓存形状/稀疏度失配时才回退 Sparse/Dense）。**full 模式的冻结层**保持所有权重不可变，但继续运行 AMA。
 
 ```mermaid
 flowchart TD
     CALL["推理调用"] --> FROZEN{"层已冻结?"}
-    FROZEN -- 是 --> CV{"缓存有效?<br/>(形状 · 行数 · 稀疏度)"}
+    FROZEN -- 是 --> MODE{"mode = full?"}
+    MODE -- 否 --> CV{"缓存有效?<br/>(形状 · 行数 · 稀疏度)"}
+    MODE -- 是 --> PROBE
     CV -- 是 --> USEC["用 Cached（确定性）"]
     CV -- 否 --> FB["回退: Sparse → Dense"]
 

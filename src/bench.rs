@@ -1,19 +1,17 @@
-use crate::achf::{aggregate_cache_stats_iter, AchfCacheStats, AchfLayer};
+use crate::achf::{aggregate_cache_stats_iter, AchfCacheStats, AchfLayer, AchfSparsityStats};
 use crate::chart::{self, ChartFormat};
 use crate::config::{AchfConfig, Config, LuckMode};
 use crate::dqn::{train_dqn_with_metrics, DuelingQNetwork};
 use crate::env_net::EnvNet;
-use crate::model_io::{
-    env_net_cache_manifest, load_env_net_cache_with_manifest, save_env_net_cache_with_manifest,
-    CacheQualitySummary,
-};
 use crate::neural::NeuralLuckOptimizer;
+use crate::policy_eval::{evaluate_dqn_policy, evaluate_ppo_policy};
 use crate::ppo::{train_ppo_with_metrics, ActorCritic};
 use crate::rng::Rng;
 use crate::sim::{simulate_fast, SimModelContext};
 use crate::trainer::{train_linear_regression, train_manifold_rl, train_neural_optimizer};
 use crate::training_metrics::StepSnapshot;
 use crate::worker::GoodJobWorker;
+use std::collections::BTreeMap;
 use std::fs;
 use std::time::Instant;
 
@@ -28,20 +26,51 @@ const BENCH_EXPERIMENTS: &[&str] = &[
     "crossover",
     "regime",
 ];
-const THROUGHPUT_SIMS: usize = 200;
+const THROUGHPUT_SIMS: usize = 1000;
 const THROUGHPUT_PULLS: usize = 100;
-const CURVE_THROUGHPUT_SIMS: usize = 100;
+const THROUGHPUT_WARMUP_SIMS: usize = 100;
+const BENCH_EVAL_EPISODES: usize = 128;
+const PATH_WARMUP_ROUNDS: usize = 100;
+const PATH_SAMPLES: usize = 1000;
+const PATH_CALLS_PER_SAMPLE: usize = 64;
+const PATH_RANK: usize = 16;
+const PATH_PRUNE_THRESHOLD: f64 = 0.0;
+const CROSSOVER_DIMS: [usize; 3] = [256, 1024, 2048];
+const CROSSOVER_SPARSITIES: [f64; 5] = [0.5, 0.8, 0.9, 0.95, 0.99];
+const CROSSOVER_BATCH: usize = 32;
+const CROSSOVER_WARMUP_ROUNDS: usize = 20;
+const CROSSOVER_SAMPLES: usize = 200;
+const REGIME_DIM: usize = 1024;
+const REGIME_SPARSITIES: [f64; 4] = [0.8, 0.9, 0.95, 0.98];
+const REGIME_SMALL_BATCH: usize = 1;
+const REGIME_LARGE_BATCH: usize = 128;
+const REGIME_WARMUP_CALLS: usize = 300;
+const REGIME_MEASURE_CALLS: usize = 1200;
+const REGIME_FORCED_WARMUP_ROUNDS: usize = 40;
+const REGIME_FORCED_CALLS_PER_SAMPLE: usize = 20;
+const SEED_TRIAL: u64 = 0xA076_1D64_78BD_642F;
+const SEED_BASE_MODELS: u64 = 0xE703_7ED1_A0B4_28DB;
+const SEED_ENV_NET: u64 = 0xD1B5_4A32_D192_ED03;
+const SEED_NEURAL_OPT: u64 = 0xABC9_8388_FB8F_AC03;
+const SEED_LINEAR_REGRESSION: u64 = 0x8CB9_2BA7_2F3D_8DD7;
+const SEED_MANIFOLD_RL: u64 = 0xDB4F_0B91_75AE_2165;
+const SEED_DQN_TRAIN: u64 = 0x8EBC_6AF0_9C88_C6E3;
+const SEED_PPO_TRAIN: u64 = 0x5899_65CC_7537_4CC3;
+const SEED_POLICY_EVAL: u64 = 0x1D8E_4E27_C47D_124F;
+const SEED_THROUGHPUT: u64 = 0xEB44_ACC9_AB45_54A3;
 
 // ── Data structures ─────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
 pub struct BenchRunResult {
     pub label: String,
-    pub total_time_ms: f64,
+    pub policy: String,
+    pub train_time_ms: f64,
     pub throughput_sims_per_sec: f64,
-    pub final_avg_reward: f64,
-    pub final_loss: f64,
+    pub eval_reward: f64,
+    pub train_loss: f64,
     pub param_count: usize,
+    pub applied_rank: Option<usize>,
     pub snapshots: Vec<StepSnapshot>,
     pub cache_stats: Option<AchfCacheStats>,
 }
@@ -57,19 +86,23 @@ pub struct BenchConfig {
 pub struct TrialStats {
     pub mean: f64,
     pub std_dev: f64,
-    pub ci_low: f64,
-    pub ci_high: f64,
+    pub ci_low: Option<f64>,
+    pub ci_high: Option<f64>,
     pub values: Vec<f64>,
 }
 
 impl TrialStats {
     fn from_values(vals: &[f64]) -> Self {
+        assert!(
+            vals.iter().all(|value| value.is_finite()),
+            "benchmark statistics contain a non-finite value: {vals:?}"
+        );
         if vals.is_empty() {
             return TrialStats {
                 mean: 0.0,
                 std_dev: 0.0,
-                ci_low: 0.0,
-                ci_high: 0.0,
+                ci_low: None,
+                ci_high: None,
                 values: Vec::new(),
             };
         }
@@ -77,39 +110,110 @@ impl TrialStats {
         let mean = vals.iter().sum::<f64>() / n;
         let variance = vals.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0).max(1.0);
         let std_dev = variance.sqrt();
-        let t_val = 2.776;
-        let se = std_dev / n.sqrt();
+        let (ci_low, ci_high) = if vals.len() > 1 {
+            let t_val = student_t_critical_95(vals.len() - 1);
+            let margin = t_val * std_dev / n.sqrt();
+            (Some(mean - margin), Some(mean + margin))
+        } else {
+            (None, None)
+        };
         TrialStats {
             mean,
             std_dev,
-            ci_low: mean - t_val * se,
-            ci_high: mean + t_val * se,
+            ci_low,
+            ci_high,
             values: vals.to_vec(),
         }
     }
 }
 
+fn student_t_critical_95(df: usize) -> f64 {
+    const T: [f64; 30] = [
+        12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179, 2.160,
+        2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086, 2.080, 2.074, 2.069, 2.064, 2.060, 2.056,
+        2.052, 2.048, 2.045, 2.042,
+    ];
+    if df == 0 {
+        return f64::NAN;
+    }
+    if df <= T.len() {
+        return T[df - 1];
+    }
+    let df = df as f64;
+    let z: f64 = 1.959_963_984_540_054;
+    z + (z.powi(3) + z) / (4.0 * df)
+        + (5.0 * z.powi(5) + 16.0 * z.powi(3) + 3.0 * z) / (96.0 * df.powi(2))
+}
+
+#[derive(Clone, Debug)]
+pub struct PairedComparison {
+    pub baseline: String,
+    pub throughput_delta: TrialStats,
+    pub eval_reward_delta: TrialStats,
+    pub train_loss_delta: TrialStats,
+    pub train_time_ms_delta: TrialStats,
+}
+
+#[derive(Clone, Debug)]
+pub struct CurvePointStats {
+    pub step: usize,
+    pub samples: usize,
+    pub train_loss: TrialStats,
+    pub train_reward: TrialStats,
+    pub gate_value: TrialStats,
+    pub g_min: TrialStats,
+    pub grad_ema: TrialStats,
+    pub cache_hit_rate: TrialStats,
+    pub sparse_ratio: TrialStats,
+    pub ema_cached_ns: TrialStats,
+    pub ema_sparse_ns: TrialStats,
+    pub adaptive_bias: TrialStats,
+    pub sinkhorn_iterations: TrialStats,
+    pub sinkhorn_row_max_dev: TrialStats,
+    pub sinkhorn_col_max_dev: TrialStats,
+    pub sinkhorn_min_value: TrialStats,
+    pub sinkhorn_negative_ratio: TrialStats,
+    pub sinkhorn_warm_started_rate: f64,
+    pub low_rank_applied_rank: TrialStats,
+}
+
 #[derive(Clone, Debug)]
 pub struct AggregatedResult {
     pub label: String,
+    pub policy: String,
     pub throughput: TrialStats,
-    pub reward: TrialStats,
-    pub loss: TrialStats,
-    pub time_ms: TrialStats,
+    pub eval_reward: TrialStats,
+    pub train_loss: TrialStats,
+    pub train_time_ms: TrialStats,
     pub param_count: usize,
-    pub best_snapshots: Vec<StepSnapshot>,
+    pub applied_rank: Option<usize>,
+    pub curve: Vec<CurvePointStats>,
     pub cache_stats: Option<AchfCacheStats>,
+    pub cache_trial_count: usize,
+    pub paired: Option<PairedComparison>,
 }
 
-/// One cell of the path-crossover grid: measured per-path latency at a given
-/// (dim, weight_sparsity) operating point, plus which path was fastest.
+#[derive(Clone, Debug)]
+struct PathLatencyResult {
+    label: String,
+    trial_samples: Vec<Vec<f64>>,
+    trial_input_dims: Vec<usize>,
+    trial_sparsity: Vec<AchfSparsityStats>,
+}
+
+/// One cell of the path-crossover grid: trial-level per-path latency at a
+/// requested (dim, weight_sparsity) operating point, including the actual
+/// frozen nnz so the benchmark cannot silently measure a different sparsity.
 #[derive(Clone, Debug)]
 struct CrossoverCell {
     dim: usize,
-    weight_sparsity: f32,
-    cached_ns: f64,
-    sparse_ns: f64,
-    dense_ns: f64,
+    requested_sparsity: f64,
+    actual_sparsity: f64,
+    total_weights: usize,
+    nonzero_weights: usize,
+    cached_ns: TrialStats,
+    sparse_ns: TrialStats,
+    dense_ns: TrialStats,
     winner: String,
 }
 
@@ -122,12 +226,16 @@ struct CrossoverCell {
 #[derive(Clone, Debug)]
 struct RegimeLatency {
     batch: usize,
-    adaptive_ns: f64,
-    cached_ns: f64,
-    sparse_ns: f64,
-    oracle_ns: f64,
+    adaptive_ns: TrialStats,
+    cached_ns: TrialStats,
+    sparse_ns: TrialStats,
+    dense_ns: TrialStats,
+    oracle_ns: TrialStats,
+    oracle_gap: TrialStats,
     oracle_path: String,
-    sparse_frac: f64,
+    oracle_path_counts: BTreeMap<String, usize>,
+    oracle_paths: Vec<String>,
+    sparse_frac: TrialStats,
 }
 
 /// One row of the regime-adaptation experiment: the small-batch (decode-like)
@@ -137,16 +245,35 @@ struct RegimeLatency {
 /// fixed path cannot win both regimes, but the batch-aware selector does.
 #[derive(Clone, Debug)]
 struct RegimeRow {
-    weight_sparsity: f32,
+    requested_sparsity: f64,
+    actual_sparsity: f64,
+    total_weights: usize,
+    nonzero_weights: usize,
     small: RegimeLatency,
     large: RegimeLatency,
 }
 
 #[derive(Clone, Debug)]
+struct RegimeTrialLatency {
+    batch: usize,
+    adaptive_ns: f64,
+    cached_ns: f64,
+    sparse_ns: f64,
+    dense_ns: f64,
+    oracle_ns: f64,
+    oracle_path: String,
+    sparse_frac: f64,
+}
+
+#[derive(Clone, Debug)]
 struct PathLatencyStats {
     label: String,
+    trials: usize,
     samples: usize,
     mean_ns: f64,
+    std_dev_ns: f64,
+    ci_low_ns: Option<f64>,
+    ci_high_ns: Option<f64>,
     min_ns: f64,
     p50_ns: f64,
     p90_ns: f64,
@@ -156,73 +283,134 @@ struct PathLatencyStats {
 }
 
 fn aggregate_trials(runs: &[BenchRunResult]) -> AggregatedResult {
+    assert!(!runs.is_empty(), "cannot aggregate zero benchmark trials");
     let label = runs[0].label.clone();
     let tputs: Vec<f64> = runs.iter().map(|r| r.throughput_sims_per_sec).collect();
-    let rewards: Vec<f64> = runs.iter().map(|r| r.final_avg_reward).collect();
-    let losses: Vec<f64> = runs.iter().map(|r| r.final_loss).collect();
-    let times: Vec<f64> = runs.iter().map(|r| r.total_time_ms).collect();
-    let best = runs
-        .iter()
-        .max_by(|a, b| a.snapshots.len().cmp(&b.snapshots.len()))
-        .unwrap();
+    let rewards: Vec<f64> = runs.iter().map(|r| r.eval_reward).collect();
+    let losses: Vec<f64> = runs.iter().map(|r| r.train_loss).collect();
+    let times: Vec<f64> = runs.iter().map(|r| r.train_time_ms).collect();
+    assert!(
+        runs.iter().all(|run| run.policy == runs[0].policy),
+        "mixed active policies under benchmark label {label}"
+    );
+    assert!(
+        runs.iter()
+            .all(|run| run.param_count == runs[0].param_count),
+        "parameter count changed across trials for {label}"
+    );
+    assert!(
+        runs.iter()
+            .all(|run| run.applied_rank == runs[0].applied_rank),
+        "applied rank changed across trials for {label}"
+    );
+    let cache_values: Vec<AchfCacheStats> = runs.iter().filter_map(|run| run.cache_stats).collect();
+    let cache_stats = (!cache_values.is_empty())
+        .then(|| aggregate_cache_stats_iter(cache_values.iter().copied()));
     AggregatedResult {
         label,
+        policy: runs[0].policy.clone(),
         throughput: TrialStats::from_values(&tputs),
-        reward: TrialStats::from_values(&rewards),
-        loss: TrialStats::from_values(&losses),
-        time_ms: TrialStats::from_values(&times),
+        eval_reward: TrialStats::from_values(&rewards),
+        train_loss: TrialStats::from_values(&losses),
+        train_time_ms: TrialStats::from_values(&times),
         param_count: runs[0].param_count,
-        best_snapshots: best.snapshots.clone(),
-        cache_stats: best.cache_stats,
+        applied_rank: runs[0].applied_rank,
+        curve: aggregate_snapshots(runs),
+        cache_stats,
+        cache_trial_count: cache_values.len(),
+        paired: None,
     }
+}
+
+fn aggregate_snapshots(runs: &[BenchRunResult]) -> Vec<CurvePointStats> {
+    let mut by_step: BTreeMap<usize, Vec<&StepSnapshot>> = BTreeMap::new();
+    for snapshot in runs.iter().flat_map(|run| run.snapshots.iter()) {
+        by_step.entry(snapshot.step).or_default().push(snapshot);
+    }
+    by_step
+        .into_iter()
+        .map(|(step, snapshots)| {
+            let stats = |value: fn(&StepSnapshot) -> f64| {
+                TrialStats::from_values(
+                    &snapshots
+                        .iter()
+                        .map(|snapshot| value(snapshot))
+                        .collect::<Vec<_>>(),
+                )
+            };
+            CurvePointStats {
+                step,
+                samples: snapshots.len(),
+                train_loss: stats(|snapshot| snapshot.loss),
+                train_reward: stats(|snapshot| snapshot.reward),
+                gate_value: stats(|snapshot| snapshot.gate_value),
+                g_min: stats(|snapshot| snapshot.g_min),
+                grad_ema: stats(|snapshot| snapshot.grad_ema),
+                cache_hit_rate: stats(|snapshot| snapshot.cache_hit_rate),
+                sparse_ratio: stats(|snapshot| snapshot.sparse_ratio),
+                ema_cached_ns: stats(|snapshot| snapshot.ema_cached_ns),
+                ema_sparse_ns: stats(|snapshot| snapshot.ema_sparse_ns),
+                adaptive_bias: stats(|snapshot| snapshot.adaptive_bias),
+                sinkhorn_iterations: stats(|snapshot| snapshot.sinkhorn_iterations as f64),
+                sinkhorn_row_max_dev: stats(|snapshot| snapshot.sinkhorn_row_max_dev),
+                sinkhorn_col_max_dev: stats(|snapshot| snapshot.sinkhorn_col_max_dev),
+                sinkhorn_min_value: stats(|snapshot| snapshot.sinkhorn_min_value),
+                sinkhorn_negative_ratio: stats(|snapshot| snapshot.sinkhorn_negative_ratio),
+                sinkhorn_warm_started_rate: snapshots
+                    .iter()
+                    .filter(|snapshot| snapshot.sinkhorn_warm_started)
+                    .count() as f64
+                    / snapshots.len() as f64,
+                low_rank_applied_rank: stats(|snapshot| snapshot.low_rank_applied_rank as f64),
+            }
+        })
+        .collect()
 }
 
 // ── Helper: build neural + worker from config ───────────────────────────
 
+fn derive_seed(root: u64, domain: u64) -> u64 {
+    let mut value = root ^ domain;
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
+fn benchmark_trial_seed(seed: u64, trial: usize) -> u64 {
+    derive_seed(seed, SEED_TRIAL.wrapping_mul(trial as u64 + 1))
+}
+
 fn build_base_models_with_worker(
     config: &Config,
-    rng: &mut Rng,
+    seed: u64,
     worker: &GoodJobWorker,
 ) -> (EnvNet, NeuralLuckOptimizer) {
-    let manifest = env_net_cache_manifest(config);
-    let mut env_net = if let Some(cached) =
-        load_env_net_cache_with_manifest("env_net.cache", config, &manifest)
-    {
-        cached
+    let mut env_rng = Rng::from_seed(derive_seed(seed, SEED_ENV_NET));
+    let mut env_net = EnvNet::new(&mut env_rng);
+    let (count, epochs) = if config.fast_init {
+        (256, 10)
     } else {
-        let mut net = EnvNet::new(rng);
-        let (count, epochs) = if config.fast_init {
-            (256, 10)
-        } else {
-            (1024, 50)
-        };
-        net.pretrain(rng, config, count, epochs);
-        let _ = save_env_net_cache_with_manifest(
-            "env_net.cache",
-            &net,
-            manifest.with_quality(CacheQualitySummary::note(format!(
-                "{count}x{epochs} pretrain"
-            ))),
-        );
-        net
+        (1024, 50)
     };
+    env_net.pretrain(&mut env_rng, config, count, epochs);
     env_net.set_train(false);
 
-    let mut neural_opt = train_neural_optimizer(rng.next_u64(), &env_net, config, worker);
-    let (w, b) = train_linear_regression(&neural_opt, rng, &env_net, config);
+    let mut neural_opt =
+        train_neural_optimizer(derive_seed(seed, SEED_NEURAL_OPT), &env_net, config, worker);
+    let mut linear_rng = Rng::from_seed(derive_seed(seed, SEED_LINEAR_REGRESSION));
+    let (w, b) = train_linear_regression(&neural_opt, &mut linear_rng, &env_net, config);
     neural_opt.set_linear_params(w, b);
-    neural_opt = train_manifold_rl(&neural_opt, rng, &env_net, config, worker);
+    let mut manifold_rng = Rng::from_seed(derive_seed(seed, SEED_MANIFOLD_RL));
+    neural_opt = train_manifold_rl(&neural_opt, &mut manifold_rng, &env_net, config, worker);
 
     (env_net, neural_opt)
 }
 
-fn build_base_models(
-    config: &Config,
-    rng: &mut Rng,
-) -> (EnvNet, NeuralLuckOptimizer, GoodJobWorker) {
+fn build_base_models(config: &Config, seed: u64) -> (EnvNet, NeuralLuckOptimizer, GoodJobWorker) {
     let worker =
         GoodJobWorker::new_with_config(config).expect("Failed to build benchmark worker pool");
-    let (env_net, neural_opt) = build_base_models_with_worker(config, rng, &worker);
+    let (env_net, neural_opt) = build_base_models_with_worker(config, seed, &worker);
     (env_net, neural_opt, worker)
 }
 
@@ -230,6 +418,7 @@ fn bench_sized_config(base_config: &Config) -> Config {
     let mut cfg = base_config.clone();
     cfg.fast_init = true;
     cfg.luck_mode = LuckMode::Ppo;
+    cfg.policy_eval_interval = 0;
     cfg.model_dim = crate::neural::DIM;
     cfg.model_hidden_dim = cfg.model_hidden_dim.clamp(32, 64);
     cfg.model_num_layers = cfg.model_num_layers.clamp(1, 2);
@@ -260,7 +449,7 @@ struct ThroughputParams<'a> {
     pulls: usize,
 }
 
-fn measure_inference_throughput(rng: &mut Rng, params: &ThroughputParams<'_>) -> f64 {
+fn measure_inference_throughput(seed: u64, params: &ThroughputParams<'_>) -> f64 {
     let ctx = SimModelContext {
         neural_opt: params.neural_opt,
         dqn_policy: params.dqn,
@@ -271,11 +460,12 @@ fn measure_inference_throughput(rng: &mut Rng, params: &ThroughputParams<'_>) ->
         neural_sender: None,
         ppo_sender: None,
     };
-    let warmup = 20u64;
-    let total = warmup + params.sims as u64;
+    let warmup = THROUGHPUT_WARMUP_SIMS;
+    let total = (warmup + params.sims) as u64;
     let pb = crate::utils::create_bar(total, "Measuring throughput");
     for i in 0..warmup {
-        let _ = simulate_fast(params.pulls, rng, 0, &ctx);
+        let mut rng = Rng::from_seed(derive_seed(seed, i as u64));
+        let _ = simulate_fast(params.pulls, &mut rng, 0, &ctx);
         pb.inc(1);
         if i == 0 {
             pb.set_message(format!("warmup {}/{}", i + 1, warmup));
@@ -284,7 +474,8 @@ fn measure_inference_throughput(rng: &mut Rng, params: &ThroughputParams<'_>) ->
     pb.set_message("measuring".to_string());
     let start = Instant::now();
     for i in 0..params.sims {
-        let _ = simulate_fast(params.pulls, rng, 0, &ctx);
+        let mut rng = Rng::from_seed(derive_seed(seed, (warmup + i) as u64));
+        let _ = simulate_fast(params.pulls, &mut rng, 0, &ctx);
         pb.inc(1);
         if i > 0 && i % 10 == 0 {
             let elapsed = start.elapsed().as_secs_f64();
@@ -295,6 +486,46 @@ fn measure_inference_throughput(rng: &mut Rng, params: &ThroughputParams<'_>) ->
     let elapsed = start.elapsed();
     pb.finish_and_clear();
     params.sims as f64 / elapsed.as_secs_f64()
+}
+
+fn cache_stats_delta(before: AchfCacheStats, after: AchfCacheStats) -> AchfCacheStats {
+    let delta = |name: &str, before: u64, after: u64| {
+        after.checked_sub(before).unwrap_or_else(|| {
+            panic!("ACHF counter {name} decreased during frozen evaluation: {before} -> {after}")
+        })
+    };
+    AchfCacheStats {
+        calls: delta("calls", before.calls, after.calls),
+        cache_hits: delta("cache_hits", before.cache_hits, after.cache_hits),
+        cache_misses: delta("cache_misses", before.cache_misses, after.cache_misses),
+        cache_skips: delta("cache_skips", before.cache_skips, after.cache_skips),
+        sparse_paths: delta("sparse_paths", before.sparse_paths, after.sparse_paths),
+        dense_paths: delta("dense_paths", before.dense_paths, after.dense_paths),
+        ema_cached_ns: after.ema_cached_ns,
+        ema_cached_long_ns: after.ema_cached_long_ns,
+        ema_sparse_ns: after.ema_sparse_ns,
+        ema_sparse_long_ns: after.ema_sparse_long_ns,
+        ema_dense_ns: after.ema_dense_ns,
+        ema_dense_long_ns: after.ema_dense_long_ns,
+        decision_ema_ns: after.decision_ema_ns,
+        decision_ema_long_ns: after.decision_ema_long_ns,
+        adaptive_bias: after.adaptive_bias,
+        latency_samples: delta(
+            "latency_samples",
+            before.latency_samples,
+            after.latency_samples,
+        ),
+        dense_latency_samples: delta(
+            "dense_latency_samples",
+            before.dense_latency_samples,
+            after.dense_latency_samples,
+        ),
+        decision_samples: delta(
+            "decision_samples",
+            before.decision_samples,
+            after.decision_samples,
+        ),
+    }
 }
 
 fn aggregate_model_cache_stats(
@@ -389,8 +620,10 @@ pub fn run_achf_benchmarks(base_config: &Config, seed: u64, bench_cfg: &BenchCon
     println!("========================================\n");
 
     let mut all_agg: Vec<(&str, Vec<AggregatedResult>)> = Vec::new();
-    let mut path_latencies: Option<Vec<(String, Vec<f64>)>> = None;
-    let mut gate_curve: Option<BenchRunResult> = None;
+    let mut path_latencies: Option<Vec<PathLatencyResult>> = None;
+    let mut gate_curve: Option<AggregatedResult> = None;
+    let mut crossover: Option<Vec<CrossoverCell>> = None;
+    let mut regime: Option<Vec<RegimeRow>> = None;
 
     if should_run(bench_cfg, "ablation") {
         let agg = run_ablation(base_config, seed, nt);
@@ -409,12 +642,12 @@ pub fn run_achf_benchmarks(base_config: &Config, seed: u64, bench_cfg: &BenchCon
     }
 
     if should_run(bench_cfg, "path") {
-        let latencies = run_path_comparison(base_config, seed);
+        let latencies = run_path_comparison(base_config, seed, nt);
         println!("[Bench] Path Comparison complete.");
         for stats in path_latency_stats(&latencies) {
             println!(
-                "  {}: avg {:.1} ns ({} samples)",
-                stats.label, stats.mean_ns, stats.samples
+                "  {}: avg {:.1} ns across {} trials ({} samples)",
+                stats.label, stats.mean_ns, stats.trials, stats.samples
             );
         }
         let e = ext(&bench_cfg.format);
@@ -424,11 +657,11 @@ pub fn run_achf_benchmarks(base_config: &Config, seed: u64, bench_cfg: &BenchCon
     }
 
     if should_run(bench_cfg, "gate") {
-        let result = run_gate_curve(base_config, seed);
+        let result = run_gate_curve(base_config, seed, nt);
         println!(
-            "[Bench] Gate Curve: {} snapshots collected over {} steps",
-            result.snapshots.len(),
-            result.snapshots.last().map_or(0, |s| s.step)
+            "[Bench] Gate Curve: {} aggregated points over {} steps",
+            result.curve.len(),
+            result.curve.last().map_or(0, |point| point.step)
         );
         let e = ext(&bench_cfg.format);
         chart_gate_curve(&result, dir, e);
@@ -461,31 +694,38 @@ pub fn run_achf_benchmarks(base_config: &Config, seed: u64, bench_cfg: &BenchCon
     }
 
     if should_run(bench_cfg, "crossover") {
-        let cells = run_path_crossover();
+        let cells = run_path_crossover(seed, nt);
         println!("[Bench] Path Crossover complete ({} cells).", cells.len());
         let e = ext(&bench_cfg.format);
         chart_crossover(&cells, dir, e);
         write_crossover_outputs(&cells, dir);
+        crossover = Some(cells);
     }
 
     if should_run(bench_cfg, "regime") {
-        let rows = run_regime_adaptation();
+        let rows = run_regime_adaptation(seed, nt);
         println!("[Bench] Regime Adaptation complete ({} rows).", rows.len());
         let e = ext(&bench_cfg.format);
         chart_regime(&rows, dir, e);
         write_regime_outputs(&rows, dir);
+        regime = Some(rows);
     }
 
     write_summary_txt(
         &all_agg,
         path_latencies.as_deref(),
         gate_curve.as_ref(),
+        crossover.as_deref(),
+        regime.as_deref(),
         dir,
     );
     write_summary_json(
         &all_agg,
         path_latencies.as_deref(),
         gate_curve.as_ref(),
+        crossover.as_deref(),
+        regime.as_deref(),
+        (seed, nt),
         dir,
     );
     write_csvs(&all_agg, dir);
@@ -498,123 +738,209 @@ pub fn run_achf_benchmarks(base_config: &Config, seed: u64, bench_cfg: &BenchCon
 
 // ── Experiment implementations ──────────────────────────────────────────
 
-fn run_multi_trial(
-    label: &str,
-    config: &Config,
+fn run_interleaved_conditions(
+    conditions: &[(String, Config)],
     seed: u64,
     num_trials: usize,
-) -> Vec<BenchRunResult> {
-    (0..num_trials)
-        .map(|t| {
-            let trial_seed = seed.wrapping_add(t as u64 * 1337);
+) -> Vec<Vec<BenchRunResult>> {
+    assert!(
+        !conditions.is_empty(),
+        "benchmark needs at least one condition"
+    );
+    let mut runs: Vec<Vec<BenchRunResult>> = (0..conditions.len())
+        .map(|_| Vec::with_capacity(num_trials))
+        .collect();
+    for trial in 0..num_trials {
+        let trial_seed = benchmark_trial_seed(seed, trial);
+        let start = trial % conditions.len();
+        for offset in 0..conditions.len() {
+            let condition_index = (start + offset) % conditions.len();
+            let (label, config) = &conditions[condition_index];
+            println!("  [{label}] trial {}/{}", trial + 1, num_trials);
             let result = train_and_measure(label, config, trial_seed);
             println!(
-                "    trial {}/{}: {:.1}s | {:.0} sims/sec | reward: {:.3} | loss: {:.4}",
-                t + 1,
-                num_trials,
-                result.total_time_ms / 1000.0,
+                "    {:.1}s | {:.0} sims/sec | eval reward: {:.3} | train loss: {:.4}",
+                result.train_time_ms / 1000.0,
                 result.throughput_sims_per_sec,
-                result.final_avg_reward,
-                result.final_loss
+                result.eval_reward,
+                result.train_loss
             );
-            result
-        })
-        .collect()
+            runs[condition_index].push(result);
+        }
+    }
+    runs
+}
+
+fn aggregate_conditions(
+    runs: &[Vec<BenchRunResult>],
+    baseline_for_condition: &[usize],
+) -> Vec<AggregatedResult> {
+    assert_eq!(runs.len(), baseline_for_condition.len());
+    let mut aggregated: Vec<AggregatedResult> = runs
+        .iter()
+        .map(|condition| aggregate_trials(condition))
+        .collect();
+    for condition_index in 0..aggregated.len() {
+        let baseline_index = baseline_for_condition[condition_index];
+        assert!(baseline_index < runs.len());
+        if condition_index == baseline_index {
+            continue;
+        }
+        let candidate = &runs[condition_index];
+        let baseline = &runs[baseline_index];
+        assert_eq!(
+            candidate.len(),
+            baseline.len(),
+            "paired benchmark conditions have different trial counts"
+        );
+        let paired = |value: fn(&BenchRunResult) -> f64| {
+            TrialStats::from_values(
+                &candidate
+                    .iter()
+                    .zip(baseline.iter())
+                    .map(|(candidate, baseline)| value(candidate) - value(baseline))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        aggregated[condition_index].paired = Some(PairedComparison {
+            baseline: aggregated[baseline_index].label.clone(),
+            throughput_delta: paired(|run| run.throughput_sims_per_sec),
+            eval_reward_delta: paired(|run| run.eval_reward),
+            train_loss_delta: paired(|run| run.train_loss),
+            train_time_ms_delta: paired(|run| run.train_time_ms),
+        });
+    }
+    aggregated
+}
+
+fn cap_ppo_training(config: &mut Config, max_steps: usize) {
+    config.ppo_total_steps = config.ppo_total_steps.min(max_steps);
+    config.ppo_steps_per_update = config.ppo_steps_per_update.min(256);
+    config.ppo_k_epochs = config.ppo_k_epochs.min(2);
 }
 
 fn run_ablation(base_config: &Config, seed: u64, nt: usize) -> Vec<AggregatedResult> {
     println!("[Bench] Running Ablation Experiment (ACHF on/off)...");
-    let mut agg = Vec::new();
-    for (label, enabled) in [("ACHF Enabled", true), ("ACHF Disabled", false)] {
-        println!("  [{}]", label);
-        let mut cfg = bench_sized_config(base_config);
-        cfg.achf.enabled = enabled;
-        let runs = run_multi_trial(label, &cfg, seed, nt);
-        agg.push(aggregate_trials(&runs));
-    }
-    agg
+    let conditions: Vec<(String, Config)> = [("ACHF Disabled", false), ("ACHF Enabled", true)]
+        .into_iter()
+        .map(|(label, enabled)| {
+            let mut cfg = bench_sized_config(base_config);
+            cfg.achf.enabled = enabled;
+            cap_ppo_training(&mut cfg, 2000);
+            (label.to_string(), cfg)
+        })
+        .collect();
+    let runs = run_interleaved_conditions(&conditions, seed, nt);
+    aggregate_conditions(&runs, &[0, 0])
 }
 
 fn run_mode_comparison(base_config: &Config, seed: u64, nt: usize) -> Vec<AggregatedResult> {
     println!("[Bench] Running Mode Comparison (lite vs full)...");
-    let mut agg = Vec::new();
-    for (label, mode) in [("Lite", "lite"), ("Full", "full")] {
-        println!("  [{}]", label);
-        let mut cfg = bench_sized_config(base_config);
-        cfg.achf.enabled = true;
-        cfg.achf.mode = mode.to_string();
-        let runs = run_multi_trial(label, &cfg, seed, nt);
-        agg.push(aggregate_trials(&runs));
-    }
-    agg
+    let conditions: Vec<(String, Config)> = [("Lite", "lite"), ("Full", "full")]
+        .into_iter()
+        .map(|(label, mode)| {
+            let mut cfg = bench_sized_config(base_config);
+            cfg.achf.enabled = true;
+            cfg.achf.mode = mode.to_string();
+            cfg.achf.adaptive_inference = false;
+            cap_ppo_training(&mut cfg, 2000);
+            (label.to_string(), cfg)
+        })
+        .collect();
+    let runs = run_interleaved_conditions(&conditions, seed, nt);
+    aggregate_conditions(&runs, &[0, 0])
 }
 
-fn run_path_comparison(base_config: &Config, seed: u64) -> Vec<(String, Vec<f64>)> {
+fn run_path_comparison(
+    base_config: &Config,
+    seed: u64,
+    num_trials: usize,
+) -> Vec<PathLatencyResult> {
     println!("[Bench] Running Path Comparison (Cached/Sparse/Dense)...");
-    let mut rng = Rng::from_seed(seed);
-    let mut cfg = bench_sized_config(base_config);
-    cfg.achf.enabled = true;
-    cfg.ppo_total_steps = cfg.ppo_total_steps.min(2000);
-    cfg.ppo_steps_per_update = cfg.ppo_steps_per_update.min(256);
-    cfg.ppo_k_epochs = cfg.ppo_k_epochs.min(2);
+    let labels = ["Cached", "Sparse", "Dense"];
+    let mut all_latencies: Vec<PathLatencyResult> = labels
+        .iter()
+        .map(|label| PathLatencyResult {
+            label: (*label).to_string(),
+            trial_samples: Vec::with_capacity(num_trials),
+            trial_input_dims: Vec::with_capacity(num_trials),
+            trial_sparsity: Vec::with_capacity(num_trials),
+        })
+        .collect();
 
-    let (env_net, _neural_opt, _worker) = build_base_models(&cfg, &mut rng);
-    let ppo = train_ppo_with_metrics(&mut rng, &env_net, &cfg, None);
-
-    // Measure the ACHF operator in ISOLATION, not the whole transformer forward.
-    // A full forward is dominated by embed/norm/attention/FFN work that is
-    // identical across paths, which dilutes the Cached/Sparse/Dense difference
-    // into single-digit percent. Timing the operator alone is what the path
-    // comparison is supposed to show.
-    let (achf, input_dim) = ppo
-        .first_achf_layer()
-        .expect("path comparison requires an ACHF layer; achf.enabled=true");
-    let sample_input: Vec<f32> = (0..input_dim).map(|i| (i as f32) * 0.1 + 0.05).collect();
-    let warmup_iterations = 100;
-    let iterations = 2000;
-    // The per-call operator cost (~hundreds of ns) is below the platform clock
-    // granularity (Instant resolves to ~100ns on Windows), so timing a single
-    // call quantizes every sample to a multiple of 100ns. That collapses the
-    // latency distribution into ~5 discrete buckets, which in turn makes the
-    // box plot's IQR degenerate (q1==q2==q3, zero-height boxes) and hides the
-    // real spread between paths. Time a BATCH of calls per sample and divide by
-    // the batch size: the timed window becomes tens of microseconds (far above
-    // clock granularity) and the reported per-call latency regains sub-ns
-    // resolution. `black_box` prevents the optimizer from hoisting/eliding the
-    // repeated identical calls.
-    let batch = 64usize;
-
-    let mut all_latencies: Vec<(String, Vec<f64>)> = Vec::new();
-
-    // 0 = Cached, 1 = Sparse, 2 = Dense
-    for (path_name, path_id) in [("Cached", 0u8), ("Sparse", 1), ("Dense", 2)] {
-        for _ in 0..warmup_iterations {
-            let _ = std::hint::black_box(
-                achf.forward_inference_forced_path(std::hint::black_box(&sample_input), path_id),
-            );
-        }
-
-        let mut latencies = Vec::with_capacity(iterations);
-        for _ in 0..iterations {
-            let start = Instant::now();
-            for _ in 0..batch {
-                let out = achf
-                    .forward_inference_forced_path(std::hint::black_box(&sample_input), path_id);
-                std::hint::black_box(out);
-            }
-            let ns = start.elapsed().as_nanos() as f64 / batch as f64;
-            latencies.push(ns);
-        }
-        println!(
-            "  [{}] avg={:.1}ns, p50={:.1}ns, p99={:.1}ns",
-            path_name,
-            latencies.iter().sum::<f64>() / latencies.len() as f64,
-            percentile(&latencies, 50),
-            percentile(&latencies, 99),
+    for trial in 0..num_trials {
+        let trial_seed = benchmark_trial_seed(seed, trial);
+        let mut cfg = bench_sized_config(base_config);
+        cfg.achf.enabled = true;
+        cfg.achf.rank = PATH_RANK;
+        cfg.achf.prune_threshold = PATH_PRUNE_THRESHOLD;
+        cap_ppo_training(&mut cfg, 2000);
+        let (env_net, _neural_opt, _worker) =
+            build_base_models(&cfg, derive_seed(trial_seed, SEED_BASE_MODELS));
+        let mut ppo_rng = Rng::from_seed(derive_seed(trial_seed, SEED_PPO_TRAIN));
+        let ppo = train_ppo_with_metrics(&mut ppo_rng, &env_net, &cfg, None);
+        let (achf, input_dim) = ppo
+            .first_achf_layer()
+            .expect("path comparison requires an ACHF layer; achf.enabled=true");
+        let sparsity = achf
+            .inference_sparsity_stats()
+            .expect("path comparison ACHF layer must expose frozen sparsity");
+        assert!(
+            sparsity.nonzero_weights > 0 && sparsity.nonzero_weights < sparsity.total_weights,
+            "path comparison requires a non-degenerate frozen operator, got nnz={}/{}",
+            sparsity.nonzero_weights,
+            sparsity.total_weights,
         );
-        all_latencies.push((path_name.to_string(), latencies));
+        let sample_input: Vec<f32> = (0..input_dim)
+            .map(|index| index as f32 * 0.1 + 0.05)
+            .collect();
+        assert_forced_paths_agree(achf, &sample_input);
+        let trial_values = measure_forced_path_samples(
+            achf,
+            &sample_input,
+            PATH_WARMUP_ROUNDS,
+            PATH_SAMPLES,
+            PATH_CALLS_PER_SAMPLE,
+            trial,
+        );
+        for path_index in 0..labels.len() {
+            let stats = TrialStats::from_values(&trial_values[path_index]);
+            println!(
+                "  trial {}/{} [{}] avg={:.1}ns, p50={:.1}ns, p99={:.1}ns",
+                trial + 1,
+                num_trials,
+                labels[path_index],
+                stats.mean,
+                percentile(&trial_values[path_index], 50),
+                percentile(&trial_values[path_index], 99),
+            );
+            all_latencies[path_index]
+                .trial_samples
+                .push(trial_values[path_index].clone());
+            all_latencies[path_index].trial_input_dims.push(input_dim);
+            all_latencies[path_index].trial_sparsity.push(sparsity);
+        }
     }
     all_latencies
+}
+
+fn assert_forced_paths_agree(layer: &AchfLayer, input: &[f32]) {
+    let cached = layer.forward_inference_forced_path(input, 0);
+    let sparse = layer.forward_inference_forced_path(input, 1);
+    let dense = layer.forward_inference_forced_path(input, 2);
+    assert_eq!(cached.len(), sparse.len());
+    assert_eq!(cached.len(), dense.len());
+    for (index, ((cached, sparse), dense)) in cached
+        .iter()
+        .zip(sparse.iter())
+        .zip(dense.iter())
+        .enumerate()
+    {
+        assert!(
+            (cached - sparse).abs() <= 1e-4 && (cached - dense).abs() <= 1e-4,
+            "forced inference paths compute different outputs at index {index}: cached={cached}, sparse={sparse}, dense={dense}"
+        );
+    }
 }
 
 /// Build a frozen square ACHF layer with an EXACT target weight sparsity by
@@ -622,25 +948,34 @@ fn run_path_comparison(base_config: &Config, seed: u64) -> Vec<(String, Vec<f64>
 /// sparse view keys on `w != 0.0`, so this controls the sparse path's FLOP
 /// count precisely — unlike magnitude pruning, whose sparsity depends on the
 /// random weight distribution. `adaptive` toggles the live AMA selector.
-fn build_synthetic_achf_layer(dim: usize, weight_sparsity: f32, adaptive: bool) -> AchfLayer {
+fn build_synthetic_achf_layer(
+    dim: usize,
+    weight_sparsity: f64,
+    adaptive: bool,
+    seed: u64,
+) -> AchfLayer {
+    assert!((0.0..=1.0).contains(&weight_sparsity));
     let cfg = AchfConfig {
         enabled: true,
-        adaptive_inference: adaptive,
+        mode: if adaptive { "full" } else { "lite" }.to_string(),
+        adaptive_inference: false,
         cache_latency_sample_every: 1,
         gate_warmup_steps: 0,
         gate_transition_steps: 0,
         g_min: 0.0,
         infer_gate: "one".to_string(),
+        rank: 0,
+        proj_mode: "none".to_string(),
         prune_threshold: 0.0,
         // Disable memoization: with a repeated benchmark input it would return a
         // memo hit and bypass the selector/path entirely, invalidating timing.
         cache_min_reuse: 0,
         ..Default::default()
     };
-    let mut layer = AchfLayer::new(dim, dim, false, cfg, 0x5EED ^ dim as u64);
+    let mut layer = AchfLayer::new(dim, dim, false, cfg, derive_seed(seed, dim as u64));
     {
         let mut w = layer.weight.weight.data_write_f32();
-        let zero_per_row = (dim as f32 * weight_sparsity) as usize;
+        let zero_per_row = (dim as f64 * weight_sparsity).floor() as usize;
         for r in 0..dim {
             for c in 0..dim {
                 let v = &mut w[r * dim + c];
@@ -656,61 +991,148 @@ fn build_synthetic_achf_layer(dim: usize, weight_sparsity: f32, adaptive: bool) 
     layer
 }
 
-/// Time one forced path (mean ns per single forward) over `iters` batches of
-/// `batch` rows, after `warmup` untimed calls. Batching keeps the timed window
-/// well above clock granularity (see run_path_comparison for the rationale).
-fn time_forced_path(layer: &AchfLayer, x: &[f32], path_id: u8, warmup: usize, iters: usize) -> f64 {
-    for _ in 0..warmup {
-        std::hint::black_box(layer.forward_inference_forced_path(std::hint::black_box(x), path_id));
+fn measure_forced_path_samples(
+    layer: &AchfLayer,
+    input: &[f32],
+    warmup_rounds: usize,
+    samples: usize,
+    calls_per_sample: usize,
+    rotation: usize,
+) -> [Vec<f64>; 3] {
+    assert!(calls_per_sample > 0);
+    for round in 0..warmup_rounds {
+        for offset in 0..3 {
+            let path = (rotation + round + offset) % 3;
+            std::hint::black_box(
+                layer.forward_inference_forced_path(std::hint::black_box(input), path as u8),
+            );
+        }
     }
-    let start = Instant::now();
-    for _ in 0..iters {
-        std::hint::black_box(layer.forward_inference_forced_path(std::hint::black_box(x), path_id));
+    let mut values: [Vec<f64>; 3] = std::array::from_fn(|_| Vec::with_capacity(samples));
+    for sample in 0..samples {
+        for offset in 0..3 {
+            let path = (rotation + sample + offset) % 3;
+            let start = Instant::now();
+            for _ in 0..calls_per_sample {
+                std::hint::black_box(
+                    layer.forward_inference_forced_path(std::hint::black_box(input), path as u8),
+                );
+            }
+            values[path].push(start.elapsed().as_nanos() as f64 / calls_per_sample as f64);
+        }
     }
-    start.elapsed().as_nanos() as f64 / iters as f64
+    values
 }
 
 /// Path-crossover experiment: sweep (dim x weight_sparsity), force each path,
 /// and record which is fastest. Demonstrates that no single fixed path wins
 /// everywhere — the premise that makes adaptive path selection worthwhile.
-fn run_path_crossover() -> Vec<CrossoverCell> {
+fn run_path_crossover(seed: u64, num_trials: usize) -> Vec<CrossoverCell> {
     println!("[Bench] Running Path Crossover (dim x weight-sparsity)...");
-    let dims = [256usize, 1024, 2048];
-    let sparsities = [0.5f32, 0.8, 0.9, 0.95, 0.99];
-    let batch = 32usize;
-    let warmup = 20usize;
-    let iters = 200usize;
-    let mut cells = Vec::new();
-    for &dim in &dims {
-        for &weight_sparsity in &sparsities {
-            let layer = build_synthetic_achf_layer(dim, weight_sparsity, false);
-            let x: Vec<f32> = (0..dim * batch).map(|i| ((i % 7) as f32) * 0.1).collect();
-            let cached_ns = time_forced_path(&layer, &x, 0, warmup, iters);
-            let sparse_ns = time_forced_path(&layer, &x, 1, warmup, iters);
-            let dense_ns = time_forced_path(&layer, &x, 2, warmup, iters);
-            let winner = if sparse_ns <= cached_ns && sparse_ns <= dense_ns {
+    let specs: Vec<(usize, f64)> = CROSSOVER_DIMS
+        .iter()
+        .flat_map(|&dim| {
+            CROSSOVER_SPARSITIES
+                .iter()
+                .map(move |&sparsity| (dim, sparsity))
+        })
+        .collect();
+    let mut measurements: Vec<(Vec<f64>, Vec<f64>, Vec<f64>)> = specs
+        .iter()
+        .map(|_| {
+            (
+                Vec::with_capacity(num_trials),
+                Vec::with_capacity(num_trials),
+                Vec::with_capacity(num_trials),
+            )
+        })
+        .collect();
+    let mut shapes: Vec<Option<(usize, usize, f64)>> = vec![None; specs.len()];
+
+    for trial in 0..num_trials {
+        let trial_seed = benchmark_trial_seed(seed, trial);
+        let start = trial % specs.len();
+        for offset in 0..specs.len() {
+            let cell_index = (start + offset) % specs.len();
+            let (dim, requested_sparsity) = specs[cell_index];
+            let layer = build_synthetic_achf_layer(
+                dim,
+                requested_sparsity,
+                false,
+                derive_seed(trial_seed, cell_index as u64),
+            );
+            let sparsity = layer
+                .inference_sparsity_stats()
+                .expect("synthetic ACHF layer must expose frozen sparsity");
+            let shape = (
+                sparsity.total_weights,
+                sparsity.nonzero_weights,
+                sparsity.sparsity,
+            );
+            if let Some(expected) = shapes[cell_index] {
+                assert_eq!(shape, expected, "synthetic sparsity changed across trials");
+            } else {
+                shapes[cell_index] = Some(shape);
+            }
+            let input: Vec<f32> = (0..dim * CROSSOVER_BATCH)
+                .map(|index| ((index % 7) as f32) * 0.1 + 0.05)
+                .collect();
+            assert_forced_paths_agree(&layer, &input);
+            let values = measure_forced_path_samples(
+                &layer,
+                &input,
+                CROSSOVER_WARMUP_ROUNDS,
+                CROSSOVER_SAMPLES,
+                1,
+                trial + cell_index,
+            );
+            let means = values.map(|path| path.iter().sum::<f64>() / path.len() as f64);
+            measurements[cell_index].0.push(means[0]);
+            measurements[cell_index].1.push(means[1]);
+            measurements[cell_index].2.push(means[2]);
+            println!(
+                "  trial={:<2} dim={dim:<5} requested={requested_sparsity:<5.2} actual={:.4} \
+                 nnz={}/{} cached={:>9.0}ns sparse={:>9.0}ns dense={:>9.0}ns",
+                trial + 1,
+                sparsity.sparsity,
+                sparsity.nonzero_weights,
+                sparsity.total_weights,
+                means[0],
+                means[1],
+                means[2],
+            );
+        }
+    }
+
+    specs
+        .into_iter()
+        .enumerate()
+        .map(|(cell_index, (dim, requested_sparsity))| {
+            let (total_weights, nonzero_weights, actual_sparsity) =
+                shapes[cell_index].expect("crossover cell was not measured");
+            let cached_ns = TrialStats::from_values(&measurements[cell_index].0);
+            let sparse_ns = TrialStats::from_values(&measurements[cell_index].1);
+            let dense_ns = TrialStats::from_values(&measurements[cell_index].2);
+            let winner = if sparse_ns.mean <= cached_ns.mean && sparse_ns.mean <= dense_ns.mean {
                 "Sparse"
-            } else if cached_ns <= dense_ns {
+            } else if cached_ns.mean <= dense_ns.mean {
                 "Cached"
             } else {
                 "Dense"
-            }
-            .to_string();
-            println!(
-                "  dim={dim:<5} wsp={weight_sparsity:<5} cached={cached_ns:>9.0}ns \
-                 sparse={sparse_ns:>9.0}ns dense={dense_ns:>9.0}ns -> {winner}"
-            );
-            cells.push(CrossoverCell {
+            };
+            CrossoverCell {
                 dim,
-                weight_sparsity,
+                requested_sparsity,
+                actual_sparsity,
+                total_weights,
+                nonzero_weights,
                 cached_ns,
                 sparse_ns,
                 dense_ns,
-                winner,
-            });
-        }
-    }
-    cells
+                winner: winner.to_string(),
+            }
+        })
+        .collect()
 }
 
 /// Regime-adaptation experiment: on ONE fixed frozen layer, run the LIVE
@@ -719,61 +1141,135 @@ fn run_path_crossover() -> Vec<CrossoverCell> {
 /// the small-batch sparse fraction exceeds the large-batch one, the selector is
 /// adapting its path choice to the operating point — the core "true adaptive"
 /// claim. Batch-bucketed latency EMAs are what make this possible.
-fn run_regime_adaptation() -> Vec<RegimeRow> {
+fn run_regime_adaptation(seed: u64, num_trials: usize) -> Vec<RegimeRow> {
     println!("[Bench] Running Regime Adaptation (batch-driven path switching)...");
-    let dim = 1024usize;
-    let sparsities = [0.8f32, 0.9, 0.95, 0.98];
-    let small_batch = 1usize;
-    let large_batch = 128usize;
-    let mut rows = Vec::new();
+    let mut trials: Vec<(Vec<RegimeTrialLatency>, Vec<RegimeTrialLatency>)> = REGIME_SPARSITIES
+        .iter()
+        .map(|_| {
+            (
+                Vec::with_capacity(num_trials),
+                Vec::with_capacity(num_trials),
+            )
+        })
+        .collect();
+    let mut shapes: Vec<Option<(usize, usize, f64)>> = vec![None; REGIME_SPARSITIES.len()];
 
-    for &weight_sparsity in &sparsities {
-        let layer = build_synthetic_achf_layer(dim, weight_sparsity, true);
-        let small = measure_regime(&layer, dim, small_batch);
-        let large = measure_regime(&layer, dim, large_batch);
-        println!(
-            "  wsp={weight_sparsity:<5} b{small_batch:<3}: adaptive={:.0}ns oracle={:.0}ns \
-             ({}) gap={:.2}x sparse_frac={:.2} | b{large_batch:<3}: adaptive={:.0}ns \
-             oracle={:.0}ns ({}) gap={:.2}x sparse_frac={:.2}",
-            small.adaptive_ns,
-            small.oracle_ns,
-            small.oracle_path,
-            small.adaptive_ns / small.oracle_ns.max(1.0),
-            small.sparse_frac,
-            large.adaptive_ns,
-            large.oracle_ns,
-            large.oracle_path,
-            large.adaptive_ns / large.oracle_ns.max(1.0),
-            large.sparse_frac,
-        );
-        rows.push(RegimeRow {
-            weight_sparsity,
-            small,
-            large,
-        });
+    for trial in 0..num_trials {
+        let trial_seed = benchmark_trial_seed(seed, trial);
+        let start = trial % REGIME_SPARSITIES.len();
+        for offset in 0..REGIME_SPARSITIES.len() {
+            let sparsity_index = (start + offset) % REGIME_SPARSITIES.len();
+            let requested_sparsity = REGIME_SPARSITIES[sparsity_index];
+            let layer = build_synthetic_achf_layer(
+                REGIME_DIM,
+                requested_sparsity,
+                true,
+                derive_seed(trial_seed, sparsity_index as u64),
+            );
+            let sparsity = layer
+                .inference_sparsity_stats()
+                .expect("synthetic ACHF layer must expose frozen sparsity");
+            let shape = (
+                sparsity.total_weights,
+                sparsity.nonzero_weights,
+                sparsity.sparsity,
+            );
+            if let Some(expected) = shapes[sparsity_index] {
+                assert_eq!(shape, expected, "synthetic sparsity changed across trials");
+            } else {
+                shapes[sparsity_index] = Some(shape);
+            }
+            let validation_input: Vec<f32> = (0..REGIME_DIM)
+                .map(|index| ((index % 7) as f32) * 0.1 + 0.05)
+                .collect();
+            assert_forced_paths_agree(&layer, &validation_input);
+            let (small, large) = if (trial + sparsity_index).is_multiple_of(2) {
+                (
+                    measure_regime(
+                        &layer,
+                        REGIME_DIM,
+                        REGIME_SMALL_BATCH,
+                        trial + sparsity_index,
+                    ),
+                    measure_regime(
+                        &layer,
+                        REGIME_DIM,
+                        REGIME_LARGE_BATCH,
+                        trial + sparsity_index + 1,
+                    ),
+                )
+            } else {
+                let large = measure_regime(
+                    &layer,
+                    REGIME_DIM,
+                    REGIME_LARGE_BATCH,
+                    trial + sparsity_index,
+                );
+                let small = measure_regime(
+                    &layer,
+                    REGIME_DIM,
+                    REGIME_SMALL_BATCH,
+                    trial + sparsity_index + 1,
+                );
+                (small, large)
+            };
+            println!(
+                "  trial={:<2} requested={requested_sparsity:<5.2} actual={:.4} \
+                 b{:<3}: gap={:.2}x oracle={} | b{:<3}: gap={:.2}x oracle={}",
+                trial + 1,
+                sparsity.sparsity,
+                REGIME_SMALL_BATCH,
+                small.adaptive_ns / small.oracle_ns.max(1.0),
+                small.oracle_path,
+                REGIME_LARGE_BATCH,
+                large.adaptive_ns / large.oracle_ns.max(1.0),
+                large.oracle_path,
+            );
+            trials[sparsity_index].0.push(small);
+            trials[sparsity_index].1.push(large);
+        }
     }
-    rows
+
+    REGIME_SPARSITIES
+        .into_iter()
+        .enumerate()
+        .map(|(index, requested_sparsity)| {
+            let (total_weights, nonzero_weights, actual_sparsity) =
+                shapes[index].expect("regime row was not measured");
+            RegimeRow {
+                requested_sparsity,
+                actual_sparsity,
+                total_weights,
+                nonzero_weights,
+                small: aggregate_regime_trials(&trials[index].0),
+                large: aggregate_regime_trials(&trials[index].1),
+            }
+        })
+        .collect()
 }
 
 /// Measure one (layer, batch) operating point: warm the batch bucket, time the
 /// live adaptive selector, time each forced fixed path, and record the sparse
 /// selection fraction over a fresh measurement window.
-fn measure_regime(layer: &AchfLayer, dim: usize, batch: usize) -> RegimeLatency {
+fn measure_regime(
+    layer: &AchfLayer,
+    dim: usize,
+    batch: usize,
+    rotation: usize,
+) -> RegimeTrialLatency {
     let x: Vec<f32> = (0..dim * batch)
         .map(|i| ((i % 7) as f32) * 0.1 + 0.05)
         .collect();
-    let warm = 300usize;
-    let iters = 600usize;
     // Warm the adaptive selector's bucket for this batch, then time it live.
-    for _ in 0..warm {
+    for _ in 0..REGIME_WARMUP_CALLS {
         let _ = std::hint::black_box(layer.forward_inference_residual(std::hint::black_box(&x)));
     }
     let before = layer.cache_stats();
     let start = Instant::now();
-    for _ in 0..iters {
+    for _ in 0..REGIME_MEASURE_CALLS {
         let _ = std::hint::black_box(layer.forward_inference_residual(std::hint::black_box(&x)));
     }
-    let adaptive_ns = start.elapsed().as_nanos() as f64 / iters as f64;
+    let adaptive_ns = start.elapsed().as_nanos() as f64 / REGIME_MEASURE_CALLS as f64;
     let after = layer.cache_stats();
     let sparse = (after.sparse_paths - before.sparse_paths) as f64;
     let total = ((after.cache_hits - before.cache_hits)
@@ -782,9 +1278,18 @@ fn measure_regime(layer: &AchfLayer, dim: usize, batch: usize) -> RegimeLatency 
     let sparse_frac = sparse / total.max(1.0);
 
     // Forced fixed-path costs at the same operating point (reproducible).
-    let cached_ns = time_forced_path(layer, &x, 0, 40, iters);
-    let sparse_ns = time_forced_path(layer, &x, 1, 40, iters);
-    let dense_ns = time_forced_path(layer, &x, 2, 40, iters);
+    let forced = measure_forced_path_samples(
+        layer,
+        &x,
+        REGIME_FORCED_WARMUP_ROUNDS,
+        REGIME_MEASURE_CALLS / REGIME_FORCED_CALLS_PER_SAMPLE,
+        REGIME_FORCED_CALLS_PER_SAMPLE,
+        rotation,
+    );
+    let [cached_values, sparse_values, dense_values] = forced;
+    let cached_ns = cached_values.iter().sum::<f64>() / cached_values.len() as f64;
+    let sparse_ns = sparse_values.iter().sum::<f64>() / sparse_values.len() as f64;
+    let dense_ns = dense_values.iter().sum::<f64>() / dense_values.len() as f64;
     let (oracle_ns, oracle_path) = [
         (cached_ns, "Cached"),
         (sparse_ns, "Sparse"),
@@ -798,82 +1303,78 @@ fn measure_regime(layer: &AchfLayer, dim: usize, batch: usize) -> RegimeLatency 
             acc
         }
     });
-    RegimeLatency {
+    RegimeTrialLatency {
         batch,
         adaptive_ns,
         cached_ns,
         sparse_ns,
+        dense_ns,
         oracle_ns,
         oracle_path: oracle_path.to_string(),
         sparse_frac,
     }
 }
 
-fn run_gate_curve(base_config: &Config, seed: u64) -> BenchRunResult {
+fn aggregate_regime_trials(trials: &[RegimeTrialLatency]) -> RegimeLatency {
+    assert!(!trials.is_empty(), "cannot aggregate zero regime trials");
+    assert!(
+        trials.iter().all(|trial| trial.batch == trials[0].batch),
+        "mixed batch sizes in regime aggregation"
+    );
+    let values = |value: fn(&RegimeTrialLatency) -> f64| {
+        TrialStats::from_values(&trials.iter().map(value).collect::<Vec<_>>())
+    };
+    let mut oracle_path_counts = BTreeMap::new();
+    for trial in trials {
+        *oracle_path_counts
+            .entry(trial.oracle_path.clone())
+            .or_insert(0usize) += 1;
+    }
+    let oracle_path = oracle_path_counts
+        .iter()
+        .max_by(|left, right| left.1.cmp(right.1).then_with(|| right.0.cmp(left.0)))
+        .map(|(path, _)| path.clone())
+        .expect("regime oracle path counts should not be empty");
+    RegimeLatency {
+        batch: trials[0].batch,
+        adaptive_ns: values(|trial| trial.adaptive_ns),
+        cached_ns: values(|trial| trial.cached_ns),
+        sparse_ns: values(|trial| trial.sparse_ns),
+        dense_ns: values(|trial| trial.dense_ns),
+        oracle_ns: values(|trial| trial.oracle_ns),
+        oracle_gap: values(|trial| trial.adaptive_ns / trial.oracle_ns.max(1.0)),
+        oracle_path,
+        oracle_path_counts,
+        oracle_paths: trials
+            .iter()
+            .map(|trial| trial.oracle_path.clone())
+            .collect(),
+        sparse_frac: values(|trial| trial.sparse_frac),
+    }
+}
+
+fn run_gate_curve(base_config: &Config, seed: u64, num_trials: usize) -> AggregatedResult {
     println!("[Bench] Running Gate Curve Experiment...");
-    let mut rng = Rng::from_seed(seed);
     let mut cfg = bench_sized_config(base_config);
     cfg.achf.enabled = true;
-    // The gate-curve experiment exists to exercise the adaptive path-selection
-    // (AMA) machinery: latency probing, EMA scoring, and re-selection across
-    // Cached/Sparse/Dense. A frozen layer's deterministic fast path only ever
-    // resolves to Cached-or-Dense (the fused cached operator is permanently
-    // cheapest, so Sparse is structurally unreachable and no latency samples are
-    // taken). Without this flag the summary reports latency_samples=0 and
-    // sparse_paths=0 — the very mechanism the experiment is meant to measure
-    // never runs. Enabling adaptive inference keeps the selector live after
-    // freeze (weights fixed, path adaptive).
-    cfg.achf.adaptive_inference = true;
-    cfg.ppo_total_steps = cfg.ppo_total_steps.min(4000);
-    cfg.ppo_steps_per_update = cfg.ppo_steps_per_update.min(256);
-    cfg.ppo_k_epochs = cfg.ppo_k_epochs.min(2);
-
-    let (env_net, neural_opt, _worker) = build_base_models(&cfg, &mut rng);
-
-    let (snapshots_tx, snapshots_rx) = std::sync::mpsc::channel();
-    let start = Instant::now();
-    let ppo = train_ppo_with_metrics(&mut rng, &env_net, &cfg, Some(snapshots_tx));
-    let elapsed = start.elapsed();
-
-    let snapshots: Vec<StepSnapshot> = snapshots_rx.try_iter().collect();
-    let final_reward = snapshots.last().map_or(0.0, |s| s.reward);
-    let throughput = measure_inference_throughput(
-        &mut rng,
-        &ThroughputParams {
-            neural_opt: &neural_opt,
-            dqn: None,
-            ppo: Some(&ppo),
-            env_net: &env_net,
-            config: &cfg,
-            sims: CURVE_THROUGHPUT_SIMS,
-            pulls: THROUGHPUT_PULLS,
-        },
-    );
-
-    BenchRunResult {
-        label: "Gate Curve".to_string(),
-        total_time_ms: elapsed.as_secs_f64() * 1000.0,
-        throughput_sims_per_sec: throughput,
-        final_avg_reward: final_reward,
-        final_loss: snapshots.last().map_or(0.0, |s| s.loss),
-        param_count: ppo.param_count(),
-        snapshots,
-        cache_stats: aggregate_model_cache_stats(&cfg, None, Some(&ppo)),
-    }
+    cfg.achf.mode = "full".to_string();
+    cfg.achf.adaptive_inference = false;
+    cap_ppo_training(&mut cfg, 4000);
+    let conditions = vec![("Gate Curve".to_string(), cfg)];
+    let runs = run_interleaved_conditions(&conditions, seed, num_trials);
+    aggregate_conditions(&runs, &[0])
+        .into_iter()
+        .next()
+        .expect("gate curve aggregation should produce one result")
 }
 
 fn run_scale_test(base_config: &Config, seed: u64, nt: usize) -> Vec<AggregatedResult> {
     println!("[Bench] Running Scale Test (varying rank + ACHF off baseline)...");
-    let mut agg = Vec::new();
-    // Baseline: ACHF disabled
-    {
-        let label = "No ACHF";
-        println!("  [{}]", label);
-        let mut cfg = bench_sized_config(base_config);
-        cfg.achf.enabled = false;
-        let runs = run_multi_trial(label, &cfg, seed, nt);
-        agg.push(aggregate_trials(&runs));
-    }
+    let mut conditions = Vec::new();
+    let mut baseline = bench_sized_config(base_config);
+    baseline.achf.enabled = false;
+    cap_ppo_training(&mut baseline, 2000);
+    conditions.push(("No ACHF".to_string(), baseline));
     // The ACHF FFN in the bench-sized model is hidden_dim*2 -> hidden_dim, and
     // bench_sized_config clamps hidden_dim to 64, so the layer's smaller
     // dimension is 64. `effective_rank` only truncates when rank < 64, and the
@@ -889,173 +1390,186 @@ fn run_scale_test(base_config: &Config, seed: u64, nt: usize) -> Vec<AggregatedR
     // so the no-op at 64 is visible rather than masquerading as a real setting.
     for rank in [8, 16, 32, 48, 64] {
         let label = format!("rank={}", rank);
-        println!("  [{}]", label);
         let mut cfg = bench_sized_config(base_config);
         cfg.achf.enabled = true;
         cfg.achf.rank = rank;
-        let runs = run_multi_trial(&label, &cfg, seed, nt);
-        agg.push(aggregate_trials(&runs));
+        cap_ppo_training(&mut cfg, 2000);
+        conditions.push((label, cfg));
     }
-    agg
+    let runs = run_interleaved_conditions(&conditions, seed, nt);
+    aggregate_conditions(&runs, &vec![0; conditions.len()])
 }
 
 fn run_apply_combination(base_config: &Config, seed: u64, nt: usize) -> Vec<AggregatedResult> {
-    println!("[Bench] Running Apply Combination Experiment...");
-    let combos: Vec<(&str, bool, bool, bool)> = vec![
-        ("None", false, false, false),
-        ("FFN only", false, true, false),
-        ("Attn only", true, false, false),
-        ("DQN only", false, false, true),
-        ("FFN+Attn", true, true, false),
-        ("FFN+Attn+DQN", true, true, true),
+    println!("[Bench] Running Apply Placement Experiment (active policy only)...");
+    let combos: Vec<(&str, LuckMode, bool, bool, bool)> = vec![
+        ("PPO: no ACHF", LuckMode::Ppo, false, false, false),
+        ("PPO: FFN", LuckMode::Ppo, false, true, false),
+        ("PPO: Attn", LuckMode::Ppo, true, false, false),
+        ("PPO: FFN+Attn", LuckMode::Ppo, true, true, false),
+        ("DQN: no ACHF", LuckMode::Dqn, false, false, false),
+        ("DQN: ACHF", LuckMode::Dqn, false, false, true),
     ];
-    let mut agg = Vec::new();
-    for (label, attn, ffn, dqn_flag) in combos {
-        println!("  [{}]", label);
-        let mut cfg = bench_sized_config(base_config);
-        cfg.achf.enabled = attn || ffn || dqn_flag;
-        cfg.achf.apply_attn = attn;
-        cfg.achf.apply_ffn = ffn;
-        cfg.achf.apply_dqn = dqn_flag;
-        cfg.luck_mode = if dqn_flag && !attn && !ffn {
-            LuckMode::Dqn
-        } else {
-            LuckMode::Ppo
-        };
-        let runs = run_multi_trial(label, &cfg, seed, nt);
-        agg.push(aggregate_trials(&runs));
-    }
-    agg
+    let conditions: Vec<(String, Config)> = combos
+        .into_iter()
+        .map(|(label, policy, attn, ffn, dqn)| {
+            let mut cfg = bench_sized_config(base_config);
+            cfg.luck_mode = policy;
+            cfg.achf.enabled = attn || ffn || dqn;
+            cfg.achf.apply_attn = attn;
+            cfg.achf.apply_ffn = ffn;
+            cfg.achf.apply_dqn = dqn;
+            cap_ppo_training(&mut cfg, 2000);
+            (label.to_string(), cfg)
+        })
+        .collect();
+    let runs = run_interleaved_conditions(&conditions, seed, nt);
+    aggregate_conditions(&runs, &[0, 0, 0, 0, 4, 4])
 }
 
 fn run_convergence(base_config: &Config, seed: u64, nt: usize) -> Vec<AggregatedResult> {
     println!("[Bench] Running Convergence Experiment (ACHF on/off loss curves)...");
-    let mut agg = Vec::new();
-    for (label, enabled) in [("ACHF Enabled", true), ("ACHF Disabled", false)] {
-        println!("  [{}]", label);
-        let mut runs = Vec::new();
-        for t in 0..nt {
-            let trial_seed = seed.wrapping_add(t as u64 * 1337);
-            let mut rng = Rng::from_seed(trial_seed);
+    let conditions: Vec<(String, Config)> = [("ACHF Disabled", false), ("ACHF Enabled", true)]
+        .into_iter()
+        .map(|(label, enabled)| {
             let mut cfg = bench_sized_config(base_config);
             cfg.achf.enabled = enabled;
-            cfg.ppo_total_steps = cfg.ppo_total_steps.min(4000);
-            cfg.ppo_steps_per_update = cfg.ppo_steps_per_update.min(256);
-            cfg.ppo_k_epochs = cfg.ppo_k_epochs.min(2);
-            let (env_net, neural_opt, _worker) = build_base_models(&cfg, &mut rng);
+            cap_ppo_training(&mut cfg, 4000);
+            (label.to_string(), cfg)
+        })
+        .collect();
+    let runs = run_interleaved_conditions(&conditions, seed, nt);
+    aggregate_conditions(&runs, &[0, 0])
+}
+
+// ── Shared training + measurement helper ────────────────────────────────
+
+fn train_and_measure(label: &str, config: &Config, seed: u64) -> BenchRunResult {
+    let cfg = config.clone();
+    let (env_net, neural_opt, _worker) =
+        build_base_models(&cfg, derive_seed(seed, SEED_BASE_MODELS));
+    let eval_seed = derive_seed(seed, SEED_POLICY_EVAL);
+    let throughput_seed = derive_seed(seed, SEED_THROUGHPUT);
+
+    match cfg.luck_mode {
+        LuckMode::Dqn => {
             let (tx, rx) = std::sync::mpsc::channel();
-            let start = Instant::now();
-            let ppo = train_ppo_with_metrics(&mut rng, &env_net, &cfg, Some(tx));
-            let elapsed = start.elapsed();
+            let mut train_rng = Rng::from_seed(derive_seed(seed, SEED_DQN_TRAIN));
+            let train_start = Instant::now();
+            let dqn = train_dqn_with_metrics(&neural_opt, &mut train_rng, &env_net, &cfg, Some(tx));
+            let train_elapsed = train_start.elapsed();
             let snapshots: Vec<StepSnapshot> = rx.try_iter().collect();
-            let final_reward = snapshots.last().map_or(0.0, |s| s.reward);
-            let final_loss = snapshots.last().map_or(0.0, |s| s.loss);
+            let train_loss = snapshots
+                .last()
+                .expect("DQN benchmark emitted no training snapshots")
+                .loss;
+            let before = aggregate_model_cache_stats(&cfg, Some(&dqn), None);
+            let eval = evaluate_dqn_policy(&dqn, &env_net, &cfg, BENCH_EVAL_EPISODES, eval_seed);
             let throughput = measure_inference_throughput(
-                &mut rng,
+                throughput_seed,
+                &ThroughputParams {
+                    neural_opt: &neural_opt,
+                    dqn: Some(&dqn),
+                    ppo: None,
+                    env_net: &env_net,
+                    config: &cfg,
+                    sims: THROUGHPUT_SIMS,
+                    pulls: THROUGHPUT_PULLS,
+                },
+            );
+            let after = aggregate_model_cache_stats(&cfg, Some(&dqn), None);
+            let cache_stats = before.zip(after).map(|(before, after)| {
+                let stats = cache_stats_delta(before, after);
+                AchfCacheStats::debug_print(&[stats]);
+                stats
+            });
+            let achf = dqn.snapshot_achf();
+            log_applied_rank(achf);
+            BenchRunResult {
+                label: label.to_string(),
+                policy: "DQN".to_string(),
+                train_time_ms: train_elapsed.as_secs_f64() * 1000.0,
+                throughput_sims_per_sec: throughput,
+                eval_reward: eval.avg_reward,
+                train_loss,
+                param_count: dqn.param_count(),
+                applied_rank: achf.map(|snapshot| snapshot.low_rank_applied_rank),
+                snapshots,
+                cache_stats,
+            }
+        }
+        LuckMode::Ppo => {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut train_rng = Rng::from_seed(derive_seed(seed, SEED_PPO_TRAIN));
+            let train_start = Instant::now();
+            let ppo = train_ppo_with_metrics(&mut train_rng, &env_net, &cfg, Some(tx));
+            let train_elapsed = train_start.elapsed();
+            let snapshots: Vec<StepSnapshot> = rx.try_iter().collect();
+            let train_loss = snapshots
+                .last()
+                .expect("PPO benchmark emitted no training snapshots")
+                .loss;
+            let before = aggregate_model_cache_stats(&cfg, None, Some(&ppo));
+            let context_len = if cfg.ppo_context_len > 0 {
+                cfg.ppo_context_len
+            } else if cfg.fast_init {
+                6
+            } else {
+                8
+            };
+            let eval = evaluate_ppo_policy(
+                &ppo,
+                &env_net,
+                &cfg,
+                context_len,
+                BENCH_EVAL_EPISODES,
+                eval_seed,
+            );
+            let throughput = measure_inference_throughput(
+                throughput_seed,
                 &ThroughputParams {
                     neural_opt: &neural_opt,
                     dqn: None,
                     ppo: Some(&ppo),
                     env_net: &env_net,
                     config: &cfg,
-                    sims: CURVE_THROUGHPUT_SIMS,
+                    sims: THROUGHPUT_SIMS,
                     pulls: THROUGHPUT_PULLS,
                 },
             );
-            let cache_stats = if enabled {
-                let stats = aggregate_model_cache_stats(&cfg, None, Some(&ppo))
-                    .unwrap_or_else(|| ppo.achf_cache_stats_aggregate());
+            let after = aggregate_model_cache_stats(&cfg, None, Some(&ppo));
+            let cache_stats = before.zip(after).map(|(before, after)| {
+                let stats = cache_stats_delta(before, after);
                 AchfCacheStats::debug_print(&[stats]);
-                Some(stats)
-            } else {
-                None
-            };
-            println!(
-                "    trial {}/{}: {:.1}s | {:.0} sims/sec | reward: {:.3} | loss: {:.4} | {} snapshots",
-                t + 1,
-                nt,
-                elapsed.as_secs_f64(),
-                throughput,
-                final_reward,
-                final_loss,
-                snapshots.len()
-            );
-            runs.push(BenchRunResult {
+                stats
+            });
+            let achf = ppo.snapshot_achf();
+            log_applied_rank(achf);
+            BenchRunResult {
                 label: label.to_string(),
-                total_time_ms: elapsed.as_secs_f64() * 1000.0,
+                policy: "PPO".to_string(),
+                train_time_ms: train_elapsed.as_secs_f64() * 1000.0,
                 throughput_sims_per_sec: throughput,
-                final_avg_reward: final_reward,
-                final_loss,
+                eval_reward: eval.avg_reward,
+                train_loss,
                 param_count: ppo.param_count(),
+                applied_rank: achf.map(|snapshot| snapshot.low_rank_applied_rank),
                 snapshots,
                 cache_stats,
-            });
-        }
-        agg.push(aggregate_trials(&runs));
-    }
-    agg
-}
-
-// ── Shared training + measurement helper ────────────────────────────────
-
-fn train_and_measure(label: &str, config: &Config, seed: u64) -> BenchRunResult {
-    let mut rng = Rng::from_seed(seed);
-    let mut cfg = config.clone();
-    if cfg.fast_init {
-        cfg.ppo_total_steps = cfg.ppo_total_steps.min(2000);
-        cfg.ppo_steps_per_update = cfg.ppo_steps_per_update.min(256);
-        cfg.ppo_k_epochs = cfg.ppo_k_epochs.min(2);
-    }
-    let (env_net, neural_opt, _worker) = build_base_models(&cfg, &mut rng);
-
-    let (tx, rx) = std::sync::mpsc::channel();
-    let train_start = Instant::now();
-    let dqn = train_dqn_with_metrics(&neural_opt, &mut rng, &env_net, &cfg, None);
-    let ppo = train_ppo_with_metrics(&mut rng, &env_net, &cfg, Some(tx));
-    let train_elapsed = train_start.elapsed();
-
-    let snapshots: Vec<StepSnapshot> = rx.try_iter().collect();
-
-    let throughput = measure_inference_throughput(
-        &mut rng,
-        &ThroughputParams {
-            neural_opt: &neural_opt,
-            dqn: Some(&dqn),
-            ppo: Some(&ppo),
-            env_net: &env_net,
-            config: &cfg,
-            sims: THROUGHPUT_SIMS,
-            pulls: THROUGHPUT_PULLS,
-        },
-    );
-
-    let cache_stats = if cfg.achf.enabled {
-        let stats = aggregate_model_cache_stats(&cfg, Some(&dqn), Some(&ppo))
-            .expect("enabled ACHF benchmark should produce aggregate stats");
-        AchfCacheStats::debug_print(&[stats]);
-        if let Some(snapshot) = ppo.snapshot_achf().or_else(|| dqn.snapshot_achf()) {
-            if snapshot.low_rank_applied_rank > 0 {
-                println!(
-                    "    [ACHF] low-rank: rank={} rel_err={:.4}",
-                    snapshot.low_rank_applied_rank, snapshot.low_rank_rel_err
-                );
             }
         }
-        Some(stats)
-    } else {
-        None
-    };
+        LuckMode::Probability => {
+            panic!("ACHF policy benchmark requires luck_mode=dqn or luck_mode=ppo")
+        }
+    }
+}
 
-    let pc = ppo.param_count() + dqn.param_count();
-    BenchRunResult {
-        label: label.to_string(),
-        total_time_ms: train_elapsed.as_secs_f64() * 1000.0,
-        throughput_sims_per_sec: throughput,
-        final_avg_reward: snapshots.last().map_or(0.0, |s| s.reward),
-        final_loss: snapshots.last().map_or(0.0, |s| s.loss),
-        param_count: pc,
-        snapshots,
-        cache_stats,
+fn log_applied_rank(snapshot: Option<crate::achf::AchfStateSnapshot>) {
+    if let Some(snapshot) = snapshot.filter(|snapshot| snapshot.low_rank_applied_rank > 0) {
+        println!(
+            "    [ACHF] low-rank: rank={} rel_err={:.4}",
+            snapshot.low_rank_applied_rank, snapshot.low_rank_rel_err
+        );
     }
 }
 
@@ -1082,7 +1596,13 @@ fn chart_ablation(agg: &[AggregatedResult], dir: &str, ext: &str) {
             500,
         ),
     );
-    chart_agg_reward_curve(agg, dir, ext, "ablation_reward", "Ablation: Reward Curve");
+    chart_agg_reward_curve(
+        agg,
+        dir,
+        ext,
+        "ablation_reward",
+        "Ablation: Training Reward Curve",
+    );
 }
 
 fn chart_mode(agg: &[AggregatedResult], dir: &str, ext: &str) {
@@ -1102,12 +1622,12 @@ fn chart_mode(agg: &[AggregatedResult], dir: &str, ext: &str) {
     );
 }
 
-fn chart_path_latency(latencies: &[(String, Vec<f64>)], dir: &str, ext: &str) {
+fn chart_path_latency(latencies: &[PathLatencyResult], dir: &str, ext: &str) {
     let stats: Vec<(&str, [f64; 5])> = latencies
         .iter()
-        .filter(|(_, vals)| !vals.is_empty())
-        .map(|(name, vals)| {
-            let mut sorted = vals.clone();
+        .filter(|result| result.trial_samples.iter().any(|values| !values.is_empty()))
+        .map(|result| {
+            let mut sorted: Vec<f64> = result.trial_samples.iter().flatten().copied().collect();
             sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let n = sorted.len();
             let q1 = sorted[n / 4];
@@ -1125,7 +1645,7 @@ fn chart_path_latency(latencies: &[(String, Vec<f64>)], dir: &str, ext: &str) {
             let lower_fence = (q1 - 1.5 * iqr).max(sorted[0]);
             let upper_fence = (q3 + 1.5 * iqr).min(sorted[n - 1]);
             let q = [lower_fence, q1, median, q3, upper_fence];
-            (name.as_str(), q)
+            (result.label.as_str(), q)
         })
         .collect();
     let path = format!("{}/path_latency_boxplot.{}", dir, ext);
@@ -1143,39 +1663,39 @@ fn chart_path_latency(latencies: &[(String, Vec<f64>)], dir: &str, ext: &str) {
     );
 }
 
-fn chart_gate_curve(result: &BenchRunResult, dir: &str, ext: &str) {
-    if result.snapshots.is_empty() {
+fn chart_gate_curve(result: &AggregatedResult, dir: &str, ext: &str) {
+    if result.curve.is_empty() {
         return;
     }
     let gate: Vec<(f64, f64)> = result
-        .snapshots
+        .curve
         .iter()
-        .map(|s| (s.step as f64, s.gate_value))
+        .map(|point| (point.step as f64, point.gate_value.mean))
         .collect();
     let gmin: Vec<(f64, f64)> = result
-        .snapshots
+        .curve
         .iter()
-        .map(|s| (s.step as f64, s.g_min))
+        .map(|point| (point.step as f64, point.g_min.mean))
         .collect();
     let grad: Vec<(f64, f64)> = result
-        .snapshots
+        .curve
         .iter()
-        .map(|s| (s.step as f64, s.grad_ema))
+        .map(|point| (point.step as f64, point.grad_ema.mean))
         .collect();
     let hit: Vec<(f64, f64)> = result
-        .snapshots
+        .curve
         .iter()
-        .map(|s| (s.step as f64, s.cache_hit_rate))
+        .map(|point| (point.step as f64, point.cache_hit_rate.mean))
         .collect();
     let lr_ratio: Vec<(f64, f64)> = result
-        .snapshots
+        .curve
         .iter()
-        .map(|s| (s.step as f64, s.sparse_ratio))
+        .map(|point| (point.step as f64, point.sparse_ratio.mean))
         .collect();
     let abias: Vec<(f64, f64)> = result
-        .snapshots
+        .curve
         .iter()
-        .map(|s| (s.step as f64, s.adaptive_bias))
+        .map(|point| (point.step as f64, point.adaptive_bias.mean))
         .collect();
 
     let series: Vec<(&str, &[(f64, f64)])> = vec![
@@ -1215,15 +1735,15 @@ fn chart_crossover(cells: &[CrossoverCell], dir: &str, ext: &str) {
         }
         let cached: Vec<(f64, f64)> = rows
             .iter()
-            .map(|c| (c.weight_sparsity as f64, c.cached_ns))
+            .map(|cell| (cell.actual_sparsity, cell.cached_ns.mean))
             .collect();
         let sparse: Vec<(f64, f64)> = rows
             .iter()
-            .map(|c| (c.weight_sparsity as f64, c.sparse_ns))
+            .map(|cell| (cell.actual_sparsity, cell.sparse_ns.mean))
             .collect();
         let dense: Vec<(f64, f64)> = rows
             .iter()
-            .map(|c| (c.weight_sparsity as f64, c.dense_ns))
+            .map(|cell| (cell.actual_sparsity, cell.dense_ns.mean))
             .collect();
         let series: Vec<(&str, &[(f64, f64)])> =
             vec![("Cached", &cached), ("Sparse", &sparse), ("Dense", &dense)];
@@ -1260,25 +1780,19 @@ fn chart_regime(rows: &[RegimeRow], dir: &str, ext: &str) {
             [
                 format!(
                     "wsp{:.2} b{}={}",
-                    r.weight_sparsity, r.small.batch, r.small.oracle_path
+                    r.actual_sparsity, r.small.batch, r.small.oracle_path
                 ),
                 format!(
                     "wsp{:.2} b{}={}",
-                    r.weight_sparsity, r.large.batch, r.large.oracle_path
+                    r.actual_sparsity, r.large.batch, r.large.oracle_path
                 ),
             ]
         })
         .collect();
     let mut bars: Vec<(&str, f64)> = Vec::with_capacity(labels.len());
     for (i, r) in rows.iter().enumerate() {
-        bars.push((
-            labels[2 * i].as_str(),
-            r.small.adaptive_ns / r.small.oracle_ns.max(1.0),
-        ));
-        bars.push((
-            labels[2 * i + 1].as_str(),
-            r.large.adaptive_ns / r.large.oracle_ns.max(1.0),
-        ));
+        bars.push((labels[2 * i].as_str(), r.small.oracle_gap.mean));
+        bars.push((labels[2 * i + 1].as_str(), r.large.oracle_gap.mean));
     }
     let path = format!("{}/regime_adaptation.{}", dir, ext);
     write_chart(
@@ -1332,12 +1846,12 @@ fn chart_apply(agg: &[AggregatedResult], dir: &str, ext: &str) {
 fn chart_convergence(agg: &[AggregatedResult], dir: &str, ext: &str) {
     let loss_series: Vec<(String, Vec<(f64, f64)>)> = agg
         .iter()
-        .filter(|a| !a.best_snapshots.is_empty())
+        .filter(|result| !result.curve.is_empty())
         .map(|a| {
             let pts: Vec<(f64, f64)> = a
-                .best_snapshots
+                .curve
                 .iter()
-                .map(|s| (s.step as f64, s.loss))
+                .map(|point| (point.step as f64, point.train_loss.mean))
                 .collect();
             (a.label.clone(), pts)
         })
@@ -1369,7 +1883,7 @@ fn chart_convergence(agg: &[AggregatedResult], dir: &str, ext: &str) {
         dir,
         ext,
         "convergence_reward",
-        "Convergence: Reward Curve",
+        "Convergence: Training Reward Curve",
     );
 }
 
@@ -1382,12 +1896,12 @@ fn chart_agg_reward_curve(
 ) {
     let series: Vec<(String, Vec<(f64, f64)>)> = agg
         .iter()
-        .filter(|a| !a.best_snapshots.is_empty())
+        .filter(|result| !result.curve.is_empty())
         .map(|a| {
             let pts: Vec<(f64, f64)> = a
-                .best_snapshots
+                .curve
                 .iter()
-                .map(|s| (s.step as f64, s.reward))
+                .map(|point| (point.step as f64, point.train_reward.mean))
                 .collect();
             (a.label.clone(), pts)
         })
@@ -1407,7 +1921,7 @@ fn chart_agg_reward_curve(
             &path,
             title,
             "Training Step",
-            "Avg Reward",
+            "Training Avg Reward",
             &series_ref,
             900,
             500,
@@ -1417,12 +1931,18 @@ fn chart_agg_reward_curve(
 
 // ── Output: summary, JSON, CSV ──────────────────────────────────────────
 
-/// Effective low-rank truncation actually applied by a config's ACHF layer,
-/// taken from its final snapshot. Returns None when the config produced no
-/// snapshots. A value of 0 means the requested rank was a no-op (>= the layer's
-/// smaller dimension), which is exactly the degenerate case worth surfacing.
+/// Effective low-rank truncation actually applied by the active frozen policy.
+/// A value of 0 means the requested rank was a no-op (>= the layer's smaller
+/// dimension), which is exactly the degenerate case worth surfacing.
 fn effective_applied_rank(a: &AggregatedResult) -> Option<usize> {
-    a.best_snapshots.last().map(|s| s.low_rank_applied_rank)
+    a.applied_rank
+}
+
+fn format_ci(stats: &TrialStats) -> String {
+    match (stats.ci_low, stats.ci_high) {
+        (Some(low), Some(high)) => format!("95% CI [{low:.4}, {high:.4}]"),
+        _ => "95% CI unavailable (n=1)".to_string(),
+    }
 }
 
 fn print_agg_summary(name: &str, agg: &[AggregatedResult]) {
@@ -1434,21 +1954,34 @@ fn print_agg_summary(name: &str, agg: &[AggregatedResult]) {
             None => String::new(),
         };
         println!(
-            "  {:20} | tput: {:.0} +/- {:.0} | reward: {:.4} +/- {:.4} | loss: {:.4} +/- {:.4} | params: {}{}",
+            "  {:20} | policy={} | tput: {:.0} +/- {:.0} | eval_reward: {:.4} +/- {:.4} | train_loss: {:.4} +/- {:.4} | params: {}{}",
             a.label,
+            a.policy,
             a.throughput.mean, a.throughput.std_dev,
-            a.reward.mean, a.reward.std_dev,
-            a.loss.mean, a.loss.std_dev,
+            a.eval_reward.mean, a.eval_reward.std_dev,
+            a.train_loss.mean, a.train_loss.std_dev,
             a.param_count,
             rank_note
         );
+        if let Some(paired) = &a.paired {
+            println!(
+                "    paired vs {}: delta_tput={:.1} ({}) | delta_eval_reward={:.4} ({})",
+                paired.baseline,
+                paired.throughput_delta.mean,
+                format_ci(&paired.throughput_delta),
+                paired.eval_reward_delta.mean,
+                format_ci(&paired.eval_reward_delta),
+            );
+        }
     }
 }
 
 fn write_summary_txt(
     all: &[(&str, Vec<AggregatedResult>)],
-    path_latencies: Option<&[(String, Vec<f64>)]>,
-    gate_curve: Option<&BenchRunResult>,
+    path_latencies: Option<&[PathLatencyResult]>,
+    gate_curve: Option<&AggregatedResult>,
+    crossover: Option<&[CrossoverCell]>,
+    regime: Option<&[RegimeRow]>,
     dir: &str,
 ) {
     let mut lines = Vec::new();
@@ -1461,14 +1994,35 @@ fn write_summary_txt(
                 None => String::new(),
             };
             lines.push(format!(
-                "  {:20} | tput={:.0}+/-{:.0} | reward={:.4}+/-{:.4} | loss={:.4}+/-{:.4} | params={}{}",
+                "  {:20} | policy={} | trials={} | tput={:.0}+/-{:.0} ({}) | eval_reward={:.4}+/-{:.4} ({}) | train_loss={:.4}+/-{:.4} ({}) | policy_train_ms={:.1}+/-{:.1} ({}) | params={}{}",
                 a.label,
+                a.policy,
+                a.throughput.values.len(),
                 a.throughput.mean, a.throughput.std_dev,
-                a.reward.mean, a.reward.std_dev,
-                a.loss.mean, a.loss.std_dev,
+                format_ci(&a.throughput),
+                a.eval_reward.mean, a.eval_reward.std_dev,
+                format_ci(&a.eval_reward),
+                a.train_loss.mean, a.train_loss.std_dev,
+                format_ci(&a.train_loss),
+                a.train_time_ms.mean, a.train_time_ms.std_dev,
+                format_ci(&a.train_time_ms),
                 a.param_count,
                 rank_note
             ));
+            if let Some(paired) = &a.paired {
+                lines.push(format!(
+                    "    paired vs {}: delta_tput={:.2} ({}) | delta_eval_reward={:.4} ({}) | delta_train_loss={:.4} ({}) | delta_train_ms={:.1} ({})",
+                    paired.baseline,
+                    paired.throughput_delta.mean,
+                    format_ci(&paired.throughput_delta),
+                    paired.eval_reward_delta.mean,
+                    format_ci(&paired.eval_reward_delta),
+                    paired.train_loss_delta.mean,
+                    format_ci(&paired.train_loss_delta),
+                    paired.train_time_ms_delta.mean,
+                    format_ci(&paired.train_time_ms_delta),
+                ));
+            }
             if let Some(ref stats) = a.cache_stats {
                 let calls = stats.calls as f64;
                 let hit_pct = if calls > 0.0 {
@@ -1477,7 +2031,8 @@ fn write_summary_txt(
                     0.0
                 };
                 lines.push(format!(
-                    "    ACHF: calls={} hit={:.1}% lr={} dense={} latency_samples={} bias={:.3}",
+                    "    frozen ACHF ({} trials): calls={} hit={:.1}% sparse={} dense={} latency_samples={} bias={:.3}",
+                    a.cache_trial_count,
                     stats.calls,
                     hit_pct,
                     stats.sparse_paths,
@@ -1493,8 +2048,19 @@ fn write_summary_txt(
         lines.push("=== path_latency ===".to_string());
         for stats in path_latency_stats(latencies) {
             lines.push(format!(
-                "  {:20} | samples={} | mean={:.1}ns | p50={:.1}ns | p95={:.1}ns | p99={:.1}ns",
-                stats.label, stats.samples, stats.mean_ns, stats.p50_ns, stats.p95_ns, stats.p99_ns
+                "  {:20} | trials={} | samples={} | mean={:.1}+/-{:.1}ns | {} | p50={:.1}ns | p95={:.1}ns | p99={:.1}ns",
+                stats.label,
+                stats.trials,
+                stats.samples,
+                stats.mean_ns,
+                stats.std_dev_ns,
+                match (stats.ci_low_ns, stats.ci_high_ns) {
+                    (Some(low), Some(high)) => format!("95% CI [{low:.1}, {high:.1}]"),
+                    _ => "95% CI unavailable (n=1)".to_string(),
+                },
+                stats.p50_ns,
+                stats.p95_ns,
+                stats.p99_ns
             ));
         }
         lines.push(String::new());
@@ -1502,24 +2068,26 @@ fn write_summary_txt(
     if let Some(result) = gate_curve {
         lines.push("=== gate_curve ===".to_string());
         lines.push(format!(
-            "  {:20} | snapshots={} | tput={:.0} | reward={:.4} | loss={:.4} | params={} | train_time_ms={:.1}",
+            "  {:20} | trials={} | curve_points={} | tput={:.0} | eval_reward={:.4} | train_loss={:.4} | params={} | policy_train_time_ms={:.1}",
             result.label,
-            result.snapshots.len(),
-            result.throughput_sims_per_sec,
-            result.final_avg_reward,
-            result.final_loss,
+            result.throughput.values.len(),
+            result.curve.len(),
+            result.throughput.mean,
+            result.eval_reward.mean,
+            result.train_loss.mean,
             result.param_count,
-            result.total_time_ms
+            result.train_time_ms.mean
         ));
-        if let Some(last) = result.snapshots.last() {
+        if let Some(last) = result.curve.last() {
             lines.push(format!(
-                "    final training: step={} gate={:.4} g_min={:.4} hit={:.1}% sparse={:.1}% bias={:.3}",
+                "    final aggregated training point: step={} n={} gate={:.4} g_min={:.4} hit={:.1}% sparse={:.1}% bias={:.3}",
                 last.step,
-                last.gate_value,
-                last.g_min,
-                last.cache_hit_rate * 100.0,
-                last.sparse_ratio * 100.0,
-                last.adaptive_bias
+                last.samples,
+                last.gate_value.mean,
+                last.g_min.mean,
+                last.cache_hit_rate.mean * 100.0,
+                last.sparse_ratio.mean * 100.0,
+                last.adaptive_bias.mean
             ));
         }
         if let Some(stats) = result.cache_stats {
@@ -1550,6 +2118,50 @@ fn write_summary_txt(
         }
         lines.push(String::new());
     }
+    if let Some(cells) = crossover {
+        lines.push("=== crossover ===".to_string());
+        for cell in cells {
+            lines.push(format!(
+                "  dim={} requested={:.4} actual={:.4} nnz={}/{} | cached={:.1}ns ({}) sparse={:.1}ns ({}) dense={:.1}ns ({}) | winner={}",
+                cell.dim,
+                cell.requested_sparsity,
+                cell.actual_sparsity,
+                cell.nonzero_weights,
+                cell.total_weights,
+                cell.cached_ns.mean,
+                format_ci(&cell.cached_ns),
+                cell.sparse_ns.mean,
+                format_ci(&cell.sparse_ns),
+                cell.dense_ns.mean,
+                format_ci(&cell.dense_ns),
+                cell.winner,
+            ));
+        }
+        lines.push(String::new());
+    }
+    if let Some(rows) = regime {
+        lines.push("=== regime ===".to_string());
+        for row in rows {
+            for latency in [&row.small, &row.large] {
+                lines.push(format!(
+                    "  requested={:.4} actual={:.4} nnz={}/{} batch={} | adaptive={:.1}ns oracle={:.1}ns path={} counts={:?} gap={:.3} ({}) sparse_frac={:.3}",
+                    row.requested_sparsity,
+                    row.actual_sparsity,
+                    row.nonzero_weights,
+                    row.total_weights,
+                    latency.batch,
+                    latency.adaptive_ns.mean,
+                    latency.oracle_ns.mean,
+                    latency.oracle_path,
+                    latency.oracle_path_counts,
+                    latency.oracle_gap.mean,
+                    format_ci(&latency.oracle_gap),
+                    latency.sparse_frac.mean,
+                ));
+            }
+        }
+        lines.push(String::new());
+    }
     let path = format!("{}/summary.txt", dir);
     write_text_file(&path, &lines.join("\n"));
     println!("[Bench] Summary -> {}", path);
@@ -1557,33 +2169,87 @@ fn write_summary_txt(
 
 fn write_summary_json(
     all: &[(&str, Vec<AggregatedResult>)],
-    path_latencies: Option<&[(String, Vec<f64>)]>,
-    gate_curve: Option<&BenchRunResult>,
+    path_latencies: Option<&[PathLatencyResult]>,
+    gate_curve: Option<&AggregatedResult>,
+    crossover: Option<&[CrossoverCell]>,
+    regime: Option<&[RegimeRow]>,
+    metadata: (u64, usize),
     dir: &str,
 ) {
+    let (seed, num_trials) = metadata;
+    let logical_cpus = std::thread::available_parallelism().map_or(1, usize::from);
     let mut root = serde_json::Map::new();
+    root.insert(
+        "metadata".to_string(),
+        serde_json::json!({
+            "schema_version": 2,
+            "package_version": env!("CARGO_PKG_VERSION"),
+            "target_os": std::env::consts::OS,
+            "target_arch": std::env::consts::ARCH,
+            "debug_assertions": cfg!(debug_assertions),
+            "logical_cpus": logical_cpus,
+            "seed": seed,
+            "num_trials": num_trials,
+            "confidence_level": 0.95,
+            "confidence_interval": "two-sided Student-t; null when n < 2",
+            "trial_order": "rotating interleaved conditions",
+            "base_model_cache": "disabled; EnvNet is rebuilt from its domain seed for every condition",
+            "policy_eval": {
+                "episodes": BENCH_EVAL_EPISODES,
+                "timing": "after training freeze",
+                "seed_domain": format!("0x{SEED_POLICY_EVAL:016X}"),
+            },
+            "throughput": {
+                "simulations": THROUGHPUT_SIMS,
+                "pulls_per_simulation": THROUGHPUT_PULLS,
+                "warmup_simulations": THROUGHPUT_WARMUP_SIMS,
+                "timing": "after training freeze and held-out evaluation",
+                "seed_domain": format!("0x{SEED_THROUGHPUT:016X}"),
+            },
+            "microbenchmarks": {
+                "path": {
+                    "rank": PATH_RANK,
+                    "prune_threshold": PATH_PRUNE_THRESHOLD,
+                    "warmup_rounds": PATH_WARMUP_ROUNDS,
+                    "samples_per_trial": PATH_SAMPLES,
+                    "calls_per_sample": PATH_CALLS_PER_SAMPLE,
+                    "path_order": "rotating interleaved",
+                },
+                "crossover": {
+                    "dims": CROSSOVER_DIMS,
+                    "requested_sparsities": CROSSOVER_SPARSITIES,
+                    "batch": CROSSOVER_BATCH,
+                    "warmup_rounds": CROSSOVER_WARMUP_ROUNDS,
+                    "samples_per_trial": CROSSOVER_SAMPLES,
+                    "path_order": "rotating interleaved",
+                },
+                "regime": {
+                    "dim": REGIME_DIM,
+                    "requested_sparsities": REGIME_SPARSITIES,
+                    "small_batch": REGIME_SMALL_BATCH,
+                    "large_batch": REGIME_LARGE_BATCH,
+                    "adaptive_warmup_calls": REGIME_WARMUP_CALLS,
+                    "adaptive_measure_calls": REGIME_MEASURE_CALLS,
+                    "forced_warmup_rounds": REGIME_FORCED_WARMUP_ROUNDS,
+                    "forced_calls_per_sample": REGIME_FORCED_CALLS_PER_SAMPLE,
+                    "batch_order": "rotating across trials",
+                    "path_order": "rotating interleaved",
+                },
+            },
+            "achf_modes": {
+                "lite": "deterministic frozen cached/sparse/dense selection",
+                "full": "frozen weights with online latency-adaptive AMA selection",
+            },
+            "metric_semantics": {
+                "eval_reward": "held-out reward from the active frozen policy using that policy's native reward; compare only within the same active_policy",
+                "train_loss": "last training snapshot from the active policy using that policy's native loss; compare only within the same active_policy",
+                "policy_train_time_ms": "active policy training only; base-model preparation excluded",
+                "param_count": "active policy trainable parameters; derived sparse inference copies excluded",
+            },
+        }),
+    );
     for (name, agg) in all {
-        let entries: Vec<serde_json::Value> = agg
-            .iter()
-            .map(|a| {
-                let mut entry = serde_json::json!({
-                    "label": a.label.as_str(),
-                    "throughput_mean": a.throughput.mean,
-                    "throughput_std": a.throughput.std_dev,
-                    "reward_mean": a.reward.mean,
-                    "reward_std": a.reward.std_dev,
-                    "loss_mean": a.loss.mean,
-                    "loss_std": a.loss.std_dev,
-                    "param_count": a.param_count,
-                    "throughput_ci": [a.throughput.ci_low, a.throughput.ci_high],
-                    "reward_ci": [a.reward.ci_low, a.reward.ci_high],
-                });
-                if let Some(stats) = a.cache_stats {
-                    entry["cache_stats"] = cache_stats_json(stats);
-                }
-                entry
-            })
-            .collect();
+        let entries: Vec<serde_json::Value> = agg.iter().map(aggregated_result_json).collect();
         root.insert((*name).to_string(), serde_json::Value::Array(entries));
     }
     if let Some(latencies) = path_latencies {
@@ -1595,6 +2261,18 @@ fn write_summary_json(
     if let Some(result) = gate_curve {
         root.insert("gate_curve".to_string(), gate_curve_summary_json(result));
     }
+    if let Some(cells) = crossover {
+        root.insert(
+            "crossover".to_string(),
+            serde_json::Value::Array(cells.iter().map(crossover_cell_json).collect()),
+        );
+    }
+    if let Some(rows) = regime {
+        root.insert(
+            "regime".to_string(),
+            serde_json::Value::Array(regime_rows_json(rows)),
+        );
+    }
     let json = serde_json::to_string_pretty(&serde_json::Value::Object(root))
         .expect("benchmark summary JSON should be serializable");
     let path = format!("{}/summary.json", dir);
@@ -1602,33 +2280,72 @@ fn write_summary_json(
     println!("[Bench] JSON  -> {}", path);
 }
 
+fn trial_stats_json(stats: &TrialStats) -> serde_json::Value {
+    serde_json::json!({
+        "n": stats.values.len(),
+        "mean": stats.mean,
+        "std_dev": stats.std_dev,
+        "ci_95": [stats.ci_low, stats.ci_high],
+        "values": stats.values,
+    })
+}
+
+fn paired_comparison_json(paired: &PairedComparison) -> serde_json::Value {
+    serde_json::json!({
+        "baseline": paired.baseline,
+        "throughput_delta": trial_stats_json(&paired.throughput_delta),
+        "eval_reward_delta": trial_stats_json(&paired.eval_reward_delta),
+        "train_loss_delta": trial_stats_json(&paired.train_loss_delta),
+        "policy_train_time_ms_delta": trial_stats_json(&paired.train_time_ms_delta),
+    })
+}
+
+fn aggregated_result_json(result: &AggregatedResult) -> serde_json::Value {
+    serde_json::json!({
+        "label": result.label,
+        "active_policy": result.policy,
+        "throughput_sims_per_sec": trial_stats_json(&result.throughput),
+        "eval_reward": trial_stats_json(&result.eval_reward),
+        "train_loss": trial_stats_json(&result.train_loss),
+        "policy_train_time_ms": trial_stats_json(&result.train_time_ms),
+        "param_count": result.param_count,
+        "applied_rank": result.applied_rank,
+        "paired_vs_baseline": result.paired.as_ref().map(paired_comparison_json),
+        "curve": result.curve.iter().map(curve_point_json).collect::<Vec<_>>(),
+        "cache_trial_count": result.cache_trial_count,
+        "frozen_cache_stats": result.cache_stats.map(cache_stats_json),
+    })
+}
+
 fn write_csvs(all: &[(&str, Vec<AggregatedResult>)], dir: &str) {
     for (name, agg) in all {
-        let mut csv = String::from("label,trial,throughput,reward,loss,time_ms,param_count\n");
+        let mut csv = String::from(
+            "label,active_policy,trial,throughput_sims_per_sec,eval_reward,train_loss,policy_train_time_ms,param_count,applied_rank\n",
+        );
         for a in agg {
             let label = csv_escape(&a.label);
-            for (t, ((&tput, &rew), &loss)) in a
+            let policy = csv_escape(&a.policy);
+            for (trial, (((&throughput, &eval_reward), &train_loss), &train_time_ms)) in a
                 .throughput
                 .values
                 .iter()
-                .zip(a.reward.values.iter())
-                .zip(a.loss.values.iter())
+                .zip(a.eval_reward.values.iter())
+                .zip(a.train_loss.values.iter())
+                .zip(a.train_time_ms.values.iter())
                 .enumerate()
             {
-                let time = if t < a.time_ms.values.len() {
-                    a.time_ms.values[t]
-                } else {
-                    0.0
-                };
                 csv.push_str(&format!(
-                    "{},{},{:.2},{:.4},{:.4},{:.1},{}\n",
+                    "{},{},{},{:.2},{:.6},{:.6},{:.3},{},{}\n",
                     label,
-                    t + 1,
-                    tput,
-                    rew,
-                    loss,
-                    time,
-                    a.param_count
+                    policy,
+                    trial + 1,
+                    throughput,
+                    eval_reward,
+                    train_loss,
+                    train_time_ms,
+                    a.param_count,
+                    a.applied_rank
+                        .map_or_else(String::new, |rank| rank.to_string()),
                 ));
             }
         }
@@ -1638,12 +2355,31 @@ fn write_csvs(all: &[(&str, Vec<AggregatedResult>)], dir: &str) {
     }
 }
 
-fn write_path_latency_outputs(latencies: &[(String, Vec<f64>)], dir: &str) {
-    let mut csv = String::from("label,sample,latency_ns\n");
-    for (label, values) in latencies {
-        let label = csv_escape(label);
-        for (idx, latency_ns) in values.iter().enumerate() {
-            csv.push_str(&format!("{},{},{:.3}\n", label, idx + 1, latency_ns));
+fn write_path_latency_outputs(latencies: &[PathLatencyResult], dir: &str) {
+    let mut csv = String::from(
+        "label,trial,input_dim,actual_sparsity,total_weights,nonzero_weights,sample,latency_ns\n",
+    );
+    for result in latencies {
+        let label = csv_escape(&result.label);
+        for (trial, values) in result.trial_samples.iter().enumerate() {
+            if values.is_empty() {
+                continue;
+            }
+            let input_dim = result.trial_input_dims[trial];
+            let sparsity = result.trial_sparsity[trial];
+            for (sample, latency_ns) in values.iter().enumerate() {
+                csv.push_str(&format!(
+                    "{},{},{},{:.8},{},{},{},{:.3}\n",
+                    label,
+                    trial + 1,
+                    input_dim,
+                    sparsity.sparsity,
+                    sparsity.total_weights,
+                    sparsity.nonzero_weights,
+                    sample + 1,
+                    latency_ns
+                ));
+            }
         }
     }
     let csv_path = format!("{}/path_latency.csv", dir);
@@ -1660,30 +2396,41 @@ fn write_path_latency_outputs(latencies: &[(String, Vec<f64>)], dir: &str) {
 }
 
 fn write_crossover_outputs(cells: &[CrossoverCell], dir: &str) {
-    let mut csv = String::from("dim,weight_sparsity,cached_ns,sparse_ns,dense_ns,winner\n");
-    for c in cells {
-        csv.push_str(&format!(
-            "{},{:.4},{:.3},{:.3},{:.3},{}\n",
-            c.dim, c.weight_sparsity, c.cached_ns, c.sparse_ns, c.dense_ns, c.winner
-        ));
+    let mut csv = String::from(
+        "dim,requested_sparsity,actual_sparsity,total_weights,nonzero_weights,trial,cached_ns,sparse_ns,dense_ns,winner\n",
+    );
+    for cell in cells {
+        for trial in 0..cell.cached_ns.values.len() {
+            let cached = cell.cached_ns.values[trial];
+            let sparse = cell.sparse_ns.values[trial];
+            let dense = cell.dense_ns.values[trial];
+            let winner = if sparse <= cached && sparse <= dense {
+                "Sparse"
+            } else if cached <= dense {
+                "Cached"
+            } else {
+                "Dense"
+            };
+            csv.push_str(&format!(
+                "{},{:.6},{:.6},{},{},{},{:.3},{:.3},{:.3},{}\n",
+                cell.dim,
+                cell.requested_sparsity,
+                cell.actual_sparsity,
+                cell.total_weights,
+                cell.nonzero_weights,
+                trial + 1,
+                cached,
+                sparse,
+                dense,
+                winner,
+            ));
+        }
     }
     let csv_path = format!("{}/path_crossover.csv", dir);
     write_text_file(&csv_path, &csv);
     println!("[Bench] CSV   -> {}", csv_path);
 
-    let arr: Vec<serde_json::Value> = cells
-        .iter()
-        .map(|c| {
-            serde_json::json!({
-                "dim": c.dim,
-                "weight_sparsity": c.weight_sparsity,
-                "cached_ns": c.cached_ns,
-                "sparse_ns": c.sparse_ns,
-                "dense_ns": c.dense_ns,
-                "winner": c.winner,
-            })
-        })
-        .collect();
+    let arr: Vec<serde_json::Value> = cells.iter().map(crossover_cell_json).collect();
     let json = serde_json::to_string_pretty(&serde_json::Value::Array(arr))
         .expect("crossover summary JSON should be serializable");
     let json_path = format!("{}/path_crossover_summary.json", dir);
@@ -1691,54 +2438,52 @@ fn write_crossover_outputs(cells: &[CrossoverCell], dir: &str) {
     println!("[Bench] JSON  -> {}", json_path);
 }
 
+fn crossover_cell_json(cell: &CrossoverCell) -> serde_json::Value {
+    serde_json::json!({
+        "dim": cell.dim,
+        "requested_sparsity": cell.requested_sparsity,
+        "actual_sparsity": cell.actual_sparsity,
+        "total_weights": cell.total_weights,
+        "nonzero_weights": cell.nonzero_weights,
+        "cached_ns": trial_stats_json(&cell.cached_ns),
+        "sparse_ns": trial_stats_json(&cell.sparse_ns),
+        "dense_ns": trial_stats_json(&cell.dense_ns),
+        "winner_by_mean": cell.winner,
+    })
+}
+
 fn write_regime_outputs(rows: &[RegimeRow], dir: &str) {
     let mut csv = String::from(
-        "weight_sparsity,batch,adaptive_ns,cached_ns,sparse_ns,dense_oracle_ns,oracle_path,oracle_gap,sparse_frac\n",
+        "requested_sparsity,actual_sparsity,total_weights,nonzero_weights,batch,trial,adaptive_ns,cached_ns,sparse_ns,dense_ns,oracle_ns,oracle_path,oracle_gap,sparse_frac\n",
     );
-    let push = |wsp: f32, r: &RegimeLatency, csv: &mut String| {
-        csv.push_str(&format!(
-            "{:.4},{},{:.3},{:.3},{:.3},{:.3},{},{:.4},{:.4}\n",
-            wsp,
-            r.batch,
-            r.adaptive_ns,
-            r.cached_ns,
-            r.sparse_ns,
-            r.oracle_ns,
-            r.oracle_path,
-            r.adaptive_ns / r.oracle_ns.max(1.0),
-            r.sparse_frac,
-        ));
-    };
-    for r in rows {
-        push(r.weight_sparsity, &r.small, &mut csv);
-        push(r.weight_sparsity, &r.large, &mut csv);
+    for row in rows {
+        for latency in [&row.small, &row.large] {
+            for trial in 0..latency.adaptive_ns.values.len() {
+                csv.push_str(&format!(
+                    "{:.6},{:.6},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{},{:.6},{:.6}\n",
+                    row.requested_sparsity,
+                    row.actual_sparsity,
+                    row.total_weights,
+                    row.nonzero_weights,
+                    latency.batch,
+                    trial + 1,
+                    latency.adaptive_ns.values[trial],
+                    latency.cached_ns.values[trial],
+                    latency.sparse_ns.values[trial],
+                    latency.dense_ns.values[trial],
+                    latency.oracle_ns.values[trial],
+                    latency.oracle_paths[trial],
+                    latency.oracle_gap.values[trial],
+                    latency.sparse_frac.values[trial],
+                ));
+            }
+        }
     }
     let csv_path = format!("{}/regime_adaptation.csv", dir);
     write_text_file(&csv_path, &csv);
     println!("[Bench] CSV   -> {}", csv_path);
 
-    let cell = |wsp: f32, r: &RegimeLatency| {
-        serde_json::json!({
-            "weight_sparsity": wsp,
-            "batch": r.batch,
-            "adaptive_ns": r.adaptive_ns,
-            "cached_ns": r.cached_ns,
-            "sparse_ns": r.sparse_ns,
-            "oracle_ns": r.oracle_ns,
-            "oracle_path": r.oracle_path,
-            "oracle_gap": r.adaptive_ns / r.oracle_ns.max(1.0),
-            "sparse_frac": r.sparse_frac,
-        })
-    };
-    let arr: Vec<serde_json::Value> = rows
-        .iter()
-        .flat_map(|r| {
-            [
-                cell(r.weight_sparsity, &r.small),
-                cell(r.weight_sparsity, &r.large),
-            ]
-        })
-        .collect();
+    let arr = regime_rows_json(rows);
     let json = serde_json::to_string_pretty(&serde_json::Value::Array(arr))
         .expect("regime summary JSON should be serializable");
     let json_path = format!("{}/regime_adaptation_summary.json", dir);
@@ -1746,31 +2491,76 @@ fn write_regime_outputs(rows: &[RegimeRow], dir: &str) {
     println!("[Bench] JSON  -> {}", json_path);
 }
 
-fn write_gate_curve_outputs(result: &BenchRunResult, dir: &str) {
-    let mut csv = String::from(
-        "step,gate_value,g_min,grad_ema,loss,reward,cache_hit_rate,sparse_ratio,ema_cached_ns,ema_sparse_ns,adaptive_bias,sinkhorn_iterations,sinkhorn_row_max_dev,sinkhorn_col_max_dev,sinkhorn_min_value,sinkhorn_negative_ratio,sinkhorn_warm_started\n",
-    );
-    for snapshot in &result.snapshots {
-        csv.push_str(&format!(
-            "{},{:.8},{:.8},{:.8},{:.8},{:.8},{:.8},{:.8},{:.3},{:.3},{:.8},{},{:.8},{:.8},{:.8},{:.8},{}\n",
-            snapshot.step,
-            snapshot.gate_value,
-            snapshot.g_min,
-            snapshot.grad_ema,
-            snapshot.loss,
-            snapshot.reward,
-            snapshot.cache_hit_rate,
-            snapshot.sparse_ratio,
-            snapshot.ema_cached_ns,
-            snapshot.ema_sparse_ns,
-            snapshot.adaptive_bias,
-            snapshot.sinkhorn_iterations,
-            snapshot.sinkhorn_row_max_dev,
-            snapshot.sinkhorn_col_max_dev,
-            snapshot.sinkhorn_min_value,
-            snapshot.sinkhorn_negative_ratio,
-            snapshot.sinkhorn_warm_started
-        ));
+fn regime_rows_json(rows: &[RegimeRow]) -> Vec<serde_json::Value> {
+    rows.iter()
+        .flat_map(|row| {
+            [&row.small, &row.large].map(|latency| {
+                serde_json::json!({
+                    "requested_sparsity": row.requested_sparsity,
+                    "actual_sparsity": row.actual_sparsity,
+                    "total_weights": row.total_weights,
+                    "nonzero_weights": row.nonzero_weights,
+                    "batch": latency.batch,
+                    "adaptive_ns": trial_stats_json(&latency.adaptive_ns),
+                    "cached_ns": trial_stats_json(&latency.cached_ns),
+                    "sparse_ns": trial_stats_json(&latency.sparse_ns),
+                    "dense_ns": trial_stats_json(&latency.dense_ns),
+                    "oracle_ns": trial_stats_json(&latency.oracle_ns),
+                    "oracle_gap": trial_stats_json(&latency.oracle_gap),
+                    "oracle_path_by_majority": latency.oracle_path,
+                    "oracle_path_counts": latency.oracle_path_counts,
+                    "oracle_paths": latency.oracle_paths,
+                    "sparse_fraction": trial_stats_json(&latency.sparse_frac),
+                })
+            })
+        })
+        .collect()
+}
+
+fn write_gate_curve_outputs(result: &AggregatedResult, dir: &str) {
+    let mut csv = String::from("step,samples,metric,mean,std_dev,ci_95_low,ci_95_high\n");
+    for point in &result.curve {
+        let warm_started_count =
+            (point.sinkhorn_warm_started_rate * point.samples as f64).round() as usize;
+        let warm_started_values: Vec<f64> = (0..point.samples)
+            .map(|index| if index < warm_started_count { 1.0 } else { 0.0 })
+            .collect();
+        let warm_started_stats = TrialStats::from_values(&warm_started_values);
+        let metrics: [(&str, &TrialStats); 17] = [
+            ("train_loss", &point.train_loss),
+            ("train_reward", &point.train_reward),
+            ("gate_value", &point.gate_value),
+            ("g_min", &point.g_min),
+            ("grad_ema", &point.grad_ema),
+            ("cache_hit_rate", &point.cache_hit_rate),
+            ("sparse_ratio", &point.sparse_ratio),
+            ("ema_cached_ns", &point.ema_cached_ns),
+            ("ema_sparse_ns", &point.ema_sparse_ns),
+            ("adaptive_bias", &point.adaptive_bias),
+            ("sinkhorn_iterations", &point.sinkhorn_iterations),
+            ("sinkhorn_row_max_dev", &point.sinkhorn_row_max_dev),
+            ("sinkhorn_col_max_dev", &point.sinkhorn_col_max_dev),
+            ("sinkhorn_min_value", &point.sinkhorn_min_value),
+            ("sinkhorn_negative_ratio", &point.sinkhorn_negative_ratio),
+            ("sinkhorn_warm_started_rate", &warm_started_stats),
+            ("low_rank_applied_rank", &point.low_rank_applied_rank),
+        ];
+        for (metric, stats) in metrics {
+            csv.push_str(&format!(
+                "{},{},{},{:.10},{:.10},{},{}\n",
+                point.step,
+                point.samples,
+                metric,
+                stats.mean,
+                stats.std_dev,
+                stats
+                    .ci_low
+                    .map_or_else(String::new, |value| format!("{value:.10}")),
+                stats
+                    .ci_high
+                    .map_or_else(String::new, |value| format!("{value:.10}")),
+            ));
+        }
     }
     let csv_path = format!("{}/gate_curve.csv", dir);
     write_text_file(&csv_path, &csv);
@@ -1783,19 +2573,29 @@ fn write_gate_curve_outputs(result: &BenchRunResult, dir: &str) {
     println!("[Bench] JSON  -> {}", json_path);
 }
 
-fn path_latency_stats(latencies: &[(String, Vec<f64>)]) -> Vec<PathLatencyStats> {
+fn path_latency_stats(latencies: &[PathLatencyResult]) -> Vec<PathLatencyStats> {
     latencies
         .iter()
-        .filter(|(_, values)| !values.is_empty())
-        .map(|(label, values)| {
-            let mut sorted = values.clone();
+        .filter(|result| result.trial_samples.iter().any(|values| !values.is_empty()))
+        .map(|result| {
+            let trial_means: Vec<f64> = result
+                .trial_samples
+                .iter()
+                .filter(|values| !values.is_empty())
+                .map(|values| values.iter().sum::<f64>() / values.len() as f64)
+                .collect();
+            let trial_stats = TrialStats::from_values(&trial_means);
+            let mut sorted: Vec<f64> = result.trial_samples.iter().flatten().copied().collect();
             sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             let samples = sorted.len();
-            let mean_ns = sorted.iter().sum::<f64>() / samples as f64;
             PathLatencyStats {
-                label: label.clone(),
+                label: result.label.clone(),
+                trials: trial_stats.values.len(),
                 samples,
-                mean_ns,
+                mean_ns: trial_stats.mean,
+                std_dev_ns: trial_stats.std_dev,
+                ci_low_ns: trial_stats.ci_low,
+                ci_high_ns: trial_stats.ci_high,
                 min_ns: sorted[0],
                 p50_ns: percentile_sorted(&sorted, 50),
                 p90_ns: percentile_sorted(&sorted, 90),
@@ -1807,60 +2607,77 @@ fn path_latency_stats(latencies: &[(String, Vec<f64>)]) -> Vec<PathLatencyStats>
         .collect()
 }
 
-fn path_latency_stats_json(latencies: &[(String, Vec<f64>)]) -> Vec<serde_json::Value> {
+fn path_latency_stats_json(latencies: &[PathLatencyResult]) -> Vec<serde_json::Value> {
     path_latency_stats(latencies)
         .into_iter()
-        .map(|stats| {
+        .zip(
+            latencies
+                .iter()
+                .filter(|result| result.trial_samples.iter().any(|values| !values.is_empty())),
+        )
+        .map(|(stats, result)| {
             serde_json::json!({
                 "label": stats.label,
+                "trials": stats.trials,
                 "samples": stats.samples,
                 "mean_ns": stats.mean_ns,
+                "std_dev_ns": stats.std_dev_ns,
+                "ci_95_ns": [stats.ci_low_ns, stats.ci_high_ns],
                 "min_ns": stats.min_ns,
                 "p50_ns": stats.p50_ns,
                 "p90_ns": stats.p90_ns,
                 "p95_ns": stats.p95_ns,
                 "p99_ns": stats.p99_ns,
                 "max_ns": stats.max_ns,
+                "trial_operating_points": result.trial_input_dims.iter()
+                    .zip(result.trial_sparsity.iter())
+                    .enumerate()
+                    .map(|(trial, (&input_dim, sparsity))| serde_json::json!({
+                        "trial": trial + 1,
+                        "input_dim": input_dim,
+                        "actual_sparsity": sparsity.sparsity,
+                        "total_weights": sparsity.total_weights,
+                        "nonzero_weights": sparsity.nonzero_weights,
+                    }))
+                    .collect::<Vec<_>>(),
             })
         })
         .collect()
 }
 
-fn gate_curve_summary_json(result: &BenchRunResult) -> serde_json::Value {
-    let final_step = result.snapshots.last().map_or(0, |s| s.step);
-    serde_json::json!({
-        "label": result.label.as_str(),
-        "total_time_ms": result.total_time_ms,
-        "throughput_sims_per_sec": result.throughput_sims_per_sec,
-        "final_avg_reward": result.final_avg_reward,
-        "final_loss": result.final_loss,
-        "param_count": result.param_count,
-        "snapshot_count": result.snapshots.len(),
-        "final_step": final_step,
-        "final_snapshot": result.snapshots.last().map(step_snapshot_json),
-        "cache_stats": result.cache_stats.map(cache_stats_json),
-    })
+fn gate_curve_summary_json(result: &AggregatedResult) -> serde_json::Value {
+    let mut value = aggregated_result_json(result);
+    value["curve_point_count"] = serde_json::json!(result.curve.len());
+    value["final_step"] = serde_json::json!(result.curve.last().map_or(0, |point| point.step));
+    value["final_curve_point"] = result
+        .curve
+        .last()
+        .map(curve_point_json)
+        .unwrap_or(serde_json::Value::Null);
+    value
 }
 
-fn step_snapshot_json(snapshot: &StepSnapshot) -> serde_json::Value {
+fn curve_point_json(point: &CurvePointStats) -> serde_json::Value {
     serde_json::json!({
-        "step": snapshot.step,
-        "gate_value": snapshot.gate_value,
-        "g_min": snapshot.g_min,
-        "grad_ema": snapshot.grad_ema,
-        "loss": snapshot.loss,
-        "reward": snapshot.reward,
-        "cache_hit_rate": snapshot.cache_hit_rate,
-        "sparse_ratio": snapshot.sparse_ratio,
-        "ema_cached_ns": snapshot.ema_cached_ns,
-        "ema_sparse_ns": snapshot.ema_sparse_ns,
-        "adaptive_bias": snapshot.adaptive_bias,
-        "sinkhorn_iterations": snapshot.sinkhorn_iterations,
-        "sinkhorn_row_max_dev": snapshot.sinkhorn_row_max_dev,
-        "sinkhorn_col_max_dev": snapshot.sinkhorn_col_max_dev,
-        "sinkhorn_min_value": snapshot.sinkhorn_min_value,
-        "sinkhorn_negative_ratio": snapshot.sinkhorn_negative_ratio,
-        "sinkhorn_warm_started": snapshot.sinkhorn_warm_started,
+        "step": point.step,
+        "samples": point.samples,
+        "train_loss": trial_stats_json(&point.train_loss),
+        "train_reward": trial_stats_json(&point.train_reward),
+        "gate_value": trial_stats_json(&point.gate_value),
+        "g_min": trial_stats_json(&point.g_min),
+        "grad_ema": trial_stats_json(&point.grad_ema),
+        "cache_hit_rate": trial_stats_json(&point.cache_hit_rate),
+        "sparse_ratio": trial_stats_json(&point.sparse_ratio),
+        "ema_cached_ns": trial_stats_json(&point.ema_cached_ns),
+        "ema_sparse_ns": trial_stats_json(&point.ema_sparse_ns),
+        "adaptive_bias": trial_stats_json(&point.adaptive_bias),
+        "sinkhorn_iterations": trial_stats_json(&point.sinkhorn_iterations),
+        "sinkhorn_row_max_dev": trial_stats_json(&point.sinkhorn_row_max_dev),
+        "sinkhorn_col_max_dev": trial_stats_json(&point.sinkhorn_col_max_dev),
+        "sinkhorn_min_value": trial_stats_json(&point.sinkhorn_min_value),
+        "sinkhorn_negative_ratio": trial_stats_json(&point.sinkhorn_negative_ratio),
+        "sinkhorn_warm_started_rate": point.sinkhorn_warm_started_rate,
+        "low_rank_applied_rank": trial_stats_json(&point.low_rank_applied_rank),
     })
 }
 
@@ -1891,10 +2708,13 @@ fn cache_stats_json(stats: AchfCacheStats) -> serde_json::Value {
         "ema_cached_long_ns": stats.ema_cached_long_ns,
         "ema_sparse_ns": stats.ema_sparse_ns,
         "ema_sparse_long_ns": stats.ema_sparse_long_ns,
+        "ema_dense_ns": stats.ema_dense_ns,
+        "ema_dense_long_ns": stats.ema_dense_long_ns,
         "decision_ema_ns": stats.decision_ema_ns,
         "decision_ema_long_ns": stats.decision_ema_long_ns,
         "adaptive_bias": stats.adaptive_bias,
         "latency_samples": stats.latency_samples,
+        "dense_latency_samples": stats.dense_latency_samples,
         "decision_samples": stats.decision_samples,
     })
 }
@@ -1964,6 +2784,74 @@ mod tests {
             format: ChartFormat::Svg,
             only,
             num_trials: 1,
+        }
+    }
+
+    fn test_snapshot(step: usize, loss: f64, reward: f64) -> StepSnapshot {
+        StepSnapshot {
+            step,
+            gate_value: 0.8,
+            g_min: 0.2,
+            grad_ema: 0.3,
+            loss,
+            reward,
+            cache_hit_rate: 0.5,
+            sparse_ratio: 0.75,
+            ema_cached_ns: 11.0,
+            ema_sparse_ns: 22.0,
+            adaptive_bias: 1.1,
+            sinkhorn_iterations: 20,
+            sinkhorn_row_max_dev: 0.0001,
+            sinkhorn_col_max_dev: 0.0002,
+            sinkhorn_min_value: 0.01,
+            sinkhorn_negative_ratio: 0.0,
+            sinkhorn_warm_started: true,
+            low_rank_applied_rank: 0,
+        }
+    }
+
+    fn test_cache_stats(calls: u64, hits: u64) -> AchfCacheStats {
+        AchfCacheStats {
+            calls,
+            cache_hits: hits,
+            cache_misses: 1,
+            cache_skips: 1,
+            sparse_paths: calls.saturating_sub(hits + 1),
+            dense_paths: 1,
+            ema_cached_ns: 11.0,
+            ema_cached_long_ns: 12.0,
+            ema_sparse_ns: 22.0,
+            ema_sparse_long_ns: 23.0,
+            ema_dense_ns: 33.0,
+            ema_dense_long_ns: 34.0,
+            decision_ema_ns: 4.0,
+            decision_ema_long_ns: 5.0,
+            adaptive_bias: 1.1,
+            latency_samples: calls,
+            dense_latency_samples: 2,
+            decision_samples: calls,
+        }
+    }
+
+    fn test_run(
+        label: &str,
+        throughput: f64,
+        eval_reward: f64,
+        train_loss: f64,
+        train_time_ms: f64,
+        snapshots: Vec<StepSnapshot>,
+    ) -> BenchRunResult {
+        BenchRunResult {
+            label: label.to_string(),
+            policy: "PPO".to_string(),
+            train_time_ms,
+            throughput_sims_per_sec: throughput,
+            eval_reward,
+            train_loss,
+            param_count: 42,
+            applied_rank: Some(0),
+            snapshots,
+            cache_stats: Some(test_cache_stats(8, 2)),
         }
     }
 
@@ -2065,44 +2953,35 @@ mod tests {
     fn write_summary_json_escapes_labels() {
         let dir = unique_temp_dir("json");
         let output_dir = dir.to_string_lossy().to_string();
-        let result = AggregatedResult {
-            label: "label,with\"quote".to_string(),
-            throughput: TrialStats::from_values(&[10.0]),
-            reward: TrialStats::from_values(&[0.5]),
-            loss: TrialStats::from_values(&[0.25]),
-            time_ms: TrialStats::from_values(&[12.0]),
-            param_count: 42,
-            best_snapshots: Vec::new(),
-            cache_stats: Some(AchfCacheStats {
-                calls: 4,
-                cache_hits: 1,
-                cache_misses: 1,
-                cache_skips: 0,
-                sparse_paths: 2,
-                dense_paths: 1,
-                ema_cached_ns: 10.0,
-                ema_cached_long_ns: 11.0,
-                ema_sparse_ns: 20.0,
-                ema_sparse_long_ns: 21.0,
-                ema_dense_ns: 30.0,
-                ema_dense_long_ns: 31.0,
-                decision_ema_ns: 3.0,
-                decision_ema_long_ns: 4.0,
-                adaptive_bias: 1.0,
-                latency_samples: 3,
-                dense_latency_samples: 1,
-                decision_samples: 2,
-            }),
-        };
+        let result = aggregate_trials(&[test_run(
+            "label,with\"quote",
+            10.0,
+            0.5,
+            0.25,
+            12.0,
+            vec![test_snapshot(10, 0.25, 1.0)],
+        )]);
 
-        write_summary_json(&[("exp", vec![result])], None, None, &output_dir);
+        write_summary_json(
+            &[("exp", vec![result])],
+            None,
+            None,
+            None,
+            None,
+            (7, 1),
+            &output_dir,
+        );
 
         let json_path = dir.join("summary.json");
         let json = std::fs::read_to_string(&json_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["exp"][0]["label"], "label,with\"quote");
-        assert_eq!(parsed["exp"][0]["cache_stats"]["calls"], 4);
-        assert_eq!(parsed["exp"][0]["cache_stats"]["hit_rate"], 0.25);
+        assert_eq!(parsed["metadata"]["schema_version"], 2);
+        assert_eq!(parsed["exp"][0]["active_policy"], "PPO");
+        assert_eq!(parsed["exp"][0]["eval_reward"]["mean"], 0.5);
+        assert!(parsed["exp"][0]["eval_reward"]["ci_95"][0].is_null());
+        assert_eq!(parsed["exp"][0]["frozen_cache_stats"]["calls"], 8);
+        assert_eq!(parsed["exp"][0]["frozen_cache_stats"]["hit_rate"], 0.25);
 
         std::fs::remove_file(json_path).unwrap();
         std::fs::remove_dir(dir).unwrap();
@@ -2116,17 +2995,133 @@ mod tests {
     }
 
     #[test]
+    fn trial_stats_use_sample_size_specific_student_t() {
+        let one = TrialStats::from_values(&[3.0]);
+        assert_eq!(one.std_dev, 0.0);
+        assert_eq!(one.ci_low, None);
+        assert_eq!(one.ci_high, None);
+
+        let five = TrialStats::from_values(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert!((five.mean - 3.0).abs() < 1e-12);
+        assert!((student_t_critical_95(4) - 2.776).abs() < 1e-12);
+        assert!((five.ci_low.unwrap() - 1.037_071_575).abs() < 1e-8);
+        assert!((five.ci_high.unwrap() - 4.962_928_425).abs() < 1e-8);
+        assert!((student_t_critical_95(9) - 2.262).abs() < 1e-12);
+    }
+
+    #[test]
+    fn domain_seeds_are_deterministic_and_separated() {
+        let trial = benchmark_trial_seed(1234, 2);
+        assert_eq!(trial, benchmark_trial_seed(1234, 2));
+        assert_ne!(trial, benchmark_trial_seed(1234, 3));
+        let domains = [
+            derive_seed(trial, SEED_BASE_MODELS),
+            derive_seed(trial, SEED_DQN_TRAIN),
+            derive_seed(trial, SEED_PPO_TRAIN),
+            derive_seed(trial, SEED_POLICY_EVAL),
+            derive_seed(trial, SEED_THROUGHPUT),
+        ];
+        for left in 0..domains.len() {
+            for right in left + 1..domains.len() {
+                assert_ne!(domains[left], domains[right]);
+            }
+        }
+    }
+
+    #[test]
+    fn aggregation_uses_all_trials_and_builds_paired_deltas() {
+        let baseline = vec![
+            test_run(
+                "baseline",
+                100.0,
+                1.0,
+                0.5,
+                20.0,
+                vec![test_snapshot(10, 0.5, 1.0), test_snapshot(20, 0.4, 1.2)],
+            ),
+            test_run(
+                "baseline",
+                120.0,
+                2.0,
+                0.3,
+                24.0,
+                vec![test_snapshot(10, 0.3, 2.0)],
+            ),
+        ];
+        let candidate = vec![
+            test_run(
+                "candidate",
+                110.0,
+                1.5,
+                0.4,
+                18.0,
+                vec![test_snapshot(10, 0.4, 1.5)],
+            ),
+            test_run(
+                "candidate",
+                150.0,
+                2.5,
+                0.2,
+                20.0,
+                vec![test_snapshot(10, 0.2, 2.5), test_snapshot(20, 0.1, 2.7)],
+            ),
+        ];
+        let aggregated = aggregate_conditions(&[baseline, candidate], &[0, 0]);
+
+        assert_eq!(aggregated[0].curve.len(), 2);
+        assert_eq!(aggregated[0].curve[0].samples, 2);
+        assert_eq!(aggregated[0].curve[1].samples, 1);
+        assert_eq!(aggregated[0].curve[0].train_loss.mean, 0.4);
+        assert_eq!(aggregated[0].cache_trial_count, 2);
+        assert_eq!(aggregated[0].cache_stats.unwrap().calls, 16);
+        let paired = aggregated[1].paired.as_ref().unwrap();
+        assert_eq!(paired.baseline, "baseline");
+        assert_eq!(paired.throughput_delta.values, vec![10.0, 30.0]);
+        assert_eq!(paired.eval_reward_delta.values, vec![0.5, 0.5]);
+        assert!(paired
+            .train_loss_delta
+            .values
+            .iter()
+            .all(|value| (*value + 0.1).abs() < 1e-12));
+        assert_eq!(paired.train_time_ms_delta.values, vec![-2.0, -4.0]);
+    }
+
+    #[test]
     fn path_latency_outputs_include_stats_in_csv_json_and_summary() {
         let dir = unique_temp_dir("path_latency");
         let output_dir = dir.to_string_lossy().to_string();
         let latencies = vec![
-            ("Dense,path".to_string(), vec![30.0, 10.0, 20.0, 40.0]),
-            ("Empty".to_string(), Vec::new()),
+            PathLatencyResult {
+                label: "Dense,path".to_string(),
+                trial_samples: vec![vec![30.0, 10.0], vec![20.0, 40.0]],
+                trial_input_dims: vec![64, 64],
+                trial_sparsity: vec![
+                    AchfSparsityStats {
+                        total_weights: 4096,
+                        nonzero_weights: 1024,
+                        zero_weights: 3072,
+                        sparsity: 0.75,
+                    },
+                    AchfSparsityStats {
+                        total_weights: 4096,
+                        nonzero_weights: 1024,
+                        zero_weights: 3072,
+                        sparsity: 0.75,
+                    },
+                ],
+            },
+            PathLatencyResult {
+                label: "Empty".to_string(),
+                trial_samples: vec![Vec::new()],
+                trial_input_dims: Vec::new(),
+                trial_sparsity: Vec::new(),
+            },
         ];
 
         let stats = path_latency_stats(&latencies);
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].label, "Dense,path");
+        assert_eq!(stats[0].trials, 2);
         assert_eq!(stats[0].samples, 4);
         assert_eq!(stats[0].mean_ns, 25.0);
         assert_eq!(stats[0].min_ns, 10.0);
@@ -2134,14 +3129,19 @@ mod tests {
         assert_eq!(stats[0].p95_ns, 40.0);
 
         write_path_latency_outputs(&latencies, &output_dir);
-        write_summary_json(&[], Some(&latencies), None, &output_dir);
+        write_summary_json(&[], Some(&latencies), None, None, None, (1, 2), &output_dir);
 
         let csv = std::fs::read_to_string(dir.join("path_latency.csv")).unwrap();
-        assert!(csv.contains("\"Dense,path\",1,30.000"));
+        assert!(csv.contains("\"Dense,path\",1,64,0.75000000,4096,1024,1,30.000"));
         let json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("summary.json")).unwrap())
                 .unwrap();
         assert_eq!(json["path_latency"][0]["label"], "Dense,path");
+        assert_eq!(json["path_latency"][0]["trials"], 2);
+        assert_eq!(
+            json["path_latency"][0]["trial_operating_points"][0]["nonzero_weights"],
+            1024
+        );
         assert_eq!(json["path_latency"][0]["p99_ns"], 40.0);
         let summary: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.join("path_latency_summary.json")).unwrap(),
@@ -2159,7 +3159,13 @@ mod tests {
         // on a frozen layer — otherwise the crossover/regime timings would be
         // comparing paths that compute different things.
         let dim = 64usize;
-        let layer = build_synthetic_achf_layer(dim, 0.75, false);
+        let layer = build_synthetic_achf_layer(dim, 0.75, false, 123);
+        let sparsity = layer.inference_sparsity_stats().unwrap();
+        assert_eq!(sparsity.total_weights, 4096);
+        assert_eq!(sparsity.nonzero_weights, 1024);
+        assert_eq!(sparsity.zero_weights, 3072);
+        assert!((sparsity.sparsity - 0.75).abs() < f64::EPSILON);
+        assert_eq!(layer.snapshot_state().low_rank_applied_rank, 0);
         let x: Vec<f32> = (0..dim).map(|i| ((i % 5) as f32) * 0.2 - 0.4).collect();
         let cached = layer.forward_inference_forced_path(&x, 0);
         let sparse = layer.forward_inference_forced_path(&x, 1);
@@ -2185,31 +3191,43 @@ mod tests {
         let cells = vec![
             CrossoverCell {
                 dim: 256,
-                weight_sparsity: 0.9,
-                cached_ns: 100.0,
-                sparse_ns: 80.0,
-                dense_ns: 120.0,
+                requested_sparsity: 0.9,
+                actual_sparsity: 0.898_437_5,
+                total_weights: 65_536,
+                nonzero_weights: 6_656,
+                cached_ns: TrialStats::from_values(&[100.0, 110.0]),
+                sparse_ns: TrialStats::from_values(&[80.0, 90.0]),
+                dense_ns: TrialStats::from_values(&[120.0, 130.0]),
                 winner: "Sparse".to_string(),
             },
             CrossoverCell {
                 dim: 256,
-                weight_sparsity: 0.5,
-                cached_ns: 70.0,
-                sparse_ns: 300.0,
-                dense_ns: 90.0,
+                requested_sparsity: 0.5,
+                actual_sparsity: 0.5,
+                total_weights: 65_536,
+                nonzero_weights: 32_768,
+                cached_ns: TrialStats::from_values(&[70.0, 75.0]),
+                sparse_ns: TrialStats::from_values(&[300.0, 310.0]),
+                dense_ns: TrialStats::from_values(&[90.0, 95.0]),
                 winner: "Cached".to_string(),
             },
         ];
         write_crossover_outputs(&cells, &output_dir);
+        write_summary_json(&[], None, None, Some(&cells), None, (1, 2), &output_dir);
         let csv = std::fs::read_to_string(dir.join("path_crossover.csv")).unwrap();
-        assert!(csv.contains("dim,weight_sparsity,cached_ns,sparse_ns,dense_ns,winner"));
-        assert!(csv.contains("256,0.9000,100.000,80.000,120.000,Sparse"));
+        assert!(csv.contains("requested_sparsity,actual_sparsity,total_weights,nonzero_weights"));
+        assert!(csv.contains("256,0.900000,0.898438,65536,6656,1,100.000,80.000,120.000,Sparse"));
         let json: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.join("path_crossover_summary.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(json[0]["winner"], "Sparse");
+        assert_eq!(json[0]["winner_by_mean"], "Sparse");
+        assert_eq!(json[0]["cached_ns"]["n"], 2);
         assert_eq!(json[1]["dim"], 256);
+        let summary: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("summary.json")).unwrap())
+                .unwrap();
+        assert_eq!(summary["crossover"][0]["winner_by_mean"], "Sparse");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2218,38 +3236,53 @@ mod tests {
         let dir = unique_temp_dir("regime");
         let output_dir = dir.to_string_lossy().to_string();
         let rows = vec![RegimeRow {
-            weight_sparsity: 0.9,
-            small: RegimeLatency {
+            requested_sparsity: 0.9,
+            actual_sparsity: 0.899_414_062_5,
+            total_weights: 1_048_576,
+            nonzero_weights: 105_472,
+            small: aggregate_regime_trials(&[RegimeTrialLatency {
                 batch: 1,
                 adaptive_ns: 90.0,
                 cached_ns: 120.0,
                 sparse_ns: 70.0,
+                dense_ns: 140.0,
                 oracle_ns: 70.0,
                 oracle_path: "Sparse".to_string(),
                 sparse_frac: 0.6,
-            },
-            large: RegimeLatency {
+            }]),
+            large: aggregate_regime_trials(&[RegimeTrialLatency {
                 batch: 128,
                 adaptive_ns: 210.0,
                 cached_ns: 200.0,
                 sparse_ns: 280.0,
+                dense_ns: 250.0,
                 oracle_ns: 200.0,
                 oracle_path: "Cached".to_string(),
                 sparse_frac: 0.1,
-            },
+            }]),
         }];
         write_regime_outputs(&rows, &output_dir);
+        write_summary_json(&[], None, None, None, Some(&rows), (1, 1), &output_dir);
         let csv = std::fs::read_to_string(dir.join("regime_adaptation.csv")).unwrap();
         // Small-batch oracle is Sparse, large-batch oracle is Cached: the two
         // regimes have different best fixed paths — the core adaptation result.
-        assert!(csv.contains("0.9000,1,90.000,120.000,70.000,70.000,Sparse,1.2857,0.6000"));
-        assert!(csv.contains("0.9000,128,210.000,200.000,280.000,200.000,Cached,1.0500,0.1000"));
+        assert!(csv.contains(
+            "0.900000,0.899414,1048576,105472,1,1,90.000,120.000,70.000,140.000,70.000,Sparse,1.285714,0.600000"
+        ));
+        assert!(csv.contains(
+            "0.900000,0.899414,1048576,105472,128,1,210.000,200.000,280.000,250.000,200.000,Cached,1.050000,0.100000"
+        ));
         let json: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.join("regime_adaptation_summary.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(json[0]["oracle_path"], "Sparse");
-        assert_eq!(json[1]["oracle_path"], "Cached");
+        assert_eq!(json[0]["oracle_path_by_majority"], "Sparse");
+        assert_eq!(json[1]["oracle_path_by_majority"], "Cached");
+        assert_eq!(json[0]["oracle_gap"]["n"], 1);
+        let summary: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("summary.json")).unwrap())
+                .unwrap();
+        assert_eq!(summary["regime"][1]["oracle_path_by_majority"], "Cached");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2257,76 +3290,51 @@ mod tests {
     fn gate_curve_outputs_include_snapshot_and_cache_summary() {
         let dir = unique_temp_dir("gate_curve");
         let output_dir = dir.to_string_lossy().to_string();
-        let result = BenchRunResult {
-            label: "Gate Curve".to_string(),
-            total_time_ms: 12.5,
-            throughput_sims_per_sec: 0.0,
-            final_avg_reward: 1.25,
-            final_loss: 0.125,
-            param_count: 7,
-            snapshots: vec![StepSnapshot {
-                step: 10,
-                gate_value: 0.8,
-                g_min: 0.2,
-                grad_ema: 0.3,
-                loss: 0.125,
-                reward: 1.25,
-                cache_hit_rate: 0.5,
-                sparse_ratio: 0.75,
-                ema_cached_ns: 11.0,
-                ema_sparse_ns: 22.0,
-                adaptive_bias: 1.1,
-                sinkhorn_iterations: 20,
-                sinkhorn_row_max_dev: 0.0001,
-                sinkhorn_col_max_dev: 0.0002,
-                sinkhorn_min_value: 0.01,
-                sinkhorn_negative_ratio: 0.0,
-                sinkhorn_warm_started: true,
-                low_rank_applied_rank: 0,
-            }],
-            cache_stats: Some(AchfCacheStats {
-                calls: 8,
-                cache_hits: 2,
-                cache_misses: 1,
-                cache_skips: 1,
-                sparse_paths: 3,
-                dense_paths: 1,
-                ema_cached_ns: 11.0,
-                ema_cached_long_ns: 12.0,
-                ema_sparse_ns: 22.0,
-                ema_sparse_long_ns: 23.0,
-                ema_dense_ns: 33.0,
-                ema_dense_long_ns: 34.0,
-                decision_ema_ns: 4.0,
-                decision_ema_long_ns: 5.0,
-                adaptive_bias: 1.1,
-                latency_samples: 6,
-                dense_latency_samples: 2,
-                decision_samples: 4,
-            }),
-        };
+        let mut second = test_snapshot(10, 0.375, 1.75);
+        second.gate_value = 1.0;
+        let result = aggregate_trials(&[
+            test_run(
+                "Gate Curve",
+                100.0,
+                1.25,
+                0.125,
+                12.5,
+                vec![test_snapshot(10, 0.125, 1.25)],
+            ),
+            test_run("Gate Curve", 120.0, 1.75, 0.375, 15.5, vec![second]),
+        ]);
 
         write_gate_curve_outputs(&result, &output_dir);
-        write_summary_json(&[], None, Some(&result), &output_dir);
+        write_summary_json(&[], None, Some(&result), None, None, (1, 2), &output_dir);
 
         let csv = std::fs::read_to_string(dir.join("gate_curve.csv")).unwrap();
-        assert!(csv.contains("10,0.80000000,0.20000000,0.30000000"));
+        assert!(csv.contains("10,2,gate_value,0.9000000000"));
+        assert!(csv.contains("10,2,train_loss,0.2500000000"));
         let json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("summary.json")).unwrap())
                 .unwrap();
-        assert_eq!(json["gate_curve"]["snapshot_count"], 1);
-        assert_eq!(json["gate_curve"]["final_snapshot"]["step"], 10);
+        assert_eq!(json["gate_curve"]["curve_point_count"], 1);
+        assert_eq!(json["gate_curve"]["final_curve_point"]["step"], 10);
         assert_eq!(
-            json["gate_curve"]["final_snapshot"]["sinkhorn_iterations"],
-            20
+            json["gate_curve"]["final_curve_point"]["gate_value"]["mean"],
+            0.9
         );
-        assert_eq!(json["gate_curve"]["cache_stats"]["hit_rate"], 0.25);
+        assert_eq!(json["gate_curve"]["frozen_cache_stats"]["hit_rate"], 0.25);
         // All path rates share the denominator `calls` (=8) and are mutually
         // consistent: cached 2/8, sparse 3/8, dense 1/8. This guards against the
         // former denominator mismatch where path rates excluded cache hits.
-        assert_eq!(json["gate_curve"]["cache_stats"]["cached_path_rate"], 0.25);
-        assert_eq!(json["gate_curve"]["cache_stats"]["sparse_path_rate"], 0.375);
-        assert_eq!(json["gate_curve"]["cache_stats"]["dense_path_rate"], 0.125);
+        assert_eq!(
+            json["gate_curve"]["frozen_cache_stats"]["cached_path_rate"],
+            0.25
+        );
+        assert_eq!(
+            json["gate_curve"]["frozen_cache_stats"]["sparse_path_rate"],
+            0.625
+        );
+        assert_eq!(
+            json["gate_curve"]["frozen_cache_stats"]["dense_path_rate"],
+            0.125
+        );
         let summary: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.join("gate_curve_summary.json")).unwrap(),
         )

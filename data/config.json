@@ -64,7 +64,7 @@
   },
   "_comment_achf": {
     "enabled": "是否启用ACHF（自适应稀疏低秩投影）",
-    "mode": "lite/full，轻量或完整模式",
+    "mode": "lite=冻结后使用确定性快速路径；full=冻结权重但保留AMA延迟自适应选路",
     "proj_mode": "rowcol/row/col，投影的维度模式",
     "proj_freq": "每隔多少步执行一次投影",
     "proj_steps": "投影持续的步数（0表示按freq触发一次）",

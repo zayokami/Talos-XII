@@ -439,6 +439,14 @@ pub struct AchfCacheStats {
     pub decision_samples: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AchfSparsityStats {
+    pub total_weights: usize,
+    pub nonzero_weights: usize,
+    pub zero_weights: usize,
+    pub sparsity: f64,
+}
+
 impl AchfCacheStats {
     pub fn debug_print(stats: &[AchfCacheStats]) {
         let mut hit = 0u64;
@@ -676,11 +684,38 @@ impl AchfLayer {
     }
 
     pub fn parameters(&self) -> Vec<Tensor> {
-        let mut p = self.weight.parameters();
-        if let Some(s) = &self.sparse_weight {
-            p.extend(s.parameters());
+        // `sparse_weight` is a detached, derived inference representation of
+        // `weight`, not an independently trainable parameter set.
+        self.weight.parameters()
+    }
+
+    pub fn inference_sparsity_stats(&self) -> Option<AchfSparsityStats> {
+        let sparse = self.valid_sparse_weight()?;
+        let total_weights = sparse.in_features.checked_mul(sparse.out_features)?;
+        if total_weights == 0 {
+            return Some(AchfSparsityStats {
+                total_weights: 0,
+                nonzero_weights: 0,
+                zero_weights: 0,
+                sparsity: 0.0,
+            });
         }
-        p
+        // Count materialized values, not `sparse_mask`: threshold=0 may mark an
+        // exact zero as "kept", while the CSR path intentionally omits it.
+        // This statistic describes the work inference actually performs.
+        let nonzero_weights = sparse
+            .weight
+            .data_to_f32_vec()
+            .iter()
+            .filter(|&&value| value != 0.0)
+            .count();
+        let zero_weights = total_weights.saturating_sub(nonzero_weights);
+        Some(AchfSparsityStats {
+            total_weights,
+            nonzero_weights,
+            zero_weights,
+            sparsity: zero_weights as f64 / total_weights as f64,
+        })
     }
 
     fn forward_blend(&self, input: &Tensor, g: f64) -> Tensor {
@@ -973,9 +1008,9 @@ impl AchfLayer {
         // Frozen fast path: skip input hashing, memoization write-back and
         // latency probing (all training-only aids). Produces the same values as
         // the general path below when the frozen selector would pick Cached.
-        // Disabled under `adaptive_inference`, which deliberately routes through
-        // the full path so the AMA selector and latency sampling stay live.
-        if self.metrics.frozen.load(Ordering::Relaxed) && !self.config.adaptive_inference {
+        // Disabled in full mode, which deliberately routes through the full
+        // path so the AMA selector and latency sampling stay live.
+        if self.metrics.frozen.load(Ordering::Relaxed) && !self.config.uses_adaptive_inference() {
             if let Some(out) = self.try_frozen_cached_scaled(x) {
                 return out;
             }
@@ -1033,18 +1068,18 @@ impl AchfLayer {
             let out = match path {
                 InferencePath::Cached => self
                     .forward_inference_cached(x)
-                    .unwrap_or_else(|| self.weight.forward_inference(x)),
+                    .unwrap_or_else(|| self.forward_inference_dense_path(x)),
                 InferencePath::Sparse => self.forward_inference_sparse(x),
-                InferencePath::Dense => self.weight.forward_inference(x),
+                InferencePath::Dense => self.forward_inference_dense_path(x),
             };
             (out, start.elapsed().as_nanos() as f64)
         } else {
             let out = match path {
                 InferencePath::Cached => self
                     .forward_inference_cached(x)
-                    .unwrap_or_else(|| self.weight.forward_inference(x)),
+                    .unwrap_or_else(|| self.forward_inference_dense_path(x)),
                 InferencePath::Sparse => self.forward_inference_sparse(x),
-                InferencePath::Dense => self.weight.forward_inference(x),
+                InferencePath::Dense => self.forward_inference_dense_path(x),
             };
             (out, 0.0)
         };
@@ -1089,7 +1124,7 @@ impl AchfLayer {
     /// results are identical to `forward_inference_residual` in every case.
     pub fn forward_inference_residual_add_into(&self, x: &[f32], out: &mut [f32]) {
         if self.metrics.frozen.load(Ordering::Relaxed)
-            && !self.config.adaptive_inference
+            && !self.config.uses_adaptive_inference()
             && self.config.enabled
             && self.try_frozen_cached_add_into(x, out)
         {
@@ -1241,9 +1276,9 @@ impl AchfLayer {
         let mut out = match forced_path {
             0 => self
                 .forward_inference_cached(x)
-                .unwrap_or_else(|| self.weight.forward_inference(x)),
+                .unwrap_or_else(|| self.forward_inference_dense_path(x)),
             1 if self.has_valid_sparse_state() => self.forward_inference_sparse(x),
-            _ => self.weight.forward_inference(x),
+            _ => self.forward_inference_dense_path(x),
         };
         for v in out.iter_mut() {
             *v *= g;
@@ -2077,6 +2112,19 @@ impl AchfLayer {
             .forward_inference(x)
     }
 
+    /// Ordinary dense execution of the same frozen inference operator used by
+    /// Cached and Sparse. If the sparse state is invalid, fall back to the
+    /// original trainable weight as the safe reference implementation.
+    fn forward_inference_dense_path(&self, x: &[f32]) -> Vec<f32> {
+        if self.has_valid_sparse_state() {
+            return self
+                .valid_sparse_weight()
+                .expect("valid sparse state must include a shape-valid weight")
+                .forward_inference(x);
+        }
+        self.weight.forward_inference(x)
+    }
+
     fn choose_inference_path(&self, x: &[f32]) -> InferencePath {
         if !self.has_valid_sparse_state() {
             self.metrics.calls.fetch_add(1, Ordering::Relaxed);
@@ -2087,13 +2135,13 @@ impl AchfLayer {
         // Path selection has two regimes:
         //   * Adaptive (AMA): latency-driven probing + EMA scoring. Used while
         //     training (weights change, so the best path can shift), and also at
-        //     inference when `adaptive_inference` is set — the weights are frozen
+        //     inference in full mode — the weights are frozen
         //     but the runtime keeps measuring path latency and re-selecting. This
         //     is what actually exercises the latency-feedback machinery online.
         //   * Frozen deterministic: a frozen layer's fused cached operator is
         //     permanently valid and cheapest, so skip probing and use it. This is
         //     the peak-throughput default once weights stop changing.
-        let decision = if self.is_training_mode() || self.config.adaptive_inference {
+        let decision = if self.is_training_mode() || self.config.uses_adaptive_inference() {
             self.select_ama_path(x)
         } else {
             self.select_frozen_path(x)
@@ -3373,14 +3421,15 @@ mod tests {
     }
 
     #[test]
-    fn achf_adaptive_inference_runs_ama_on_frozen_layer() {
-        // With `adaptive_inference`, a frozen layer must keep exercising the
+    fn achf_full_mode_runs_ama_on_frozen_layer() {
+        // In full mode, a frozen layer must keep exercising the
         // latency-driven AMA selector: latency samples must accumulate (proving
         // the machinery is live), whereas the default frozen fast path records
         // none. This is the core fix — otherwise the AMA code is unreachable.
         let cfg = AchfConfig {
             enabled: true,
-            adaptive_inference: true,
+            mode: "full".to_string(),
+            adaptive_inference: false,
             cache_latency_sample_every: 1,
             ..Default::default()
         };
@@ -3395,13 +3444,14 @@ mod tests {
         let stats = layer.cache_stats();
         assert!(
             stats.latency_samples > 0,
-            "adaptive_inference must produce latency samples, got {}",
+            "full mode must produce latency samples, got {}",
             stats.latency_samples
         );
 
-        // Control: same layer frozen WITHOUT adaptive_inference records none.
+        // Control: the same frozen layer in lite mode records no AMA samples.
         let cfg2 = AchfConfig {
             enabled: true,
+            mode: "lite".to_string(),
             adaptive_inference: false,
             ..Default::default()
         };
@@ -3414,7 +3464,7 @@ mod tests {
         assert_eq!(
             frozen.cache_stats().latency_samples,
             0,
-            "deterministic frozen path must not sample latency"
+            "lite mode's deterministic frozen path must not sample latency"
         );
     }
 
@@ -4185,11 +4235,12 @@ mod tests {
     }
 
     #[test]
-    fn achf_csr_sparse_path_matches_cached_dense_pruned() {
+    fn achf_inference_paths_match_on_pruned_operator() {
         // The CSR SpMV path (forced_path=1) scatters only surviving weights,
-        // while the Cached path (forced_path=0) does a dense forward over the
-        // materialized pruned weight. After freeze both operate on the SAME
-        // pruned weight with the SAME gate, so their outputs MUST be bit-close.
+        // Cached (forced_path=0) and Dense (forced_path=2) both execute the
+        // materialized pruned weight densely. After freeze all three paths
+        // operate on the SAME pruned weight with the SAME gate, so their outputs
+        // MUST be bit-close.
         // This is the numerical anchor for the scatter-write kernel — the old
         // test only checked shapes and would not have caught an indexing bug.
         let cfg = AchfConfig {
@@ -4219,11 +4270,17 @@ mod tests {
         ];
         let cached = layer.forward_inference_forced_path(&x, 0);
         let sparse = layer.forward_inference_forced_path(&x, 1);
+        let dense = layer.forward_inference_forced_path(&x, 2);
         assert_eq!(cached.len(), sparse.len());
-        for (c, s) in cached.iter().zip(sparse.iter()) {
+        assert_eq!(cached.len(), dense.len());
+        for ((c, s), d) in cached.iter().zip(sparse.iter()).zip(dense.iter()) {
             assert!(
                 (c - s).abs() < 1e-5,
                 "CSR sparse output {s} diverged from cached dense-pruned {c}"
+            );
+            assert!(
+                (c - d).abs() < 1e-5,
+                "ordinary dense output {d} diverged from cached dense-pruned {c}"
             );
         }
         // Sanity: the CSR view must actually be sparser than dense (pruning
@@ -4721,6 +4778,38 @@ mod tests {
         layer.prune(0.0);
         let mask = layer.sparse_mask.as_ref().unwrap();
         assert!(mask.iter().all(|&m| m == 1));
+        let stats = layer.inference_sparsity_stats().unwrap();
+        assert_eq!(stats.total_weights, 16);
+        assert_eq!(stats.nonzero_weights, 16);
+        assert_eq!(stats.zero_weights, 0);
+        assert_eq!(stats.sparsity, 0.0);
+    }
+
+    #[test]
+    fn achf_sparse_inference_copy_does_not_inflate_parameter_count() {
+        let cfg = AchfConfig {
+            enabled: true,
+            rank: 0,
+            proj_mode: "none".to_string(),
+            prune_threshold: 0.0,
+            ..Default::default()
+        };
+        let mut layer = AchfLayer::new(4, 3, true, cfg, 202);
+        let before: usize = layer
+            .parameters()
+            .iter()
+            .map(|parameter| parameter.shape.iter().product::<usize>())
+            .sum();
+        layer.freeze_for_inference();
+        let after: usize = layer
+            .parameters()
+            .iter()
+            .map(|parameter| parameter.shape.iter().product::<usize>())
+            .sum();
+
+        assert_eq!(before, 15);
+        assert_eq!(after, before);
+        assert!(layer.sparse_weight.is_some());
     }
 
     #[test]

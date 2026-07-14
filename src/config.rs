@@ -173,6 +173,26 @@ fn sanitize_positive(value: &mut f64, key: &str, default: f64) {
 
 fn sanitize_achf_config(achf: &mut AchfConfig) {
     let defaults = AchfConfig::default();
+    let normalized_mode = achf.mode.trim().to_ascii_lowercase();
+    match normalized_mode.as_str() {
+        "lite" | "full" => achf.mode = normalized_mode,
+        _ => {
+            eprintln!(
+                "[Config Warning] ACHF mode '{}' is unsupported, fallback to '{}'",
+                achf.mode, defaults.mode
+            );
+            achf.mode = defaults.mode;
+        }
+    }
+    if achf.adaptive_inference && achf.mode != "full" {
+        eprintln!(
+            "[Config Warning] ACHF adaptive_inference=true is a legacy alias for mode='full'"
+        );
+        achf.mode = "full".to_string();
+    }
+    // The mode is canonical after sanitization. Clear the legacy alias so a
+    // later runtime switch from full back to lite cannot remain stuck in AMA.
+    achf.adaptive_inference = false;
     sanitize_unit_interval(
         &mut achf.gate_momentum,
         "gate_momentum",
@@ -367,11 +387,9 @@ pub struct AchfConfig {
     pub apply_ffn: bool,
     pub apply_dqn: bool,
     pub infer_gate: String,
-    /// When true, a frozen (inference-only) layer keeps using the adaptive
-    /// latency-driven path selector (AMA) instead of the deterministic Cached
-    /// fast path. Weights stay fixed; only path *selection* remains adaptive.
-    /// This is what exercises the latency-EMA machinery at inference time.
-    /// Default false: freeze to the deterministic fast path for peak throughput.
+    /// Legacy compatibility alias for `mode = "full"`. Config sanitization
+    /// migrates this flag into `mode` and clears it; new callers should set
+    /// `mode` directly.
     pub adaptive_inference: bool,
 }
 
@@ -418,6 +436,16 @@ impl Default for AchfConfig {
             infer_gate: "last".to_string(),
             adaptive_inference: false,
         }
+    }
+}
+
+impl AchfConfig {
+    /// Whether frozen inference should keep the latency-adaptive AMA selector
+    /// active. `adaptive_inference` remains a compatibility alias for configs
+    /// constructed by older callers; sanitized configs canonicalize it to
+    /// `mode = "full"`.
+    pub fn uses_adaptive_inference(&self) -> bool {
+        self.mode.trim().eq_ignore_ascii_case("full") || self.adaptive_inference
     }
 }
 
@@ -1553,5 +1581,36 @@ mod tests {
         assert_eq!(achf.cache_latency_ema, 0.0);
         assert_eq!(achf.cache_latency_long_ema, defaults.cache_latency_long_ema);
         assert_eq!(achf.cache_adapt_blend, 0.0);
+    }
+
+    #[test]
+    fn sanitize_achf_canonicalizes_inference_mode() {
+        let mut full = AchfConfig {
+            mode: " FULL ".to_string(),
+            ..Default::default()
+        };
+        sanitize_achf_config(&mut full);
+        assert_eq!(full.mode, "full");
+        assert!(!full.adaptive_inference);
+        assert!(full.uses_adaptive_inference());
+
+        let mut invalid = AchfConfig {
+            mode: "turbo".to_string(),
+            ..Default::default()
+        };
+        sanitize_achf_config(&mut invalid);
+        assert_eq!(invalid.mode, "lite");
+        assert!(!invalid.adaptive_inference);
+        assert!(!invalid.uses_adaptive_inference());
+
+        let mut legacy = AchfConfig {
+            mode: "lite".to_string(),
+            adaptive_inference: true,
+            ..Default::default()
+        };
+        sanitize_achf_config(&mut legacy);
+        assert_eq!(legacy.mode, "full");
+        assert!(!legacy.adaptive_inference);
+        assert!(legacy.uses_adaptive_inference());
     }
 }
