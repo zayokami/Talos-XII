@@ -41,7 +41,7 @@ const ONES_5_1_DATA: [f64; 5] = [1.0; 5];
 
 fn dqn_achf_orthogonal_penalty_interval(config: &AchfConfig) -> usize {
     if config.enabled && config.apply_dqn && config.lambda_ortho > 0.0 {
-        config.proj_freq.max(1)
+        config.ortho_penalty_freq.max(1)
     } else {
         usize::MAX
     }
@@ -724,9 +724,9 @@ impl DuelingQNetwork {
         }
     }
 
-    pub fn maybe_project_achf_after_optimizer_step(&self) {
-        if let Some(achf) = &self.achf {
-            achf.maybe_project_after_optimizer_step();
+    pub fn refresh_achf_after_optimizer_step(&mut self) {
+        if let Some(achf) = &mut self.achf {
+            achf.refresh_after_optimizer_step();
         }
     }
 
@@ -2199,7 +2199,7 @@ fn train_dqn_impl(
 
             let start_opt = std::time::Instant::now();
             optimizer.step();
-            policy_net.maybe_project_achf_after_optimizer_step();
+            policy_net.refresh_achf_after_optimizer_step();
             optimizer_step_counter += 1;
             let opt_time = start_opt.elapsed();
 
@@ -2548,7 +2548,7 @@ impl OnlineDqnTrainer {
         loss.backward();
         self.policy.update_achf_after_backward();
         self.optimizer.step();
-        self.policy.maybe_project_achf_after_optimizer_step();
+        self.policy.refresh_achf_after_optimizer_step();
 
         // Write back per-sample TD errors for priority update
         {
@@ -2648,10 +2648,10 @@ mod tests {
         achf.enabled = true;
         achf.apply_dqn = true;
         achf.lambda_ortho = 0.001;
-        achf.proj_freq = 8;
+        achf.ortho_penalty_freq = 8;
         assert_eq!(dqn_achf_orthogonal_penalty_interval(&achf), 8);
 
-        achf.proj_freq = 0;
+        achf.ortho_penalty_freq = 0;
         assert_eq!(dqn_achf_orthogonal_penalty_interval(&achf), 1);
 
         achf.lambda_ortho = 0.0;
@@ -2666,7 +2666,7 @@ mod tests {
             enabled: true,
             apply_dqn: true,
             proj_mode: "none".to_string(),
-            proj_freq: 0,
+            ortho_penalty_freq: 0,
             lambda_ortho: 0.0,
             rank: 0,
             prune_threshold: 0.0,
@@ -2680,7 +2680,14 @@ mod tests {
         };
         let dqn_off = DuelingQNetwork::new_with_config(&off, 123);
         let dqn_on = DuelingQNetwork::new_with_config(&on, 123);
-        assert_eq!(dqn_on.param_count(), dqn_off.param_count());
+        let connection_parameters = dqn_on
+            .achf
+            .as_ref()
+            .map_or(0, |achf| achf.connection_logits.numel());
+        assert_eq!(
+            dqn_on.param_count(),
+            dqn_off.param_count() + connection_parameters
+        );
         assert_eq!(
             dqn_on
                 .achf
@@ -2760,7 +2767,7 @@ mod tests {
         config.achf = AchfConfig {
             enabled: true,
             apply_dqn: true,
-            proj_freq: 1,
+            ortho_penalty_freq: 1,
             ..AchfConfig::default()
         };
         let dqn = DuelingQNetwork::new_with_config(&config, 123);

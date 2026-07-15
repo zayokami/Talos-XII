@@ -131,79 +131,53 @@ Model cache manifests fingerprint probability, pity, luck-budget, architecture, 
 
 ### ACHF (Adaptive Cache-aware Hyper-Connections)
 
-ACHF is Talos-XII's proprietary training/inference acceleration layer. It replaces a plain dense `Linear` with a gated block that trains a dense reference weight, materializes a pruned candidate at freeze time, and then chooses the fastest numerically equivalent physical execution path for that candidate. The gate scales the active operator; it does not interpolate Cached/Sparse/Dense, because those names are execution strategies for the same frozen candidate. The goal is to cut the CPU matmul and cache-miss cost that dominates small-batch neural inference while keeping approximation error observable.
+ACHF replaces selected dense `Linear` layers with three explicitly separated decisions. The trainable dense `weight` remains the **reference operator** and is updated only by the optimizer; derived candidate refreshes and connection constraints never overwrite it.
 
-The block behaves differently in the two lifecycle phases. **During training** the dense reference is scaled by the live gate and periodically projected (row/column or Sinkhorn normalization + low-rank truncation). **After `freeze_for_inference()`** the projected weight is pruned, the same gate scale is applied to the frozen candidate, and ACHF prepares Cached/Sparse/Dense execution views. In `lite` mode inference uses the deterministic frozen fast path; in `full` mode the weights remain frozen but AMA keeps measuring and adapting the physical execution path (see AMA below).
+1. **Reference/candidate quality selection.** A sparse or low-rank candidate is derived from the current reference. The live gate is a reference coefficient: `1` means reference-only. When a candidate is eligible, its effective share is `(1 - reference_gate) * connection_candidate_weight`, and the output is a reference/candidate blend. An absent, stale, or ineligible candidate always falls back to the reference. This formula applies to the soft `last`/`g_min` inference modes; `infer_gate=candidate` hard-selects an admitted candidate, while `infer_gate=reference` hard-selects the reference. `fixed_*` remains an explicitly labeled diagnostic override that also bypasses admission.
+2. **Dedicated connection map.** A separate trainable `2×2 connection_logits` tensor controls the cross-connection. `rowcol` or `sinkhorn` produces a differentiable constrained map during forward; Adam moments stay attached to the unconstrained logits. `lambda_ortho` is allowed only with `proj_mode=none`, so incompatible constraints are never stacked on one tensor.
+3. **Candidate execution routing.** Only after quality selection chooses the candidate does ACHF select its physical implementation. Cached, Sparse, and Dense are execution layouts for the same candidate, not quality branches and not gate values.
 
 ```mermaid
-flowchart TD
-    X["input x"] --> G{"training or frozen?"}
-
-    subgraph TRAIN["Training path (weights changing)"]
-        direction TB
-        CG["compute_gate&nbsp;g&nbsp;∈&nbsp;[g_min,&nbsp;1]<br/>gate_mode: grad_ema / fim_trace"] --> ACTIVE["dense reference · g"]
-        ACTIVE --> BWD["backward → update_after_backward<br/>(EMA of grad RMS)"]
-        BWD --> PROJ{"step % proj_freq == 0?"}
-        PROJ -- yes --> MANI["project_weight:<br/>row/col or Sinkhorn normalize<br/>+ low-rank truncation (rank r)"]
-        MANI --> KEEP["keep projected dense reference"]
-        PROJ -- no --> SKIP["keep operator"]
-    end
-
-    subgraph INFER["Frozen path (weights fixed)"]
-        direction TB
-        FUSE["frozen pruned candidate<br/>+ prepared cache/CSR views"] --> AMA["AMA path selection<br/>Cached / Sparse / Dense"]
-    end
-
-    G -- training --> TRAIN
-    G -- frozen --> INFER
-    TRAIN --> OUT["output"]
-    INFER --> OUT
+flowchart LR
+    X["input x"] --> REF["reference F(x)<br/>optimizer-owned"]
+    X --> CAND["derived candidate C(x)"]
+    ENTRY{"candidate entry<br/>valid · fresh · accurate"}
+    CAND --> ENTRY
+    LOGITS["2×2 connection_logits"] --> MAP["differentiable rowcol / Sinkhorn map"]
+    MAP --> QUALITY["reference/candidate blend"]
+    REF --> QUALITY
+    ENTRY -- reject --> REFOUT["reference output"]
+    ENTRY -- accept --> QUALITY
+    QUALITY --> SELECT{"candidate selected?"}
+    SELECT -- no --> REFOUT
+    SELECT -- yes --> ROUTE["Cached / Sparse / Dense"]
+    ROUTE --> OUT["output"]
+    REFOUT --> OUT
 ```
 
-**Problems solved:** CPU-bound neural-network matrix multiplication; cache misses degrading throughput; the fact that the optimal sparsity/projection frequency and even the fastest execution path differ across hardware.
+Candidate modes are mutually exclusive:
 
-**Four mechanisms:**
-- **Low-rank Projection** — row/column or dual (Sinkhorn) projection (`proj_mode`), followed by rank-`r` truncation, constrains the operator (`proj_freq` controls how often it runs; `0` disables it). The current rank-r result is materialized densely, so rank alone is not claimed as storage or kernel compression.
-- **Gate and Pruning** — the live gate `g ∈ [g_min, 1]` multiplicatively scales the active operator. Magnitude pruning is a separate freeze-time step controlled only by `prune_threshold`; it does not reuse rank as an nnz budget.
-- **Adaptive Control (AMA)** — runtime latency sampling with EMA smoothing decides which execution path to run, with hysteresis to avoid path thrashing (see below).
-- **Path-level Toggle** — independently enable/disable ACHF on Attention (`apply_attn`), FFN (`apply_ffn`), and DQN (`apply_dqn`) paths to protect accuracy-sensitive links.
+- `candidate_mode=sparse` applies only `prune_threshold`. Production admission requires `candidate_min_sparsity`, `candidate_max_relative_error`, a valid mask, and CSR storage smaller than the dense candidate. Sparse routing is unavailable otherwise.
+- `candidate_mode=low_rank` applies only `rank`. It does not prune and does not expose a Sparse route. The current approximation is materialized densely, so rank is not claimed as factorized storage or a low-rank kernel speedup.
+- `candidate_mode=none` keeps reference-only behavior.
 
-**Recommended starting point:** `mode=lite` + `apply_ffn=true`. If oscillation or slow convergence occurs, raise `g_min` or lower `proj_freq` (or set it to `0`). For accuracy-sensitive scenarios, enable only the FFN path.
+`candidate_refresh_freq` controls post-optimizer candidate rebuilding. A skipped refresh immediately revokes production eligibility until the next rebuild, preventing stale candidates from being reused. The default is `1`. `freeze_for_inference()` rebuilds and validates once more before preparing candidate layouts.
+
+Frozen output memoization is separate from Cached execution. It hashes every input element and also compares the complete stored input before returning a memoized output. Benchmarks disable it unless memoization itself is under study, so selector/path counters remain interpretable. `cache_min_reuse` controls only this memo threshold; AMA warm-up and hysteresis use the independent `path_warmup_samples` and `path_min_dwell` settings.
+
+**Recommended starting point:** `candidate_mode=sparse`, `candidate_refresh_freq=1`, `proj_mode=sinkhorn`, `mode=lite`, and `apply_ffn=true`. Treat every `fixed_*` mode as a diagnostic override: it forces candidate selection even when production admission fails.
 
 ### AMA
 
-AMA is the runtime scheduler inside ACHF that answers a single question on every inference call: *which of the three mathematically-equivalent execution paths is fastest right now?*
+AMA is the latency scheduler inside the third layer. It runs only after the quality layer has selected an eligible candidate (except explicit `fixed_*` diagnostics). Its paths are:
 
-- **Cached** — the pre-fused low-rank/sparse operator; cheapest when the cache is valid.
-- **Sparse** — the pruned weight applied directly (skips zeroed channels).
-- **Dense** — the same frozen pruned operator through an ordinary dense kernel; if sparse state is invalid, it safely falls back to the original trainable weight.
+- **Cached** — a prepared dense candidate buffer with the fused CPU row kernel.
+- **Sparse** — the sparse candidate's CSR/masked kernel; available only for a valid sparse candidate.
+- **Dense** — the same candidate through its ordinary dense `Linear` implementation.
 
-Because the fastest path depends on batch shape, sparsity ratio, and the host CPU's cache behavior, AMA treats the three paths as arms of a multi-armed bandit. It measures each arm's latency (cold/warm split, EMA-smoothed), *probes* arms that have gone stale, and otherwise sticks with the current winner. A **hysteresis margin** keeps the previous path unless a challenger is meaningfully faster, so the scheduler doesn't flip-flop between two near-equal paths.
+`lite` uses deterministic routing: Cached when its shape/row/input-density conditions hold, otherwise Sparse when available, otherwise Dense. `plain_ema` and `full` sample path latency; `full` additionally uses cold/warm and short/long EMAs, per-batch buckets, stale probing, hysteresis, and bounded loser re-probing. A low-rank candidate is compared only across Cached and Dense; AMA never fabricates or probes a Sparse arm for it.
 
-A **lite-mode frozen** layer short-circuits this entirely: its weights never change, so the fused Cached path is permanently valid and cheapest — AMA is skipped and Cached is used deterministically (falling back to Sparse/Dense only if the cache is shape/sparsity-invalid). A **full-mode frozen** layer keeps AMA active while leaving all weights immutable.
-
-```mermaid
-flowchart TD
-    CALL["inference call"] --> FROZEN{"layer frozen?"}
-    FROZEN -- yes --> MODE{"mode = full?"}
-    MODE -- no --> CV{"cache valid?<br/>(shape · rows · sparsity)"}
-    MODE -- yes --> PROBE
-    CV -- yes --> USEC["use Cached (deterministic)"]
-    CV -- no --> FB["fall back: Sparse → Dense"]
-
-    FROZEN -- no --> PROBE{"any arm stale /<br/>never measured?"}
-    PROBE -- yes --> DOPROBE["probe that arm<br/>(force latency sample)"]
-    PROBE -- no --> SCORE["compare EMA latencies<br/>Cached vs Sparse vs Dense"]
-    SCORE --> HYST{"challenger faster<br/>beyond margin?"}
-    HYST -- no --> KEEP["keep previous path (hysteresis)"]
-    HYST -- yes --> SWITCH["switch to faster path"]
-    DOPROBE --> REC["record latency → update EMA"]
-    KEEP --> REC
-    SWITCH --> REC
-    USEC --> REC
-    FB --> REC
-    REC --> DONE["execute chosen path"]
-```
+Metrics report the layers separately: memo hits, reference/candidate selections, candidate rejections, and Cached/Sparse/Dense rates within candidate executions. This prevents an output memo hit or reference fallback from being misreported as a cache-layout win.
 
 ### SIMD Acceleration (`src/simd.rs`)
 
@@ -384,79 +358,53 @@ cargo run --release -- benchmark                  # 快速内置基准
 
 ### ACHF（Adaptive Cache-aware Hyper-Connections）
 
-ACHF 是 Talos-XII 自研的训练/推理加速层。它用一个自调节模块替换普通的稠密 `Linear`：训练期维护稠密参考权重，冻结时生成剪枝候选，并在运行时选择该候选最快的物理执行路径。门控只缩放当前活跃算子，不在 Dense/Sparse/Cached 之间插值。目标是削减小 batch 神经推理中占主导的 CPU 矩阵乘法和缓存未命中开销，同时让近似误差保持可观测。
+ACHF 把被替换的稠密 `Linear` 明确拆成三层决策。可训练的稠密 `weight` 始终是 **reference 算子**，只允许优化器更新；候选重建和连接约束都不会覆盖它。
 
-模块在两个生命周期阶段行为不同。**训练期**门控会真实缩放稠密参考算子的输出，并周期性执行**流形投影**（行/列或 Sinkhorn 归一化 + 低秩截断）。**调用 `freeze_for_inference()` 之后**，投影后的权重被剪枝，同一门控缩放继续作用于冻结候选算子，同时生成 Cached/Sparse/Dense 三种数值等价的物理执行视图。`lite` 模式使用确定性的冻结快速路径；`full` 模式保持权重冻结，但 AMA 继续测量并自适应选择物理执行路径（见下方 AMA）。
+1. **reference/candidate 质量选择。** 系统从当前 reference 派生稀疏或低秩 candidate。实时 gate 表示 reference 系数，`1` 即纯 reference。候选合格时，有效候选占比为 `(1 - reference_gate) * connection_candidate_weight`，输出是 reference/candidate 插值；候选缺失、陈旧或不合格时强制回退 reference。该公式用于 `last`/`g_min` 软门控；`infer_gate=candidate` 会硬选择已通过准入的 candidate，`infer_gate=reference` 会硬选择 reference。`fixed_*` 仍是明确标注且会额外绕过准入的诊断覆盖。
+2. **专用连接图。** 独立可训练的 `2×2 connection_logits` 控制跨连接。`rowcol`/`sinkhorn` 在前向中可微地派生受约束 connection map，Adam 动量始终绑定未投影 logits。`lambda_ortho` 只允许与 `proj_mode=none` 搭配，不会在同一个张量上叠加冲突约束。
+3. **candidate 执行路由。** 只有质量层选中 candidate 后，才在 Cached、Sparse、Dense 之间选择物理实现。这三者是同一个 candidate 的执行布局，不是质量分支，也不是 gate 值。
 
 ```mermaid
-flowchart TD
-    X["输入 x"] --> G{"训练 or 冻结?"}
-
-    subgraph TRAIN["训练路径（权重变化中）"]
-        direction TB
-        CG["compute_gate&nbsp;g&nbsp;∈&nbsp;[g_min,&nbsp;1]<br/>gate_mode: grad_ema / fim_trace"] --> ACTIVE["稠密参考算子 · g"]
-        ACTIVE --> BWD["反向 → update_after_backward<br/>(梯度 RMS 的 EMA)"]
-        BWD --> PROJ{"step % proj_freq == 0?"}
-        PROJ -- 是 --> MANI["project_weight:<br/>行/列 或 Sinkhorn 归一化<br/>+ 低秩截断 (rank r)"]
-        MANI --> KEEP["保留投影后的稠密参考"]
-        PROJ -- 否 --> SKIP["保持算子"]
-    end
-
-    subgraph INFER["冻结路径（权重固定）"]
-        direction TB
-        FUSE["冻结剪枝候选<br/>+ Cache/CSR 执行视图"] --> AMA["AMA 路径选择<br/>Cached / Sparse / Dense"]
-    end
-
-    G -- 训练 --> TRAIN
-    G -- 冻结 --> INFER
-    TRAIN --> OUT["输出"]
-    INFER --> OUT
+flowchart LR
+    X["输入 x"] --> REF["reference F(x)<br/>由优化器管理"]
+    X --> CAND["派生 candidate C(x)"]
+    ENTRY{"候选准入<br/>有效 · 新鲜 · 误差合格"}
+    CAND --> ENTRY
+    LOGITS["2×2 connection_logits"] --> MAP["可微 rowcol / Sinkhorn map"]
+    MAP --> QUALITY["reference/candidate 插值"]
+    REF --> QUALITY
+    ENTRY -- 拒绝 --> REFOUT["reference 输出"]
+    ENTRY -- 接受 --> QUALITY
+    QUALITY --> SELECT{"选中 candidate?"}
+    SELECT -- 否 --> REFOUT
+    SELECT -- 是 --> ROUTE["Cached / Sparse / Dense"]
+    ROUTE --> OUT["输出"]
+    REFOUT --> OUT
 ```
 
-**解决的问题：** CPU 上神经网络大矩阵乘法的瓶颈；缓存未命中拖慢吞吐量；不同机器上最佳稀疏度、投影频率、甚至最快的执行路径都各不相同，固定超参难以兼顾。
+候选模式严格互斥：
 
-**四个核心机制：**
-- **低秩投影** — 对权重矩阵做行/列或双向（Sinkhorn）投影（`proj_mode`），再做 rank-`r` 截断以约束算子（`proj_freq` 控制频率，设为 `0` 关闭）。当前 rank-r 结果仍以稠密矩阵物化，因此不能把 rank 本身宣称为存储或内核压缩。
-- **门控与剪枝** — 门控值 `g ∈ [g_min, 1]` 乘法缩放当前活跃算子；幅度剪枝是冻结阶段的独立步骤，仅由 `prune_threshold` 控制，不再把 rank 偷换成 nnz 预算。
-- **自适应控制（AMA）** — 运行时采样延迟并 EMA 平滑，决定走哪条执行路径，并用滞回避免路径抖动（见下）。
-- **路径级开关** — 可分别对 Attention（`apply_attn`）、FFN（`apply_ffn`）、DQN（`apply_dqn`）启用/关闭 ACHF，保护对精度敏感的链路。
+- `candidate_mode=sparse` 只使用 `prune_threshold`。生产准入同时要求达到 `candidate_min_sparsity`、不超过 `candidate_max_relative_error`、mask 有效且 CSR 存储小于稠密候选；否则不能进入 Sparse/候选生产路径。
+- `candidate_mode=low_rank` 只使用 `rank`，不剪枝，也没有 Sparse 路由。当前近似仍以稠密矩阵物化，因此不能把 rank 宣称为因子化存储或低秩核加速。
+- `candidate_mode=none` 始终使用 reference。
 
-**推荐起步：** `mode=lite` + `apply_ffn=true`。出现震荡或收敛变慢时，提高 `g_min` 或降低 `proj_freq`（或设为 `0`）。精度敏感场景可只开 FFN 路径。
+`candidate_refresh_freq` 控制优化器更新后的候选重建。跳过刷新时会立刻撤销候选生产准入，直到下一次重建，杜绝陈旧 candidate 复用；默认值为 `1`。`freeze_for_inference()` 会再次重建和校验，然后准备执行布局。
+
+冻结输出 memo 与 Cached 执行是两回事。memo 哈希覆盖全部输入元素，并在返回前比较完整输入；论文 benchmark 默认关闭 memo，避免污染 selector 与路径统计。`cache_min_reuse` 只控制 memo 阈值；AMA 预热和滞回分别由独立的 `path_warmup_samples`、`path_min_dwell` 控制。
+
+**推荐起步：** `candidate_mode=sparse`、`candidate_refresh_freq=1`、`proj_mode=sinkhorn`、`mode=lite`、`apply_ffn=true`。所有 `fixed_*` 模式都是诊断覆盖：即使候选不满足生产准入，也会强制选择候选。
 
 ### AMA
 
-AMA 是 ACHF 内部的运行时调度器，每次推理只回答一个问题：*此刻三条数学等价的执行路径里哪条最快？*
+AMA 是第三层内部的延迟调度器。正常情况下，只有质量层已经选中合格 candidate 后才会运行（`fixed_*` 诊断除外）。三条路径是：
 
-- **Cached** — 预融合的低秩/稀疏算子，缓存有效时最省。
-- **Sparse** — 直接用剪枝权重（跳过置零通道）。
-- **Dense** — 对同一个冻结剪枝算子使用普通稠密核；仅当稀疏状态无效时安全回退到原始可训练权重。
+- **Cached** — 预备好的稠密 candidate 缓冲区和融合 CPU 行核。
+- **Sparse** — 稀疏 candidate 的 CSR/mask 内核；仅对有效稀疏候选可用。
+- **Dense** — 同一个 candidate 的普通稠密 `Linear` 实现。
 
-由于最快路径取决于 batch 形状、稀疏率和主机 CPU 的缓存行为，AMA 把三条路径当作多臂老虎机的三个臂：测量每个臂的延迟（冷/热分开，EMA 平滑），对"变陈旧"的臂做**探测（probe）**，其余时候维持当前赢家。一道**滞回边界（hysteresis margin）**让它保持上一条路径，除非挑战者明显更快，从而避免在两条接近的路径间反复横跳。
+`lite` 使用确定性路由：满足形状、行数和输入密度条件时走 Cached，否则有 Sparse 就走 Sparse，再否则走 Dense。`plain_ema` 与 `full` 会采样候选内部路径延迟；`full` 额外使用冷/热、短/长 EMA、按 batch 分桶、陈旧探测、滞回和有上限的失败路径重探测。低秩 candidate 只比较 Cached 与 Dense，AMA 不会伪造或探测 Sparse 路径。
 
-**lite 模式的冻结层**会完全短路这套逻辑：权重不再变化，融合 Cached 路径永远有效且最省 —— 于是跳过 AMA、确定性地走 Cached（仅当缓存形状/稀疏度失配时才回退 Sparse/Dense）。**full 模式的冻结层**保持所有权重不可变，但继续运行 AMA。
-
-```mermaid
-flowchart TD
-    CALL["推理调用"] --> FROZEN{"层已冻结?"}
-    FROZEN -- 是 --> MODE{"mode = full?"}
-    MODE -- 否 --> CV{"缓存有效?<br/>(形状 · 行数 · 稀疏度)"}
-    MODE -- 是 --> PROBE
-    CV -- 是 --> USEC["用 Cached（确定性）"]
-    CV -- 否 --> FB["回退: Sparse → Dense"]
-
-    FROZEN -- 否 --> PROBE{"有臂陈旧 /<br/>从未测量?"}
-    PROBE -- 是 --> DOPROBE["探测该臂<br/>(强制采样延迟)"]
-    PROBE -- 否 --> SCORE["比较 EMA 延迟<br/>Cached vs Sparse vs Dense"]
-    SCORE --> HYST{"挑战者超出<br/>滞回边界更快?"}
-    HYST -- 否 --> KEEP["保持上一路径（滞回）"]
-    HYST -- 是 --> SWITCH["切换到更快路径"]
-    DOPROBE --> REC["记录延迟 → 更新 EMA"]
-    KEEP --> REC
-    SWITCH --> REC
-    USEC --> REC
-    FB --> REC
-    REC --> DONE["执行选中路径"]
-```
+指标也按三层拆分：输出 memo 命中、reference/candidate 选择、candidate 拒绝，以及 candidate 内部 Cached/Sparse/Dense 比例。这样 memo 命中或 reference 回退不会再被冒充为缓存执行胜利。
 
 ### SIMD 加速（`src/simd.rs`）
 

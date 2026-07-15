@@ -171,6 +171,16 @@ fn sanitize_positive(value: &mut f64, key: &str, default: f64) {
     }
 }
 
+fn sanitize_finite(value: &mut f64, key: &str, default: f64) {
+    if !value.is_finite() {
+        eprintln!(
+            "[Config Warning] ACHF {key} is non-finite, fallback to {}",
+            default
+        );
+        *value = default;
+    }
+}
+
 fn sanitize_achf_config(achf: &mut AchfConfig) {
     let defaults = AchfConfig::default();
     let normalized_mode = achf.mode.trim().to_ascii_lowercase();
@@ -185,6 +195,54 @@ fn sanitize_achf_config(achf: &mut AchfConfig) {
             );
             achf.mode = defaults.mode;
         }
+    }
+    let normalized_candidate_mode = achf.candidate_mode.trim().to_ascii_lowercase();
+    match normalized_candidate_mode.as_str() {
+        "none" | "sparse" | "low_rank" => achf.candidate_mode = normalized_candidate_mode,
+        _ => {
+            eprintln!(
+                "[Config Warning] ACHF candidate_mode '{}' is unsupported, fallback to '{}'",
+                achf.candidate_mode, defaults.candidate_mode
+            );
+            achf.candidate_mode = defaults.candidate_mode.clone();
+        }
+    }
+    let normalized_projection = achf.proj_mode.trim().to_ascii_lowercase();
+    match normalized_projection.as_str() {
+        "none" | "rowcol" | "sinkhorn" => achf.proj_mode = normalized_projection,
+        _ => {
+            eprintln!(
+                "[Config Warning] ACHF proj_mode '{}' is unsupported, fallback to '{}'",
+                achf.proj_mode, defaults.proj_mode
+            );
+            achf.proj_mode = defaults.proj_mode.clone();
+        }
+    }
+    sanitize_non_negative(
+        &mut achf.lambda_ortho,
+        "lambda_ortho",
+        defaults.lambda_ortho,
+    );
+    sanitize_finite(&mut achf.gate_alpha, "gate_alpha", defaults.gate_alpha);
+    sanitize_finite(&mut achf.gate_beta, "gate_beta", defaults.gate_beta);
+    if achf.proj_mode != "none" && achf.lambda_ortho > 0.0 {
+        eprintln!(
+            "[Config Warning] ACHF lambda_ortho cannot be stacked with '{}' on the dedicated connection map; disabling lambda_ortho",
+            achf.proj_mode
+        );
+        achf.lambda_ortho = 0.0;
+    }
+    if achf.candidate_mode == "sparse" && achf.rank > 0 {
+        eprintln!(
+            "[Config Warning] ACHF rank is a low-rank candidate setting and cannot be stacked with sparse pruning; disabling rank"
+        );
+        achf.rank = 0;
+    }
+    if achf.candidate_mode == "low_rank" && achf.prune_threshold > 0.0 {
+        eprintln!(
+            "[Config Warning] ACHF prune_threshold cannot be stacked with a low-rank candidate; disabling pruning"
+        );
+        achf.prune_threshold = 0.0;
     }
     if achf.adaptive_inference && achf.mode != "full" {
         eprintln!(
@@ -281,6 +339,27 @@ fn sanitize_achf_config(achf: &mut AchfConfig) {
         "prune_threshold",
         defaults.prune_threshold,
     );
+    sanitize_unit_interval(
+        &mut achf.candidate_min_sparsity,
+        "candidate_min_sparsity",
+        defaults.candidate_min_sparsity,
+    );
+    sanitize_unit_interval(
+        &mut achf.candidate_max_relative_error,
+        "candidate_max_relative_error",
+        defaults.candidate_max_relative_error,
+    );
+    sanitize_unit_interval(
+        &mut achf.candidate_weight_error_momentum,
+        "candidate_weight_error_momentum",
+        defaults.candidate_weight_error_momentum,
+    );
+    let normalized_infer_gate = achf.infer_gate.trim().to_ascii_lowercase();
+    achf.infer_gate = match normalized_infer_gate.as_str() {
+        "candidate" | "reference" | "last" | "g_min" => normalized_infer_gate,
+        "one" => "candidate".to_string(),
+        _ => defaults.infer_gate,
+    };
 }
 /// Determines which policy drives the luck factor during simulation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -353,8 +432,13 @@ impl ComputeDevice {
 pub struct AchfConfig {
     pub enabled: bool,
     pub mode: String,
+    #[serde(default = "default_achf_candidate_mode")]
+    pub candidate_mode: String,
+    #[serde(default = "default_achf_candidate_refresh_freq")]
+    pub candidate_refresh_freq: usize,
     pub proj_mode: String,
-    pub proj_freq: usize,
+    #[serde(default = "default_achf_ortho_penalty_freq", alias = "proj_freq")]
+    pub ortho_penalty_freq: usize,
     pub proj_steps: usize,
     pub lambda_ortho: f64,
     pub gate_mode: String,
@@ -372,6 +456,10 @@ pub struct AchfConfig {
     pub cache_min_rows: usize,
     pub cache_min_nonzero_ratio: f64,
     pub cache_min_reuse: usize,
+    #[serde(default = "default_achf_path_warmup_samples")]
+    pub path_warmup_samples: usize,
+    #[serde(default = "default_achf_path_min_dwell")]
+    pub path_min_dwell: usize,
     pub cache_sparsity_sample_rows: usize,
     pub cache_cost_bias: f64,
     pub cache_adapt_rate: f64,
@@ -386,6 +474,15 @@ pub struct AchfConfig {
     pub diagnostics_enabled: bool,
     pub rank: usize,
     pub prune_threshold: f64,
+    #[serde(default = "default_achf_candidate_min_sparsity")]
+    pub candidate_min_sparsity: f64,
+    #[serde(default = "default_achf_candidate_max_relative_error")]
+    pub candidate_max_relative_error: f64,
+    #[serde(
+        default = "default_achf_candidate_weight_error_momentum",
+        alias = "candidate_discrepancy_momentum"
+    )]
+    pub candidate_weight_error_momentum: f64,
     pub apply_attn: bool,
     pub apply_ffn: bool,
     pub apply_dqn: bool,
@@ -401,10 +498,12 @@ impl Default for AchfConfig {
         AchfConfig {
             enabled: false,
             mode: "lite".to_string(),
-            proj_mode: "rowcol".to_string(),
-            proj_freq: 8,
+            candidate_mode: default_achf_candidate_mode(),
+            candidate_refresh_freq: default_achf_candidate_refresh_freq(),
+            proj_mode: "sinkhorn".to_string(),
+            ortho_penalty_freq: default_achf_ortho_penalty_freq(),
             proj_steps: 0,
-            lambda_ortho: 1e-3,
+            lambda_ortho: 0.0,
             gate_mode: "grad_ema".to_string(),
             gate_momentum: 0.95,
             gate_beta: 0.7,
@@ -420,6 +519,8 @@ impl Default for AchfConfig {
             cache_min_rows: 1,
             cache_min_nonzero_ratio: 0.0,
             cache_min_reuse: 2,
+            path_warmup_samples: default_achf_path_warmup_samples(),
+            path_min_dwell: default_achf_path_min_dwell(),
             cache_sparsity_sample_rows: 0,
             cache_cost_bias: 1.0,
             cache_adapt_rate: 0.0,
@@ -432,15 +533,50 @@ impl Default for AchfConfig {
             cache_log_interval_steps: 0,
             cache_log_per_layer: false,
             diagnostics_enabled: false,
-            rank: 128,
+            rank: 0,
             prune_threshold: 0.01,
+            candidate_min_sparsity: default_achf_candidate_min_sparsity(),
+            candidate_max_relative_error: default_achf_candidate_max_relative_error(),
+            candidate_weight_error_momentum: default_achf_candidate_weight_error_momentum(),
             apply_attn: true,
             apply_ffn: true,
             apply_dqn: false,
-            infer_gate: "last".to_string(),
+            infer_gate: "candidate".to_string(),
             adaptive_inference: false,
         }
     }
+}
+
+fn default_achf_candidate_mode() -> String {
+    "sparse".to_string()
+}
+
+fn default_achf_candidate_refresh_freq() -> usize {
+    1
+}
+
+fn default_achf_ortho_penalty_freq() -> usize {
+    8
+}
+
+fn default_achf_path_warmup_samples() -> usize {
+    2
+}
+
+fn default_achf_path_min_dwell() -> usize {
+    2
+}
+
+fn default_achf_candidate_min_sparsity() -> f64 {
+    0.5
+}
+
+fn default_achf_candidate_max_relative_error() -> f64 {
+    0.05
+}
+
+fn default_achf_candidate_weight_error_momentum() -> f64 {
+    0.9
 }
 
 impl AchfConfig {
@@ -872,17 +1008,26 @@ impl Config {
                 if let Some(v) = achf_map.get("mode") {
                     config.achf.mode = v.as_str().unwrap_or("lite").to_string();
                 }
-                if let Some(v) = achf_map.get("proj_mode") {
-                    config.achf.proj_mode = v.as_str().unwrap_or("rowcol").to_string();
+                if let Some(v) = achf_map.get("candidate_mode") {
+                    config.achf.candidate_mode = v.as_str().unwrap_or("sparse").to_string();
                 }
-                if let Some(v) = achf_map.get("proj_freq") {
-                    config.achf.proj_freq = v.as_f64().unwrap_or(8.0).round() as usize;
+                if let Some(v) = achf_map.get("proj_mode") {
+                    config.achf.proj_mode = v.as_str().unwrap_or("sinkhorn").to_string();
+                }
+                if let Some(v) = achf_map.get("candidate_refresh_freq") {
+                    config.achf.candidate_refresh_freq = v.as_f64().unwrap_or(1.0).round() as usize;
+                }
+                if let Some(v) = achf_map
+                    .get("ortho_penalty_freq")
+                    .or_else(|| achf_map.get("proj_freq"))
+                {
+                    config.achf.ortho_penalty_freq = v.as_f64().unwrap_or(8.0).round() as usize;
                 }
                 if let Some(v) = achf_map.get("proj_steps") {
                     config.achf.proj_steps = v.as_f64().unwrap_or(0.0).round() as usize;
                 }
                 if let Some(v) = achf_map.get("lambda_ortho") {
-                    config.achf.lambda_ortho = v.as_f64().unwrap_or(1e-3);
+                    config.achf.lambda_ortho = v.as_f64().unwrap_or(0.0);
                 }
                 if let Some(v) = achf_map.get("gate_mode") {
                     config.achf.gate_mode = v.as_str().unwrap_or("grad_ema").to_string();
@@ -901,6 +1046,9 @@ impl Config {
                 }
                 if let Some(v) = achf_map.get("gate_warmup_steps") {
                     config.achf.gate_warmup_steps = v.as_f64().unwrap_or(0.0).round() as usize;
+                }
+                if let Some(v) = achf_map.get("gate_transition_steps") {
+                    config.achf.gate_transition_steps = v.as_f64().unwrap_or(50.0).round() as usize;
                 }
                 if let Some(v) = achf_map.get("gate_k_clip") {
                     config.achf.gate_k_clip = v.as_f64().unwrap_or(0.0);
@@ -925,6 +1073,12 @@ impl Config {
                 }
                 if let Some(v) = achf_map.get("cache_min_reuse") {
                     config.achf.cache_min_reuse = v.as_f64().unwrap_or(2.0).round() as usize;
+                }
+                if let Some(v) = achf_map.get("path_warmup_samples") {
+                    config.achf.path_warmup_samples = v.as_f64().unwrap_or(2.0).round() as usize;
+                }
+                if let Some(v) = achf_map.get("path_min_dwell") {
+                    config.achf.path_min_dwell = v.as_f64().unwrap_or(2.0).round() as usize;
                 }
                 if let Some(v) = achf_map.get("cache_sparsity_sample_rows") {
                     config.achf.cache_sparsity_sample_rows =
@@ -966,11 +1120,24 @@ impl Config {
                     config.achf.diagnostics_enabled = v.as_bool().unwrap_or(false);
                 }
                 if let Some(v) = achf_map.get("rank") {
-                    config.achf.rank = v.as_f64().unwrap_or(128.0).round() as usize;
+                    config.achf.rank = v.as_f64().unwrap_or(0.0).round() as usize;
                 }
                 if let Some(v) = achf_map.get("prune_threshold") {
                     config.achf.prune_threshold = v.as_f64().unwrap_or(0.01);
                 }
+                if let Some(v) = achf_map.get("candidate_min_sparsity") {
+                    config.achf.candidate_min_sparsity = v.as_f64().unwrap_or(0.5);
+                }
+                if let Some(v) = achf_map.get("candidate_max_relative_error") {
+                    config.achf.candidate_max_relative_error = v.as_f64().unwrap_or(0.05);
+                }
+                if let Some(v) = achf_map
+                    .get("candidate_weight_error_momentum")
+                    .or_else(|| achf_map.get("candidate_discrepancy_momentum"))
+                {
+                    config.achf.candidate_weight_error_momentum = v.as_f64().unwrap_or(0.9);
+                }
+
                 if let Some(v) = achf_map.get("apply_attn") {
                     config.achf.apply_attn = v.as_bool().unwrap_or(false);
                 }
@@ -981,7 +1148,7 @@ impl Config {
                     config.achf.apply_dqn = v.as_bool().unwrap_or(false);
                 }
                 if let Some(v) = achf_map.get("infer_gate") {
-                    config.achf.infer_gate = v.as_str().unwrap_or("g_min").to_string();
+                    config.achf.infer_gate = v.as_str().unwrap_or("candidate").to_string();
                 }
                 if let Some(v) = achf_map.get("adaptive_inference") {
                     config.achf.adaptive_inference = v.as_bool().unwrap_or(false);
@@ -1534,7 +1701,7 @@ mod tests {
         assert_eq!(config.model_kv_lora_rank, 128);
         assert_eq!(config.model_qk_rope_dim, 64);
         assert_eq!(config.multi_stream_factor, 2);
-        assert_eq!(config.achf.rank, 128);
+        assert_eq!(config.achf.rank, 0);
     }
 
     #[test]
@@ -1574,6 +1741,9 @@ mod tests {
         let defaults = AchfConfig::default();
         let mut achf = AchfConfig {
             gate_momentum: 2.0,
+            gate_alpha: f64::NAN,
+            gate_beta: f64::INFINITY,
+            lambda_ortho: f64::NAN,
             g_min: -0.1,
             g_target_min: 1.5,
             g_target_max: -0.4,
@@ -1594,6 +1764,9 @@ mod tests {
         sanitize_achf_config(&mut achf);
 
         assert_eq!(achf.gate_momentum, 1.0);
+        assert_eq!(achf.gate_alpha, defaults.gate_alpha);
+        assert_eq!(achf.gate_beta, defaults.gate_beta);
+        assert_eq!(achf.lambda_ortho, defaults.lambda_ortho);
         assert_eq!(achf.g_min, 0.0);
         assert_eq!(achf.g_target_min, 1.0);
         assert_eq!(achf.g_target_max, 1.0);
@@ -1648,5 +1821,55 @@ mod tests {
         assert_eq!(legacy.mode, "full");
         assert!(!legacy.adaptive_inference);
         assert!(legacy.uses_adaptive_inference());
+    }
+
+    #[test]
+    fn sanitize_achf_separates_candidate_and_connection_constraints() {
+        let mut sparse = AchfConfig {
+            candidate_mode: "sparse".to_string(),
+            rank: 8,
+            ..Default::default()
+        };
+        sanitize_achf_config(&mut sparse);
+        assert_eq!(sparse.rank, 0);
+
+        let mut low_rank = AchfConfig {
+            candidate_mode: "low_rank".to_string(),
+            rank: 8,
+            prune_threshold: 0.5,
+            ..Default::default()
+        };
+        sanitize_achf_config(&mut low_rank);
+        assert_eq!(low_rank.prune_threshold, 0.0);
+
+        let mut constrained_connection = AchfConfig {
+            proj_mode: "sinkhorn".to_string(),
+            lambda_ortho: 0.1,
+            ..Default::default()
+        };
+        sanitize_achf_config(&mut constrained_connection);
+        assert_eq!(constrained_connection.lambda_ortho, 0.0);
+    }
+
+    #[test]
+    fn config_load_migrates_legacy_achf_frequency_and_error_keys() {
+        let path = std::env::temp_dir().join(format!(
+            "talos_xii_achf_legacy_keys_{}.json",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"{"achf":{"proj_freq":3,"candidate_discrepancy_momentum":0.7,"path_warmup_samples":5,"path_min_dwell":7,"gate_transition_steps":23}}"#,
+        )
+        .unwrap();
+        let config = Config::load(path.to_str().unwrap());
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(config.achf.ortho_penalty_freq, 3);
+        assert_eq!(config.achf.candidate_weight_error_momentum, 0.7);
+        assert_eq!(config.achf.candidate_refresh_freq, 1);
+        assert_eq!(config.achf.path_warmup_samples, 5);
+        assert_eq!(config.achf.path_min_dwell, 7);
+        assert_eq!(config.achf.gate_transition_steps, 23);
     }
 }

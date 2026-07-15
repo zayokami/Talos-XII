@@ -8,21 +8,25 @@ pub struct StepSnapshot {
     pub gate_value: f64,
     pub gate_velocity: f64,
     pub g_min: f64,
+    pub candidate_eligible: bool,
+    pub candidate_sparsity: f64,
+    pub candidate_relative_error: f64,
+    pub candidate_weight_error_ema: f64,
+    pub connection_candidate_weight: f64,
     pub grad_ema: f64,
     pub gradient_cosine: f64,
     pub loss: f64,
     pub reward: f64,
-    pub cache_hit_rate: f64,
+    pub cached_path_rate: f64,
     pub sparse_ratio: f64,
     pub ema_cached_ns: f64,
     pub ema_sparse_ns: f64,
     pub adaptive_bias: f64,
-    pub sinkhorn_iterations: usize,
-    pub sinkhorn_row_max_dev: f64,
-    pub sinkhorn_col_max_dev: f64,
-    pub sinkhorn_min_value: f64,
-    pub sinkhorn_negative_ratio: f64,
-    pub sinkhorn_warm_started: bool,
+    pub connection_projection_iterations: usize,
+    pub connection_row_max_deviation: f64,
+    pub connection_col_max_deviation: f64,
+    pub connection_min_value: f64,
+    pub connection_negative_ratio: f64,
     /// Rank actually applied by the low-rank truncation (0 = no truncation
     /// happened, e.g. because the requested rank was >= the layer's smaller
     /// dimension). Surfacing this makes degenerate rank sweeps visible instead
@@ -37,21 +41,26 @@ impl StepSnapshot {
             gate_value: achf.map_or(1.0, |s| s.gate),
             gate_velocity: achf.map_or(0.0, |s| s.gate_velocity),
             g_min: achf.map_or(0.0, |s| s.g_min),
+            candidate_eligible: achf.is_some_and(|s| s.candidate_eligible),
+            candidate_sparsity: achf.map_or(0.0, |s| s.candidate_sparsity),
+            candidate_relative_error: achf.map_or(0.0, |s| s.candidate_relative_error),
+            candidate_weight_error_ema: achf.map_or(0.0, |s| s.candidate_weight_error_ema),
+            connection_candidate_weight: achf.map_or(0.0, |s| s.connection_candidate_weight),
             grad_ema: achf.map_or(0.0, |s| s.grad_ema),
             gradient_cosine: achf.map_or(0.0, |s| s.gradient_cosine),
             loss,
             reward,
-            cache_hit_rate: achf.map_or(0.0, |s| s.cache_hit_rate),
-            sparse_ratio: achf.map_or(0.0, |s| s.low_rank_ratio),
+            cached_path_rate: achf.map_or(0.0, |s| s.cached_path_rate),
+            sparse_ratio: achf.map_or(0.0, |s| s.sparse_path_ratio),
             ema_cached_ns: achf.map_or(0.0, |s| s.ema_cached_ns),
             ema_sparse_ns: achf.map_or(0.0, |s| s.ema_sparse_ns),
             adaptive_bias: achf.map_or(1.0, |s| s.adaptive_bias),
-            sinkhorn_iterations: achf.map_or(0, |s| s.sinkhorn_iterations),
-            sinkhorn_row_max_dev: achf.map_or(0.0, |s| s.sinkhorn_row_max_dev),
-            sinkhorn_col_max_dev: achf.map_or(0.0, |s| s.sinkhorn_col_max_dev),
-            sinkhorn_min_value: achf.map_or(0.0, |s| s.sinkhorn_min_value),
-            sinkhorn_negative_ratio: achf.map_or(0.0, |s| s.sinkhorn_negative_ratio),
-            sinkhorn_warm_started: achf.is_some_and(|s| s.sinkhorn_warm_started),
+            connection_projection_iterations: achf
+                .map_or(0, |s| s.connection_projection_iterations),
+            connection_row_max_deviation: achf.map_or(0.0, |s| s.connection_row_max_deviation),
+            connection_col_max_deviation: achf.map_or(0.0, |s| s.connection_col_max_deviation),
+            connection_min_value: achf.map_or(0.0, |s| s.connection_min_value),
+            connection_negative_ratio: achf.map_or(0.0, |s| s.connection_negative_ratio),
             low_rank_applied_rank: achf.map_or(0, |s| s.low_rank_applied_rank),
         }
     }
@@ -206,16 +215,15 @@ mod tests {
         assert_eq!(snapshot.gradient_cosine, 0.0);
         assert_eq!(snapshot.loss, 0.5);
         assert_eq!(snapshot.reward, 3.0);
-        assert_eq!(snapshot.cache_hit_rate, 0.0);
+        assert_eq!(snapshot.cached_path_rate, 0.0);
         assert_eq!(snapshot.sparse_ratio, 0.0);
         assert_eq!(snapshot.ema_cached_ns, 0.0);
         assert_eq!(snapshot.ema_sparse_ns, 0.0);
         assert_eq!(snapshot.adaptive_bias, 1.0);
-        assert_eq!(snapshot.sinkhorn_iterations, 0);
-        assert_eq!(snapshot.sinkhorn_row_max_dev, 0.0);
-        assert_eq!(snapshot.sinkhorn_col_max_dev, 0.0);
-        assert_eq!(snapshot.sinkhorn_min_value, 0.0);
-        assert_eq!(snapshot.sinkhorn_negative_ratio, 0.0);
-        assert!(!snapshot.sinkhorn_warm_started);
+        assert_eq!(snapshot.connection_projection_iterations, 0);
+        assert_eq!(snapshot.connection_row_max_deviation, 0.0);
+        assert_eq!(snapshot.connection_col_max_deviation, 0.0);
+        assert_eq!(snapshot.connection_min_value, 0.0);
+        assert_eq!(snapshot.connection_negative_ratio, 0.0);
     }
 }

@@ -112,7 +112,7 @@ Runs the quick built-in benchmark: 500 fast simulations and 100 detailed simulat
 Generates complete experimental data and charts (SVG/PNG) for the ACHF paper:
 
 ```bash
-cargo run --release -- benchmark paper                      # all 7 experiments, 5 trials
+cargo run --release -- benchmark paper                      # all 9 experiments, 5 trials
 cargo run --release -- benchmark paper --trials 5           # 5 independent trials w/ CI
 cargo run --release -- benchmark paper --only ablation      # ablation study only
 cargo run --release -- benchmark paper --format png         # PNG output
@@ -123,17 +123,19 @@ Each experiment runs 5 trials by default (`--trials N` to adjust), outputting me
 
 Saved calibration overrides are validated and merged into the complete pool catalog before model cache selection, training, or inference on the next model-using startup.
 
-7 experiments:
+9 experiments:
 
 | Experiment | Description |
 |---|---|
 | `ablation` | ACHF on/off throughput + reward curves |
 | `mode` | lite vs full mode comparison |
-| `path` | Cached / LowRank / Dense inference path latency (boxplot) |
-| `gate` | Training curves: gate, g_min, grad_ema, sparsity, adaptive_bias |
+| `path` | Cached / Sparse / Dense inference path latency (boxplot) |
+| `gate` | Reference-gate/floor, candidate admission/error, connection weight, and candidate-path curves |
 | `scale` | Throughput vs rank (with ACHF-off baseline) |
 | `apply` | ACHF applied to different components (FFN/Attention/DQN) |
 | `convergence` | Training loss + reward convergence with ACHF on/off |
+| `crossover` | Forced candidate-kernel crossover across dimensions and sparsities |
+| `regime` | Guarded AMA vs plain EMA and fixed-path oracle across batch regimes |
 
 Output goes to `bench_output/` (`--output-dir` to customize).
 
@@ -249,7 +251,7 @@ cargo run --release -- benchmark
 为 ACHF 技术论文生成完整实验数据和图表（SVG/PNG）：
 
 ```bash
-cargo run --release -- benchmark paper                      # 全部 7 项实验，默认 5 次试验
+cargo run --release -- benchmark paper                      # 全部 9 项实验，默认 5 次试验
 cargo run --release -- benchmark paper --trials 5           # 5 次独立试验，计算 mean/std/95%CI
 cargo run --release -- benchmark paper --only ablation      # 仅消融实验
 cargo run --release -- benchmark paper --format png         # PNG 格式输出
@@ -260,15 +262,17 @@ cargo run --release -- benchmark paper --output-dir results # 指定输出目录
 
 保存的校准覆盖值会先经过合法性检查，并在下一次需要模型的启动中，于缓存选择、训练和推理之前合并到完整卡池目录。
 
-7 项实验：
+9 项实验：
 
 | 实验 | 说明 |
 |---|---|
 | `ablation` | ACHF 开/关消融对比（吞吐量 + 奖励曲线） |
 | `mode` | lite vs full 模式对比 |
-| `path` | Cached / LowRank / Dense 推理路径延迟分布（箱线图） |
-| `gate` | 训练过程中 gate、g_min、grad_ema、sparsity、adaptive_bias 曲线 |
+| `path` | Cached / Sparse / Dense 推理路径延迟分布（箱线图） |
+| `gate` | reference gate/下限、候选准入/误差、连接权重与候选内部路径曲线 |
 | `scale` | 不同 rank 下的吞吐量（含 ACHF 关闭基线） |
+| `crossover` | 不同维度/稀疏率下强制候选执行核的交叉点 |
+| `regime` | 不同 batch 区间下 guarded AMA、plain EMA 与固定路径 oracle 对比 |
 | `apply` | ACHF 应用于不同组件（FFN/Attention/DQN）的组合效果 |
 | `convergence` | ACHF 开/关状态下的训练 loss + reward 收敛曲线 |
 

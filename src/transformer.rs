@@ -66,6 +66,52 @@ pub struct MhcResidual {
     pub h_post: Vec<Linear>,
     pub n: usize,
 }
+fn sinkhorn_normalize_connection(weights: &mut [f32], rows: usize, cols: usize, steps: usize) {
+    if rows == 0 || cols == 0 || weights.len() != rows.saturating_mul(cols) {
+        return;
+    }
+
+    let max_input = weights
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .fold(f32::NEG_INFINITY, f32::max);
+    if max_input.is_finite() {
+        for value in weights.iter_mut() {
+            let shifted = if value.is_finite() {
+                (*value - max_input).clamp(-60.0, 0.0)
+            } else {
+                -60.0
+            };
+            *value = shifted.exp();
+        }
+    } else {
+        weights.fill(1.0);
+    }
+
+    let column_target = rows as f32 / cols as f32;
+    for _ in 0..steps.max(1) {
+        for row in 0..rows {
+            let row_slice = &mut weights[row * cols..(row + 1) * cols];
+            let sum = row_slice.iter().copied().sum::<f32>();
+            let scale = if sum > 1e-12 { 1.0 / sum } else { 1.0 };
+            for value in row_slice {
+                *value *= scale;
+            }
+        }
+        for col in 0..cols {
+            let sum = (0..rows).map(|row| weights[row * cols + col]).sum::<f32>();
+            let scale = if sum > 1e-12 {
+                column_target / sum
+            } else {
+                1.0
+            };
+            for row in 0..rows {
+                weights[row * cols + col] *= scale;
+            }
+        }
+    }
+}
 
 impl MhcResidual {
     pub fn new(dim: usize, n: usize, seed: u64) -> Self {
@@ -87,7 +133,7 @@ impl MhcResidual {
             for v in w.iter_mut() {
                 *v = v.abs();
             }
-            let _ = crate::achf::sinkhorn_project(&mut w, dim * n, dim * n, 20, None, None);
+            sinkhorn_normalize_connection(&mut w, dim * n, dim * n, 20);
         }
         Self {
             h_pre,
@@ -621,13 +667,13 @@ impl LuckTransformer {
         }
     }
 
-    pub fn maybe_project_achf_after_optimizer_step(&self) {
-        for block in &self.blocks {
-            if let Some(achf) = &block.achf_ffn {
-                achf.maybe_project_after_optimizer_step();
+    pub fn refresh_achf_after_optimizer_step(&mut self) {
+        for block in &mut self.blocks {
+            if let Some(achf) = &mut block.achf_ffn {
+                achf.refresh_after_optimizer_step();
             }
-            if let Some(achf) = &block.mla_layer.achf_wo {
-                achf.maybe_project_after_optimizer_step();
+            if let Some(achf) = &mut block.mla_layer.achf_wo {
+                achf.refresh_after_optimizer_step();
             }
         }
     }
@@ -3267,7 +3313,7 @@ mod tests {
             apply_attn: true,
             apply_ffn: false,
             proj_mode: "none".to_string(),
-            proj_freq: 0,
+            ortho_penalty_freq: 0,
             rank: 0,
             prune_threshold: 0.0,
             infer_gate: "one".to_string(),
@@ -3408,7 +3454,7 @@ mod tests {
             apply_attn: false,
             apply_ffn: true,
             proj_mode: "none".to_string(),
-            proj_freq: 0,
+            ortho_penalty_freq: 0,
             lambda_ortho: 0.0,
             rank: 0,
             prune_threshold: 0.0,
@@ -3424,19 +3470,23 @@ mod tests {
         let model_on = LuckTransformer::new_compat(8, 16, true, 2, 42, &achf_on);
         let model_off = LuckTransformer::new_compat(8, 16, true, 2, 42, &achf_off);
 
-        assert_eq!(
-            model_on
-                .parameters()
-                .iter()
-                .map(Tensor::numel)
-                .sum::<usize>(),
-            model_off
-                .parameters()
-                .iter()
-                .map(Tensor::numel)
-                .sum::<usize>(),
-            "a replacement layer must not leave the unused dense layer in the optimizer"
-        );
+        let on_parameters = model_on
+            .parameters()
+            .iter()
+            .map(Tensor::numel)
+            .sum::<usize>();
+        let off_parameters = model_off
+            .parameters()
+            .iter()
+            .map(Tensor::numel)
+            .sum::<usize>();
+        let connection_parameters = model_on
+            .blocks
+            .iter()
+            .filter_map(|block| block.achf_ffn.as_ref())
+            .map(|achf| achf.connection_logits.numel())
+            .sum::<usize>();
+        assert_eq!(on_parameters, off_parameters + connection_parameters);
         assert_eq!(
             model_on.blocks[0]
                 .achf_ffn
@@ -3476,7 +3526,7 @@ mod tests {
             apply_attn: true,
             apply_ffn: true,
             proj_mode: "none".to_string(),
-            proj_freq: 0,
+            ortho_penalty_freq: 0,
             lambda_ortho: 0.0,
             rank: 0,
             prune_threshold: 0.0,

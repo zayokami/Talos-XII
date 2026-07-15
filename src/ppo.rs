@@ -256,8 +256,8 @@ impl ActorCritic {
         self.backbone.update_achf_after_backward();
     }
 
-    pub fn maybe_project_achf_after_optimizer_step(&self) {
-        self.backbone.maybe_project_achf_after_optimizer_step();
+    pub fn refresh_achf_after_optimizer_step(&mut self) {
+        self.backbone.refresh_achf_after_optimizer_step();
     }
 
     pub fn freeze_achf_for_inference(&mut self) {
@@ -864,7 +864,7 @@ pub struct Ppo {
 impl Ppo {
     fn achf_orthogonal_penalty_interval_from_config(config: &AchfConfig) -> usize {
         if config.enabled && config.apply_ffn && config.lambda_ortho > 0.0 {
-            config.proj_freq.max(1).saturating_mul(4)
+            config.ortho_penalty_freq.max(1).saturating_mul(4)
         } else {
             usize::MAX
         }
@@ -967,7 +967,20 @@ impl Ppo {
         let student_params = self.policy.parameters();
         let ema_params = ema.parameters();
 
-        for (ema_p, stud_p) in ema_params.iter().zip(student_params.iter()) {
+        assert_eq!(
+            ema_params.len(),
+            student_params.len(),
+            "EMA teacher/student parameter topology mismatch"
+        );
+        for (index, (ema_p, stud_p)) in ema_params.iter().zip(student_params.iter()).enumerate() {
+            assert_eq!(
+                ema_p.shape, stud_p.shape,
+                "EMA teacher/student parameter shape mismatch at index {index}"
+            );
+            assert_eq!(
+                ema_p.dtype, stud_p.dtype,
+                "EMA teacher/student parameter dtype mismatch at index {index}"
+            );
             #[cfg(cuda)]
             if ema_p.cuda_lerp_in_place_from(stud_p, inv) {
                 continue;
@@ -989,6 +1002,7 @@ impl Ppo {
                 }
             }
         }
+        ema.refresh_achf_after_optimizer_step();
     }
 
     pub(crate) fn store_raw(&mut self, input: PpoStoreRawInput) {
@@ -1286,7 +1300,7 @@ impl Ppo {
                 final_loss.backward();
                 self.policy.update_achf_after_backward();
                 self.optimizer.step();
-                self.policy.maybe_project_achf_after_optimizer_step();
+                self.policy.refresh_achf_after_optimizer_step();
                 self.optimizer_step_counter += 1;
                 completed_batches += 1;
                 on_batch(
@@ -2122,7 +2136,7 @@ mod tests {
             enabled: true,
             apply_ffn: true,
             lambda_ortho: 0.001,
-            proj_freq: 64,
+            ortho_penalty_freq: 64,
             ..crate::config::AchfConfig::default()
         };
         let policy = ActorCritic::new(42, &achf, 16, 1);
@@ -2173,6 +2187,72 @@ mod tests {
             let expected = 0.5 * before + 0.5 * 1.0f32;
             assert!((after - expected).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "EMA teacher/student parameter shape mismatch at index")]
+    fn ema_update_rejects_parameter_shape_mismatch() {
+        let policy = ActorCritic::new(42, &crate::config::AchfConfig::default(), 64, 2);
+        let mut ppo = Ppo::from_policy(policy, 2, 128);
+        ppo.ema_policy = Some(ActorCritic::new(
+            42,
+            &crate::config::AchfConfig::default(),
+            32,
+            2,
+        ));
+
+        ppo.update_ema_teacher();
+    }
+
+    #[test]
+    fn ema_update_refreshes_achf_candidate_from_updated_reference() {
+        let achf = AchfConfig {
+            enabled: true,
+            candidate_mode: "sparse".to_string(),
+            candidate_refresh_freq: 1,
+            prune_threshold: 0.5,
+            candidate_min_sparsity: 0.0,
+            candidate_max_relative_error: 1.0,
+            ..Default::default()
+        };
+        let policy = ActorCritic::new(42, &achf, 16, 1);
+        let mut ppo = Ppo::from_policy(policy, 2, 128);
+        ppo.ema_policy = Some(ActorCritic::new(42, &achf, 16, 1));
+        ppo.distill_ema_decay = 0.5;
+
+        let candidate_before = ppo.ema_policy.as_ref().unwrap().backbone.blocks[0]
+            .achf_ffn
+            .as_ref()
+            .unwrap()
+            .sparse_weight
+            .as_ref()
+            .unwrap()
+            .weight
+            .data_to_f32_vec();
+        {
+            let student_achf = ppo.policy.backbone.blocks[0].achf_ffn.as_ref().unwrap();
+            student_achf.weight.weight.data_write_f32().fill(2.0);
+        }
+
+        ppo.update_ema_teacher();
+
+        let teacher_achf = ppo.ema_policy.as_ref().unwrap().backbone.blocks[0]
+            .achf_ffn
+            .as_ref()
+            .unwrap();
+        let reference = teacher_achf.weight.weight.data_to_f32_vec();
+        let candidate = teacher_achf
+            .sparse_weight
+            .as_ref()
+            .unwrap()
+            .weight
+            .data_to_f32_vec();
+        assert_ne!(candidate, candidate_before);
+        assert!(candidate
+            .iter()
+            .zip(reference.iter())
+            .all(|(candidate, reference)| *candidate == 0.0 || candidate == reference));
+        assert_eq!(teacher_achf.state.read().unwrap().step, 1);
     }
 
     #[test]
@@ -2403,18 +2483,25 @@ mod tests {
     #[test]
     fn actor_critic_freeze_prunes_backbone_achf_for_cache_hits() {
         let achf = crate::config::AchfConfig {
+            mode: "fixed_cached".to_string(),
+            cache_min_reuse: 0,
             enabled: true,
             cache_cost_bias: 0.0,
             infer_gate: "one".to_string(),
             prune_threshold: 0.01,
-            proj_freq: 0,
+            ortho_penalty_freq: 0,
             ..Default::default()
         };
         let mut policy = ActorCritic::new(7, &achf, 16, 1);
         assert!(policy.backbone.blocks[0]
             .achf_ffn
             .as_ref()
-            .is_some_and(|achf| achf.sparse_weight.is_none()));
+            .is_some_and(|achf| achf.sparse_weight.is_some()));
+
+        assert!(policy.backbone.blocks[0]
+            .achf_ffn
+            .as_ref()
+            .is_some_and(|achf| { achf.cache.read().unwrap().dense.is_none() }));
 
         policy.freeze_achf_for_inference();
         assert!(policy.backbone.blocks[0]
@@ -2428,6 +2515,7 @@ mod tests {
         // Default config applies ACHF to both the FFN and the MLA w_o
         // projection, so a single block contributes two ACHF calls.
         assert_eq!(stats.calls, 2);
+        assert_eq!(stats.candidate_paths, 2);
         assert_eq!(stats.cache_hits, 2);
         assert_eq!(stats.dense_paths, 0);
         assert_eq!(stats.sparse_paths, 0);

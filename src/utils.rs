@@ -297,20 +297,25 @@ pub fn compute_reward_ppo(
 
 /// Format ACHF cache statistics into a human-readable summary string.
 pub fn format_achf_stats(stats: &AchfCacheStats) -> String {
-    let calls = stats.calls as f64;
-    let hit_rate = if calls > 0.0 {
-        stats.cache_hits as f64 / calls
-    } else {
-        0.0
+    let candidate_calls = stats.candidate_paths as f64;
+    let candidate_rate = |count: u64| {
+        if candidate_calls > 0.0 {
+            count as f64 / candidate_calls * 100.0
+        } else {
+            0.0
+        }
     };
     format!(
-        "[ACHF] Calls: {} | Hit: {:.2}% | Miss: {} | Skip: {} | Sparse: {} | Dense: {} | CachedEMA(ns): {:.1}/{:.1} | SparseEMA(ns): {:.1}/{:.1} | DecisionEMA(ns): {:.1}/{:.1} | Bias: {:.3} | Samples: {}/{}",
+        "[ACHF] Calls: {} | Memo: {} | Reference: {} | Candidate: {} | Rejected: {} | Candidate routes C/S/D: {:.1}%/{:.1}%/{:.1}% | Skip: {} | CachedEMA(ns): {:.1}/{:.1} | SparseEMA(ns): {:.1}/{:.1} | DecisionEMA(ns): {:.1}/{:.1} | Bias: {:.3} | Samples: {}/{}",
         stats.calls,
-        hit_rate * 100.0,
-        stats.cache_misses,
+        stats.memo_hits,
+        stats.reference_paths,
+        stats.candidate_paths,
+        stats.candidate_rejections,
+        candidate_rate(stats.cache_hits),
+        candidate_rate(stats.sparse_paths),
+        candidate_rate(stats.dense_paths),
         stats.cache_skips,
-        stats.sparse_paths,
-        stats.dense_paths,
         stats.ema_cached_ns,
         stats.ema_cached_long_ns,
         stats.ema_sparse_ns,

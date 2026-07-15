@@ -37,7 +37,6 @@ const BENCH_EVAL_EPISODES: usize = 128;
 const PATH_WARMUP_ROUNDS: usize = 100;
 const PATH_SAMPLES: usize = 1000;
 const PATH_CALLS_PER_SAMPLE: usize = 64;
-const PATH_RANK: usize = 16;
 const PATH_PRUNE_THRESHOLD: f64 = 0.005;
 const CROSSOVER_DIMS: [usize; 3] = [256, 1024, 2048];
 const CROSSOVER_SPARSITIES: [f64; 5] = [0.5, 0.8, 0.9, 0.95, 0.99];
@@ -79,7 +78,7 @@ pub struct BenchRunResult {
     pub train_loss: f64,
     pub param_count: usize,
     pub applied_rank: Option<usize>,
-    pub prune_rel_err: Option<f64>,
+    pub candidate_relative_error: Option<f64>,
     pub memory_stats: Option<AchfMemoryStats>,
     pub snapshots: Vec<StepSnapshot>,
     pub cache_stats: Option<AchfCacheStats>,
@@ -174,19 +173,23 @@ pub struct CurvePointStats {
     pub gate_value: TrialStats,
     pub gate_velocity: TrialStats,
     pub g_min: TrialStats,
+    pub candidate_eligible_rate: TrialStats,
+    pub candidate_sparsity: TrialStats,
+    pub candidate_relative_error: TrialStats,
+    pub candidate_weight_error_ema: TrialStats,
+    pub connection_candidate_weight: TrialStats,
     pub grad_ema: TrialStats,
     pub gradient_cosine: TrialStats,
-    pub cache_hit_rate: TrialStats,
+    pub cached_path_rate: TrialStats,
     pub sparse_ratio: TrialStats,
     pub ema_cached_ns: TrialStats,
     pub ema_sparse_ns: TrialStats,
     pub adaptive_bias: TrialStats,
-    pub sinkhorn_iterations: TrialStats,
-    pub sinkhorn_row_max_dev: TrialStats,
-    pub sinkhorn_col_max_dev: TrialStats,
-    pub sinkhorn_min_value: TrialStats,
-    pub sinkhorn_negative_ratio: TrialStats,
-    pub sinkhorn_warm_started_rate: f64,
+    pub connection_projection_iterations: TrialStats,
+    pub connection_row_max_deviation: TrialStats,
+    pub connection_col_max_deviation: TrialStats,
+    pub connection_min_value: TrialStats,
+    pub connection_negative_ratio: TrialStats,
     pub low_rank_applied_rank: TrialStats,
 }
 
@@ -202,7 +205,7 @@ pub struct AggregatedResult {
     pub train_time_ms: TrialStats,
     pub param_count: usize,
     pub applied_rank: Option<usize>,
-    pub prune_rel_err: Option<TrialStats>,
+    pub candidate_relative_error: Option<TrialStats>,
     pub memory_stats: Vec<AchfMemoryStats>,
     pub curve: Vec<CurvePointStats>,
     pub cache_stats: Option<AchfCacheStats>,
@@ -338,11 +341,15 @@ fn aggregate_trials(runs: &[BenchRunResult]) -> AggregatedResult {
         "applied rank changed across trials for {label}"
     );
     let cache_values: Vec<AchfCacheStats> = runs.iter().filter_map(|run| run.cache_stats).collect();
-    let prune_rel_err_values: Vec<f64> = runs.iter().filter_map(|run| run.prune_rel_err).collect();
+    let candidate_relative_error_values: Vec<f64> = runs
+        .iter()
+        .filter_map(|run| run.candidate_relative_error)
+        .collect();
     let memory_stats: Vec<AchfMemoryStats> =
         runs.iter().filter_map(|run| run.memory_stats).collect();
     assert!(
-        prune_rel_err_values.is_empty() || prune_rel_err_values.len() == runs.len(),
+        candidate_relative_error_values.is_empty()
+            || candidate_relative_error_values.len() == runs.len(),
         "pruning diagnostics missing from some trials for {label}"
     );
     assert!(
@@ -362,8 +369,8 @@ fn aggregate_trials(runs: &[BenchRunResult]) -> AggregatedResult {
         train_time_ms: TrialStats::from_values(&times),
         param_count: runs[0].param_count,
         applied_rank: runs[0].applied_rank,
-        prune_rel_err: (!prune_rel_err_values.is_empty())
-            .then(|| TrialStats::from_values(&prune_rel_err_values)),
+        candidate_relative_error: (!candidate_relative_error_values.is_empty())
+            .then(|| TrialStats::from_values(&candidate_relative_error_values)),
         memory_stats,
         curve: aggregate_snapshots(runs),
         cache_stats,
@@ -396,23 +403,35 @@ fn aggregate_snapshots(runs: &[BenchRunResult]) -> Vec<CurvePointStats> {
                 gate_value: stats(|snapshot| snapshot.gate_value),
                 gate_velocity: stats(|snapshot| snapshot.gate_velocity),
                 g_min: stats(|snapshot| snapshot.g_min),
+                candidate_eligible_rate: stats(|snapshot| {
+                    if snapshot.candidate_eligible {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }),
+                candidate_sparsity: stats(|snapshot| snapshot.candidate_sparsity),
+                candidate_relative_error: stats(|snapshot| snapshot.candidate_relative_error),
+                candidate_weight_error_ema: stats(|snapshot| snapshot.candidate_weight_error_ema),
+                connection_candidate_weight: stats(|snapshot| snapshot.connection_candidate_weight),
                 grad_ema: stats(|snapshot| snapshot.grad_ema),
                 gradient_cosine: stats(|snapshot| snapshot.gradient_cosine),
-                cache_hit_rate: stats(|snapshot| snapshot.cache_hit_rate),
+                cached_path_rate: stats(|snapshot| snapshot.cached_path_rate),
                 sparse_ratio: stats(|snapshot| snapshot.sparse_ratio),
                 ema_cached_ns: stats(|snapshot| snapshot.ema_cached_ns),
                 ema_sparse_ns: stats(|snapshot| snapshot.ema_sparse_ns),
                 adaptive_bias: stats(|snapshot| snapshot.adaptive_bias),
-                sinkhorn_iterations: stats(|snapshot| snapshot.sinkhorn_iterations as f64),
-                sinkhorn_row_max_dev: stats(|snapshot| snapshot.sinkhorn_row_max_dev),
-                sinkhorn_col_max_dev: stats(|snapshot| snapshot.sinkhorn_col_max_dev),
-                sinkhorn_min_value: stats(|snapshot| snapshot.sinkhorn_min_value),
-                sinkhorn_negative_ratio: stats(|snapshot| snapshot.sinkhorn_negative_ratio),
-                sinkhorn_warm_started_rate: snapshots
-                    .iter()
-                    .filter(|snapshot| snapshot.sinkhorn_warm_started)
-                    .count() as f64
-                    / snapshots.len() as f64,
+                connection_projection_iterations: stats(|snapshot| {
+                    snapshot.connection_projection_iterations as f64
+                }),
+                connection_row_max_deviation: stats(|snapshot| {
+                    snapshot.connection_row_max_deviation
+                }),
+                connection_col_max_deviation: stats(|snapshot| {
+                    snapshot.connection_col_max_deviation
+                }),
+                connection_min_value: stats(|snapshot| snapshot.connection_min_value),
+                connection_negative_ratio: stats(|snapshot| snapshot.connection_negative_ratio),
                 low_rank_applied_rank: stats(|snapshot| snapshot.low_rank_applied_rank as f64),
             }
         })
@@ -489,6 +508,7 @@ fn bench_sized_config(base_config: &Config) -> Config {
     }
     cfg.multi_stream_factor = cfg.multi_stream_factor.clamp(1, 2);
     cfg.achf.prune_threshold = cfg.achf.prune_threshold.min(0.005);
+    cfg.achf.cache_min_reuse = 0;
     cfg
 }
 
@@ -500,17 +520,23 @@ fn validate_candidate_memory(label: &str, memory: Option<AchfMemoryStats>) {
                 && memory.candidate_nonzero_weights > 0,
             "benchmark condition '{label}' produced an absent or all-zero ACHF candidate; lower prune_threshold or fix projection/pruning before using the data"
         );
-        let relative_error = memory.candidate_prune_rel_err().unwrap_or_else(|| {
+        let relative_error = memory.candidate_relative_error().unwrap_or_else(|| {
             panic!("benchmark condition '{label}' has no aggregate candidate-error diagnostic")
         });
         assert!(
             relative_error.is_finite()
                 && relative_error <= 1.0 + f64::EPSILON
-                && memory.max_layer_prune_rel_err.is_finite()
-                && memory.max_layer_prune_rel_err <= 1.0 + f64::EPSILON,
+                && memory.max_layer_candidate_relative_error.is_finite()
+                && memory.max_layer_candidate_relative_error <= 1.0 + f64::EPSILON,
             "benchmark condition '{label}' has invalid candidate error: aggregate={relative_error}, max_layer={}",
-            memory.max_layer_prune_rel_err
+            memory.max_layer_candidate_relative_error
         );
+        if memory.eligible_candidate_layers < memory.candidate_layers {
+            eprintln!(
+                "[Bench Warning] condition '{label}' materialized {} candidate layers but only {} satisfy production entry criteria; fixed modes are diagnostic overrides and normal inference falls back to reference",
+                memory.candidate_layers, memory.eligible_candidate_layers
+            );
+        }
     }
 }
 
@@ -566,6 +592,22 @@ fn cache_stats_delta(before: AchfCacheStats, after: AchfCacheStats) -> AchfCache
         cache_hits: delta("cache_hits", before.cache_hits, after.cache_hits),
         cache_misses: delta("cache_misses", before.cache_misses, after.cache_misses),
         cache_skips: delta("cache_skips", before.cache_skips, after.cache_skips),
+        memo_hits: delta("memo_hits", before.memo_hits, after.memo_hits),
+        reference_paths: delta(
+            "reference_paths",
+            before.reference_paths,
+            after.reference_paths,
+        ),
+        candidate_paths: delta(
+            "candidate_paths",
+            before.candidate_paths,
+            after.candidate_paths,
+        ),
+        candidate_rejections: delta(
+            "candidate_rejections",
+            before.candidate_rejections,
+            after.candidate_rejections,
+        ),
         sparse_paths: delta("sparse_paths", before.sparse_paths, after.sparse_paths),
         dense_paths: delta("dense_paths", before.dense_paths, after.dense_paths),
         ema_cached_ns: after.ema_cached_ns,
@@ -1435,7 +1477,7 @@ fn run_ablation(base_config: &Config, seed: u64, nt: usize) -> Vec<AggregatedRes
     let mut static_pruned = bench_sized_config(base_config);
     static_pruned.achf.enabled = true;
     static_pruned.achf.proj_mode = "none".to_string();
-    static_pruned.achf.proj_freq = 0;
+    static_pruned.achf.ortho_penalty_freq = 0;
     static_pruned.achf.lambda_ortho = 0.0;
     static_pruned.achf.rank = 0;
     static_pruned.achf.gate_warmup_steps = 0;
@@ -1599,7 +1641,8 @@ fn run_path_comparison(
         let trial_seed = benchmark_trial_seed(seed, trial);
         let mut cfg = bench_sized_config(base_config);
         cfg.achf.enabled = true;
-        cfg.achf.rank = PATH_RANK;
+        cfg.achf.candidate_mode = "sparse".to_string();
+        cfg.achf.rank = 0;
         cfg.achf.prune_threshold = PATH_PRUNE_THRESHOLD;
         cap_ppo_training(&mut cfg, 2000);
         let (env_net, _neural_opt, _worker) =
@@ -2181,15 +2224,11 @@ fn run_scale_test(base_config: &Config, seed: u64, nt: usize) -> Vec<AggregatedR
     baseline.achf.enabled = false;
     cap_ppo_training(&mut baseline, 2000);
     conditions.push(("No ACHF".to_string(), baseline));
-    // The ACHF FFN in the bench-sized model is hidden_dim*2 -> hidden_dim, and
-    // bench_sized_config clamps hidden_dim to 64, so the layer's smaller
-    // dimension is 64. `effective_rank` only truncates when rank < 64.
-    // The previous sweep [16,32,64,128,256] therefore had THREE degenerate
-    // entries: rank 64/128/256 all resolve to "no truncation". This sweep spans
-    // the meaningful low-rank regime and keeps rank 64 as an explicit no-op
-    // boundary. Magnitude pruning remains controlled solely by its threshold.
-    // The effective applied rank is reported per config (see print_agg_summary),
-    // so the no-op at 64 is visible rather than masquerading as a real setting.
+    // The bench-sized FFN candidate has smaller dimension 64. This sweep uses
+    // the mutually exclusive low-rank candidate mode; rank 64 is retained as
+    // an explicit invalid/no-op boundary. Candidate entry remains subject to
+    // the configured approximation-error ceiling, so rejected ranks execute
+    // the reference path and are reported as ineligible rather than forced.
     for rank in [8, 16, 32, 48, 64] {
         let label = if rank == 64 {
             "rank=64 (no-op control)".to_string()
@@ -2199,6 +2238,8 @@ fn run_scale_test(base_config: &Config, seed: u64, nt: usize) -> Vec<AggregatedR
         let mut cfg = bench_sized_config(base_config);
         cfg.achf.enabled = true;
         cfg.achf.rank = rank;
+        cfg.achf.candidate_mode = "low_rank".to_string();
+        cfg.achf.prune_threshold = 0.0;
         cap_ppo_training(&mut cfg, 2000);
         conditions.push((label, cfg));
     }
@@ -2363,7 +2404,7 @@ fn measure_trained_ppo(params: TrainedPpoParams<'_>) -> BenchRunResult {
         train_loss,
         param_count: policy.param_count(),
         applied_rank: achf.map(|snapshot| snapshot.low_rank_applied_rank),
-        prune_rel_err: memory_stats.and_then(|stats| stats.candidate_prune_rel_err()),
+        candidate_relative_error: memory_stats.and_then(|stats| stats.candidate_relative_error()),
         memory_stats,
         snapshots: snapshots.to_vec(),
         cache_stats,
@@ -2417,7 +2458,8 @@ fn train_and_measure(label: &str, config: &Config, seed: u64) -> BenchRunResult 
             let achf = dqn.snapshot_achf();
             let memory_stats = dqn.achf_memory_stats();
             validate_candidate_memory(label, memory_stats);
-            let prune_rel_err = memory_stats.and_then(|stats| stats.candidate_prune_rel_err());
+            let candidate_relative_error =
+                memory_stats.and_then(|stats| stats.candidate_relative_error());
             log_applied_rank(achf);
             BenchRunResult {
                 label: label.to_string(),
@@ -2430,7 +2472,7 @@ fn train_and_measure(label: &str, config: &Config, seed: u64) -> BenchRunResult 
                 train_loss,
                 param_count: dqn.param_count(),
                 applied_rank: achf.map(|snapshot| snapshot.low_rank_applied_rank),
-                prune_rel_err,
+                candidate_relative_error,
                 memory_stats,
                 snapshots,
                 cache_stats,
@@ -2484,7 +2526,8 @@ fn train_and_measure(label: &str, config: &Config, seed: u64) -> BenchRunResult 
             let achf = ppo.snapshot_achf();
             let memory_stats = cfg.achf.enabled.then(|| ppo.achf_memory_stats_aggregate());
             validate_candidate_memory(label, memory_stats);
-            let prune_rel_err = memory_stats.and_then(|stats| stats.candidate_prune_rel_err());
+            let candidate_relative_error =
+                memory_stats.and_then(|stats| stats.candidate_relative_error());
             log_applied_rank(achf);
             BenchRunResult {
                 label: label.to_string(),
@@ -2497,7 +2540,7 @@ fn train_and_measure(label: &str, config: &Config, seed: u64) -> BenchRunResult 
                 train_loss,
                 param_count: ppo.param_count(),
                 applied_rank: achf.map(|snapshot| snapshot.low_rank_applied_rank),
-                prune_rel_err,
+                candidate_relative_error,
                 memory_stats,
                 snapshots,
                 cache_stats,
@@ -2512,8 +2555,10 @@ fn train_and_measure(label: &str, config: &Config, seed: u64) -> BenchRunResult 
 fn log_applied_rank(snapshot: Option<crate::achf::AchfStateSnapshot>) {
     if let Some(snapshot) = snapshot {
         println!(
-            "    [ACHF] applied_rank={} low_rank_rel_err={:.4} prune_rel_err={:.4}",
-            snapshot.low_rank_applied_rank, snapshot.low_rank_rel_err, snapshot.prune_rel_err
+            "    [ACHF] applied_rank={} low_rank_rel_err={:.4} candidate_weight_relative_frobenius_error={:.4}",
+            snapshot.low_rank_applied_rank,
+            snapshot.low_rank_rel_err,
+            snapshot.candidate_relative_error
         );
     }
 }
@@ -2666,8 +2711,8 @@ fn chart_gate_curve(result: &AggregatedResult, dir: &str, ext: &str) {
         .curve
         .iter()
         .map(|point| {
-            let (low, high) = ci_bounds(&point.cache_hit_rate);
-            (point.step as f64, point.cache_hit_rate.mean, low, high)
+            let (low, high) = ci_bounds(&point.cached_path_rate);
+            (point.step as f64, point.cached_path_rate.mean, low, high)
         })
         .collect();
     let lr_ratio: Vec<(f64, f64, f64, f64)> = result
@@ -2688,13 +2733,13 @@ fn chart_gate_curve(result: &AggregatedResult, dir: &str, ext: &str) {
         .collect();
 
     let series: Vec<chart::CiSeries<'_>> = vec![
-        ("Gate Value", &gate),
-        ("g_min", &gmin),
-        ("Gate Velocity", &gate_velocity),
+        ("Reference Gate", &gate),
+        ("Reference Gate Floor", &gmin),
+        ("Reference Gate Velocity", &gate_velocity),
         ("Grad EMA", &grad),
         ("Gradient Cosine", &gradient_cosine),
-        ("Cache Hit Rate", &hit),
-        ("Sparse Ratio", &lr_ratio),
+        ("Cached Within Candidate", &hit),
+        ("Sparse Within Candidate", &lr_ratio),
         ("Adaptive Bias", &abias),
     ];
     let path = format!("{}/gate_curve.{}", dir, ext);
@@ -3015,11 +3060,11 @@ fn print_agg_summary(name: &str, agg: &[AggregatedResult]) {
                 format_ci(&paired.eval_reward_delta),
             );
         }
-        if let Some(prune_rel_err) = &a.prune_rel_err {
+        if let Some(candidate_relative_error) = &a.candidate_relative_error {
             println!(
-                "    prune_rel_err={:.4} ({})",
-                prune_rel_err.mean,
-                format_ci(prune_rel_err)
+                "    candidate_weight_relative_frobenius_error={:.4} ({})",
+                candidate_relative_error.mean,
+                format_ci(candidate_relative_error)
             );
         }
         if !a.memory_stats.is_empty() {
@@ -3066,6 +3111,16 @@ fn path_has_unpruned_candidate(path_latencies: Option<&[PathLatencyResult]>) -> 
             result.trial_sparsity.iter().any(|stats| {
                 stats.total_weights > 0 && stats.nonzero_weights == stats.total_weights
             })
+        })
+    })
+}
+fn has_ineligible_candidate(all: &[(&str, Vec<AggregatedResult>)]) -> bool {
+    all.iter().any(|(_, results)| {
+        results.iter().any(|result| {
+            result
+                .memory_stats
+                .iter()
+                .any(|stats| stats.eligible_candidate_layers < stats.candidate_layers)
         })
     })
 }
@@ -3169,11 +3224,11 @@ fn write_summary_txt(
                     stats.adaptive_bias
                 ));
             }
-            if let Some(prune_rel_err) = &a.prune_rel_err {
+            if let Some(candidate_relative_error) = &a.candidate_relative_error {
                 lines.push(format!(
-                    "    prune_rel_err={:.6} ({})",
-                    prune_rel_err.mean,
-                    format_ci(prune_rel_err)
+                    "    candidate_weight_relative_frobenius_error={:.6} ({})",
+                    candidate_relative_error.mean,
+                    format_ci(candidate_relative_error)
                 ));
             }
             if !a.memory_stats.is_empty() {
@@ -3239,38 +3294,43 @@ fn write_summary_txt(
         ));
         if let Some(last) = result.curve.last() {
             lines.push(format!(
-                "    final aggregated training point: step={} n={} gate={:.4} g_min={:.4} hit={:.1}% sparse={:.1}% bias={:.3}",
+                "    final aggregated training point: step={} n={} reference_gate={:.4} reference_floor={:.4} cached_within_candidate={:.1}% sparse_within_candidate={:.1}% bias={:.3}",
                 last.step,
                 last.samples,
                 last.gate_value.mean,
                 last.g_min.mean,
-                last.cache_hit_rate.mean * 100.0,
+                last.cached_path_rate.mean * 100.0,
                 last.sparse_ratio.mean * 100.0,
                 last.adaptive_bias.mean
             ));
         }
         if let Some(stats) = result.cache_stats {
             let calls = stats.calls as f64;
-            // Share the denominator `calls` across hit/sparse/dense so the three
-            // percentages are comparable and sum to ~100%. Dividing the path
-            // rates by only (sparse+dense) previously excluded cache hits,
-            // making dense read 100% even when 45% of calls were cache hits.
-            let pct = |n: u64| {
+            let candidate_calls = stats.candidate_paths as f64;
+            let call_pct = |n: u64| {
                 if calls > 0.0 {
                     n as f64 / calls * 100.0
                 } else {
                     0.0
                 }
             };
-            let hit_pct = pct(stats.cache_hits);
-            let sparse_pct = pct(stats.sparse_paths);
-            let dense_pct = pct(stats.dense_paths);
+            let candidate_pct = |n: u64| {
+                if candidate_calls > 0.0 {
+                    n as f64 / candidate_calls * 100.0
+                } else {
+                    0.0
+                }
+            };
             lines.push(format!(
-                "    ACHF inference: calls={} hit={:.1}% sparse={:.1}% dense={:.1}% latency_samples={} decision_ns={:.1}",
+                "    ACHF inference: calls={} memo={:.1}% reference={:.1}% candidate={:.1}% rejected={} | candidate routes cached={:.1}% sparse={:.1}% dense={:.1}% | latency_samples={} decision_ns={:.1}",
                 stats.calls,
-                hit_pct,
-                sparse_pct,
-                dense_pct,
+                call_pct(stats.memo_hits),
+                call_pct(stats.reference_paths),
+                call_pct(stats.candidate_paths),
+                stats.candidate_rejections,
+                candidate_pct(stats.cache_hits),
+                candidate_pct(stats.sparse_paths),
+                candidate_pct(stats.dense_paths),
                 stats.latency_samples,
                 stats.decision_ema_ns
             ));
@@ -3356,6 +3416,12 @@ fn write_summary_txt(
         "  blocker: time-resolved candidate-output discrepancy and ACHF-local Adam moment drift are absent"
             .to_string(),
     );
+    if has_ineligible_candidate(all) {
+        lines.push(
+            "  blocker: at least one materialized candidate failed production entry criteria; fixed-mode results are diagnostic only"
+                .to_string(),
+        );
+    }
     lines.push(
         "  note: use these results as a transparent single-machine pilot, not final submission evidence"
             .to_string(),
@@ -3380,7 +3446,7 @@ fn write_summary_json(
     root.insert(
         "metadata".to_string(),
         serde_json::json!({
-            "schema_version": 3,
+            "schema_version": 4,
             "run_manifest": "run_manifest.json",
             "package_version": env!("CARGO_PKG_VERSION"),
             "target_os": std::env::consts::OS,
@@ -3409,7 +3475,8 @@ fn write_summary_json(
             },
             "microbenchmarks": {
                 "path": {
-                    "rank": PATH_RANK,
+                    "candidate_mode": "sparse",
+                    "candidate_selection": "forced diagnostic; bypasses production entry only for kernel equivalence/timing",
                     "prune_threshold": PATH_PRUNE_THRESHOLD,
                     "warmup_rounds": PATH_WARMUP_ROUNDS,
                     "samples_per_trial": PATH_SAMPLES,
@@ -3438,10 +3505,10 @@ fn write_summary_json(
                 },
             },
             "achf_modes": {
-                "lite": "deterministic frozen cached fast path",
-                "fixed_cached": "no online selector; force cached candidate execution when valid",
-                "fixed_sparse": "no online selector; force sparse candidate execution",
-                "fixed_dense": "no online selector; force dense execution of the pruned candidate",
+                "lite": "production quality gate, then deterministic candidate cached/sparse fallback routing",
+                "fixed_cached": "diagnostic override: force candidate selection, then request Cached execution",
+                "fixed_sparse": "diagnostic override: force candidate selection, then request Sparse execution",
+                "fixed_dense": "diagnostic override: force candidate selection, then request Dense execution",
                 "plain_ema": "single short-window latency EMA with fixed stale probing; no cold/warm separation, long EMA blend, or hysteresis",
                 "full": "guarded AMA with cold/warm and short/long EMAs, hysteresis, stale probing, and per-batch buckets",
             },
@@ -3450,9 +3517,9 @@ fn write_summary_json(
                 "train_loss": "last training snapshot from the active policy using that policy's native loss; compare only within the same active_policy",
                 "policy_train_time_ms": "active policy training only; base-model preparation excluded",
                 "param_count": "active policy trainable parameters; derived sparse inference copies excluded",
-                "rank": "rank constrains low-rank projection only; magnitude pruning is controlled independently by prune_threshold, and the projected operator remains materialized densely",
-                "training_curve_scope": "ACHF state snapshots come from the first FFN ACHF layer, or the first attention ACHF layer when no FFN layer is active; final prune error is recomputed over every active ACHF layer",
-                "gate": "the gate multiplicatively scales the active operator in both training and frozen inference; Cached/Sparse/Dense are numerically equivalent execution paths, not interpolation branches",
+                "rank": "rank applies only when candidate_mode=low_rank; sparse pruning is mutually exclusive and controlled by prune_threshold; the low-rank candidate remains materialized densely",
+                "training_curve_scope": "ACHF snapshots come from the first FFN layer, or first attention layer when no FFN layer is active; aggregate candidate weight error is recomputed over every active ACHF layer",
+                "gate": "quality selection blends reference and candidate; only after candidate selection do Cached/Sparse/Dense choose numerically equivalent physical execution of that candidate",
             },
         }),
     );
@@ -3518,6 +3585,9 @@ fn write_summary_json(
     blockers.push(
         "time-resolved candidate-output discrepancy and ACHF-local optimizer-moment drift are not implemented",
     );
+    if has_ineligible_candidate(all) {
+        blockers.push("at least one materialized candidate failed production entry criteria");
+    }
     root.insert(
         "publication_readiness".to_string(),
         serde_json::json!({
@@ -3537,6 +3607,7 @@ fn write_summary_json(
                 "convergence_superiority": false,
                 "cross_hardware_generalization": false,
                 "rank_as_storage_compression": false,
+                "production_candidate_execution": !has_ineligible_candidate(all),
             },
             "blocking_reasons": blockers,
             "note": "false is intentional: software cannot manufacture independent machines, process repetitions, or missing scientific baselines",
@@ -3586,7 +3657,7 @@ fn aggregated_result_json(result: &AggregatedResult) -> serde_json::Value {
         "policy_train_time_ms": trial_stats_json(&result.train_time_ms),
         "param_count": result.param_count,
         "applied_rank": result.applied_rank,
-        "prune_relative_frobenius_error": result.prune_rel_err.as_ref().map(trial_stats_json),
+        "candidate_relative_frobenius_error": result.candidate_relative_error.as_ref().map(trial_stats_json),
         "inference_memory": memory_stats_json(&result.memory_stats),
         "paired_vs_baseline": result.paired.as_ref().map(paired_comparison_json),
         "curve": result.curve.iter().map(curve_point_json).collect::<Vec<_>>(),
@@ -3611,10 +3682,12 @@ fn memory_stats_json(values: &[AchfMemoryStats]) -> serde_json::Value {
         TrialStats::from_values(&values.iter().map(value).collect::<Vec<_>>())
     };
     serde_json::json!({
-        "semantics": "materialized runtime bytes; the current rank-r operator is stored densely and is not a factorized compression",
+        "semantics": "materialized runtime bytes for reference, dedicated connection logits, derived candidate, execution layouts, and exact memo input/output",
         "layers": trial_stats_json(&stats(|entry| entry.layers)),
         "candidate_total_weights": trial_stats_json(&stats(|entry| entry.candidate_total_weights)),
         "candidate_nonzero_weights": trial_stats_json(&stats(|entry| entry.candidate_nonzero_weights)),
+        "candidate_layers": trial_stats_json(&stats(|entry| entry.candidate_layers)),
+        "eligible_candidate_layers": trial_stats_json(&stats(|entry| entry.eligible_candidate_layers)),
         "candidate_sparsity": trial_stats_json(&ratios(|entry| {
             if entry.candidate_total_weights == 0 {
                 0.0
@@ -3623,11 +3696,11 @@ fn memory_stats_json(values: &[AchfMemoryStats]) -> serde_json::Value {
                     / entry.candidate_total_weights as f64
             }
         })),
-        "candidate_prune_relative_frobenius_error": trial_stats_json(&ratios(|entry| {
-            entry.candidate_prune_rel_err().unwrap_or(0.0)
+        "candidate_relative_frobenius_error": trial_stats_json(&ratios(|entry| {
+            entry.candidate_relative_error().unwrap_or(0.0)
         })),
-        "max_layer_prune_relative_frobenius_error": trial_stats_json(&ratios(|entry| {
-            entry.max_layer_prune_rel_err
+        "max_layer_candidate_relative_frobenius_error": trial_stats_json(&ratios(|entry| {
+            entry.max_layer_candidate_relative_error
         })),
         "reference_parameter_bytes": trial_stats_json(&stats(|entry| entry.reference_parameter_bytes)),
         "candidate_dense_bytes": trial_stats_json(&stats(|entry| entry.candidate_dense_bytes)),
@@ -3637,8 +3710,9 @@ fn memory_stats_json(values: &[AchfMemoryStats]) -> serde_json::Value {
         "csr_row_ptr_bytes": trial_stats_json(&stats(|entry| entry.csr_row_ptr_bytes)),
         "csr_column_bytes": trial_stats_json(&stats(|entry| entry.csr_column_bytes)),
         "csr_value_bytes": trial_stats_json(&stats(|entry| entry.csr_value_bytes)),
+        "connection_parameter_bytes": trial_stats_json(&stats(|entry| entry.connection_parameter_bytes)),
+        "memoized_input_bytes": trial_stats_json(&stats(|entry| entry.memoized_input_bytes)),
         "memoized_output_bytes": trial_stats_json(&stats(|entry| entry.memoized_output_bytes)),
-        "sinkhorn_state_bytes": trial_stats_json(&stats(|entry| entry.sinkhorn_state_bytes)),
         "total_materialized_bytes": trial_stats_json(&stats(|entry| entry.total_materialized_bytes)),
         "materialization_ratio_vs_reference": trial_stats_json(&ratios(|entry| {
             entry.total_materialized_bytes as f64
@@ -3651,7 +3725,7 @@ fn memory_stats_json(values: &[AchfMemoryStats]) -> serde_json::Value {
 fn write_csvs(all: &[(&str, Vec<AggregatedResult>)], dir: &str) {
     for (name, agg) in all {
         let mut csv = String::from(
-            "label,active_policy,trial,throughput_sims_per_sec,eval_reward,train_loss,policy_train_time_ms,param_count,applied_rank,prune_rel_err,candidate_total_weights,candidate_nonzero_weights,total_materialized_bytes\n",
+            "label,active_policy,trial,throughput_sims_per_sec,eval_reward,train_loss,policy_train_time_ms,param_count,applied_rank,candidate_relative_frobenius_error,candidate_total_weights,candidate_nonzero_weights,total_materialized_bytes\n",
         );
         for a in agg {
             let label = csv_escape(&a.label);
@@ -3677,7 +3751,7 @@ fn write_csvs(all: &[(&str, Vec<AggregatedResult>)], dir: &str) {
                     a.param_count,
                     a.applied_rank
                         .map_or_else(String::new, |rank| rank.to_string()),
-                    a.prune_rel_err
+                    a.candidate_relative_error
                         .as_ref()
                         .and_then(|stats| stats.values.get(trial))
                         .map_or_else(String::new, |value| format!("{value:.10}")),
@@ -3890,31 +3964,50 @@ fn regime_rows_json(rows: &[RegimeRow]) -> Vec<serde_json::Value> {
 fn write_gate_curve_outputs(result: &AggregatedResult, dir: &str) {
     let mut csv = String::from("step,samples,metric,mean,std_dev,ci_95_low,ci_95_high\n");
     for point in &result.curve {
-        let warm_started_count =
-            (point.sinkhorn_warm_started_rate * point.samples as f64).round() as usize;
-        let warm_started_values: Vec<f64> = (0..point.samples)
-            .map(|index| if index < warm_started_count { 1.0 } else { 0.0 })
-            .collect();
-        let warm_started_stats = TrialStats::from_values(&warm_started_values);
-        let metrics: [(&str, &TrialStats); 19] = [
+        let metrics: [(&str, &TrialStats); 23] = [
             ("train_loss", &point.train_loss),
             ("train_reward", &point.train_reward),
-            ("gate_value", &point.gate_value),
-            ("gate_velocity", &point.gate_velocity),
-            ("g_min", &point.g_min),
+            ("reference_gate", &point.gate_value),
+            ("reference_gate_velocity", &point.gate_velocity),
+            ("reference_gate_floor", &point.g_min),
+            ("candidate_eligible_rate", &point.candidate_eligible_rate),
+            ("candidate_sparsity", &point.candidate_sparsity),
+            (
+                "candidate_weight_relative_frobenius_error",
+                &point.candidate_relative_error,
+            ),
+            (
+                "candidate_weight_error_ema",
+                &point.candidate_weight_error_ema,
+            ),
+            (
+                "connection_candidate_weight",
+                &point.connection_candidate_weight,
+            ),
             ("grad_ema", &point.grad_ema),
             ("gradient_cosine", &point.gradient_cosine),
-            ("cache_hit_rate", &point.cache_hit_rate),
-            ("sparse_ratio", &point.sparse_ratio),
+            ("cached_path_rate_within_candidate", &point.cached_path_rate),
+            ("sparse_path_rate_within_candidate", &point.sparse_ratio),
             ("ema_cached_ns", &point.ema_cached_ns),
             ("ema_sparse_ns", &point.ema_sparse_ns),
             ("adaptive_bias", &point.adaptive_bias),
-            ("sinkhorn_iterations", &point.sinkhorn_iterations),
-            ("sinkhorn_row_max_dev", &point.sinkhorn_row_max_dev),
-            ("sinkhorn_col_max_dev", &point.sinkhorn_col_max_dev),
-            ("sinkhorn_min_value", &point.sinkhorn_min_value),
-            ("sinkhorn_negative_ratio", &point.sinkhorn_negative_ratio),
-            ("sinkhorn_warm_started_rate", &warm_started_stats),
+            (
+                "connection_normalization_iterations",
+                &point.connection_projection_iterations,
+            ),
+            (
+                "connection_row_max_deviation",
+                &point.connection_row_max_deviation,
+            ),
+            (
+                "connection_col_max_deviation",
+                &point.connection_col_max_deviation,
+            ),
+            ("connection_min_value", &point.connection_min_value),
+            (
+                "connection_negative_ratio",
+                &point.connection_negative_ratio,
+            ),
             ("low_rank_applied_rank", &point.low_rank_applied_rank),
         ];
         for (metric, stats) in metrics {
@@ -4035,38 +4128,45 @@ fn curve_point_json(point: &CurvePointStats) -> serde_json::Value {
         "samples": point.samples,
         "train_loss": trial_stats_json(&point.train_loss),
         "train_reward": trial_stats_json(&point.train_reward),
-        "gate_value": trial_stats_json(&point.gate_value),
-        "gate_velocity": trial_stats_json(&point.gate_velocity),
-        "g_min": trial_stats_json(&point.g_min),
+        "reference_gate": trial_stats_json(&point.gate_value),
+        "reference_gate_velocity": trial_stats_json(&point.gate_velocity),
+        "reference_gate_floor": trial_stats_json(&point.g_min),
+        "candidate_eligible_rate": trial_stats_json(&point.candidate_eligible_rate),
+        "candidate_sparsity": trial_stats_json(&point.candidate_sparsity),
+        "candidate_weight_relative_frobenius_error": trial_stats_json(
+            &point.candidate_relative_error
+        ),
+        "candidate_weight_error_ema": trial_stats_json(&point.candidate_weight_error_ema),
+        "connection_candidate_weight": trial_stats_json(
+            &point.connection_candidate_weight
+        ),
         "grad_ema": trial_stats_json(&point.grad_ema),
         "gradient_cosine": trial_stats_json(&point.gradient_cosine),
-        "cache_hit_rate": trial_stats_json(&point.cache_hit_rate),
-        "sparse_ratio": trial_stats_json(&point.sparse_ratio),
+        "cached_path_rate_within_candidate": trial_stats_json(&point.cached_path_rate),
+        "sparse_path_rate_within_candidate": trial_stats_json(&point.sparse_ratio),
         "ema_cached_ns": trial_stats_json(&point.ema_cached_ns),
         "ema_sparse_ns": trial_stats_json(&point.ema_sparse_ns),
         "adaptive_bias": trial_stats_json(&point.adaptive_bias),
-        "sinkhorn_iterations": trial_stats_json(&point.sinkhorn_iterations),
-        "sinkhorn_row_max_dev": trial_stats_json(&point.sinkhorn_row_max_dev),
-        "sinkhorn_col_max_dev": trial_stats_json(&point.sinkhorn_col_max_dev),
-        "sinkhorn_min_value": trial_stats_json(&point.sinkhorn_min_value),
-        "sinkhorn_negative_ratio": trial_stats_json(&point.sinkhorn_negative_ratio),
-        "sinkhorn_warm_started_rate": point.sinkhorn_warm_started_rate,
+        "connection_normalization_iterations": trial_stats_json(&point.connection_projection_iterations),
+        "connection_row_max_deviation": trial_stats_json(&point.connection_row_max_deviation),
+        "connection_col_max_deviation": trial_stats_json(&point.connection_col_max_deviation),
+        "connection_min_value": trial_stats_json(&point.connection_min_value),
+        "connection_negative_ratio": trial_stats_json(&point.connection_negative_ratio),
         "low_rank_applied_rank": trial_stats_json(&point.low_rank_applied_rank),
     })
 }
 
 fn cache_stats_json(stats: AchfCacheStats) -> serde_json::Value {
     let calls = stats.calls as f64;
-    // Every call resolves to exactly one path: Cached (cache_hits), Sparse, or
-    // Dense. All three rates therefore share the SAME denominator (total calls)
-    // so they are directly comparable and sum to ~1.0. Previously hit_rate was
-    // divided by `calls` while the path rates were divided by only
-    // (sparse+dense), which excluded cache hits from the denominator — that is
-    // why a run could report hit_rate=0.45 alongside dense_path_rate=1.0 for the
-    // same data, an apparent contradiction that was purely a denominator
-    // mismatch. `cached_path_rate` is added so the three paths are reported on
-    // equal footing.
     let rate = |n: u64| if calls > 0.0 { n as f64 / calls } else { 0.0 };
+    let candidate_calls = stats.candidate_paths as f64;
+    let candidate_rate = |n: u64| {
+        if candidate_calls > 0.0 {
+            n as f64 / candidate_calls
+        } else {
+            0.0
+        }
+    };
     let fastest_path_ns = [stats.ema_cached_ns, stats.ema_sparse_ns, stats.ema_dense_ns]
         .into_iter()
         .filter(|value| value.is_finite() && *value > 0.0)
@@ -4078,12 +4178,19 @@ fn cache_stats_json(stats: AchfCacheStats) -> serde_json::Value {
         "cache_hits": stats.cache_hits,
         "cache_misses": stats.cache_misses,
         "cache_skips": stats.cache_skips,
+        "memo_hits": stats.memo_hits,
+        "reference_paths": stats.reference_paths,
+        "candidate_paths": stats.candidate_paths,
+        "candidate_rejections": stats.candidate_rejections,
         "sparse_paths": stats.sparse_paths,
         "dense_paths": stats.dense_paths,
-        "hit_rate": rate(stats.cache_hits),
-        "cached_path_rate": rate(stats.cache_hits),
-        "sparse_path_rate": rate(stats.sparse_paths),
-        "dense_path_rate": rate(stats.dense_paths),
+        "memo_hit_rate": rate(stats.memo_hits),
+        "reference_execution_rate": rate(stats.reference_paths),
+        "candidate_execution_rate": rate(stats.candidate_paths),
+        "candidate_rejection_rate": rate(stats.candidate_rejections),
+        "cached_path_rate_within_candidate": candidate_rate(stats.cache_hits),
+        "sparse_path_rate_within_candidate": candidate_rate(stats.sparse_paths),
+        "dense_path_rate_within_candidate": candidate_rate(stats.dense_paths),
         "ema_cached_ns": stats.ema_cached_ns,
         "ema_cached_long_ns": stats.ema_cached_long_ns,
         "ema_sparse_ns": stats.ema_sparse_ns,
@@ -4277,20 +4384,24 @@ mod tests {
             gate_velocity: -0.01,
             g_min: 0.2,
             grad_ema: 0.3,
+            candidate_eligible: true,
+            candidate_sparsity: 0.75,
+            candidate_relative_error: 0.01,
+            candidate_weight_error_ema: 0.01,
+            connection_candidate_weight: 0.6,
             gradient_cosine: 0.25,
             loss,
             reward,
-            cache_hit_rate: 0.5,
+            cached_path_rate: 0.5,
             sparse_ratio: 0.75,
             ema_cached_ns: 11.0,
             ema_sparse_ns: 22.0,
             adaptive_bias: 1.1,
-            sinkhorn_iterations: 20,
-            sinkhorn_row_max_dev: 0.0001,
-            sinkhorn_col_max_dev: 0.0002,
-            sinkhorn_min_value: 0.01,
-            sinkhorn_negative_ratio: 0.0,
-            sinkhorn_warm_started: true,
+            connection_projection_iterations: 20,
+            connection_row_max_deviation: 0.0001,
+            connection_col_max_deviation: 0.0002,
+            connection_min_value: 0.01,
+            connection_negative_ratio: 0.0,
             low_rank_applied_rank: 0,
         }
     }
@@ -4300,6 +4411,7 @@ mod tests {
             calls,
             cache_hits: hits,
             cache_misses: 1,
+            candidate_paths: calls,
             cache_skips: 1,
             sparse_paths: calls.saturating_sub(hits + 1),
             dense_paths: 1,
@@ -4338,7 +4450,7 @@ mod tests {
             train_loss,
             param_count: 42,
             applied_rank: Some(0),
-            prune_rel_err: Some(0.125),
+            candidate_relative_error: Some(0.125),
             memory_stats: Some(AchfMemoryStats {
                 layers: 1,
                 candidate_total_weights: 16,
@@ -4490,12 +4602,19 @@ mod tests {
         let json = std::fs::read_to_string(&json_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["exp"][0]["label"], "label,with\"quote");
-        assert_eq!(parsed["metadata"]["schema_version"], 3);
+        assert_eq!(parsed["metadata"]["schema_version"], 4);
         assert_eq!(parsed["exp"][0]["active_policy"], "PPO");
         assert_eq!(parsed["exp"][0]["eval_reward"]["mean"], 0.5);
+        assert_eq!(
+            parsed["exp"][0]["candidate_relative_frobenius_error"]["mean"],
+            0.125
+        );
         assert!(parsed["exp"][0]["eval_reward"]["ci_95"][0].is_null());
         assert_eq!(parsed["exp"][0]["frozen_cache_stats"]["calls"], 8);
-        assert_eq!(parsed["exp"][0]["frozen_cache_stats"]["hit_rate"], 0.25);
+        assert_eq!(
+            parsed["exp"][0]["frozen_cache_stats"]["cached_path_rate_within_candidate"],
+            0.25
+        );
 
         std::fs::remove_file(json_path).unwrap();
         std::fs::remove_dir(dir).unwrap();
@@ -4834,7 +4953,10 @@ mod tests {
         write_summary_json(&[], None, Some(&result), None, None, (1, 2), &output_dir);
 
         let csv = std::fs::read_to_string(dir.join("gate_curve.csv")).unwrap();
-        assert!(csv.contains("10,2,gate_value,0.9000000000"));
+        assert!(csv.contains("10,2,reference_gate,0.9000000000"));
+        assert!(csv.contains("10,2,candidate_eligible_rate,1.0000000000"));
+        assert!(csv.contains("10,2,candidate_weight_relative_frobenius_error,0.0100000000"));
+        assert!(csv.contains("10,2,cached_path_rate_within_candidate,0.5000000000"));
         assert!(csv.contains("10,2,train_loss,0.2500000000"));
         let json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("summary.json")).unwrap())
@@ -4842,23 +4964,35 @@ mod tests {
         assert_eq!(json["gate_curve"]["curve_point_count"], 1);
         assert_eq!(json["gate_curve"]["final_curve_point"]["step"], 10);
         assert_eq!(
-            json["gate_curve"]["final_curve_point"]["gate_value"]["mean"],
+            json["gate_curve"]["final_curve_point"]["reference_gate"]["mean"],
             0.9
         );
-        assert_eq!(json["gate_curve"]["frozen_cache_stats"]["hit_rate"], 0.25);
-        // All path rates share the denominator `calls` (=8) and are mutually
-        // consistent: cached 2/8, sparse 3/8, dense 1/8. This guards against the
-        // former denominator mismatch where path rates excluded cache hits.
         assert_eq!(
-            json["gate_curve"]["frozen_cache_stats"]["cached_path_rate"],
+            json["gate_curve"]["final_curve_point"]["candidate_weight_relative_frobenius_error"]
+                ["mean"],
+            0.01
+        );
+        assert_eq!(
+            json["gate_curve"]["final_curve_point"]["candidate_eligible_rate"]["mean"],
+            1.0
+        );
+        assert_eq!(
+            json["gate_curve"]["frozen_cache_stats"]["cached_path_rate_within_candidate"],
+            0.25
+        );
+        // All candidate-internal path rates share `candidate_paths` (=8) and are
+        // mutually consistent: cached 2/8, sparse 5/8, dense 1/8. This guards
+        // against mixing total calls with candidate execution denominators.
+        assert_eq!(
+            json["gate_curve"]["frozen_cache_stats"]["cached_path_rate_within_candidate"],
             0.25
         );
         assert_eq!(
-            json["gate_curve"]["frozen_cache_stats"]["sparse_path_rate"],
+            json["gate_curve"]["frozen_cache_stats"]["sparse_path_rate_within_candidate"],
             0.625
         );
         assert_eq!(
-            json["gate_curve"]["frozen_cache_stats"]["dense_path_rate"],
+            json["gate_curve"]["frozen_cache_stats"]["dense_path_rate_within_candidate"],
             0.125
         );
         let summary: serde_json::Value = serde_json::from_str(
