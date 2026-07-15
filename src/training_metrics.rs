@@ -12,6 +12,13 @@ pub struct StepSnapshot {
     pub candidate_sparsity: f64,
     pub candidate_relative_error: f64,
     pub candidate_weight_error_ema: f64,
+    pub candidate_output_relative_error: f64,
+    pub candidate_output_error_ema: f64,
+    pub candidate_output_samples: usize,
+    pub candidate_calibration_steps: usize,
+    pub candidate_masked_weight_max_abs: f64,
+    pub candidate_masked_gradient_max_abs: f64,
+    pub candidate_masked_moment_max_abs: f64,
     pub connection_candidate_weight: f64,
     pub grad_ema: f64,
     pub gradient_cosine: f64,
@@ -45,6 +52,17 @@ impl StepSnapshot {
             candidate_sparsity: achf.map_or(0.0, |s| s.candidate_sparsity),
             candidate_relative_error: achf.map_or(0.0, |s| s.candidate_relative_error),
             candidate_weight_error_ema: achf.map_or(0.0, |s| s.candidate_weight_error_ema),
+            candidate_output_relative_error: achf
+                .map_or(0.0, |s| s.candidate_output_relative_error),
+            candidate_output_error_ema: achf.map_or(0.0, |s| s.candidate_output_error_ema),
+            candidate_output_samples: achf.map_or(0, |s| s.candidate_output_samples),
+            candidate_calibration_steps: achf.map_or(0, |s| s.candidate_calibration_steps),
+            candidate_masked_weight_max_abs: achf
+                .map_or(0.0, |s| s.candidate_masked_weight_max_abs),
+            candidate_masked_gradient_max_abs: achf
+                .map_or(0.0, |s| s.candidate_masked_gradient_max_abs),
+            candidate_masked_moment_max_abs: achf
+                .map_or(0.0, |s| s.candidate_masked_moment_max_abs),
             connection_candidate_weight: achf.map_or(0.0, |s| s.connection_candidate_weight),
             grad_ema: achf.map_or(0.0, |s| s.grad_ema),
             gradient_cosine: achf.map_or(0.0, |s| s.gradient_cosine),

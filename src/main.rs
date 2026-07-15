@@ -152,7 +152,7 @@ enum BenchAction {
     /// Run full ACHF benchmark suite
     #[command(name = "paper", visible_alias = "achf", alias = "p")]
     Achf {
-        /// Run only specific experiments (comma-separated: ablation,mode,path,gate,scale,apply,convergence,crossover,regime)
+        /// Run only specific experiments (comma-separated: ablation,mode,path,gate,scale,apply,convergence,admission,crossover,regime)
         #[arg(long)]
         only: Option<String>,
         /// Output directory for charts and data
@@ -162,9 +162,14 @@ enum BenchAction {
         #[arg(long, default_value = "svg")]
         format: String,
         /// Number of independently seeded in-process trials per experiment.
-        /// Use separate invocations for independent process repetitions.
         #[arg(long, default_value_t = DEFAULT_BENCH_TRIALS)]
         trials: usize,
+        /// Number of independent operating-system process repetitions.
+        #[arg(long, default_value_t = 1)]
+        processes: usize,
+        /// Internal child index populated by the process orchestrator.
+        #[arg(long, hide = true)]
+        process_index: Option<usize>,
     },
 }
 
@@ -611,12 +616,16 @@ fn build_bench_config(
     format: &str,
     only: Option<Vec<String>>,
     trials: usize,
+    processes: usize,
+    process_index: Option<usize>,
 ) -> Result<bench::BenchConfig, String> {
     let cfg = bench::BenchConfig {
         output_dir,
         format: bench::parse_chart_format(format)?,
         only,
         num_trials: trials,
+        process_repetitions: processes,
+        process_index,
     };
     bench::validate_bench_config(&cfg)?;
     Ok(cfg)
@@ -628,10 +637,19 @@ fn validate_bench_action(action: &Option<BenchAction>) -> Result<(), String> {
         output_dir: _,
         format,
         trials,
+        processes,
+        process_index,
     }) = action
     {
         let only = only.as_deref().map(bench::parse_only_filter);
-        build_bench_config(String::new(), format, only, *trials)?;
+        build_bench_config(
+            String::new(),
+            format,
+            only,
+            *trials,
+            *processes,
+            *process_index,
+        )?;
     }
     Ok(())
 }
@@ -741,6 +759,8 @@ fn main() {
                 output_dir,
                 format,
                 trials,
+                processes,
+                process_index,
             }),
     }) = args.command.clone()
     {
@@ -749,6 +769,8 @@ fn main() {
             &format,
             only.map(|s| bench::parse_only_filter(&s)),
             trials,
+            processes,
+            process_index,
         )
         .unwrap_or_else(|err| {
             eprintln!("\x1b[1;31m[Benchmark Error]\x1b[0m {}", err);
@@ -756,7 +778,16 @@ fn main() {
         });
         let config = Config::load(&args.config);
         let seed = args.seed.unwrap_or(42);
-        bench::run_achf_benchmarks(&config, seed, &bench_cfg);
+        if bench_cfg.process_repetitions > 1 && bench_cfg.process_index.is_none() {
+            bench::run_achf_benchmark_processes(&args.config, seed, &bench_cfg).unwrap_or_else(
+                |error| {
+                    eprintln!("\x1b[1;31m[Benchmark Error]\x1b[0m {error}");
+                    std::process::exit(2);
+                },
+            );
+        } else {
+            bench::run_achf_benchmarks(&config, seed, &bench_cfg);
+        }
         return;
     }
 
@@ -837,12 +868,16 @@ fn main() {
                 output_dir,
                 format,
                 trials,
+                processes,
+                process_index,
             }) => {
                 let bench_cfg = build_bench_config(
                     output_dir,
                     &format,
                     only.map(|s| bench::parse_only_filter(&s)),
                     trials,
+                    processes,
+                    process_index,
                 )
                 .unwrap_or_else(|err| {
                     eprintln!("\x1b[1;31m[Benchmark Error]\x1b[0m {}", err);
@@ -1558,14 +1593,20 @@ fn run_interactive(args: RunInteractiveArgs) {
                             _ => {}
                         }
                     }
-                    let bench_cfg =
-                        match build_bench_config(output_dir, &format_str, only_filter, trials) {
-                            Ok(cfg) => cfg,
-                            Err(err) => {
-                                println!("\x1b[1;31m[Benchmark Error]\x1b[0m {}", err);
-                                continue;
-                            }
-                        };
+                    let bench_cfg = match build_bench_config(
+                        output_dir,
+                        &format_str,
+                        only_filter,
+                        trials,
+                        1,
+                        None,
+                    ) {
+                        Ok(cfg) => cfg,
+                        Err(err) => {
+                            println!("\x1b[1;31m[Benchmark Error]\x1b[0m {}", err);
+                            continue;
+                        }
+                    };
                     let seed = rng.next_u64();
                     bench::run_achf_benchmarks(&config, seed, &bench_cfg);
                 }
@@ -1592,6 +1633,8 @@ fn run_interactive(args: RunInteractiveArgs) {
                         "svg",
                         Some(vec![sub_lower]),
                         DEFAULT_BENCH_TRIALS,
+                        1,
+                        None,
                     ) {
                         Ok(cfg) => cfg,
                         Err(err) => {
@@ -2245,6 +2288,7 @@ mod tests {
                         output_dir,
                         format,
                         trials,
+                        ..
                     }),
             }) => {
                 assert_eq!(only.as_deref(), Some("path,gate"));
@@ -2266,15 +2310,45 @@ mod tests {
 
     #[test]
     fn benchmark_config_rejects_invalid_values() {
-        assert!(build_bench_config("out".to_string(), "jpg", None, 1).is_err());
-        assert!(build_bench_config("out".to_string(), "svg", None, 0).is_err());
+        assert!(build_bench_config("out".to_string(), "jpg", None, 1, 1, None).is_err());
+        assert!(build_bench_config("out".to_string(), "svg", None, 0, 1, None).is_err());
         assert!(build_bench_config(
             "out".to_string(),
             "svg",
             Some(vec!["missing".to_string()]),
-            1
+            1,
+            1,
+            None,
         )
         .is_err());
+    }
+
+    #[test]
+    fn benchmark_paper_parses_process_repetitions() {
+        let args = Args::try_parse_from([
+            "talos_xii",
+            "benchmark",
+            "paper",
+            "--processes",
+            "3",
+            "--trials",
+            "5",
+        ])
+        .unwrap();
+        match args.command {
+            Some(Commands::Benchmark {
+                action:
+                    Some(BenchAction::Achf {
+                        processes,
+                        process_index,
+                        ..
+                    }),
+            }) => {
+                assert_eq!(processes, 3);
+                assert_eq!(process_index, None);
+            }
+            _ => panic!("expected benchmark paper process options"),
+        }
     }
 
     #[test]

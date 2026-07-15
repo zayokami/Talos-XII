@@ -244,6 +244,27 @@ fn sanitize_achf_config(achf: &mut AchfConfig) {
         );
         achf.prune_threshold = 0.0;
     }
+    if achf.candidate_mode == "low_rank" && achf.candidate_target_sparsity > 0.0 {
+        eprintln!(
+            "[Config Warning] ACHF candidate_target_sparsity applies only to sparse candidates; disabling it"
+        );
+        achf.candidate_target_sparsity = 0.0;
+    }
+    if achf.candidate_mode != "sparse" && achf.candidate_train_from_scratch {
+        eprintln!(
+            "[Config Warning] ACHF candidate_train_from_scratch requires candidate_mode='sparse'; disabling it"
+        );
+        achf.candidate_train_from_scratch = false;
+    }
+    if achf.candidate_train_from_scratch {
+        if achf.candidate_min_calibration_samples > 0 || achf.candidate_calibration_steps > 0 {
+            eprintln!(
+                "[Config Warning] ACHF sparse-training baseline is independent of post-training candidate calibration; disabling calibration"
+            );
+        }
+        achf.candidate_min_calibration_samples = 0;
+        achf.candidate_calibration_steps = 0;
+    }
     if achf.adaptive_inference && achf.mode != "full" {
         eprintln!(
             "[Config Warning] ACHF adaptive_inference=true is a legacy alias for mode='full'"
@@ -340,6 +361,20 @@ fn sanitize_achf_config(achf: &mut AchfConfig) {
         defaults.prune_threshold,
     );
     sanitize_unit_interval(
+        &mut achf.candidate_target_sparsity,
+        "candidate_target_sparsity",
+        defaults.candidate_target_sparsity,
+    );
+    if achf.candidate_mode == "sparse"
+        && achf.candidate_target_sparsity > 0.0
+        && achf.prune_threshold > 0.0
+    {
+        eprintln!(
+            "[Config Warning] ACHF candidate_target_sparsity supersedes prune_threshold; disabling the legacy absolute threshold"
+        );
+        achf.prune_threshold = 0.0;
+    }
+    sanitize_unit_interval(
         &mut achf.candidate_min_sparsity,
         "candidate_min_sparsity",
         defaults.candidate_min_sparsity,
@@ -349,6 +384,29 @@ fn sanitize_achf_config(achf: &mut AchfConfig) {
         "candidate_max_relative_error",
         defaults.candidate_max_relative_error,
     );
+    sanitize_unit_interval(
+        &mut achf.candidate_max_output_relative_error,
+        "candidate_max_output_relative_error",
+        defaults.candidate_max_output_relative_error,
+    );
+    sanitize_positive(
+        &mut achf.candidate_calibration_lr,
+        "candidate_calibration_lr",
+        defaults.candidate_calibration_lr,
+    );
+    if achf.candidate_min_calibration_samples > achf.candidate_calibration_max_samples {
+        eprintln!(
+            "[Config Warning] ACHF candidate_min_calibration_samples ({}) exceeds candidate_calibration_max_samples ({}), clamping",
+            achf.candidate_min_calibration_samples, achf.candidate_calibration_max_samples
+        );
+        achf.candidate_min_calibration_samples = achf.candidate_calibration_max_samples;
+    }
+    if achf.candidate_mode != "sparse" && achf.candidate_min_calibration_samples > 0 {
+        eprintln!(
+            "[Config Warning] ACHF candidate calibration currently applies only to sparse candidates; disabling the calibration requirement"
+        );
+        achf.candidate_min_calibration_samples = 0;
+    }
     sanitize_unit_interval(
         &mut achf.candidate_weight_error_momentum,
         "candidate_weight_error_momentum",
@@ -474,10 +532,24 @@ pub struct AchfConfig {
     pub diagnostics_enabled: bool,
     pub rank: usize,
     pub prune_threshold: f64,
+    #[serde(default = "default_achf_candidate_target_sparsity")]
+    pub candidate_target_sparsity: f64,
     #[serde(default = "default_achf_candidate_min_sparsity")]
     pub candidate_min_sparsity: f64,
     #[serde(default = "default_achf_candidate_max_relative_error")]
     pub candidate_max_relative_error: f64,
+    #[serde(default = "default_achf_candidate_max_output_relative_error")]
+    pub candidate_max_output_relative_error: f64,
+    #[serde(default = "default_achf_candidate_min_calibration_samples")]
+    pub candidate_min_calibration_samples: usize,
+    #[serde(default = "default_achf_candidate_calibration_steps")]
+    pub candidate_calibration_steps: usize,
+    #[serde(default = "default_achf_candidate_calibration_lr")]
+    pub candidate_calibration_lr: f64,
+    #[serde(default = "default_achf_candidate_calibration_max_samples")]
+    pub candidate_calibration_max_samples: usize,
+    #[serde(default)]
+    pub candidate_train_from_scratch: bool,
     #[serde(
         default = "default_achf_candidate_weight_error_momentum",
         alias = "candidate_discrepancy_momentum"
@@ -535,8 +607,15 @@ impl Default for AchfConfig {
             diagnostics_enabled: false,
             rank: 0,
             prune_threshold: 0.01,
+            candidate_target_sparsity: default_achf_candidate_target_sparsity(),
             candidate_min_sparsity: default_achf_candidate_min_sparsity(),
             candidate_max_relative_error: default_achf_candidate_max_relative_error(),
+            candidate_max_output_relative_error: default_achf_candidate_max_output_relative_error(),
+            candidate_min_calibration_samples: default_achf_candidate_min_calibration_samples(),
+            candidate_calibration_steps: default_achf_candidate_calibration_steps(),
+            candidate_calibration_lr: default_achf_candidate_calibration_lr(),
+            candidate_calibration_max_samples: default_achf_candidate_calibration_max_samples(),
+            candidate_train_from_scratch: false,
             candidate_weight_error_momentum: default_achf_candidate_weight_error_momentum(),
             apply_attn: true,
             apply_ffn: true,
@@ -571,8 +650,32 @@ fn default_achf_candidate_min_sparsity() -> f64 {
     0.5
 }
 
+fn default_achf_candidate_target_sparsity() -> f64 {
+    0.0
+}
+
 fn default_achf_candidate_max_relative_error() -> f64 {
     0.05
+}
+
+fn default_achf_candidate_max_output_relative_error() -> f64 {
+    0.05
+}
+
+fn default_achf_candidate_min_calibration_samples() -> usize {
+    0
+}
+
+fn default_achf_candidate_calibration_steps() -> usize {
+    256
+}
+
+fn default_achf_candidate_calibration_lr() -> f64 {
+    1e-3
+}
+
+fn default_achf_candidate_calibration_max_samples() -> usize {
+    256
 }
 
 fn default_achf_candidate_weight_error_momentum() -> f64 {
@@ -1125,11 +1228,35 @@ impl Config {
                 if let Some(v) = achf_map.get("prune_threshold") {
                     config.achf.prune_threshold = v.as_f64().unwrap_or(0.01);
                 }
+                if let Some(v) = achf_map.get("candidate_target_sparsity") {
+                    config.achf.candidate_target_sparsity = v.as_f64().unwrap_or(0.0);
+                }
                 if let Some(v) = achf_map.get("candidate_min_sparsity") {
                     config.achf.candidate_min_sparsity = v.as_f64().unwrap_or(0.5);
                 }
                 if let Some(v) = achf_map.get("candidate_max_relative_error") {
                     config.achf.candidate_max_relative_error = v.as_f64().unwrap_or(0.05);
+                }
+                if let Some(v) = achf_map.get("candidate_max_output_relative_error") {
+                    config.achf.candidate_max_output_relative_error = v.as_f64().unwrap_or(0.05);
+                }
+                if let Some(v) = achf_map.get("candidate_min_calibration_samples") {
+                    config.achf.candidate_min_calibration_samples =
+                        v.as_f64().unwrap_or(0.0).round() as usize;
+                }
+                if let Some(v) = achf_map.get("candidate_calibration_steps") {
+                    config.achf.candidate_calibration_steps =
+                        v.as_f64().unwrap_or(256.0).round() as usize;
+                }
+                if let Some(v) = achf_map.get("candidate_calibration_lr") {
+                    config.achf.candidate_calibration_lr = v.as_f64().unwrap_or(1e-3);
+                }
+                if let Some(v) = achf_map.get("candidate_calibration_max_samples") {
+                    config.achf.candidate_calibration_max_samples =
+                        v.as_f64().unwrap_or(256.0).round() as usize;
+                }
+                if let Some(v) = achf_map.get("candidate_train_from_scratch") {
+                    config.achf.candidate_train_from_scratch = v.as_bool().unwrap_or(false);
                 }
                 if let Some(v) = achf_map
                     .get("candidate_weight_error_momentum")
@@ -1758,6 +1885,9 @@ mod tests {
             cache_latency_ema: -0.5,
             cache_latency_long_ema: f64::INFINITY,
             cache_adapt_blend: -0.8,
+            candidate_target_sparsity: 1.5,
+            candidate_max_output_relative_error: -0.5,
+            candidate_calibration_lr: 0.0,
             ..Default::default()
         };
 
@@ -1781,6 +1911,12 @@ mod tests {
         assert_eq!(achf.cache_latency_ema, 0.0);
         assert_eq!(achf.cache_latency_long_ema, defaults.cache_latency_long_ema);
         assert_eq!(achf.cache_adapt_blend, 0.0);
+        assert_eq!(achf.candidate_target_sparsity, 1.0);
+        assert_eq!(achf.candidate_max_output_relative_error, 0.0);
+        assert_eq!(
+            achf.candidate_calibration_lr,
+            defaults.candidate_calibration_lr
+        );
     }
 
     #[test]
@@ -1837,10 +1973,31 @@ mod tests {
             candidate_mode: "low_rank".to_string(),
             rank: 8,
             prune_threshold: 0.5,
+            candidate_target_sparsity: 0.9,
             ..Default::default()
         };
         sanitize_achf_config(&mut low_rank);
         assert_eq!(low_rank.prune_threshold, 0.0);
+        assert_eq!(low_rank.candidate_target_sparsity, 0.0);
+
+        let mut target_sparse = AchfConfig {
+            candidate_mode: "sparse".to_string(),
+            prune_threshold: 0.5,
+            candidate_target_sparsity: 0.9,
+            ..Default::default()
+        };
+        sanitize_achf_config(&mut target_sparse);
+        assert_eq!(target_sparse.prune_threshold, 0.0);
+
+        let mut sparse_training = AchfConfig {
+            candidate_train_from_scratch: true,
+            candidate_min_calibration_samples: 64,
+            candidate_calibration_steps: 32,
+            ..Default::default()
+        };
+        sanitize_achf_config(&mut sparse_training);
+        assert_eq!(sparse_training.candidate_min_calibration_samples, 0);
+        assert_eq!(sparse_training.candidate_calibration_steps, 0);
 
         let mut constrained_connection = AchfConfig {
             proj_mode: "sinkhorn".to_string(),

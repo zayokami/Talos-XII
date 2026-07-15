@@ -157,15 +157,21 @@ flowchart LR
 
 Candidate modes are mutually exclusive:
 
-- `candidate_mode=sparse` applies only `prune_threshold`. Production admission requires `candidate_min_sparsity`, `candidate_max_relative_error`, a valid mask, and CSR storage smaller than the dense candidate. Sparse routing is unavailable otherwise.
+- `candidate_mode=sparse` uses deterministic magnitude-percentile pruning when `candidate_target_sparsity > 0`; equal magnitudes are resolved by stable parameter index. `prune_threshold` remains the legacy absolute-threshold mode when the target is zero.
+- A normal sparse candidate is calibrated after reference training with a separate Adam optimizer and real PPO rollout states. The reference is frozen; the sparse mask applies to forward values and gradients, and masked weights plus both Adam moments must remain exactly zero.
+- With `candidate_min_calibration_samples > 0`, production admission uses held-out candidate-output error (`candidate_max_output_relative_error`), realized sparsity, a valid mask, zero-mask optimizer invariants, and economical CSR storage. Weight Frobenius error remains diagnostic. A zero minimum sample count enables the legacy weight-error rule.
 - `candidate_mode=low_rank` applies only `rank`. It does not prune and does not expose a Sparse route. The current approximation is materialized densely, so rank is not claimed as factorized storage or a low-rank kernel speedup.
 - `candidate_mode=none` keeps reference-only behavior.
 
-`candidate_refresh_freq` controls post-optimizer candidate rebuilding. A skipped refresh immediately revokes production eligibility until the next rebuild, preventing stale candidates from being reused. The default is `1`. `freeze_for_inference()` rebuilds and validates once more before preparing candidate layouts.
+`candidate_refresh_freq` controls post-optimizer candidate rebuilding. A skipped refresh immediately revokes production eligibility until the next rebuild, preventing stale candidates from being reused. After calibration, `freeze_for_inference()` preserves the candidate only while its complete reference fingerprint still matches; otherwise it rebuilds and revokes stale calibration.
+
+`candidate_train_from_scratch=true` is reserved for the fixed-mask sparse-training scientific baseline. It gives the candidate—not the reference—to the policy optimizer from initialization and is not the production prune-and-calibrate path.
 
 Frozen output memoization is separate from Cached execution. It hashes every input element and also compares the complete stored input before returning a memoized output. Benchmarks disable it unless memoization itself is under study, so selector/path counters remain interpretable. `cache_min_reuse` controls only this memo threshold; AMA warm-up and hysteresis use the independent `path_warmup_samples` and `path_min_dwell` settings.
 
-**Recommended starting point:** `candidate_mode=sparse`, `candidate_refresh_freq=1`, `proj_mode=sinkhorn`, `mode=lite`, and `apply_ffn=true`. Treat every `fixed_*` mode as a diagnostic override: it forces candidate selection even when production admission fails.
+**Recommended starting point:** `candidate_mode=sparse`, `candidate_target_sparsity=0.51`, `candidate_calibration_steps=256`, `candidate_refresh_freq=1`, `proj_mode=sinkhorn`, `mode=lite`, and `apply_ffn=true`. Calibration stops early only after every layer satisfies the held-out output-error target. The 50% point remains a structural rejection control because CSR row pointers make it larger than dense storage; higher sparsities stay visible in the admission frontier and fall back to reference unless every production criterion passes. Treat every `fixed_*` mode as a diagnostic override.
+
+The paper benchmark includes a real-weight admission frontier, prune-and-calibrate and fixed-mask sparse-training baselines, time-resolved output discrepancy, and masked Adam invariants. `cargo run --release -- benchmark paper --trials 5 --processes 3` runs three independent OS processes; the parent verifies every child manifest and computes confidence intervals over process means. Submission readiness is blocked when tracked source differs from the recorded commit. Cross-hardware replication remains a separate external requirement.
 
 ### AMA
 
@@ -384,15 +390,21 @@ flowchart LR
 
 候选模式严格互斥：
 
-- `candidate_mode=sparse` 只使用 `prune_threshold`。生产准入同时要求达到 `candidate_min_sparsity`、不超过 `candidate_max_relative_error`、mask 有效且 CSR 存储小于稠密候选；否则不能进入 Sparse/候选生产路径。
+- `candidate_mode=sparse` 在 `candidate_target_sparsity > 0` 时使用确定性的 magnitude percentile；幅值相同按参数索引稳定裁决。目标为零时才使用兼容的绝对阈值 `prune_threshold`。
+- 正常 sparse candidate 会在 reference 训练完成后，用独立 Adam 和真实 PPO rollout 状态校准；reference 冻结，mask 同时约束前向、梯度、权重和 Adam 一二阶矩。
+- 当 `candidate_min_calibration_samples > 0` 时，生产准入要求留出集输出误差不超过 `candidate_max_output_relative_error`、实际稀疏率达标、mask 有效、被 mask 的权重/矩严格为零且 CSR 存储经济。权重 Frobenius 误差仅作诊断。
 - `candidate_mode=low_rank` 只使用 `rank`，不剪枝，也没有 Sparse 路由。当前近似仍以稠密矩阵物化，因此不能把 rank 宣称为因子化存储或低秩核加速。
 - `candidate_mode=none` 始终使用 reference。
 
-`candidate_refresh_freq` 控制优化器更新后的候选重建。跳过刷新时会立刻撤销候选生产准入，直到下一次重建，杜绝陈旧 candidate 复用；默认值为 `1`。`freeze_for_inference()` 会再次重建和校验，然后准备执行布局。
+`candidate_refresh_freq` 控制优化器更新后的候选重建。跳过刷新会立刻撤销生产准入。校准完成后，`freeze_for_inference()` 只有在完整 reference 指纹仍匹配时才保留校准候选，否则会重建并撤销陈旧校准。
+
+`candidate_train_from_scratch=true` 只用于固定 mask 从初始化开始训练的科学基线；策略优化器持有 candidate，reference 不参与其优化，不能与生产的“剪枝后校准”混称。
 
 冻结输出 memo 与 Cached 执行是两回事。memo 哈希覆盖全部输入元素，并在返回前比较完整输入；论文 benchmark 默认关闭 memo，避免污染 selector 与路径统计。`cache_min_reuse` 只控制 memo 阈值；AMA 预热和滞回分别由独立的 `path_warmup_samples`、`path_min_dwell` 控制。
 
 **推荐起步：** `candidate_mode=sparse`、`candidate_refresh_freq=1`、`proj_mode=sinkhorn`、`mode=lite`、`apply_ffn=true`。所有 `fixed_*` 模式都是诊断覆盖：即使候选不满足生产准入，也会强制选择候选。
+
+论文 benchmark 现包含真实训练权重的准入前沿、剪枝后校准与固定 mask 从零稀疏训练基线、随校准步变化的输出误差和 Adam mask 一致性诊断。`cargo run --release -- benchmark paper --trials 5 --processes 3` 会运行 3 个真正独立的 OS 进程；父进程校验每个子 manifest，并以进程均值汇总置信区间。跨硬件复现仍是单独的外部条件。
 
 ### AMA
 

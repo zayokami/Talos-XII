@@ -1,5 +1,6 @@
 use crate::achf::{
-    aggregate_cache_stats_iter, AchfCacheStats, AchfLayer, AchfMemoryStats, AchfSparsityStats,
+    aggregate_cache_stats_iter, AchfCacheStats, AchfCandidateCalibration, AchfLayer,
+    AchfMemoryStats, AchfSparsityStats,
 };
 use crate::chart::{self, ChartFormat};
 use crate::config::{AchfConfig, Config, LuckMode};
@@ -27,6 +28,7 @@ const BENCH_EXPERIMENTS: &[&str] = &[
     "scale",
     "apply",
     "convergence",
+    "admission",
     "crossover",
     "regime",
 ];
@@ -38,6 +40,7 @@ const PATH_WARMUP_ROUNDS: usize = 100;
 const PATH_SAMPLES: usize = 1000;
 const PATH_CALLS_PER_SAMPLE: usize = 64;
 const PATH_PRUNE_THRESHOLD: f64 = 0.005;
+const ADMISSION_TARGET_SPARSITIES: [f64; 9] = [0.5, 0.51, 0.55, 0.6, 0.7, 0.8, 0.9, 0.95, 0.98];
 const CROSSOVER_DIMS: [usize; 3] = [256, 1024, 2048];
 const CROSSOVER_SPARSITIES: [f64; 5] = [0.5, 0.8, 0.9, 0.95, 0.99];
 const CROSSOVER_BATCH: usize = 32;
@@ -80,6 +83,7 @@ pub struct BenchRunResult {
     pub applied_rank: Option<usize>,
     pub candidate_relative_error: Option<f64>,
     pub memory_stats: Option<AchfMemoryStats>,
+    pub candidate_calibration: Vec<AchfCandidateCalibration>,
     pub snapshots: Vec<StepSnapshot>,
     pub cache_stats: Option<AchfCacheStats>,
 }
@@ -89,6 +93,8 @@ pub struct BenchConfig {
     pub format: ChartFormat,
     pub only: Option<Vec<String>>,
     pub num_trials: usize,
+    pub process_repetitions: usize,
+    pub process_index: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -177,6 +183,13 @@ pub struct CurvePointStats {
     pub candidate_sparsity: TrialStats,
     pub candidate_relative_error: TrialStats,
     pub candidate_weight_error_ema: TrialStats,
+    pub candidate_output_relative_error: TrialStats,
+    pub candidate_output_error_ema: TrialStats,
+    pub candidate_output_samples: TrialStats,
+    pub candidate_calibration_steps: TrialStats,
+    pub candidate_masked_weight_max_abs: TrialStats,
+    pub candidate_masked_gradient_max_abs: TrialStats,
+    pub candidate_masked_moment_max_abs: TrialStats,
     pub connection_candidate_weight: TrialStats,
     pub grad_ema: TrialStats,
     pub gradient_cosine: TrialStats,
@@ -207,6 +220,7 @@ pub struct AggregatedResult {
     pub applied_rank: Option<usize>,
     pub candidate_relative_error: Option<TrialStats>,
     pub memory_stats: Vec<AchfMemoryStats>,
+    pub candidate_calibration_trials: Vec<Vec<AchfCandidateCalibration>>,
     pub curve: Vec<CurvePointStats>,
     pub cache_stats: Option<AchfCacheStats>,
     pub cache_trial_count: usize,
@@ -372,6 +386,10 @@ fn aggregate_trials(runs: &[BenchRunResult]) -> AggregatedResult {
         candidate_relative_error: (!candidate_relative_error_values.is_empty())
             .then(|| TrialStats::from_values(&candidate_relative_error_values)),
         memory_stats,
+        candidate_calibration_trials: runs
+            .iter()
+            .map(|run| run.candidate_calibration.clone())
+            .collect(),
         curve: aggregate_snapshots(runs),
         cache_stats,
         cache_trial_count: cache_values.len(),
@@ -413,6 +431,25 @@ fn aggregate_snapshots(runs: &[BenchRunResult]) -> Vec<CurvePointStats> {
                 candidate_sparsity: stats(|snapshot| snapshot.candidate_sparsity),
                 candidate_relative_error: stats(|snapshot| snapshot.candidate_relative_error),
                 candidate_weight_error_ema: stats(|snapshot| snapshot.candidate_weight_error_ema),
+                candidate_output_relative_error: stats(|snapshot| {
+                    snapshot.candidate_output_relative_error
+                }),
+                candidate_output_error_ema: stats(|snapshot| snapshot.candidate_output_error_ema),
+                candidate_output_samples: stats(|snapshot| {
+                    snapshot.candidate_output_samples as f64
+                }),
+                candidate_calibration_steps: stats(|snapshot| {
+                    snapshot.candidate_calibration_steps as f64
+                }),
+                candidate_masked_weight_max_abs: stats(|snapshot| {
+                    snapshot.candidate_masked_weight_max_abs
+                }),
+                candidate_masked_gradient_max_abs: stats(|snapshot| {
+                    snapshot.candidate_masked_gradient_max_abs
+                }),
+                candidate_masked_moment_max_abs: stats(|snapshot| {
+                    snapshot.candidate_masked_moment_max_abs
+                }),
                 connection_candidate_weight: stats(|snapshot| snapshot.connection_candidate_weight),
                 grad_ema: stats(|snapshot| snapshot.grad_ema),
                 gradient_cosine: stats(|snapshot| snapshot.gradient_cosine),
@@ -507,7 +544,6 @@ fn bench_sized_config(base_config: &Config) -> Config {
         cfg.model_qk_rope_dim -= 1;
     }
     cfg.multi_stream_factor = cfg.multi_stream_factor.clamp(1, 2);
-    cfg.achf.prune_threshold = cfg.achf.prune_threshold.min(0.005);
     cfg.achf.cache_min_reuse = 0;
     cfg
 }
@@ -694,6 +730,15 @@ pub fn parse_only_filter(value: &str) -> Vec<String> {
 pub fn validate_bench_config(bench_cfg: &BenchConfig) -> Result<(), String> {
     if bench_cfg.num_trials == 0 {
         return Err("benchmark trials must be at least 1".to_string());
+    }
+    if bench_cfg.process_repetitions == 0 {
+        return Err("benchmark process repetitions must be at least 1".to_string());
+    }
+    if bench_cfg
+        .process_index
+        .is_some_and(|index| index >= bench_cfg.process_repetitions)
+    {
+        return Err("benchmark process index must be below process repetitions".to_string());
     }
     validate_only_filter(bench_cfg.only.as_deref())
 }
@@ -1026,12 +1071,15 @@ fn build_run_manifest(
             "output_dir": bench_cfg.output_dir,
             "seed": seed,
             "num_trials": bench_cfg.num_trials,
+            "process_repetitions": bench_cfg.process_repetitions,
+            "process_index": bench_cfg.process_index,
             "selected_experiments": bench_cfg.only.clone().unwrap_or_else(|| {
                 BENCH_EXPERIMENTS.iter().map(|name| (*name).to_string()).collect()
             }),
             "chart_format": chart_format,
             "trial_unit": "independent deterministic seed within one operating-system process",
-            "independent_process_repetitions": 1,
+            "independent_process_repetitions": bench_cfg.process_repetitions,
+            "process_aggregation_verified": false,
             "condition_order": "rotating interleaved within each trial",
         },
         "source": git,
@@ -1171,6 +1219,343 @@ fn finalize_run_manifest(
     write_run_manifest(dir, manifest);
 }
 
+fn chart_format_name(format: &ChartFormat) -> &'static str {
+    match format {
+        ChartFormat::Svg => "svg",
+        ChartFormat::Png => "png",
+    }
+}
+
+fn process_metric_stats(entries: &[serde_json::Value], metric: &str) -> Option<serde_json::Value> {
+    let values: Vec<f64> = entries
+        .iter()
+        .filter_map(|entry| entry.get(metric)?.get("mean")?.as_f64())
+        .collect();
+    (!values.is_empty()).then(|| trial_stats_json(&TrialStats::from_values(&values)))
+}
+
+fn aggregate_process_summaries(
+    summaries: &[serde_json::Value],
+    process_records: &[serde_json::Value],
+    trials_per_process: usize,
+) -> serde_json::Value {
+    let mut experiments = serde_json::Map::new();
+    for experiment in BENCH_EXPERIMENTS {
+        let mut by_label: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
+        for summary in summaries {
+            let Some(entries) = summary
+                .get(*experiment)
+                .and_then(serde_json::Value::as_array)
+            else {
+                continue;
+            };
+            for entry in entries {
+                let Some(label) = entry.get("label").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                by_label
+                    .entry(label.to_string())
+                    .or_default()
+                    .push(entry.clone());
+            }
+        }
+        if by_label.is_empty() {
+            continue;
+        }
+        let aggregated: Vec<serde_json::Value> = by_label
+            .into_iter()
+            .map(|(label, entries)| {
+                serde_json::json!({
+                    "label": label,
+                    "process_count": entries.len(),
+                    "statistical_unit": "independent operating-system process mean",
+                    "throughput_sims_per_sec": process_metric_stats(
+                        &entries, "throughput_sims_per_sec"),
+                    "eval_reward": process_metric_stats(&entries, "eval_reward"),
+                    "train_loss": process_metric_stats(&entries, "train_loss"),
+                    "policy_train_time_ms": process_metric_stats(
+                        &entries, "policy_train_time_ms"),
+                    "per_process": entries,
+                })
+            })
+            .collect();
+        experiments.insert(
+            (*experiment).to_string(),
+            serde_json::Value::Array(aggregated),
+        );
+    }
+
+    let process_count = summaries.len();
+    let software_ready = summaries.iter().all(|summary| {
+        summary
+            .pointer("/publication_readiness/software_diagnostics_ready")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+            && summary
+                .pointer("/publication_readiness/missing_experiments")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(Vec::is_empty)
+            && summary
+                .pointer("/publication_readiness/claim_eligibility/prune_and_fine_tune_baseline")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            && summary
+                .pointer(
+                    "/publication_readiness/claim_eligibility/independent_sparse_training_baseline",
+                )
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+    });
+    let release_builds = summaries.iter().all(|summary| {
+        !summary
+            .pointer("/metadata/debug_assertions")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true)
+    });
+    let source_reproducible_from_commit = summaries.iter().all(|summary| {
+        summary
+            .pointer("/metadata/source_reproducible_from_commit")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    });
+    let process_repetition_ready = process_count >= 3;
+    let mut blockers = Vec::new();
+    if !release_builds {
+        blockers.push("at least one child used a debug build");
+    }
+    if !source_reproducible_from_commit {
+        blockers.push("at least one child used tracked source that differs from its commit");
+    }
+    if !software_ready {
+        blockers.push("at least one child failed software diagnostics or production admission");
+    }
+    if !process_repetition_ready {
+        blockers.push("fewer than three independent operating-system processes");
+    }
+    blockers.push("only one hardware/software environment");
+    let final_submission_ready = blockers.is_empty();
+
+    serde_json::json!({
+        "metadata": {
+            "schema_version": 2,
+            "summary_type": "independent_process_aggregate",
+            "independent_process_repetitions": process_count,
+            "trials_per_process": trials_per_process,
+            "confidence_level": 0.95,
+            "confidence_interval": "two-sided Student-t over independent process means",
+            "process_records": process_records,
+        },
+        "experiments": experiments,
+        "admission_operating_points": summaries.iter()
+            .map(|summary| summary.get("admission_operating_point")
+                .cloned().unwrap_or(serde_json::Value::Null))
+            .collect::<Vec<_>>(),
+        "publication_readiness": {
+            "final_submission_ready": final_submission_ready,
+            "software_diagnostics_ready": software_ready,
+            "independent_process_repetition_ready": process_repetition_ready,
+            "source_reproducible_from_commit": source_reproducible_from_commit,
+            "cross_hardware_generalization": false,
+            "blocking_reasons": blockers,
+            "note": "process-level confidence intervals are valid; a second hardware/software environment is still external evidence",
+        },
+    })
+}
+
+pub fn run_achf_benchmark_processes(
+    config_path: &str,
+    seed: u64,
+    bench_cfg: &BenchConfig,
+) -> Result<(), String> {
+    validate_bench_config(bench_cfg)?;
+    if bench_cfg.process_index.is_some() || bench_cfg.process_repetitions <= 1 {
+        return Err(
+            "process orchestrator requires --processes > 1 and no child process index".to_string(),
+        );
+    }
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("failed to locate benchmark executable: {error}"))?;
+    let root = PathBuf::from(&bench_cfg.output_dir);
+    fs::create_dir_all(&root)
+        .map_err(|error| format!("failed to create process output directory: {error}"))?;
+    for entry in fs::read_dir(&root)
+        .map_err(|error| format!("failed to inspect process output directory: {error}"))?
+        .flatten()
+    {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let known_process_directory = name.strip_prefix("process_").is_some_and(|suffix| {
+            suffix.len() == 3 && suffix.chars().all(|ch| ch.is_ascii_digit())
+        });
+        if known_process_directory && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            fs::remove_dir_all(entry.path()).map_err(|error| {
+                format!("failed to clear known process directory {name}: {error}")
+            })?;
+        }
+    }
+
+    let mut summaries = Vec::with_capacity(bench_cfg.process_repetitions);
+    let mut process_records = Vec::with_capacity(bench_cfg.process_repetitions);
+    for process_index in 0..bench_cfg.process_repetitions {
+        let child_dir = root.join(format!("process_{:03}", process_index + 1));
+        if child_dir.exists() {
+            fs::remove_dir_all(&child_dir).map_err(|error| {
+                format!(
+                    "failed to clear known child output directory {}: {error}",
+                    child_dir.display()
+                )
+            })?;
+        }
+        let child_seed = derive_seed(
+            seed,
+            0x5052_4F43_4553_5300u64.wrapping_add(process_index as u64),
+        );
+        println!(
+            "[Bench] Independent process {}/{} -> {}",
+            process_index + 1,
+            bench_cfg.process_repetitions,
+            child_dir.display()
+        );
+        let mut command = Command::new(&executable);
+        command
+            .arg("--config")
+            .arg(config_path)
+            .arg("--seed")
+            .arg(child_seed.to_string())
+            .arg("benchmark")
+            .arg("paper")
+            .arg("--output-dir")
+            .arg(&child_dir)
+            .arg("--format")
+            .arg(chart_format_name(&bench_cfg.format))
+            .arg("--trials")
+            .arg(bench_cfg.num_trials.to_string())
+            .arg("--processes")
+            .arg(bench_cfg.process_repetitions.to_string())
+            .arg("--process-index")
+            .arg(process_index.to_string());
+        if let Some(only) = &bench_cfg.only {
+            command.arg("--only").arg(only.join(","));
+        }
+        let status = command
+            .status()
+            .map_err(|error| format!("failed to start child benchmark: {error}"))?;
+        if !status.success() {
+            return Err(format!(
+                "child benchmark {} failed with status {status}",
+                process_index + 1
+            ));
+        }
+
+        let manifest_path = child_dir.join("run_manifest.json");
+        let summary_path = child_dir.join("summary.json");
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(&manifest_path)
+                .map_err(|error| format!("failed to read {}: {error}", manifest_path.display()))?,
+        )
+        .map_err(|error| format!("invalid child manifest JSON: {error}"))?;
+        if manifest.get("status").and_then(serde_json::Value::as_str) != Some("complete") {
+            return Err(format!(
+                "child benchmark {} did not finalize its manifest",
+                process_index + 1
+            ));
+        }
+        if manifest
+            .pointer("/run/process_index")
+            .and_then(serde_json::Value::as_u64)
+            != Some(process_index as u64)
+        {
+            return Err(format!(
+                "child benchmark {} reported the wrong process index",
+                process_index + 1
+            ));
+        }
+        let summary_bytes = fs::read(&summary_path)
+            .map_err(|error| format!("failed to read {}: {error}", summary_path.display()))?;
+        let summary: serde_json::Value = serde_json::from_slice(&summary_bytes)
+            .map_err(|error| format!("invalid child summary JSON: {error}"))?;
+        if summary
+            .pointer("/metadata/seed")
+            .and_then(serde_json::Value::as_u64)
+            != Some(child_seed)
+        {
+            return Err(format!(
+                "child benchmark {} reported the wrong seed",
+                process_index + 1
+            ));
+        }
+        process_records.push(serde_json::json!({
+            "process_index": process_index,
+            "seed": child_seed,
+            "directory": child_dir,
+            "summary_sha256": sha256_hex(&summary_bytes),
+            "manifest_sha256": sha256_file(&manifest_path).ok(),
+            "source_commit": manifest.pointer("/source/commit"),
+            "configuration_sha256": manifest.pointer("/configuration/sha256"),
+            "source_reproducible_from_commit": manifest.pointer("/source/source_reproducible_from_commit"),
+            "executable_sha256": manifest.pointer("/build/executable_sha256"),
+        }));
+        summaries.push(summary);
+    }
+
+    for key in [
+        "source_commit",
+        "source_reproducible_from_commit",
+        "configuration_sha256",
+        "executable_sha256",
+    ] {
+        let expected = process_records
+            .first()
+            .and_then(|record| record.get(key))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        if process_records
+            .iter()
+            .any(|record| record.get(key) != Some(&expected))
+        {
+            return Err(format!("independent process provenance mismatch for {key}"));
+        }
+    }
+
+    let aggregate = aggregate_process_summaries(&summaries, &process_records, bench_cfg.num_trials);
+    let aggregate_json = serde_json::to_string_pretty(&aggregate)
+        .map_err(|error| format!("failed to serialize process aggregate: {error}"))?;
+    write_text_file(
+        &root.join("summary.json").to_string_lossy(),
+        &aggregate_json,
+    );
+    let readiness = &aggregate["publication_readiness"];
+    let summary_text = format!(
+        "=== independent_process_aggregate ===\nprocesses={}\ntrials_per_process={}\nsoftware_diagnostics_ready={}\nindependent_process_repetition_ready={}\nfinal_submission_ready={}\nblocking_reasons={}\n",
+        bench_cfg.process_repetitions,
+        bench_cfg.num_trials,
+        readiness["software_diagnostics_ready"],
+        readiness["independent_process_repetition_ready"],
+        readiness["final_submission_ready"],
+        readiness["blocking_reasons"],
+    );
+    write_text_file(&root.join("summary.txt").to_string_lossy(), &summary_text);
+    let manifest = serde_json::json!({
+        "schema_version": 1,
+        "status": "complete",
+        "summary_type": "independent_process_aggregate",
+        "completed_unix_ms": unix_time_ms(),
+        "process_repetitions": bench_cfg.process_repetitions,
+        "trials_per_process": bench_cfg.num_trials,
+        "process_records": process_records,
+        "summary_sha256": sha256_hex(aggregate_json.as_bytes()),
+    });
+    write_text_file(
+        &root.join("run_manifest.json").to_string_lossy(),
+        &serde_json::to_string_pretty(&manifest)
+            .map_err(|error| format!("failed to serialize aggregate manifest: {error}"))?,
+    );
+    println!(
+        "[Bench] Independent process aggregate -> {}",
+        root.display()
+    );
+    Ok(())
+}
+
 // ── Main entry point ────────────────────────────────────────────────────
 
 pub fn run_achf_benchmarks(base_config: &Config, seed: u64, bench_cfg: &BenchConfig) {
@@ -1181,6 +1566,10 @@ pub fn run_achf_benchmarks(base_config: &Config, seed: u64, bench_cfg: &BenchCon
     prepare_output_directory(dir);
     let run_started = Instant::now();
     let mut run_manifest = build_run_manifest(base_config, seed, bench_cfg);
+    let source_reproducible_from_commit = run_manifest
+        .pointer("/source/source_reproducible_from_commit")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     write_run_manifest(dir, &run_manifest);
 
     println!("\n========================================");
@@ -1262,6 +1651,14 @@ pub fn run_achf_benchmarks(base_config: &Config, seed: u64, bench_cfg: &BenchCon
         all_agg.push(("convergence", agg));
     }
 
+    if should_run(bench_cfg, "admission") {
+        let agg = run_admission_frontier(base_config, seed, nt);
+        print_agg_summary("Candidate Admission Frontier", &agg);
+        let e = ext(&bench_cfg.format);
+        chart_admission(&agg, dir, e);
+        all_agg.push(("admission", agg));
+    }
+
     if should_run(bench_cfg, "crossover") {
         let cells = run_path_crossover(seed, nt);
         println!("[Bench] Path Crossover complete ({} cells).", cells.len());
@@ -1286,7 +1683,7 @@ pub fn run_achf_benchmarks(base_config: &Config, seed: u64, bench_cfg: &BenchCon
         gate_curve.as_ref(),
         crossover.as_deref(),
         regime.as_deref(),
-        nt,
+        (nt, source_reproducible_from_commit),
         dir,
     );
     write_summary_json(
@@ -1295,7 +1692,7 @@ pub fn run_achf_benchmarks(base_config: &Config, seed: u64, bench_cfg: &BenchCon
         gate_curve.as_ref(),
         crossover.as_deref(),
         regime.as_deref(),
-        (seed, nt),
+        (seed, nt, source_reproducible_from_commit),
         dir,
     );
     write_csvs(&all_agg, dir);
@@ -1433,7 +1830,9 @@ fn run_static_pruning_pair(
             ("Dense reference", dense_config, policy)
         } else {
             let mut policy = trained_policy.fork_inference_runtime();
-            policy.rebuild_achf_inference_candidates(static_config.achf.prune_threshold);
+            policy.rebuild_achf_inference_candidates_target(
+                static_config.achf.candidate_target_sparsity,
+            );
             policy.set_achf_inference_mode("fixed_sparse", u64::MAX);
             ("Static magnitude pruning", static_config, policy)
         };
@@ -1469,7 +1868,7 @@ fn run_static_pruning_pair(
 }
 
 fn run_ablation(base_config: &Config, seed: u64, nt: usize) -> Vec<AggregatedResult> {
-    println!("[Bench] Running Ablation Experiment (dense/static pruning/full ACHF)...");
+    println!("[Bench] Running Ablation Experiment (dense/static/calibrated/sparse-training)...");
     let mut dense = bench_sized_config(base_config);
     dense.achf.enabled = false;
     cap_ppo_training(&mut dense, 2000);
@@ -1491,7 +1890,10 @@ fn run_ablation(base_config: &Config, seed: u64, nt: usize) -> Vec<AggregatedRes
     cap_ppo_training(&mut static_pruned, 2000);
 
     let mut shared_training = static_pruned.clone();
+    shared_training.achf.candidate_mode = "none".to_string();
     shared_training.achf.prune_threshold = 0.0;
+    shared_training.achf.candidate_target_sparsity = 0.0;
+    shared_training.achf.candidate_calibration_steps = 0;
     shared_training.achf.mode = "fixed_dense".to_string();
 
     let mut guarded_ama = bench_sized_config(base_config);
@@ -1500,34 +1902,62 @@ fn run_ablation(base_config: &Config, seed: u64, nt: usize) -> Vec<AggregatedRes
     guarded_ama.achf.adaptive_inference = false;
     cap_ppo_training(&mut guarded_ama, 2000);
 
-    let mut runs: Vec<Vec<BenchRunResult>> = (0..3).map(|_| Vec::with_capacity(nt)).collect();
+    let mut sparse_training = bench_sized_config(base_config);
+    sparse_training.achf.enabled = true;
+    sparse_training.achf.candidate_mode = "sparse".to_string();
+    sparse_training.achf.prune_threshold = 0.0;
+    sparse_training.achf.candidate_target_sparsity = 0.9;
+    sparse_training.achf.candidate_train_from_scratch = true;
+    sparse_training.achf.candidate_min_calibration_samples = 0;
+    sparse_training.achf.candidate_calibration_steps = 0;
+    sparse_training.achf.candidate_max_relative_error = 1.0;
+    sparse_training.achf.mode = "fixed_sparse".to_string();
+    sparse_training.achf.infer_gate = "candidate".to_string();
+    cap_ppo_training(&mut sparse_training, 2000);
+
+    let mut runs: Vec<Vec<BenchRunResult>> = (0..4).map(|_| Vec::with_capacity(nt)).collect();
     for trial in 0..nt {
         let trial_seed = benchmark_trial_seed(seed, trial);
-        let (pair, full) = if trial.is_multiple_of(2) {
-            let pair = run_static_pruning_pair(
-                &shared_training,
-                &dense,
-                &static_pruned,
-                trial_seed,
-                trial,
-                nt,
-            );
-            println!("  [Full ACHF (guarded AMA)] trial {}/{}", trial + 1, nt);
-            let full = train_and_measure("Full ACHF (guarded AMA)", &guarded_ama, trial_seed);
-            (pair, full)
-        } else {
-            println!("  [Full ACHF (guarded AMA)] trial {}/{}", trial + 1, nt);
-            let full = train_and_measure("Full ACHF (guarded AMA)", &guarded_ama, trial_seed);
-            let pair = run_static_pruning_pair(
-                &shared_training,
-                &dense,
-                &static_pruned,
-                trial_seed,
-                trial,
-                nt,
-            );
-            (pair, full)
-        };
+        let mut pair = None;
+        let mut full = None;
+        let mut sparse = None;
+        for offset in 0..3 {
+            match (trial + offset) % 3 {
+                0 => {
+                    pair = Some(run_static_pruning_pair(
+                        &shared_training,
+                        &dense,
+                        &static_pruned,
+                        trial_seed,
+                        trial,
+                        nt,
+                    ));
+                }
+                1 => {
+                    println!("  [Full ACHF (guarded AMA)] trial {}/{}", trial + 1, nt);
+                    full = Some(train_and_measure(
+                        "Full ACHF (guarded AMA)",
+                        &guarded_ama,
+                        trial_seed,
+                    ));
+                }
+                _ => {
+                    println!(
+                        "  [Sparse training (fixed mask)] trial {}/{}",
+                        trial + 1,
+                        nt
+                    );
+                    sparse = Some(train_and_measure(
+                        "Sparse training (fixed mask)",
+                        &sparse_training,
+                        trial_seed,
+                    ));
+                }
+            }
+        }
+        let pair = pair.expect("dense/static pair missing");
+        let full = full.expect("full ACHF result missing");
+        let sparse = sparse.expect("sparse-training result missing");
         println!(
             "    {:.1}s | {:.0} sims/sec | eval reward: {:.3} | train loss: {:.4}",
             full.train_time_ms / 1000.0,
@@ -1538,8 +1968,9 @@ fn run_ablation(base_config: &Config, seed: u64, nt: usize) -> Vec<AggregatedRes
         runs[0].push(pair[0].clone());
         runs[1].push(pair[1].clone());
         runs[2].push(full);
+        runs[3].push(sparse);
     }
-    aggregate_conditions(&runs, &[0, 0, 0])
+    aggregate_conditions(&runs, &[0, 0, 0, 0])
 }
 
 fn run_mode_comparison(base_config: &Config, seed: u64, nt: usize) -> Vec<AggregatedResult> {
@@ -2240,10 +2671,35 @@ fn run_scale_test(base_config: &Config, seed: u64, nt: usize) -> Vec<AggregatedR
         cfg.achf.rank = rank;
         cfg.achf.candidate_mode = "low_rank".to_string();
         cfg.achf.prune_threshold = 0.0;
+        cfg.achf.candidate_min_calibration_samples = 0;
         cap_ppo_training(&mut cfg, 2000);
         conditions.push((label, cfg));
     }
     let runs = run_interleaved_conditions(&conditions, seed, nt);
+    aggregate_conditions(&runs, &vec![0; conditions.len()])
+}
+
+fn run_admission_frontier(
+    base_config: &Config,
+    seed: u64,
+    num_trials: usize,
+) -> Vec<AggregatedResult> {
+    println!("[Bench] Running production candidate admission frontier...");
+    let conditions: Vec<(String, Config)> = ADMISSION_TARGET_SPARSITIES
+        .iter()
+        .map(|&target_sparsity| {
+            let mut config = bench_sized_config(base_config);
+            config.achf.enabled = true;
+            config.achf.candidate_mode = "sparse".to_string();
+            config.achf.prune_threshold = 0.0;
+            config.achf.candidate_target_sparsity = target_sparsity;
+            config.achf.mode = "lite".to_string();
+            config.achf.infer_gate = "candidate".to_string();
+            cap_ppo_training(&mut config, 2000);
+            (format!("target={target_sparsity:.2}"), config)
+        })
+        .collect();
+    let runs = run_interleaved_conditions(&conditions, seed, num_trials);
     aggregate_conditions(&runs, &vec![0; conditions.len()])
 }
 
@@ -2406,6 +2862,7 @@ fn measure_trained_ppo(params: TrainedPpoParams<'_>) -> BenchRunResult {
         applied_rank: achf.map(|snapshot| snapshot.low_rank_applied_rank),
         candidate_relative_error: memory_stats.and_then(|stats| stats.candidate_relative_error()),
         memory_stats,
+        candidate_calibration: policy.achf_candidate_calibration_records(),
         snapshots: snapshots.to_vec(),
         cache_stats,
     }
@@ -2474,6 +2931,7 @@ fn train_and_measure(label: &str, config: &Config, seed: u64) -> BenchRunResult 
                 applied_rank: achf.map(|snapshot| snapshot.low_rank_applied_rank),
                 candidate_relative_error,
                 memory_stats,
+                candidate_calibration: dqn.achf_candidate_calibration_records(),
                 snapshots,
                 cache_stats,
             }
@@ -2542,6 +3000,7 @@ fn train_and_measure(label: &str, config: &Config, seed: u64) -> BenchRunResult 
                 applied_rank: achf.map(|snapshot| snapshot.low_rank_applied_rank),
                 candidate_relative_error,
                 memory_stats,
+                candidate_calibration: ppo.achf_candidate_calibration_records(),
                 snapshots,
                 cache_stats,
             }
@@ -2905,6 +3364,23 @@ fn chart_scale(agg: &[AggregatedResult], dir: &str, ext: &str) {
     );
 }
 
+fn chart_admission(agg: &[AggregatedResult], dir: &str, ext: &str) {
+    let bars = agg_bars_with_ci(agg);
+    let path = format!("{}/admission_frontier.{}", dir, ext);
+    write_chart(
+        &path,
+        chart::draw_bar_chart_with_ci(
+            &path,
+            "Production Candidate Admission Frontier",
+            "Requested Weight Sparsity",
+            "Sims/sec",
+            &bars,
+            1100,
+            500,
+        ),
+    );
+}
+
 fn chart_apply(agg: &[AggregatedResult], dir: &str, ext: &str) {
     let bars = agg_bars_with_ci(agg);
     let path = format!("{}/apply_combination.{}", dir, ext);
@@ -3097,6 +3573,13 @@ fn print_agg_summary(name: &str, agg: &[AggregatedResult]) {
 fn has_unpruned_candidate(all: &[(&str, Vec<AggregatedResult>)]) -> bool {
     all.iter().any(|(_, results)| {
         results.iter().any(|result| {
+            if result_achf_config(result)
+                .and_then(|config| config.get("candidate_mode"))
+                .and_then(serde_json::Value::as_str)
+                != Some("sparse")
+            {
+                return false;
+            }
             result.memory_stats.iter().any(|stats| {
                 stats.candidate_total_weights > 0
                     && stats.candidate_nonzero_weights == stats.candidate_total_weights
@@ -3123,6 +3606,108 @@ fn has_ineligible_candidate(all: &[(&str, Vec<AggregatedResult>)]) -> bool {
                 .any(|stats| stats.eligible_candidate_layers < stats.candidate_layers)
         })
     })
+}
+
+fn result_achf_config(result: &AggregatedResult) -> Option<&serde_json::Value> {
+    result
+        .condition_config
+        .get("achf")
+        .or_else(|| result.condition_config.pointer("/inference/achf"))
+}
+
+fn selected_admission_result<'a>(
+    all: &'a [(&str, Vec<AggregatedResult>)],
+) -> Option<&'a AggregatedResult> {
+    all.iter()
+        .find(|(name, _)| *name == "admission")
+        .into_iter()
+        .flat_map(|(_, results)| results.iter())
+        .filter(|result| {
+            !result.memory_stats.is_empty()
+                && result.memory_stats.iter().all(|stats| {
+                    stats.candidate_layers > 0
+                        && stats.eligible_candidate_layers == stats.candidate_layers
+                        && stats
+                            .candidate_output_relative_error()
+                            .is_some_and(f64::is_finite)
+                        && stats.candidate_masked_weight_max_abs == 0.0
+                        && stats.candidate_masked_gradient_max_abs == 0.0
+                        && stats.candidate_masked_moment_max_abs == 0.0
+                })
+        })
+        .max_by(|left, right| {
+            let target = |result: &AggregatedResult| {
+                result_achf_config(result)
+                    .and_then(|config| config.get("candidate_target_sparsity"))
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0)
+            };
+            target(left).total_cmp(&target(right))
+        })
+}
+
+fn admission_operating_point_json(all: &[(&str, Vec<AggregatedResult>)]) -> serde_json::Value {
+    let Some(result) = selected_admission_result(all) else {
+        return serde_json::Value::Null;
+    };
+    let requested_sparsity = result_achf_config(result)
+        .and_then(|config| config.get("candidate_target_sparsity"))
+        .and_then(serde_json::Value::as_f64);
+    let actual_sparsity = TrialStats::from_values(
+        &result
+            .memory_stats
+            .iter()
+            .map(|stats| {
+                1.0 - stats.candidate_nonzero_weights as f64
+                    / stats.candidate_total_weights.max(1) as f64
+            })
+            .collect::<Vec<_>>(),
+    );
+    let output_error = TrialStats::from_values(
+        &result
+            .memory_stats
+            .iter()
+            .filter_map(AchfMemoryStats::candidate_output_relative_error)
+            .collect::<Vec<_>>(),
+    );
+    serde_json::json!({
+        "label": result.label,
+        "requested_sparsity": requested_sparsity,
+        "actual_sparsity": trial_stats_json(&actual_sparsity),
+        "candidate_output_relative_error": trial_stats_json(&output_error),
+        "throughput_sims_per_sec": trial_stats_json(&result.throughput),
+        "all_trials_admitted": true,
+    })
+}
+
+fn selected_admission_has_complete_diagnostics(all: &[(&str, Vec<AggregatedResult>)]) -> bool {
+    selected_admission_result(all).is_some_and(|result| {
+        result.candidate_calibration_trials.len() == result.throughput.values.len()
+            && result.candidate_calibration_trials.iter().all(|layers| {
+                !layers.is_empty()
+                    && layers.iter().all(|record| {
+                        record.calibrated
+                            && record.trace.len() >= 2
+                            && record.masked_weight_max_abs == 0.0
+                            && record.masked_gradient_max_abs == 0.0
+                            && record.masked_moment_max_abs == 0.0
+                    })
+            })
+    })
+}
+
+fn has_sparse_training_baseline(all: &[(&str, Vec<AggregatedResult>)]) -> bool {
+    all.iter()
+        .find(|(name, _)| *name == "ablation")
+        .is_some_and(|(_, results)| {
+            results.iter().any(|result| {
+                result_achf_config(result)
+                    .and_then(|config| config.get("candidate_train_from_scratch"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                    && !result.throughput.values.is_empty()
+            })
+        })
 }
 
 fn missing_benchmark_experiments(
@@ -3152,9 +3737,10 @@ fn write_summary_txt(
     gate_curve: Option<&AggregatedResult>,
     crossover: Option<&[CrossoverCell]>,
     regime: Option<&[RegimeRow]>,
-    num_trials: usize,
+    metadata: (usize, bool),
     dir: &str,
 ) {
+    let (num_trials, source_reproducible_from_commit) = metadata;
     let missing_experiments =
         missing_benchmark_experiments(all, path_latencies, gate_curve, crossover, regime);
     let mut lines = Vec::new();
@@ -3247,13 +3833,41 @@ fn write_summary_txt(
                         })
                         .collect::<Vec<_>>(),
                 );
+                let output_error = TrialStats::from_values(
+                    &a.memory_stats
+                        .iter()
+                        .filter_map(AchfMemoryStats::candidate_output_relative_error)
+                        .collect::<Vec<_>>(),
+                );
+                let eligible = TrialStats::from_values(
+                    &a.memory_stats
+                        .iter()
+                        .map(|stats| stats.eligible_candidate_layers as f64)
+                        .collect::<Vec<_>>(),
+                );
                 lines.push(format!(
-                    "    materialized_bytes={:.0} ({}) | candidate_sparsity={:.6} ({})",
+                    "    materialized_bytes={:.0} ({}) | candidate_sparsity={:.6} ({}) | candidate_output_error={:.6} ({}) | eligible_layers={:.1}",
                     total.mean,
                     format_ci(&total),
                     sparsity.mean,
-                    format_ci(&sparsity)
+                    format_ci(&sparsity),
+                    output_error.mean,
+                    format_ci(&output_error),
+                    eligible.mean,
                 ));
+                if let Some(record) = a
+                    .candidate_calibration_trials
+                    .first()
+                    .and_then(|layers| layers.first())
+                {
+                    lines.push(format!(
+                        "    calibration_trace_points={} | masked_weight_max={:.3e} | masked_gradient_max={:.3e} | masked_adam_moment_max={:.3e}",
+                        record.trace.len(),
+                        record.masked_weight_max_abs,
+                        record.masked_gradient_max_abs,
+                        record.masked_moment_max_abs,
+                    ));
+                }
             }
         }
         lines.push(String::new());
@@ -3386,44 +4000,58 @@ fn write_summary_txt(
         }
         lines.push(String::new());
     }
-    lines.push("=== publication_readiness ===".to_string());
-    lines.push("  final_submission_ready=false".to_string());
+    let mut blockers = Vec::new();
     if cfg!(debug_assertions) {
-        lines.push("  blocker: debug build; rerun the release executable".to_string());
+        blockers.push("debug build; rerun the release executable".to_string());
+    }
+    if !source_reproducible_from_commit {
+        blockers.push("tracked source differs from the recorded commit".to_string());
     }
     if num_trials < 5 {
-        lines.push("  blocker: fewer than 5 seeded trials".to_string());
+        blockers.push("fewer than 5 seeded trials".to_string());
     }
     if !missing_experiments.is_empty() {
-        lines.push(format!(
-            "  blocker: partial benchmark suite; missing={}",
+        blockers.push(format!(
+            "partial benchmark suite; missing={}",
             missing_experiments.join(",")
         ));
     }
     if has_unpruned_candidate(all) || path_has_unpruned_candidate(path_latencies) {
-        lines.push(
-            "  blocker: at least one real ACHF candidate has zero realized sparsity; do not claim sparse-candidate speedup"
+        blockers.push("at least one real sparse candidate has zero realized sparsity".to_string());
+    }
+    if selected_admission_result(all).is_none() {
+        blockers.push(
+            "no admission-frontier operating point passed every production entry criterion"
                 .to_string(),
         );
     }
-    lines.push("  blocker: only one operating-system process repetition".to_string());
-    lines.push("  blocker: only one hardware/software environment".to_string());
-    lines.push(
-        "  blocker: prune-and-fine-tune and sparse-training quality baselines are absent"
-            .to_string(),
-    );
-    lines.push(
-        "  blocker: time-resolved candidate-output discrepancy and ACHF-local Adam moment drift are absent"
-            .to_string(),
-    );
+    if !selected_admission_has_complete_diagnostics(all) {
+        blockers
+            .push("candidate calibration trace or masked Adam invariant is incomplete".to_string());
+    }
+    blockers.push("only one operating-system process repetition".to_string());
+    blockers.push("only one hardware/software environment".to_string());
+    if !has_sparse_training_baseline(all) {
+        blockers.push("independent sparse-training quality baseline is absent".to_string());
+    }
+    let final_submission_ready = blockers.is_empty();
+    lines.push("=== publication_readiness ===".to_string());
+    lines.push(format!("  final_submission_ready={final_submission_ready}"));
+    lines.push(format!(
+        "  selected_admission_operating_point={}",
+        admission_operating_point_json(all)
+    ));
+    for blocker in &blockers {
+        lines.push(format!("  blocker: {blocker}"));
+    }
     if has_ineligible_candidate(all) {
         lines.push(
-            "  blocker: at least one materialized candidate failed production entry criteria; fixed-mode results are diagnostic only"
+            "  note: some frontier/diagnostic candidates failed entry; they are reported but never used by production routing"
                 .to_string(),
         );
     }
     lines.push(
-        "  note: use these results as a transparent single-machine pilot, not final submission evidence"
+        "  note: software-side calibration/admission diagnostics are explicit; external replication remains a separate requirement"
             .to_string(),
     );
     let path = format!("{}/summary.txt", dir);
@@ -3437,22 +4065,23 @@ fn write_summary_json(
     gate_curve: Option<&AggregatedResult>,
     crossover: Option<&[CrossoverCell]>,
     regime: Option<&[RegimeRow]>,
-    metadata: (u64, usize),
+    metadata: (u64, usize, bool),
     dir: &str,
 ) {
-    let (seed, num_trials) = metadata;
+    let (seed, num_trials, source_reproducible_from_commit) = metadata;
     let logical_cpus = std::thread::available_parallelism().map_or(1, usize::from);
     let mut root = serde_json::Map::new();
     root.insert(
         "metadata".to_string(),
         serde_json::json!({
-            "schema_version": 4,
+            "schema_version": 6,
             "run_manifest": "run_manifest.json",
             "package_version": env!("CARGO_PKG_VERSION"),
             "target_os": std::env::consts::OS,
             "target_arch": std::env::consts::ARCH,
             "debug_assertions": cfg!(debug_assertions),
             "logical_cpus": logical_cpus,
+            "source_reproducible_from_commit": source_reproducible_from_commit,
             "seed": seed,
             "num_trials": num_trials,
             "confidence_level": 0.95,
@@ -3527,6 +4156,10 @@ fn write_summary_json(
         let entries: Vec<serde_json::Value> = agg.iter().map(aggregated_result_json).collect();
         root.insert((*name).to_string(), serde_json::Value::Array(entries));
     }
+    root.insert(
+        "admission_operating_point".to_string(),
+        admission_operating_point_json(all),
+    );
     if let Some(latencies) = path_latencies {
         root.insert(
             "path_latency".to_string(),
@@ -3568,6 +4201,9 @@ fn write_summary_json(
     if cfg!(debug_assertions) {
         blockers.push("debug build; rerun the release executable");
     }
+    if !source_reproducible_from_commit {
+        blockers.push("tracked source differs from the recorded commit");
+    }
     if num_trials < 5 {
         blockers.push("fewer than 5 seeded trials");
     }
@@ -3575,23 +4211,30 @@ fn write_summary_json(
         blockers.push("partial benchmark suite");
     }
     if has_unpruned_candidate(all) || path_has_unpruned_candidate(path_latencies) {
-        blockers.push(
-            "at least one real ACHF candidate has zero realized sparsity; sparse-candidate speedup claims are ineligible",
-        );
+        blockers.push("at least one real sparse candidate has zero realized sparsity");
+    }
+    if selected_admission_result(all).is_none() {
+        blockers
+            .push("no admission-frontier operating point passed every production entry criterion");
+    }
+    if !selected_admission_has_complete_diagnostics(all) {
+        blockers.push("candidate calibration trace or masked Adam invariant is incomplete");
     }
     blockers.push("only one operating-system process repetition");
     blockers.push("only one hardware/software environment");
-    blockers.push("prune-and-fine-tune and sparse-training quality baselines are not implemented");
-    blockers.push(
-        "time-resolved candidate-output discrepancy and ACHF-local optimizer-moment drift are not implemented",
-    );
-    if has_ineligible_candidate(all) {
-        blockers.push("at least one materialized candidate failed production entry criteria");
+    if !has_sparse_training_baseline(all) {
+        blockers.push("independent sparse-training quality baseline is absent");
     }
+    let final_submission_ready = blockers.is_empty();
     root.insert(
         "publication_readiness".to_string(),
         serde_json::json!({
-            "final_submission_ready": false,
+            "final_submission_ready": final_submission_ready,
+            "source_reproducible_from_commit": source_reproducible_from_commit,
+            "software_diagnostics_ready": selected_admission_result(all).is_some()
+                && selected_admission_has_complete_diagnostics(all)
+                && has_sparse_training_baseline(all)
+                && missing_experiments.is_empty(),
             "data_tier": if cfg!(debug_assertions) || num_trials < 2 {
                 "diagnostic"
             } else {
@@ -3605,12 +4248,17 @@ fn write_summary_json(
                 "single_machine_selector_regret": regime.is_some() && num_trials >= 2,
                 "task_quality_superiority": false,
                 "convergence_superiority": false,
+                "candidate_quality_preservation": selected_admission_result(all).is_some()
+                    && num_trials >= 2,
+                "prune_and_fine_tune_baseline": selected_admission_has_complete_diagnostics(all),
+                "independent_sparse_training_baseline": has_sparse_training_baseline(all),
                 "cross_hardware_generalization": false,
                 "rank_as_storage_compression": false,
-                "production_candidate_execution": !has_ineligible_candidate(all),
+                "production_candidate_execution": selected_admission_result(all).is_some(),
             },
+            "diagnostic_candidates_rejected": has_ineligible_candidate(all),
             "blocking_reasons": blockers,
-            "note": "false is intentional: software cannot manufacture independent machines, process repetitions, or missing scientific baselines",
+            "note": "failed frontier/diagnostic candidates remain visible and never enter production routing",
         }),
     );
     let json = serde_json::to_string_pretty(&serde_json::Value::Object(root))
@@ -3659,6 +4307,7 @@ fn aggregated_result_json(result: &AggregatedResult) -> serde_json::Value {
         "applied_rank": result.applied_rank,
         "candidate_relative_frobenius_error": result.candidate_relative_error.as_ref().map(trial_stats_json),
         "inference_memory": memory_stats_json(&result.memory_stats),
+        "candidate_calibration_trials": result.candidate_calibration_trials,
         "paired_vs_baseline": result.paired.as_ref().map(paired_comparison_json),
         "curve": result.curve.iter().map(curve_point_json).collect::<Vec<_>>(),
         "cache_trial_count": result.cache_trial_count,
@@ -3702,6 +4351,23 @@ fn memory_stats_json(values: &[AchfMemoryStats]) -> serde_json::Value {
         "max_layer_candidate_relative_frobenius_error": trial_stats_json(&ratios(|entry| {
             entry.max_layer_candidate_relative_error
         })),
+        "candidate_output_relative_error": trial_stats_json(&ratios(|entry| {
+            entry.candidate_output_relative_error().unwrap_or(0.0)
+        })),
+        "max_layer_candidate_output_relative_error": trial_stats_json(&ratios(|entry| {
+            entry.max_layer_candidate_output_relative_error
+        })),
+        "candidate_output_samples": trial_stats_json(&stats(|entry| entry.candidate_output_samples)),
+        "candidate_calibration_steps": trial_stats_json(&stats(|entry| entry.candidate_calibration_steps)),
+        "candidate_masked_weight_max_abs": trial_stats_json(&ratios(|entry| {
+            entry.candidate_masked_weight_max_abs
+        })),
+        "candidate_masked_gradient_max_abs": trial_stats_json(&ratios(|entry| {
+            entry.candidate_masked_gradient_max_abs
+        })),
+        "candidate_masked_moment_max_abs": trial_stats_json(&ratios(|entry| {
+            entry.candidate_masked_moment_max_abs
+        })),
         "reference_parameter_bytes": trial_stats_json(&stats(|entry| entry.reference_parameter_bytes)),
         "candidate_dense_bytes": trial_stats_json(&stats(|entry| entry.candidate_dense_bytes)),
         "sparse_mask_bytes": trial_stats_json(&stats(|entry| entry.sparse_mask_bytes)),
@@ -3725,7 +4391,7 @@ fn memory_stats_json(values: &[AchfMemoryStats]) -> serde_json::Value {
 fn write_csvs(all: &[(&str, Vec<AggregatedResult>)], dir: &str) {
     for (name, agg) in all {
         let mut csv = String::from(
-            "label,active_policy,trial,throughput_sims_per_sec,eval_reward,train_loss,policy_train_time_ms,param_count,applied_rank,candidate_relative_frobenius_error,candidate_total_weights,candidate_nonzero_weights,total_materialized_bytes\n",
+            "label,active_policy,trial,throughput_sims_per_sec,eval_reward,train_loss,policy_train_time_ms,param_count,applied_rank,candidate_relative_frobenius_error,candidate_output_relative_error,candidate_output_samples,candidate_calibration_steps,candidate_masked_weight_max_abs,candidate_masked_gradient_max_abs,candidate_masked_moment_max_abs,candidate_total_weights,candidate_nonzero_weights,eligible_candidate_layers,total_materialized_bytes\n",
         );
         for a in agg {
             let label = csv_escape(&a.label);
@@ -3740,7 +4406,7 @@ fn write_csvs(all: &[(&str, Vec<AggregatedResult>)], dir: &str) {
                 .enumerate()
             {
                 csv.push_str(&format!(
-                    "{},{},{},{:.2},{:.6},{:.6},{:.3},{},{},{},{},{},{}\n",
+                    "{},{},{},{:.2},{:.6},{:.6},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
                     label,
                     policy,
                     trial + 1,
@@ -3757,19 +4423,35 @@ fn write_csvs(all: &[(&str, Vec<AggregatedResult>)], dir: &str) {
                         .map_or_else(String::new, |value| format!("{value:.10}")),
                     a.memory_stats
                         .get(trial)
-                        .map_or_else(String::new, |stats| stats
-                            .candidate_total_weights
-                            .to_string()),
+                        .and_then(AchfMemoryStats::candidate_output_relative_error)
+                        .map_or_else(String::new, |value| format!("{value:.10}")),
                     a.memory_stats
                         .get(trial)
-                        .map_or_else(String::new, |stats| stats
-                            .candidate_nonzero_weights
-                            .to_string()),
+                        .map_or(0, |stats| stats.candidate_output_samples),
                     a.memory_stats
                         .get(trial)
-                        .map_or_else(String::new, |stats| stats
-                            .total_materialized_bytes
-                            .to_string()),
+                        .map_or(0, |stats| stats.candidate_calibration_steps),
+                    a.memory_stats
+                        .get(trial)
+                        .map_or(0.0, |stats| stats.candidate_masked_weight_max_abs),
+                    a.memory_stats
+                        .get(trial)
+                        .map_or(0.0, |stats| stats.candidate_masked_gradient_max_abs),
+                    a.memory_stats
+                        .get(trial)
+                        .map_or(0.0, |stats| stats.candidate_masked_moment_max_abs),
+                    a.memory_stats
+                        .get(trial)
+                        .map_or(0, |stats| stats.candidate_total_weights),
+                    a.memory_stats
+                        .get(trial)
+                        .map_or(0, |stats| stats.candidate_nonzero_weights),
+                    a.memory_stats
+                        .get(trial)
+                        .map_or(0, |stats| stats.eligible_candidate_layers),
+                    a.memory_stats
+                        .get(trial)
+                        .map_or(0, |stats| stats.total_materialized_bytes),
                 ));
             }
         }
@@ -3964,7 +4646,7 @@ fn regime_rows_json(rows: &[RegimeRow]) -> Vec<serde_json::Value> {
 fn write_gate_curve_outputs(result: &AggregatedResult, dir: &str) {
     let mut csv = String::from("step,samples,metric,mean,std_dev,ci_95_low,ci_95_high\n");
     for point in &result.curve {
-        let metrics: [(&str, &TrialStats); 23] = [
+        let metrics: [(&str, &TrialStats); 30] = [
             ("train_loss", &point.train_loss),
             ("train_reward", &point.train_reward),
             ("reference_gate", &point.gate_value),
@@ -3979,6 +4661,31 @@ fn write_gate_curve_outputs(result: &AggregatedResult, dir: &str) {
             (
                 "candidate_weight_error_ema",
                 &point.candidate_weight_error_ema,
+            ),
+            (
+                "candidate_output_relative_error",
+                &point.candidate_output_relative_error,
+            ),
+            (
+                "candidate_output_error_ema",
+                &point.candidate_output_error_ema,
+            ),
+            ("candidate_output_samples", &point.candidate_output_samples),
+            (
+                "candidate_calibration_steps",
+                &point.candidate_calibration_steps,
+            ),
+            (
+                "candidate_masked_weight_max_abs",
+                &point.candidate_masked_weight_max_abs,
+            ),
+            (
+                "candidate_masked_gradient_max_abs",
+                &point.candidate_masked_gradient_max_abs,
+            ),
+            (
+                "candidate_masked_moment_max_abs",
+                &point.candidate_masked_moment_max_abs,
             ),
             (
                 "connection_candidate_weight",
@@ -4137,6 +4844,21 @@ fn curve_point_json(point: &CurvePointStats) -> serde_json::Value {
             &point.candidate_relative_error
         ),
         "candidate_weight_error_ema": trial_stats_json(&point.candidate_weight_error_ema),
+        "candidate_output_relative_error": trial_stats_json(
+            &point.candidate_output_relative_error
+        ),
+        "candidate_output_error_ema": trial_stats_json(&point.candidate_output_error_ema),
+        "candidate_output_samples": trial_stats_json(&point.candidate_output_samples),
+        "candidate_calibration_steps": trial_stats_json(&point.candidate_calibration_steps),
+        "candidate_masked_weight_max_abs": trial_stats_json(
+            &point.candidate_masked_weight_max_abs
+        ),
+        "candidate_masked_gradient_max_abs": trial_stats_json(
+            &point.candidate_masked_gradient_max_abs
+        ),
+        "candidate_masked_moment_max_abs": trial_stats_json(
+            &point.candidate_masked_moment_max_abs
+        ),
         "connection_candidate_weight": trial_stats_json(
             &point.connection_candidate_weight
         ),
@@ -4374,6 +5096,8 @@ mod tests {
             format: ChartFormat::Svg,
             only,
             num_trials: 1,
+            process_repetitions: 1,
+            process_index: None,
         }
     }
 
@@ -4388,6 +5112,13 @@ mod tests {
             candidate_sparsity: 0.75,
             candidate_relative_error: 0.01,
             candidate_weight_error_ema: 0.01,
+            candidate_output_relative_error: 0.02,
+            candidate_output_error_ema: 0.02,
+            candidate_output_samples: 64,
+            candidate_calibration_steps: 8,
+            candidate_masked_weight_max_abs: 0.0,
+            candidate_masked_gradient_max_abs: 0.0,
+            candidate_masked_moment_max_abs: 0.0,
             connection_candidate_weight: 0.6,
             gradient_cosine: 0.25,
             loss,
@@ -4459,6 +5190,7 @@ mod tests {
                 total_materialized_bytes: 160,
                 ..Default::default()
             }),
+            candidate_calibration: Vec::new(),
             snapshots,
             cache_stats: Some(test_cache_stats(8, 2)),
         }
@@ -4499,6 +5231,8 @@ mod tests {
             format: ChartFormat::Svg,
             only: None,
             num_trials: 0,
+            process_repetitions: 1,
+            process_index: None,
         };
         assert_eq!(
             validate_bench_config(&cfg).unwrap_err(),
@@ -4506,6 +5240,84 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validate_bench_config_rejects_invalid_process_topology() {
+        let mut config = bench_config_with_only(None);
+        config.process_repetitions = 0;
+        assert_eq!(
+            validate_bench_config(&config).unwrap_err(),
+            "benchmark process repetitions must be at least 1"
+        );
+        config.process_repetitions = 2;
+        config.process_index = Some(2);
+        assert_eq!(
+            validate_bench_config(&config).unwrap_err(),
+            "benchmark process index must be below process repetitions"
+        );
+    }
+
+    #[test]
+    fn process_aggregate_uses_independent_process_means() {
+        let summaries: Vec<serde_json::Value> = [10.0, 20.0, 30.0]
+            .into_iter()
+            .map(|throughput| {
+                serde_json::json!({
+                    "metadata": {"debug_assertions": false, "source_reproducible_from_commit": true},
+                    "ablation": [{
+                        "label": "Full ACHF",
+                        "throughput_sims_per_sec": {"mean": throughput},
+                        "eval_reward": {"mean": 1.0},
+                        "train_loss": {"mean": 0.5},
+                        "policy_train_time_ms": {"mean": 2.0}
+                    }],
+                    "admission_operating_point": {"requested_sparsity": 0.9},
+                    "publication_readiness": {"software_diagnostics_ready": true}
+                })
+            })
+            .collect();
+        let records: Vec<serde_json::Value> = (0..3)
+            .map(|process_index| serde_json::json!({"process_index": process_index}))
+            .collect();
+
+        let aggregate = aggregate_process_summaries(&summaries, &records, 5);
+
+        assert_eq!(aggregate["metadata"]["independent_process_repetitions"], 3);
+        assert_eq!(
+            aggregate["experiments"]["ablation"][0]["throughput_sims_per_sec"]["mean"],
+            20.0
+        );
+        assert_eq!(
+            aggregate["experiments"]["ablation"][0]["throughput_sims_per_sec"]["n"],
+            3
+        );
+        assert_eq!(
+            aggregate["publication_readiness"]["independent_process_repetition_ready"],
+            true
+        );
+        assert_eq!(
+            aggregate["publication_readiness"]["source_reproducible_from_commit"],
+            true
+        );
+        assert_eq!(
+            aggregate["publication_readiness"]["final_submission_ready"],
+            false
+        );
+
+        let mut dirty_summaries = summaries;
+        dirty_summaries[0]["metadata"]["source_reproducible_from_commit"] =
+            serde_json::json!(false);
+        let dirty_aggregate = aggregate_process_summaries(&dirty_summaries, &records, 5);
+        assert_eq!(
+            dirty_aggregate["publication_readiness"]["source_reproducible_from_commit"],
+            false
+        );
+        assert!(dirty_aggregate["publication_readiness"]["blocking_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason
+                == "at least one child used tracked source that differs from its commit"));
+    }
     #[test]
     fn parse_chart_format_rejects_unknown_formats() {
         assert!(matches!(
@@ -4563,13 +5375,14 @@ mod tests {
         let dir = unique_temp_dir("partial_summary");
         let output_dir = dir.to_string_lossy().to_string();
 
-        write_summary_txt(&[], None, None, None, None, 5, &output_dir);
+        write_summary_txt(&[], None, None, None, None, (5, true), &output_dir);
 
         let summary_path = dir.join("summary.txt");
         let summary = std::fs::read_to_string(&summary_path).unwrap();
         assert!(summary.contains("blocker: partial benchmark suite"));
-        assert!(summary
-            .contains("missing=ablation,mode,path,gate,scale,apply,convergence,crossover,regime"));
+        assert!(summary.contains(
+            "missing=ablation,mode,path,gate,scale,apply,convergence,admission,crossover,regime"
+        ));
 
         std::fs::remove_file(summary_path).unwrap();
         std::fs::remove_dir(dir).unwrap();
@@ -4594,7 +5407,7 @@ mod tests {
             None,
             None,
             None,
-            (7, 1),
+            (7, 1, false),
             &output_dir,
         );
 
@@ -4602,7 +5415,13 @@ mod tests {
         let json = std::fs::read_to_string(&json_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["exp"][0]["label"], "label,with\"quote");
-        assert_eq!(parsed["metadata"]["schema_version"], 4);
+        assert_eq!(parsed["metadata"]["schema_version"], 6);
+        assert_eq!(parsed["metadata"]["source_reproducible_from_commit"], false);
+        assert!(parsed["publication_readiness"]["blocking_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "tracked source differs from the recorded commit"));
         assert_eq!(parsed["exp"][0]["active_policy"], "PPO");
         assert_eq!(parsed["exp"][0]["eval_reward"]["mean"], 0.5);
         assert_eq!(
@@ -4762,7 +5581,15 @@ mod tests {
         assert_eq!(stats[0].p95_ns, 38.5);
 
         write_path_latency_outputs(&latencies, &output_dir);
-        write_summary_json(&[], Some(&latencies), None, None, None, (1, 2), &output_dir);
+        write_summary_json(
+            &[],
+            Some(&latencies),
+            None,
+            None,
+            None,
+            (1, 2, true),
+            &output_dir,
+        );
 
         let csv = std::fs::read_to_string(dir.join("path_latency.csv")).unwrap();
         assert!(csv.contains("\"Dense,path\",1,64,0.75000000,4096,1024,1,30.000"));
@@ -4854,7 +5681,15 @@ mod tests {
             },
         ];
         write_crossover_outputs(&cells, &output_dir);
-        write_summary_json(&[], None, None, Some(&cells), None, (1, 2), &output_dir);
+        write_summary_json(
+            &[],
+            None,
+            None,
+            Some(&cells),
+            None,
+            (1, 2, true),
+            &output_dir,
+        );
         let csv = std::fs::read_to_string(dir.join("path_crossover.csv")).unwrap();
         assert!(csv.contains("requested_sparsity,actual_sparsity,total_weights,nonzero_weights"));
         assert!(csv.contains("256,0.900000,0.898438,65536,6656,1,100.000,80.000,120.000,Sparse"));
@@ -4907,7 +5742,15 @@ mod tests {
             }]),
         }];
         write_regime_outputs(&rows, &output_dir);
-        write_summary_json(&[], None, None, None, Some(&rows), (1, 1), &output_dir);
+        write_summary_json(
+            &[],
+            None,
+            None,
+            None,
+            Some(&rows),
+            (1, 1, true),
+            &output_dir,
+        );
         let csv = std::fs::read_to_string(dir.join("regime_adaptation.csv")).unwrap();
         // Small-batch oracle is Sparse, large-batch oracle is Cached: the two
         // regimes have different best fixed paths — the core adaptation result.
@@ -4950,7 +5793,15 @@ mod tests {
         ]);
 
         write_gate_curve_outputs(&result, &output_dir);
-        write_summary_json(&[], None, Some(&result), None, None, (1, 2), &output_dir);
+        write_summary_json(
+            &[],
+            None,
+            Some(&result),
+            None,
+            None,
+            (1, 2, true),
+            &output_dir,
+        );
 
         let csv = std::fs::read_to_string(dir.join("gate_curve.csv")).unwrap();
         assert!(csv.contains("10,2,reference_gate,0.9000000000"));

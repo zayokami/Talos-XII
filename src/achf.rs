@@ -50,6 +50,36 @@ enum CandidateMode {
     LowRank,
 }
 
+#[repr(u64)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CandidateCalibrationMode {
+    Off = 0,
+    Train = 1,
+    Validate = 2,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AchfCandidateCalibrationPoint {
+    pub step: usize,
+    pub output_relative_error: f64,
+    pub samples: usize,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AchfCandidateCalibration {
+    pub calibrated: bool,
+    pub reference_fingerprint: u64,
+    pub steps: usize,
+    pub output_samples: usize,
+    pub output_reference_norm_sq: f64,
+    pub output_error_norm_sq: f64,
+    pub output_relative_error: f64,
+    pub masked_weight_max_abs: f64,
+    pub masked_gradient_max_abs: f64,
+    pub masked_moment_max_abs: f64,
+    pub trace: Vec<AchfCandidateCalibrationPoint>,
+}
+
 fn default_connection_logits() -> Tensor {
     Tensor::with_dtype(vec![-0.25, 0.25, 0.25, -0.25], vec![2, 2], Dtype::F32)
 }
@@ -71,6 +101,8 @@ pub struct AchfLayer {
     /// Shape: [in_features, out_features]. Used by CUDA sparse kernel.
     #[serde(default)]
     pub sparse_mask: Option<Vec<u8>>,
+    #[serde(default)]
+    pub candidate_calibration: AchfCandidateCalibration,
     pub config: AchfConfig,
     #[serde(skip, default = "default_state")]
     pub state: Arc<RwLock<AchfState>>,
@@ -95,6 +127,15 @@ pub struct AchfState {
     pub candidate_sparsity: f64,
     pub candidate_relative_error: f64,
     pub candidate_weight_error_ema: f64,
+    pub candidate_output_reference_norm_sq: f64,
+    pub candidate_output_error_norm_sq: f64,
+    pub candidate_output_relative_error: f64,
+    pub candidate_output_error_ema: f64,
+    pub candidate_output_samples: usize,
+    pub candidate_calibration_steps: usize,
+    pub candidate_masked_weight_max_abs: f64,
+    pub candidate_masked_gradient_max_abs: f64,
+    pub candidate_masked_moment_max_abs: f64,
     pub connection_candidate_weight: f64,
     pub frozen_for_inference: bool,
     pub connection_projection_iterations: usize,
@@ -126,6 +167,7 @@ pub struct AchfMetrics {
     pub decision_samples: AtomicU64,
     pub memo_hash: AtomicU64,
     pub memo_count: AtomicU64,
+    pub candidate_calibration_mode: AtomicU64,
     /// Lock-free mirror of `AchfState::frozen_for_inference`, set once by
     /// `freeze_for_inference`. Lets the inference hot path detect frozen mode
     /// without taking the `state` RwLock on every call.
@@ -152,6 +194,9 @@ impl Clone for AchfMetrics {
             decision_samples: AtomicU64::new(self.decision_samples.load(Ordering::Relaxed)),
             memo_hash: AtomicU64::new(self.memo_hash.load(Ordering::Relaxed)),
             memo_count: AtomicU64::new(self.memo_count.load(Ordering::Relaxed)),
+            candidate_calibration_mode: AtomicU64::new(
+                self.candidate_calibration_mode.load(Ordering::Relaxed),
+            ),
             frozen: AtomicBool::new(self.frozen.load(Ordering::Relaxed)),
         }
     }
@@ -175,6 +220,7 @@ impl Default for AchfMetrics {
             decision_samples: AtomicU64::new(0),
             memo_hash: AtomicU64::new(0),
             memo_count: AtomicU64::new(0),
+            candidate_calibration_mode: AtomicU64::new(0),
             frozen: AtomicBool::new(false),
         }
     }
@@ -277,6 +323,7 @@ pub struct AchfCache {
     pub last_input: Option<Vec<f32>>,
     pub last_output: Option<Vec<f32>>,
     pub last_input_count: u64,
+    pub candidate_calibration_loss: Option<Tensor>,
     #[cfg(cuda)]
     pub sparse_mask_cuda: Option<Arc<crate::cuda::memory::DevicePtr<u8>>>,
 }
@@ -296,6 +343,15 @@ fn default_state() -> Arc<RwLock<AchfState>> {
         candidate_sparsity: 0.0,
         candidate_relative_error: 0.0,
         candidate_weight_error_ema: 0.0,
+        candidate_output_reference_norm_sq: 0.0,
+        candidate_output_error_norm_sq: 0.0,
+        candidate_output_relative_error: 0.0,
+        candidate_output_error_ema: 0.0,
+        candidate_output_samples: 0,
+        candidate_calibration_steps: 0,
+        candidate_masked_weight_max_abs: 0.0,
+        candidate_masked_gradient_max_abs: 0.0,
+        candidate_masked_moment_max_abs: 0.0,
         connection_candidate_weight: 1.0,
         frozen_for_inference: false,
         connection_projection_iterations: 0,
@@ -349,6 +405,7 @@ fn default_cache() -> Arc<RwLock<AchfCache>> {
         last_input: None,
         last_output: None,
         last_input_count: 0,
+        candidate_calibration_loss: None,
         #[cfg(cuda)]
         sparse_mask_cuda: None,
     }))
@@ -513,6 +570,14 @@ pub struct AchfMemoryStats {
     pub candidate_reference_norm_sq: f64,
     pub candidate_error_norm_sq: f64,
     pub max_layer_candidate_relative_error: f64,
+    pub candidate_output_reference_norm_sq: f64,
+    pub candidate_output_error_norm_sq: f64,
+    pub candidate_output_samples: usize,
+    pub max_layer_candidate_output_relative_error: f64,
+    pub candidate_calibration_steps: usize,
+    pub candidate_masked_weight_max_abs: f64,
+    pub candidate_masked_gradient_max_abs: f64,
+    pub candidate_masked_moment_max_abs: f64,
     pub reference_parameter_bytes: usize,
     pub candidate_dense_bytes: usize,
     pub sparse_mask_bytes: usize,
@@ -543,6 +608,24 @@ where
         out.max_layer_candidate_relative_error = out
             .max_layer_candidate_relative_error
             .max(stats.max_layer_candidate_relative_error);
+        out.candidate_output_reference_norm_sq += stats.candidate_output_reference_norm_sq;
+        out.candidate_output_error_norm_sq += stats.candidate_output_error_norm_sq;
+        out.candidate_output_samples += stats.candidate_output_samples;
+        out.max_layer_candidate_output_relative_error = out
+            .max_layer_candidate_output_relative_error
+            .max(stats.max_layer_candidate_output_relative_error);
+        out.candidate_calibration_steps = out
+            .candidate_calibration_steps
+            .max(stats.candidate_calibration_steps);
+        out.candidate_masked_weight_max_abs = out
+            .candidate_masked_weight_max_abs
+            .max(stats.candidate_masked_weight_max_abs);
+        out.candidate_masked_gradient_max_abs = out
+            .candidate_masked_gradient_max_abs
+            .max(stats.candidate_masked_gradient_max_abs);
+        out.candidate_masked_moment_max_abs = out
+            .candidate_masked_moment_max_abs
+            .max(stats.candidate_masked_moment_max_abs);
         out.reference_parameter_bytes += stats.reference_parameter_bytes;
         out.candidate_dense_bytes += stats.candidate_dense_bytes;
         out.sparse_mask_bytes += stats.sparse_mask_bytes;
@@ -568,6 +651,19 @@ impl AchfMemoryStats {
             return Some((self.candidate_error_norm_sq / self.candidate_reference_norm_sq).sqrt());
         }
         (self.candidate_error_norm_sq == 0.0).then_some(0.0)
+    }
+
+    pub fn candidate_output_relative_error(&self) -> Option<f64> {
+        if self.candidate_output_samples == 0 {
+            return None;
+        }
+        if self.candidate_output_reference_norm_sq > 0.0 {
+            return Some(
+                (self.candidate_output_error_norm_sq / self.candidate_output_reference_norm_sq)
+                    .sqrt(),
+            );
+        }
+        (self.candidate_output_error_norm_sq == 0.0).then_some(0.0)
     }
 }
 
@@ -607,6 +703,13 @@ pub struct AchfStateSnapshot {
     pub candidate_sparsity: f64,
     pub candidate_relative_error: f64,
     pub candidate_weight_error_ema: f64,
+    pub candidate_output_relative_error: f64,
+    pub candidate_output_error_ema: f64,
+    pub candidate_output_samples: usize,
+    pub candidate_calibration_steps: usize,
+    pub candidate_masked_weight_max_abs: f64,
+    pub candidate_masked_gradient_max_abs: f64,
+    pub candidate_masked_moment_max_abs: f64,
     pub connection_candidate_weight: f64,
     pub grad_ema: f64,
     pub gradient_cosine: f64,
@@ -803,6 +906,7 @@ impl AchfLayer {
             connection_logits: default_connection_logits(),
             sparse_weight: None,
             sparse_mask: None,
+            candidate_calibration: AchfCandidateCalibration::default(),
             config,
             state: default_state(),
             cache: default_cache(),
@@ -913,11 +1017,21 @@ impl AchfLayer {
         if !self.config.enabled || self.candidate_mode() == CandidateMode::None {
             self.sparse_weight = None;
             self.sparse_mask = None;
+            self.candidate_calibration = AchfCandidateCalibration::default();
             let mut state = self.state.write().unwrap();
             state.candidate_eligible = false;
             state.candidate_sparsity = 0.0;
             state.candidate_relative_error = 0.0;
             state.candidate_weight_error_ema = 0.0;
+            state.candidate_output_reference_norm_sq = 0.0;
+            state.candidate_output_error_norm_sq = 0.0;
+            state.candidate_output_relative_error = 0.0;
+            state.candidate_output_error_ema = 0.0;
+            state.candidate_output_samples = 0;
+            state.candidate_calibration_steps = 0;
+            state.candidate_masked_weight_max_abs = 0.0;
+            state.candidate_masked_gradient_max_abs = 0.0;
+            state.candidate_masked_moment_max_abs = 0.0;
             state.low_rank_rel_err = 0.0;
             state.low_rank_applied_rank = 0;
             drop(state);
@@ -934,11 +1048,11 @@ impl AchfLayer {
         let mut candidate_values = reference.clone();
         let (mask, sparsity, relative_error, applied_rank) = match self.candidate_mode() {
             CandidateMode::Sparse => {
-                let threshold = self.config.prune_threshold as f32;
-                let mask: Vec<u8> = reference
-                    .iter()
-                    .map(|value| u8::from(value.abs() >= threshold))
-                    .collect();
+                let mask = build_sparse_candidate_mask(
+                    &reference,
+                    self.config.candidate_target_sparsity,
+                    self.config.prune_threshold,
+                );
                 for (value, keep) in candidate_values.iter_mut().zip(mask.iter()) {
                     if *keep == 0 {
                         *value = 0.0;
@@ -991,6 +1105,7 @@ impl AchfLayer {
         };
         self.sparse_weight = Some(candidate);
         self.sparse_mask = mask;
+        self.candidate_calibration = AchfCandidateCalibration::default();
 
         let total = candidate_values.len();
         let nonzero = candidate_values
@@ -1004,7 +1119,9 @@ impl AchfLayer {
             );
         let dense_bytes = total.saturating_mul(std::mem::size_of::<f32>());
         let storage_economical = csr_bytes < dense_bytes;
-        let eligible = relative_error <= self.config.candidate_max_relative_error
+        let calibration_not_required = self.config.candidate_min_calibration_samples == 0;
+        let eligible = calibration_not_required
+            && relative_error <= self.config.candidate_max_relative_error
             && match self.candidate_mode() {
                 CandidateMode::Sparse => {
                     sparsity >= self.config.candidate_min_sparsity && storage_economical
@@ -1025,6 +1142,15 @@ impl AchfLayer {
         } else {
             relative_error
         };
+        state.candidate_output_reference_norm_sq = 0.0;
+        state.candidate_output_error_norm_sq = 0.0;
+        state.candidate_output_relative_error = 0.0;
+        state.candidate_output_error_ema = 0.0;
+        state.candidate_output_samples = 0;
+        state.candidate_calibration_steps = 0;
+        state.candidate_masked_weight_max_abs = 0.0;
+        state.candidate_masked_gradient_max_abs = 0.0;
+        state.candidate_masked_moment_max_abs = 0.0;
         state.low_rank_rel_err = if self.candidate_mode() == CandidateMode::LowRank {
             relative_error
         } else {
@@ -1033,6 +1159,425 @@ impl AchfLayer {
         state.low_rank_applied_rank = applied_rank;
         drop(state);
         self.clear_cache();
+    }
+
+    fn candidate_calibration_mode(&self) -> CandidateCalibrationMode {
+        match self
+            .metrics
+            .candidate_calibration_mode
+            .load(Ordering::Acquire)
+        {
+            1 => CandidateCalibrationMode::Train,
+            2 => CandidateCalibrationMode::Validate,
+            _ => CandidateCalibrationMode::Off,
+        }
+    }
+
+    fn set_candidate_calibration_mode(&self, mode: CandidateCalibrationMode) {
+        self.metrics
+            .candidate_calibration_mode
+            .store(mode as u64, Ordering::Release);
+    }
+
+    fn candidate_mask_tensor(&self, candidate: &Linear) -> Option<Tensor> {
+        let mask = self.valid_sparse_mask()?;
+        let tensor = Tensor::with_dtype(
+            mask.iter().map(|&keep| keep as f64).collect(),
+            candidate.weight.shape.clone(),
+            candidate.weight.dtype,
+        );
+        #[cfg(cuda)]
+        if candidate.weight.device == Device::Cuda {
+            return tensor.to_cuda().ok();
+        }
+        Some(tensor)
+    }
+
+    fn forward_candidate_calibration(&self, input: &Tensor) -> Option<Tensor> {
+        let mode = self.candidate_calibration_mode();
+        if mode == CandidateCalibrationMode::Off || self.candidate_mode() != CandidateMode::Sparse {
+            return None;
+        }
+        let candidate = self.valid_sparse_weight()?;
+        let mask = self.candidate_mask_tensor(candidate)?;
+        let reference = self.weight.forward(input);
+        let masked_weight = &candidate.weight * &mask;
+        let candidate_linear = Linear {
+            weight: masked_weight,
+            bias: candidate.bias.clone(),
+            in_features: candidate.in_features,
+            out_features: candidate.out_features,
+        };
+        let candidate_output = candidate_linear.forward(&input.detach());
+        let reference_target = reference.detach();
+        let diff = candidate_output - reference_target.clone();
+
+        match mode {
+            CandidateCalibrationMode::Train => {
+                let loss = (&diff * &diff).mean();
+                let mut cache = self.cache.write().unwrap();
+                cache.candidate_calibration_loss = Some(
+                    cache
+                        .candidate_calibration_loss
+                        .take()
+                        .map_or(loss.clone(), |accumulated| accumulated + loss),
+                );
+            }
+            CandidateCalibrationMode::Validate => {
+                let reference_values = reference_target.data_as_f64_vec();
+                let candidate_values = (&diff + &reference_target).data_as_f64_vec();
+                let mut reference_norm_sq = 0.0;
+                let mut error_norm_sq = 0.0;
+                for (reference_value, candidate_value) in
+                    reference_values.iter().zip(candidate_values.iter())
+                {
+                    if !reference_value.is_finite() || !candidate_value.is_finite() {
+                        reference_norm_sq = f64::INFINITY;
+                        error_norm_sq = f64::INFINITY;
+                        break;
+                    }
+                    reference_norm_sq += reference_value * reference_value;
+                    error_norm_sq += (candidate_value - reference_value).powi(2);
+                }
+                let relative_error = if reference_norm_sq > 0.0
+                    && reference_norm_sq.is_finite()
+                    && error_norm_sq.is_finite()
+                {
+                    (error_norm_sq / reference_norm_sq).sqrt()
+                } else if reference_norm_sq == 0.0 && error_norm_sq == 0.0 {
+                    0.0
+                } else {
+                    f64::INFINITY
+                };
+                let rows = input
+                    .shape
+                    .iter()
+                    .take(input.shape.len().saturating_sub(1))
+                    .product::<usize>()
+                    .max(1);
+                let mut state = self.state.write().unwrap();
+                let previous_samples = state.candidate_output_samples;
+                state.candidate_output_reference_norm_sq += reference_norm_sq;
+                state.candidate_output_error_norm_sq += error_norm_sq;
+                state.candidate_output_samples =
+                    state.candidate_output_samples.saturating_add(rows);
+                state.candidate_output_relative_error = candidate_output_relative_error_from_sums(
+                    state.candidate_output_reference_norm_sq,
+                    state.candidate_output_error_norm_sq,
+                );
+                state.candidate_output_error_ema = if previous_samples == 0 {
+                    relative_error
+                } else {
+                    self.config.candidate_weight_error_momentum * state.candidate_output_error_ema
+                        + (1.0 - self.config.candidate_weight_error_momentum) * relative_error
+                };
+            }
+            CandidateCalibrationMode::Off => {}
+        }
+        Some(reference)
+    }
+
+    fn forward_sparse_training(&self, input: &Tensor) -> Option<Tensor> {
+        if !self.config.candidate_train_from_scratch
+            || self.candidate_mode() != CandidateMode::Sparse
+        {
+            return None;
+        }
+        let candidate = self.valid_sparse_weight()?;
+        let mask = self.candidate_mask_tensor(candidate)?;
+        let masked_weight = &candidate.weight * &mask;
+        let candidate_linear = Linear {
+            weight: masked_weight,
+            bias: candidate.bias.clone(),
+            in_features: candidate.in_features,
+            out_features: candidate.out_features,
+        };
+        Some(candidate_linear.forward(input))
+    }
+
+    pub fn candidate_calibration_parameters(&self) -> Vec<Tensor> {
+        if self.candidate_mode() != CandidateMode::Sparse {
+            return Vec::new();
+        }
+        self.valid_sparse_weight()
+            .map(Module::parameters)
+            .unwrap_or_default()
+    }
+
+    pub fn candidate_calibration_parameter_masks(&self) -> Vec<Option<Vec<u8>>> {
+        let Some(candidate) = self.valid_sparse_weight() else {
+            return Vec::new();
+        };
+        let Some(mask) = self.valid_sparse_mask() else {
+            return Vec::new();
+        };
+        let mut masks = vec![Some(mask.to_vec())];
+        if candidate.bias.is_some() {
+            masks.push(None);
+        }
+        masks
+    }
+
+    pub fn take_candidate_calibration_loss(&self) -> Option<Tensor> {
+        self.cache
+            .write()
+            .unwrap()
+            .candidate_calibration_loss
+            .take()
+    }
+
+    pub fn clear_candidate_calibration_loss(&self) {
+        self.cache.write().unwrap().candidate_calibration_loss = None;
+    }
+
+    pub fn reset_candidate_output_diagnostics(&self) {
+        let mut state = self.state.write().unwrap();
+        state.candidate_output_reference_norm_sq = 0.0;
+        state.candidate_output_error_norm_sq = 0.0;
+        state.candidate_output_relative_error = 0.0;
+        state.candidate_output_error_ema = 0.0;
+        state.candidate_output_samples = 0;
+    }
+
+    pub fn candidate_calibration_record(&self) -> AchfCandidateCalibration {
+        self.candidate_calibration.clone()
+    }
+
+    pub fn begin_candidate_calibration(&mut self) -> bool {
+        if !self.config.enabled
+            || self.candidate_mode() != CandidateMode::Sparse
+            || self.config.candidate_calibration_steps == 0
+            || self.config.candidate_calibration_max_samples == 0
+        {
+            self.set_candidate_calibration_mode(CandidateCalibrationMode::Off);
+            return false;
+        }
+        self.rebuild_candidate_from_reference();
+        if !self.has_valid_sparse_state() {
+            self.set_candidate_calibration_mode(CandidateCalibrationMode::Off);
+            return false;
+        }
+        self.candidate_calibration = AchfCandidateCalibration::default();
+        self.reset_candidate_output_diagnostics();
+        self.clear_candidate_calibration_loss();
+        self.set_candidate_calibration_mode(CandidateCalibrationMode::Train);
+        true
+    }
+
+    pub fn set_candidate_calibration_training(&self) {
+        self.clear_candidate_calibration_loss();
+        self.set_candidate_calibration_mode(CandidateCalibrationMode::Train);
+    }
+
+    pub fn set_candidate_calibration_validation(&self) {
+        self.clear_candidate_calibration_loss();
+        self.reset_candidate_output_diagnostics();
+        self.set_candidate_calibration_mode(CandidateCalibrationMode::Validate);
+    }
+
+    pub fn stop_candidate_calibration(&self) {
+        self.clear_candidate_calibration_loss();
+        self.set_candidate_calibration_mode(CandidateCalibrationMode::Off);
+    }
+
+    pub fn enforce_candidate_mask(&mut self) {
+        let Some(mask) = self.valid_sparse_mask().map(<[u8]>::to_vec) else {
+            return;
+        };
+        let Some(candidate) = self.sparse_weight.as_mut() else {
+            return;
+        };
+        let mut values = candidate.weight.data_to_f32_vec();
+        for (value, keep) in values.iter_mut().zip(mask.iter()) {
+            if *keep == 0 {
+                *value = 0.0;
+            }
+        }
+        sync_weight_from_host_f32(&candidate.weight, &values);
+    }
+
+    fn masked_candidate_weight_max_abs(&self) -> f64 {
+        let Some(mask) = self.valid_sparse_mask() else {
+            return f64::INFINITY;
+        };
+        let Some(candidate) = self.valid_sparse_weight() else {
+            return f64::INFINITY;
+        };
+        let mut maximum = 0.0f64;
+        for (value, keep) in candidate.weight.data_to_f32_vec().iter().zip(mask.iter()) {
+            if *keep == 0 {
+                if !value.is_finite() {
+                    return f64::INFINITY;
+                }
+                maximum = maximum.max(value.abs() as f64);
+            }
+        }
+        maximum
+    }
+
+    fn masked_candidate_gradient_max_abs(&self) -> f64 {
+        let Some(mask) = self.valid_sparse_mask() else {
+            return f64::INFINITY;
+        };
+        let Some(candidate) = self.valid_sparse_weight() else {
+            return f64::INFINITY;
+        };
+        let gradients = candidate.weight.grad_to_f32_vec();
+        if gradients.len() != mask.len() {
+            return f64::INFINITY;
+        }
+        let mut maximum = 0.0f64;
+        for (gradient, keep) in gradients.iter().zip(mask.iter()) {
+            if *keep == 0 {
+                if !gradient.is_finite() {
+                    return f64::INFINITY;
+                }
+                maximum = maximum.max(gradient.abs() as f64);
+            }
+        }
+        maximum
+    }
+
+    pub fn record_candidate_calibration_checkpoint(&mut self, step: usize) {
+        let state = self.state.read().unwrap();
+        let point = AchfCandidateCalibrationPoint {
+            step,
+            output_relative_error: state.candidate_output_relative_error,
+            samples: state.candidate_output_samples,
+        };
+        drop(state);
+        if self
+            .candidate_calibration
+            .trace
+            .last()
+            .is_some_and(|previous| previous.step == step)
+        {
+            self.candidate_calibration.trace.pop();
+        }
+        self.candidate_calibration.trace.push(point);
+    }
+
+    pub fn finalize_candidate_calibration(&mut self, steps: usize, masked_moment_max_abs: f64) {
+        self.enforce_candidate_mask();
+        self.stop_candidate_calibration();
+        let state = self.state.read().unwrap();
+        let output_reference_norm_sq = state.candidate_output_reference_norm_sq;
+        let output_error_norm_sq = state.candidate_output_error_norm_sq;
+        let output_samples = state.candidate_output_samples;
+        let output_relative_error = candidate_output_relative_error_from_sums(
+            output_reference_norm_sq,
+            output_error_norm_sq,
+        );
+        drop(state);
+        self.record_candidate_calibration_checkpoint(steps);
+        self.candidate_calibration.calibrated = output_samples > 0;
+        self.candidate_calibration.reference_fingerprint = self.reference_fingerprint();
+        self.candidate_calibration.steps = steps;
+        self.candidate_calibration.output_samples = output_samples;
+        self.candidate_calibration.output_reference_norm_sq = output_reference_norm_sq;
+        self.candidate_calibration.output_error_norm_sq = output_error_norm_sq;
+        self.candidate_calibration.output_relative_error = output_relative_error;
+        self.candidate_calibration.masked_weight_max_abs = self.masked_candidate_weight_max_abs();
+        self.candidate_calibration.masked_gradient_max_abs =
+            self.masked_candidate_gradient_max_abs();
+        self.candidate_calibration.masked_moment_max_abs = masked_moment_max_abs;
+        self.refresh_candidate_admission_from_current();
+        self.clear_cache();
+    }
+
+    fn reference_fingerprint(&self) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let mut mix = |value: u64| {
+            hash ^= value;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+        };
+        mix(self.weight.in_features as u64);
+        mix(self.weight.out_features as u64);
+        for value in self.weight.weight.data_to_f32_vec() {
+            mix(value.to_bits() as u64);
+        }
+        if let Some(bias) = &self.weight.bias {
+            for value in bias.data_to_f32_vec() {
+                mix(value.to_bits() as u64);
+            }
+        }
+        hash
+    }
+
+    fn refresh_candidate_admission_from_current(&mut self) {
+        let Some(candidate) = self.valid_candidate_weight() else {
+            self.state.write().unwrap().candidate_eligible = false;
+            return;
+        };
+        let reference = self.weight.weight.data_to_f32_vec();
+        let candidate_values = candidate.weight.data_to_f32_vec();
+        let reference_norm_sq = reference
+            .iter()
+            .map(|value| (*value as f64).powi(2))
+            .sum::<f64>();
+        let error_norm_sq = reference
+            .iter()
+            .zip(candidate_values.iter())
+            .map(|(reference, candidate)| (*reference as f64 - *candidate as f64).powi(2))
+            .sum::<f64>();
+        let relative_error = if reference_norm_sq > 0.0 {
+            (error_norm_sq / reference_norm_sq).sqrt()
+        } else if error_norm_sq == 0.0 {
+            0.0
+        } else {
+            f64::INFINITY
+        };
+        let nonzero = candidate_values
+            .iter()
+            .filter(|value| **value != 0.0)
+            .count();
+        let total = candidate_values.len();
+        let sparsity = if total == 0 {
+            0.0
+        } else {
+            1.0 - nonzero as f64 / total as f64
+        };
+        let csr_bytes = nonzero
+            .saturating_mul(std::mem::size_of::<u32>() + std::mem::size_of::<f32>())
+            .saturating_add(
+                (self.weight.in_features + 1).saturating_mul(std::mem::size_of::<u32>()),
+            );
+        let dense_bytes = total.saturating_mul(std::mem::size_of::<f32>());
+        let calibration_current = self.candidate_calibration.calibrated
+            && self.candidate_calibration.reference_fingerprint == self.reference_fingerprint();
+        let quality_eligible = if self.config.candidate_min_calibration_samples > 0 {
+            calibration_current
+                && self.candidate_calibration.output_samples
+                    >= self.config.candidate_min_calibration_samples
+                && self.candidate_calibration.output_relative_error.is_finite()
+                && self.candidate_calibration.output_relative_error
+                    <= self.config.candidate_max_output_relative_error
+                && self.candidate_calibration.masked_weight_max_abs == 0.0
+                && self.candidate_calibration.masked_gradient_max_abs == 0.0
+                && self.candidate_calibration.masked_moment_max_abs == 0.0
+        } else {
+            relative_error.is_finite() && relative_error <= self.config.candidate_max_relative_error
+        };
+        let eligible = quality_eligible
+            && nonzero > 0
+            && sparsity >= self.config.candidate_min_sparsity
+            && csr_bytes < dense_bytes;
+        let mut state = self.state.write().unwrap();
+        state.candidate_eligible = eligible;
+        state.candidate_sparsity = sparsity;
+        state.candidate_relative_error = relative_error;
+        state.candidate_weight_error_ema = relative_error;
+        state.candidate_output_reference_norm_sq =
+            self.candidate_calibration.output_reference_norm_sq;
+        state.candidate_output_error_norm_sq = self.candidate_calibration.output_error_norm_sq;
+        state.candidate_output_relative_error = self.candidate_calibration.output_relative_error;
+        state.candidate_output_error_ema = self.candidate_calibration.output_relative_error;
+        state.candidate_output_samples = self.candidate_calibration.output_samples;
+        state.candidate_calibration_steps = self.candidate_calibration.steps;
+        state.candidate_masked_weight_max_abs = self.candidate_calibration.masked_weight_max_abs;
+        state.candidate_masked_gradient_max_abs =
+            self.candidate_calibration.masked_gradient_max_abs;
+        state.candidate_masked_moment_max_abs = self.candidate_calibration.masked_moment_max_abs;
     }
 
     pub fn candidate_is_eligible(&self) -> bool {
@@ -1060,6 +1605,13 @@ impl AchfLayer {
             candidate_sparsity: state.candidate_sparsity,
             candidate_relative_error: state.candidate_relative_error,
             candidate_weight_error_ema: state.candidate_weight_error_ema,
+            candidate_output_relative_error: state.candidate_output_relative_error,
+            candidate_output_error_ema: state.candidate_output_error_ema,
+            candidate_output_samples: state.candidate_output_samples,
+            candidate_calibration_steps: state.candidate_calibration_steps,
+            candidate_masked_weight_max_abs: state.candidate_masked_weight_max_abs,
+            candidate_masked_gradient_max_abs: state.candidate_masked_gradient_max_abs,
+            candidate_masked_moment_max_abs: state.candidate_masked_moment_max_abs,
             connection_candidate_weight: state.connection_candidate_weight,
             grad_ema: state.grad_ema,
             gradient_cosine: state.gradient_cosine,
@@ -1191,6 +1743,16 @@ impl AchfLayer {
             candidate_reference_norm_sq,
             candidate_error_norm_sq,
             max_layer_candidate_relative_error,
+            candidate_output_reference_norm_sq: self.candidate_calibration.output_reference_norm_sq,
+            candidate_output_error_norm_sq: self.candidate_calibration.output_error_norm_sq,
+            candidate_output_samples: self.candidate_calibration.output_samples,
+            max_layer_candidate_output_relative_error: self
+                .candidate_calibration
+                .output_relative_error,
+            candidate_calibration_steps: self.candidate_calibration.steps,
+            candidate_masked_weight_max_abs: self.candidate_calibration.masked_weight_max_abs,
+            candidate_masked_gradient_max_abs: self.candidate_calibration.masked_gradient_max_abs,
+            candidate_masked_moment_max_abs: self.candidate_calibration.masked_moment_max_abs,
             reference_parameter_bytes,
             candidate_dense_bytes,
             sparse_mask_bytes,
@@ -1222,6 +1784,7 @@ impl AchfLayer {
             connection_logits: self.connection_logits.clone(),
             sparse_weight: self.sparse_weight.clone(),
             sparse_mask: self.sparse_mask.clone(),
+            candidate_calibration: self.candidate_calibration.clone(),
             config: self.config.clone(),
             state: Arc::new(RwLock::new(state)),
             cache,
@@ -1239,18 +1802,27 @@ impl AchfLayer {
         self.prepare_inference_cache();
     }
 
-    pub fn rebuild_inference_candidate(&mut self, threshold: f64) {
-        self.config.prune_threshold = threshold;
-        self.prune(threshold);
+    pub fn rebuild_inference_candidate_target(&mut self, target_sparsity: f64) {
+        self.config.candidate_mode = "sparse".to_string();
+        self.config.rank = 0;
+        self.config.prune_threshold = 0.0;
+        self.config.candidate_target_sparsity = target_sparsity.clamp(0.0, 1.0);
+        self.rebuild_candidate_from_reference();
         self.prepare_inference_cache();
         self.state.write().unwrap().frozen_for_inference = true;
         self.metrics.frozen.store(true, Ordering::Release);
     }
 
     pub fn parameters(&self) -> Vec<Tensor> {
-        // `sparse_weight` is a detached, derived inference representation of
-        // `weight`, not an independently trainable parameter set.
-        let mut parameters = self.weight.parameters();
+        let mut parameters = if self.config.candidate_train_from_scratch {
+            self.valid_sparse_weight()
+                .map(Module::parameters)
+                .unwrap_or_default()
+        } else {
+            // The normal candidate is detached and owned by its calibration
+            // optimizer, never by the reference optimizer.
+            self.weight.parameters()
+        };
         parameters.push(self.connection_logits.clone());
         parameters
     }
@@ -1417,6 +1989,14 @@ impl Module for AchfLayer {
             return self.weight.forward(input);
         }
         if self.is_training_mode() {
+            if let Some(candidate) = self.forward_sparse_training(input) {
+                return candidate;
+            }
+        }
+        if let Some(reference) = self.forward_candidate_calibration(input) {
+            return reference;
+        }
+        if self.is_training_mode() {
             let reference_gate = self.compute_gate();
             return self.forward_gated_candidate(input, reference_gate);
         }
@@ -1438,6 +2018,14 @@ impl AchfLayer {
             self.metrics.calls.fetch_add(1, Ordering::Relaxed);
             self.metrics.cache_skips.fetch_add(1, Ordering::Relaxed);
             return self.zero_tensor_output(x);
+        }
+        if self.is_training_mode() {
+            if let Some(candidate) = self.forward_sparse_training(x) {
+                return candidate;
+            }
+        }
+        if let Some(reference) = self.forward_candidate_calibration(x) {
+            return reference;
         }
         if self.is_training_mode() {
             let reference_gate = self.compute_gate();
@@ -1781,18 +2369,24 @@ impl AchfLayer {
         if !self.config.enabled {
             return;
         }
+        let gradient_weight = if self.config.candidate_train_from_scratch {
+            self.valid_sparse_weight()
+                .map_or(&self.weight.weight, |candidate| &candidate.weight)
+        } else {
+            &self.weight.weight
+        };
         #[cfg(cuda)]
         {
-            if self.weight.weight.device == Device::Cuda
+            if gradient_weight.device == Device::Cuda
                 && crate::cuda::is_available()
-                && !self.weight.weight.grad.is_empty()
+                && !gradient_weight.grad.is_empty()
             {
-                if let Some(mean_sq) = crate::cuda::achf::grad_mean_sq(&self.weight.weight) {
+                if let Some(mean_sq) = crate::cuda::achf::grad_mean_sq(gradient_weight) {
                     let grad_rms = mean_sq.sqrt();
                     let diagnostic_gradient = self
                         .config
                         .diagnostics_enabled
-                        .then(|| self.weight.weight.grad_to_f32_vec());
+                        .then(|| gradient_weight.grad_to_f32_vec());
                     let mut state = self.state.write().unwrap();
                     match self.gate_mode() {
                         GateMode::GradEma => {
@@ -1813,7 +2407,7 @@ impl AchfLayer {
         }
         let mut sum_sq = 0.0;
         let mut count = 0usize;
-        let gradient = self.weight.weight.grad_to_f32_vec();
+        let gradient = gradient_weight.grad_to_f32_vec();
         for &value in &gradient {
             sum_sq += (value * value) as f64;
         }
@@ -1945,8 +2539,20 @@ impl AchfLayer {
         if !self.config.enabled {
             return;
         }
+        self.stop_candidate_calibration();
         self.refresh_connection_projection_stats();
-        self.rebuild_candidate_from_reference();
+        let sparse_training_candidate =
+            self.config.candidate_train_from_scratch && self.has_valid_sparse_state();
+        let calibrated_candidate_is_current = self.candidate_calibration.calibrated
+            && self.candidate_calibration.reference_fingerprint == self.reference_fingerprint()
+            && self.has_valid_candidate_state();
+        if sparse_training_candidate || calibrated_candidate_is_current {
+            self.enforce_candidate_mask();
+            self.refresh_candidate_admission_from_current();
+            self.clear_cache();
+        } else {
+            self.rebuild_candidate_from_reference();
+        }
         self.prepare_inference_cache();
         let mut state = self.state.write().unwrap();
         state.frozen_for_inference = true;
@@ -2058,6 +2664,22 @@ impl AchfLayer {
         if !self.config.enabled {
             return;
         }
+        if self.config.candidate_train_from_scratch {
+            self.state.write().unwrap().step += 1;
+            self.refresh_connection_projection_stats();
+            self.enforce_candidate_mask();
+            self.refresh_candidate_admission_from_current();
+            self.clear_cache();
+            return;
+        }
+        if self.config.candidate_min_calibration_samples > 0 {
+            let mut state = self.state.write().unwrap();
+            state.step += 1;
+            state.candidate_eligible = false;
+            drop(state);
+            self.refresh_connection_projection_stats();
+            return;
+        }
         let should_refresh_candidate = {
             let mut state = self.state.write().unwrap();
             if state.frozen_for_inference {
@@ -2081,7 +2703,29 @@ impl AchfLayer {
         copy_linear(&mut self.weight, &other.weight);
         copy_tensor(&self.connection_logits, &other.connection_logits);
         self.refresh_connection_projection_stats();
-        self.rebuild_candidate_from_reference();
+        let copied_sparse_candidate = if self.config.candidate_train_from_scratch
+            && other.config.candidate_train_from_scratch
+        {
+            if let (Some(target), Some(source)) =
+                (self.sparse_weight.as_mut(), other.sparse_weight.as_ref())
+            {
+                copy_linear(target, source);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if copied_sparse_candidate {
+            self.sparse_mask = other.sparse_mask.clone();
+            self.candidate_calibration = other.candidate_calibration.clone();
+            self.enforce_candidate_mask();
+            self.refresh_candidate_admission_from_current();
+            self.clear_cache();
+        } else {
+            self.rebuild_candidate_from_reference();
+        }
     }
 
     pub fn to_inference_bf16(&self) -> Self {
@@ -2100,13 +2744,25 @@ impl AchfLayer {
             connection_logits: self.connection_logits.to_bf16(),
             sparse_weight: self.sparse_weight.as_ref().map(Linear::to_inference_bf16),
             sparse_mask: self.sparse_mask.clone(),
+            candidate_calibration: self.candidate_calibration.clone(),
             config: self.config.clone(),
             state: Arc::new(RwLock::new(state)),
             cache,
             metrics,
         };
         layer.refresh_connection_projection_stats();
-        layer.rebuild_candidate_from_reference();
+        if layer.config.candidate_train_from_scratch && layer.has_valid_sparse_state() {
+            layer.enforce_candidate_mask();
+            layer.refresh_candidate_admission_from_current();
+            layer.clear_cache();
+        } else if layer.candidate_calibration.calibrated && layer.has_valid_candidate_state() {
+            layer.candidate_calibration.reference_fingerprint = layer.reference_fingerprint();
+            layer.enforce_candidate_mask();
+            layer.refresh_candidate_admission_from_current();
+            layer.clear_cache();
+        } else {
+            layer.rebuild_candidate_from_reference();
+        }
         layer.prepare_inference_cache();
         layer
     }
@@ -2115,7 +2771,28 @@ impl AchfLayer {
         soft_update_linear(&mut self.weight, &source.weight, tau);
         soft_update_tensor(&self.connection_logits, &source.connection_logits, tau);
         self.refresh_connection_projection_stats();
-        self.rebuild_candidate_from_reference();
+        let updated_sparse_candidate = if self.config.candidate_train_from_scratch
+            && source.config.candidate_train_from_scratch
+        {
+            if let (Some(target), Some(source_candidate)) =
+                (self.sparse_weight.as_mut(), source.sparse_weight.as_ref())
+            {
+                soft_update_linear(target, source_candidate, tau);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if updated_sparse_candidate {
+            self.sparse_mask = source.sparse_mask.clone();
+            self.enforce_candidate_mask();
+            self.refresh_candidate_admission_from_current();
+            self.clear_cache();
+        } else {
+            self.rebuild_candidate_from_reference();
+        }
     }
 
     fn has_valid_candidate_state(&self) -> bool {
@@ -2193,6 +2870,7 @@ impl AchfLayer {
         self.config.candidate_mode = "sparse".to_string();
         self.config.rank = 0;
         self.config.prune_threshold = threshold;
+        self.config.candidate_target_sparsity = 0.0;
         self.rebuild_candidate_from_reference();
     }
 
@@ -2237,6 +2915,7 @@ impl AchfLayer {
         cache.last_input = None;
         cache.last_output = None;
         cache.last_input_count = 0;
+        cache.candidate_calibration_loss = None;
         #[cfg(cuda)]
         {
             cache.sparse_mask_cuda = None;
@@ -3360,6 +4039,47 @@ fn copy_linear(dst: &mut Linear, src: &Linear) {
     if let (Some(dst_bias), Some(src_bias)) = (&dst.bias, &src.bias) {
         copy_tensor(dst_bias, src_bias);
     }
+}
+
+fn candidate_output_relative_error_from_sums(reference_norm_sq: f64, error_norm_sq: f64) -> f64 {
+    if reference_norm_sq > 0.0 && reference_norm_sq.is_finite() && error_norm_sq.is_finite() {
+        (error_norm_sq / reference_norm_sq).sqrt()
+    } else if reference_norm_sq == 0.0 && error_norm_sq == 0.0 {
+        0.0
+    } else {
+        f64::INFINITY
+    }
+}
+
+fn build_sparse_candidate_mask(reference: &[f32], target_sparsity: f64, threshold: f64) -> Vec<u8> {
+    if target_sparsity > 0.0 && !reference.is_empty() {
+        let prune_count = (target_sparsity.clamp(0.0, 1.0) * reference.len() as f64)
+            .round()
+            .min(reference.len() as f64) as usize;
+        let mut ordered_indices: Vec<usize> = (0..reference.len()).collect();
+        ordered_indices.sort_unstable_by(|left, right| {
+            reference[*left]
+                .abs()
+                .total_cmp(&reference[*right].abs())
+                .then_with(|| left.cmp(right))
+        });
+        let mut mask = vec![1u8; reference.len()];
+        for &index in ordered_indices.iter().take(prune_count) {
+            mask[index] = 0;
+        }
+        for (keep, value) in mask.iter_mut().zip(reference.iter()) {
+            if *value == 0.0 {
+                *keep = 0;
+            }
+        }
+        return mask;
+    }
+
+    let threshold = threshold.max(0.0) as f32;
+    reference
+        .iter()
+        .map(|value| u8::from(*value != 0.0 && value.abs() >= threshold))
+        .collect()
 }
 
 fn clone_linear_detached(src: &Linear) -> Linear {
@@ -5284,6 +6004,17 @@ mod tests {
         assert_eq!(storage_rejected.snapshot_state().candidate_sparsity, 0.5);
         assert!(!storage_rejected.candidate_is_eligible());
 
+        let boundary = AchfConfig {
+            candidate_target_sparsity: 0.51,
+            prune_threshold: 0.0,
+            candidate_max_relative_error: 1.0,
+            ..base.clone()
+        };
+        let mut boundary_eligible = AchfLayer::new(64, 64, false, boundary, 303);
+        boundary_eligible.rebuild_candidate_from_reference();
+        assert!(boundary_eligible.snapshot_state().candidate_sparsity >= 0.51);
+        assert!(boundary_eligible.candidate_is_eligible());
+
         let mut eligible = AchfLayer::new(8, 8, false, base.clone(), 301);
         {
             let mut weights = eligible.weight.weight.data_write_f32();
@@ -5390,5 +6121,110 @@ mod tests {
             .iter()
             .zip(reference_after_optimizer.iter())
             .all(|(candidate, reference)| *candidate == 0.0 || candidate == reference));
+    }
+
+    #[test]
+    fn achf_target_sparsity_is_exact_and_ties_are_index_deterministic() {
+        let config = AchfConfig {
+            enabled: true,
+            candidate_mode: "sparse".to_string(),
+            candidate_target_sparsity: 0.5,
+            prune_threshold: 100.0,
+            candidate_min_sparsity: 0.0,
+            candidate_max_relative_error: 1.0,
+            ..Default::default()
+        };
+        let mut layer = AchfLayer::new(2, 4, false, config, 401);
+        let reference = vec![1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0];
+        sync_weight_from_host_f32(&layer.weight.weight, &reference);
+        layer.rebuild_candidate_from_reference();
+
+        assert_eq!(layer.weight.weight.data_to_f32_vec(), reference);
+        assert_eq!(
+            layer.sparse_mask.as_deref(),
+            Some(&[0, 0, 0, 0, 1, 1, 1, 1][..])
+        );
+        assert_eq!(layer.snapshot_state().candidate_sparsity, 0.5);
+
+        let first_mask = layer.sparse_mask.clone();
+        layer.rebuild_candidate_from_reference();
+        assert_eq!(layer.sparse_mask, first_mask);
+    }
+
+    #[test]
+    fn achf_output_calibration_admission_uses_held_out_outputs() {
+        let config = AchfConfig {
+            enabled: true,
+            candidate_mode: "sparse".to_string(),
+            candidate_target_sparsity: 0.75,
+            prune_threshold: 0.0,
+            candidate_min_sparsity: 0.5,
+            candidate_max_relative_error: 0.0,
+            candidate_max_output_relative_error: 0.0,
+            candidate_min_calibration_samples: 1,
+            candidate_calibration_steps: 1,
+            candidate_calibration_max_samples: 8,
+            ..Default::default()
+        };
+        let mut layer = AchfLayer::new_square(4, config, 402);
+        sync_weight_from_host_f32(
+            &layer.weight.weight,
+            &[
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ],
+        );
+        let reference_before = layer.weight.weight.data_to_f32_vec();
+        assert!(layer.begin_candidate_calibration());
+        assert!(!layer.candidate_is_eligible());
+
+        layer.set_candidate_calibration_validation();
+        let input = Tensor::new_f32(vec![1.0, 2.0, 3.0, 4.0, -1.0, -2.0, -3.0, -4.0], vec![2, 4]);
+        let output = layer.forward(&input);
+        assert_eq!(output.data_as_f64_vec(), input.data_as_f64_vec());
+        layer.record_candidate_calibration_checkpoint(0);
+        layer.finalize_candidate_calibration(1, 0.0);
+
+        let snapshot = layer.snapshot_state();
+        assert_eq!(layer.weight.weight.data_to_f32_vec(), reference_before);
+        assert_eq!(snapshot.candidate_output_relative_error, 0.0);
+        assert_eq!(snapshot.candidate_output_samples, 2);
+        assert_eq!(snapshot.candidate_masked_weight_max_abs, 0.0);
+        assert_eq!(snapshot.candidate_masked_gradient_max_abs, 0.0);
+        assert_eq!(snapshot.candidate_masked_moment_max_abs, 0.0);
+        assert!(layer.candidate_is_eligible());
+        assert!(layer.candidate_calibration.calibrated);
+        assert!(layer.candidate_calibration.trace.len() >= 2);
+    }
+
+    #[test]
+    fn achf_sparse_training_owns_candidate_and_masks_gradients() {
+        let config = AchfConfig {
+            enabled: true,
+            candidate_mode: "sparse".to_string(),
+            candidate_target_sparsity: 0.75,
+            candidate_train_from_scratch: true,
+            candidate_min_sparsity: 0.5,
+            candidate_max_relative_error: 1.0,
+            ..Default::default()
+        };
+        let layer = AchfLayer::new_square(4, config, 403);
+        let reference_before = layer.weight.weight.data_to_f32_vec();
+        let mask = layer.sparse_mask.clone().unwrap();
+        let input = Tensor::new_f32(vec![1.0, 2.0, 3.0, 4.0], vec![1, 4]);
+        layer.forward(&input).sum().backward();
+
+        let reference_gradient = layer.weight.weight.grad_to_f32_vec();
+        let candidate = layer.valid_sparse_weight().unwrap();
+        let candidate_gradient = candidate.weight.grad_to_f32_vec();
+        assert!(reference_gradient.iter().all(|gradient| *gradient == 0.0));
+        assert!(candidate_gradient
+            .iter()
+            .zip(mask.iter())
+            .all(|(gradient, keep)| *keep != 0 || *gradient == 0.0));
+        assert!(candidate_gradient
+            .iter()
+            .zip(mask.iter())
+            .any(|(gradient, keep)| *keep != 0 && *gradient != 0.0));
+        assert_eq!(layer.weight.weight.data_to_f32_vec(), reference_before);
     }
 }

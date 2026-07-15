@@ -689,6 +689,112 @@ impl LuckTransformer {
         }
     }
 
+    pub fn begin_achf_candidate_calibration(&mut self) -> usize {
+        let mut active_layers = 0usize;
+        for block in &mut self.blocks {
+            for achf in block
+                .achf_ffn
+                .iter_mut()
+                .chain(block.mla_layer.achf_wo.iter_mut())
+            {
+                active_layers += usize::from(achf.begin_candidate_calibration());
+            }
+        }
+        active_layers
+    }
+
+    pub fn set_achf_candidate_calibration_training(&self) {
+        for block in &self.blocks {
+            for achf in block.achf_ffn.iter().chain(block.mla_layer.achf_wo.iter()) {
+                achf.set_candidate_calibration_training();
+            }
+        }
+    }
+
+    pub fn set_achf_candidate_calibration_validation(&self) {
+        for block in &self.blocks {
+            for achf in block.achf_ffn.iter().chain(block.mla_layer.achf_wo.iter()) {
+                achf.set_candidate_calibration_validation();
+            }
+        }
+    }
+
+    pub fn achf_candidate_calibration_parameters(&self) -> Vec<Tensor> {
+        self.blocks
+            .iter()
+            .flat_map(|block| block.achf_ffn.iter().chain(block.mla_layer.achf_wo.iter()))
+            .flat_map(AchfLayer::candidate_calibration_parameters)
+            .collect()
+    }
+
+    pub fn achf_candidate_calibration_parameter_masks(&self) -> Vec<Option<Vec<u8>>> {
+        self.blocks
+            .iter()
+            .flat_map(|block| block.achf_ffn.iter().chain(block.mla_layer.achf_wo.iter()))
+            .flat_map(AchfLayer::candidate_calibration_parameter_masks)
+            .collect()
+    }
+
+    pub fn achf_candidate_calibration_records(&self) -> Vec<crate::achf::AchfCandidateCalibration> {
+        self.blocks
+            .iter()
+            .flat_map(|block| block.achf_ffn.iter().chain(block.mla_layer.achf_wo.iter()))
+            .map(AchfLayer::candidate_calibration_record)
+            .collect()
+    }
+
+    pub fn take_achf_candidate_calibration_loss(&self) -> Option<Tensor> {
+        let mut total: Option<Tensor> = None;
+        for block in &self.blocks {
+            for achf in block.achf_ffn.iter().chain(block.mla_layer.achf_wo.iter()) {
+                if let Some(loss) = achf.take_candidate_calibration_loss() {
+                    total = Some(total.map_or(loss.clone(), |accumulated| accumulated + loss));
+                }
+            }
+        }
+        total
+    }
+
+    pub fn enforce_achf_candidate_masks(&mut self) {
+        for block in &mut self.blocks {
+            for achf in block
+                .achf_ffn
+                .iter_mut()
+                .chain(block.mla_layer.achf_wo.iter_mut())
+            {
+                achf.enforce_candidate_mask();
+            }
+        }
+    }
+
+    pub fn record_achf_candidate_calibration_checkpoint(&mut self, step: usize) {
+        for block in &mut self.blocks {
+            for achf in block
+                .achf_ffn
+                .iter_mut()
+                .chain(block.mla_layer.achf_wo.iter_mut())
+            {
+                achf.record_candidate_calibration_checkpoint(step);
+            }
+        }
+    }
+
+    pub fn finalize_achf_candidate_calibration(
+        &mut self,
+        steps: usize,
+        masked_moment_max_abs: f64,
+    ) {
+        for block in &mut self.blocks {
+            for achf in block
+                .achf_ffn
+                .iter_mut()
+                .chain(block.mla_layer.achf_wo.iter_mut())
+            {
+                achf.finalize_candidate_calibration(steps, masked_moment_max_abs);
+            }
+        }
+    }
+
     pub fn snapshot_achf(&self) -> Option<crate::achf::AchfStateSnapshot> {
         for block in &self.blocks {
             if let Some(achf) = &block.achf_ffn {
@@ -786,13 +892,13 @@ impl LuckTransformer {
         }
     }
 
-    pub fn rebuild_achf_inference_candidates(&mut self, threshold: f64) {
+    pub fn rebuild_achf_inference_candidates_target(&mut self, target_sparsity: f64) {
         for block in &mut self.blocks {
             if let Some(achf) = &mut block.achf_ffn {
-                achf.rebuild_inference_candidate(threshold);
+                achf.rebuild_inference_candidate_target(target_sparsity);
             }
             if let Some(achf) = &mut block.mla_layer.achf_wo {
-                achf.rebuild_inference_candidate(threshold);
+                achf.rebuild_inference_candidate_target(target_sparsity);
             }
         }
     }

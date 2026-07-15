@@ -379,7 +379,11 @@ fn ppo_architecture(config: &Config) -> String {
 
 fn achf_config_fingerprint(achf: &AchfConfig) -> String {
     format!(
+        concat!(
         "enabled={}|mode={}|candidate_mode={}|candidate_refresh_freq={}|proj_mode={}|ortho_penalty_freq={}|proj_steps={}|lambda_ortho={:.17}|gate_mode={}|gate_momentum={:.17}|gate_beta={:.17}|gate_alpha={:.17}|g_min={:.17}|gate_warmup={}|gate_trans={}|gate_k_clip={:.17}|g_tgt_min={:.17}|g_tgt_max={:.17}|g_min_adapt={:.17}|g_min_mom={:.17}|cache_min_rows={}|cache_min_nz={:.17}|cache_min_reuse={}|path_warmup={}|path_min_dwell={}|cache_sp_rows={}|cache_cost={:.17}|cache_adapt={:.17}|cache_bias_min={:.17}|cache_bias_max={:.17}|cache_lat_ema={:.17}|cache_lat_long={:.17}|cache_blend={:.17}|cache_lat_every={}|cache_log_int={}|cache_log_layer={}|rank={}|prune={:.17}|candidate_min_sparsity={:.17}|candidate_max_relative_error={:.17}|candidate_weight_error_momentum={:.17}|attn={}|ffn={}|dqn={}|infer_gate={}",
+        "|candidate_target_sparsity={:.17}|candidate_max_output_relative_error={:.17}|candidate_min_calibration_samples={}|candidate_calibration_steps={}|candidate_calibration_lr={:.17}|candidate_calibration_max_samples={}",
+        "|candidate_train_from_scratch={}"
+        ),
         achf.enabled,
         achf.mode,
         achf.candidate_mode,
@@ -425,6 +429,13 @@ fn achf_config_fingerprint(achf: &AchfConfig) -> String {
         achf.apply_ffn,
         achf.apply_dqn,
         achf.infer_gate,
+        achf.candidate_target_sparsity,
+        achf.candidate_max_output_relative_error,
+        achf.candidate_min_calibration_samples,
+        achf.candidate_calibration_steps,
+        achf.candidate_calibration_lr,
+        achf.candidate_calibration_max_samples,
+        achf.candidate_train_from_scratch,
     )
 }
 

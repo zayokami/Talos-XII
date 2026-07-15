@@ -736,6 +736,74 @@ impl DuelingQNetwork {
         }
     }
 
+    pub fn begin_achf_candidate_calibration(&mut self) -> bool {
+        self.achf
+            .as_mut()
+            .is_some_and(AchfLayer::begin_candidate_calibration)
+    }
+
+    pub fn set_achf_candidate_calibration_training(&self) {
+        if let Some(achf) = &self.achf {
+            achf.set_candidate_calibration_training();
+        }
+    }
+
+    pub fn set_achf_candidate_calibration_validation(&self) {
+        if let Some(achf) = &self.achf {
+            achf.set_candidate_calibration_validation();
+        }
+    }
+
+    pub fn achf_candidate_calibration_parameters(&self) -> Vec<Tensor> {
+        self.achf
+            .as_ref()
+            .map(AchfLayer::candidate_calibration_parameters)
+            .unwrap_or_default()
+    }
+
+    pub fn achf_candidate_calibration_parameter_masks(&self) -> Vec<Option<Vec<u8>>> {
+        self.achf
+            .as_ref()
+            .map(AchfLayer::candidate_calibration_parameter_masks)
+            .unwrap_or_default()
+    }
+
+    pub fn take_achf_candidate_calibration_loss(&self) -> Option<Tensor> {
+        self.achf
+            .as_ref()
+            .and_then(AchfLayer::take_candidate_calibration_loss)
+    }
+
+    pub fn enforce_achf_candidate_mask(&mut self) {
+        if let Some(achf) = &mut self.achf {
+            achf.enforce_candidate_mask();
+        }
+    }
+
+    pub fn record_achf_candidate_calibration_checkpoint(&mut self, step: usize) {
+        if let Some(achf) = &mut self.achf {
+            achf.record_candidate_calibration_checkpoint(step);
+        }
+    }
+
+    pub fn finalize_achf_candidate_calibration(
+        &mut self,
+        steps: usize,
+        masked_moment_max_abs: f64,
+    ) {
+        if let Some(achf) = &mut self.achf {
+            achf.finalize_candidate_calibration(steps, masked_moment_max_abs);
+        }
+    }
+
+    pub fn achf_candidate_calibration_records(&self) -> Vec<crate::achf::AchfCandidateCalibration> {
+        self.achf
+            .as_ref()
+            .map(AchfLayer::candidate_calibration_record)
+            .into_iter()
+            .collect()
+    }
+
     pub fn achf_cache_stats(&self) -> Option<crate::achf::AchfCacheStats> {
         self.achf.as_ref().map(|achf| achf.cache_stats())
     }
@@ -1199,6 +1267,30 @@ impl Adam {
             param.zero_grad();
         }
     }
+
+    fn masked_moment_max_abs(&self, masks: &[Option<Vec<u8>>]) -> f64 {
+        let mut maximum = 0.0f64;
+        for ((first_moment, second_moment), mask) in
+            self.m.iter().zip(self.v.iter()).zip(masks.iter())
+        {
+            let Some(mask) = mask else {
+                continue;
+            };
+            for ((first, second), keep) in first_moment
+                .iter()
+                .zip(second_moment.iter())
+                .zip(mask.iter())
+            {
+                if *keep == 0 {
+                    if !first.is_finite() || !second.is_finite() {
+                        return f64::INFINITY;
+                    }
+                    maximum = maximum.max(first.abs() as f64).max(second.abs() as f64);
+                }
+            }
+        }
+        maximum
+    }
 }
 
 #[cfg(cuda)]
@@ -1359,6 +1451,54 @@ impl GpuAdam {
             p.zero_grad();
         }
     }
+
+    fn masked_moment_max_abs(&self, masks: &[Option<Vec<u8>>]) -> f64 {
+        use crate::cuda::memory::{copy_d2h, CudaBuffer};
+        let mut maximum = 0.0f64;
+        for ((first_moment, second_moment), mask) in
+            self.m.iter().zip(self.v.iter()).zip(masks.iter())
+        {
+            let Some(mask) = mask else {
+                continue;
+            };
+            let (first, second): (Vec<f64>, Vec<f64>) =
+                match (first_moment.as_ref(), second_moment.as_ref()) {
+                    (CudaBuffer::F32(first), CudaBuffer::F32(second)) => {
+                        let mut first_host = vec![0.0f32; first.len()];
+                        let mut second_host = vec![0.0f32; second.len()];
+                        if copy_d2h(&mut first_host, first).is_err()
+                            || copy_d2h(&mut second_host, second).is_err()
+                        {
+                            return f64::INFINITY;
+                        }
+                        (
+                            first_host.into_iter().map(f64::from).collect(),
+                            second_host.into_iter().map(f64::from).collect(),
+                        )
+                    }
+                    (CudaBuffer::F64(first), CudaBuffer::F64(second)) => {
+                        let mut first_host = vec![0.0f64; first.len()];
+                        let mut second_host = vec![0.0f64; second.len()];
+                        if copy_d2h(&mut first_host, first).is_err()
+                            || copy_d2h(&mut second_host, second).is_err()
+                        {
+                            return f64::INFINITY;
+                        }
+                        (first_host, second_host)
+                    }
+                    _ => return f64::INFINITY,
+                };
+            for ((first, second), keep) in first.iter().zip(second.iter()).zip(mask.iter()) {
+                if *keep == 0 {
+                    if !first.is_finite() || !second.is_finite() {
+                        return f64::INFINITY;
+                    }
+                    maximum = maximum.max(first.abs()).max(second.abs());
+                }
+            }
+        }
+        maximum
+    }
 }
 
 enum Optimizer {
@@ -1368,6 +1508,19 @@ enum Optimizer {
 }
 
 impl Optimizer {
+    fn new(params: Vec<Tensor>, learning_rate: f64) -> Self {
+        #[cfg(cuda)]
+        {
+            GpuAdam::new(params.clone(), learning_rate)
+                .map(Optimizer::Gpu)
+                .unwrap_or_else(|| Optimizer::Cpu(Adam::new(params, learning_rate)))
+        }
+        #[cfg(not(cuda))]
+        {
+            Optimizer::Cpu(Adam::new(params, learning_rate))
+        }
+    }
+
     fn step(&mut self) {
         match self {
             Optimizer::Cpu(o) => o.step(),
@@ -1381,6 +1534,14 @@ impl Optimizer {
             Optimizer::Cpu(o) => o.zero_grad(),
             #[cfg(cuda)]
             Optimizer::Gpu(o) => o.zero_grad(),
+        }
+    }
+
+    fn masked_moment_max_abs(&self, masks: &[Option<Vec<u8>>]) -> f64 {
+        match self {
+            Optimizer::Cpu(optimizer) => optimizer.masked_moment_max_abs(masks),
+            #[cfg(cuda)]
+            Optimizer::Gpu(optimizer) => optimizer.masked_moment_max_abs(masks),
         }
     }
 }
@@ -1521,6 +1682,24 @@ impl ReplayBuffer {
             }
         }
         self.tree.add(priority, exp);
+    }
+
+    fn calibration_states(&self, maximum: usize) -> Vec<Vec<f64>> {
+        if maximum == 0 {
+            return Vec::new();
+        }
+        let mut states = Vec::with_capacity(maximum);
+        for experience in self.tree.data.iter().flatten() {
+            for state in [&experience.state, &experience.next_state] {
+                if state.len() == DIM {
+                    states.push(state.clone());
+                    if states.len() == maximum {
+                        return states;
+                    }
+                }
+            }
+        }
+        states
     }
 
     /// Proportional PER sampling with importance-sampling weights.
@@ -1953,6 +2132,154 @@ pub fn train_dqn(
     )
 }
 
+fn dqn_candidate_calibration_batch(corpus: &[Vec<f64>], indices: &[usize]) -> Option<Tensor> {
+    if indices.is_empty() {
+        return None;
+    }
+    let mut data = Vec::with_capacity(indices.len() * DIM);
+    for &index in indices {
+        let state = corpus.get(index)?;
+        if state.len() != DIM {
+            return None;
+        }
+        data.extend_from_slice(state);
+    }
+    let batch = Tensor::new_f32(data, vec![indices.len(), DIM]);
+    #[cfg(cuda)]
+    {
+        Some(batch.to_cuda().unwrap_or(batch))
+    }
+    #[cfg(not(cuda))]
+    {
+        Some(batch)
+    }
+}
+
+fn validate_dqn_achf_candidate(
+    policy: &mut DuelingQNetwork,
+    corpus: &[Vec<f64>],
+    validation_indices: &[usize],
+    step: usize,
+) {
+    policy.set_achf_candidate_calibration_validation();
+    for chunk in validation_indices.chunks(BATCH_SIZE) {
+        if let Some(batch) = dqn_candidate_calibration_batch(corpus, chunk) {
+            let _ = policy.forward(&batch);
+        }
+    }
+    policy.record_achf_candidate_calibration_checkpoint(step);
+}
+
+fn dqn_candidate_calibration_target_met(
+    policy: &DuelingQNetwork,
+    minimum_samples: usize,
+    maximum_relative_error: f64,
+) -> bool {
+    let records = policy.achf_candidate_calibration_records();
+    !records.is_empty()
+        && records.iter().all(|record| {
+            record.trace.last().is_some_and(|point| {
+                point.samples >= minimum_samples
+                    && point.output_relative_error.is_finite()
+                    && point.output_relative_error <= maximum_relative_error
+            })
+        })
+}
+
+fn calibrate_dqn_achf_candidate(
+    policy: &mut DuelingQNetwork,
+    replay_buffer: &ReplayBuffer,
+    config: &Config,
+) {
+    let calibration = &config.achf;
+    if !calibration.enabled
+        || !calibration.apply_dqn
+        || calibration.candidate_mode != "sparse"
+        || calibration.candidate_train_from_scratch
+        || calibration.candidate_calibration_steps == 0
+        || calibration.candidate_calibration_max_samples == 0
+    {
+        return;
+    }
+    let corpus = replay_buffer.calibration_states(calibration.candidate_calibration_max_samples);
+    if corpus.len() < 2 || !policy.begin_achf_candidate_calibration() {
+        eprintln!("[ACHF] DQN candidate calibration skipped: fewer than two valid replay states");
+        return;
+    }
+    let parameters = policy.achf_candidate_calibration_parameters();
+    let parameter_masks = policy.achf_candidate_calibration_parameter_masks();
+    assert_eq!(
+        parameters.len(),
+        parameter_masks.len(),
+        "DQN ACHF candidate calibration parameter/mask topology mismatch"
+    );
+    let mut optimizer = Optimizer::new(parameters, calibration.candidate_calibration_lr);
+    let mut training_indices = Vec::new();
+    let mut validation_indices = Vec::new();
+    for index in 0..corpus.len() {
+        if index % 4 == 0 {
+            validation_indices.push(index);
+        } else {
+            training_indices.push(index);
+        }
+    }
+    if training_indices.is_empty() {
+        training_indices.push(validation_indices[0]);
+    }
+    if validation_indices.is_empty() {
+        validation_indices.push(training_indices[0]);
+    }
+
+    let total_steps = calibration.candidate_calibration_steps;
+    let checkpoint_interval = (total_steps / 4).max(1);
+    validate_dqn_achf_candidate(policy, &corpus, &validation_indices, 0);
+    let mut completed_steps = 0usize;
+    for step in 1..=total_steps {
+        let start = ((step - 1) * BATCH_SIZE) % training_indices.len();
+        let count = BATCH_SIZE.min(training_indices.len()).max(1);
+        let batch_indices: Vec<usize> = (0..count)
+            .map(|offset| training_indices[(start + offset) % training_indices.len()])
+            .collect();
+        policy.set_achf_candidate_calibration_training();
+        optimizer.zero_grad();
+        let Some(batch) = dqn_candidate_calibration_batch(&corpus, &batch_indices) else {
+            continue;
+        };
+        let _ = policy.forward(&batch);
+        let Some(loss) = policy.take_achf_candidate_calibration_loss() else {
+            continue;
+        };
+        loss.backward();
+        optimizer.step();
+        policy.enforce_achf_candidate_mask();
+        completed_steps = step;
+        if step.is_multiple_of(checkpoint_interval) || step == total_steps {
+            validate_dqn_achf_candidate(policy, &corpus, &validation_indices, step);
+            if dqn_candidate_calibration_target_met(
+                policy,
+                calibration.candidate_min_calibration_samples,
+                calibration.candidate_max_output_relative_error,
+            ) {
+                break;
+            }
+        }
+    }
+    if completed_steps != total_steps {
+        validate_dqn_achf_candidate(policy, &corpus, &validation_indices, completed_steps);
+    }
+    let masked_moment_max_abs = optimizer.masked_moment_max_abs(&parameter_masks);
+    policy.finalize_achf_candidate_calibration(completed_steps, masked_moment_max_abs);
+    if let Some(memory) = policy.achf_memory_stats() {
+        println!(
+            "[ACHF] DQN candidate calibration: steps={completed_steps}, validation_samples={}, output_error={:.6}, eligible={}/{}",
+            memory.candidate_output_samples,
+            memory.candidate_output_relative_error().unwrap_or(f64::INFINITY),
+            memory.eligible_candidate_layers,
+            memory.candidate_layers,
+        );
+    }
+}
+
 fn train_dqn_impl(
     _initial_model: &NeuralLuckOptimizer,
     rng: &mut Rng,
@@ -2338,6 +2665,7 @@ fn train_dqn_impl(
         }
     }
     pb.finish_with_message("DQN Training Complete.");
+    calibrate_dqn_achf_candidate(&mut policy_net, &replay_buffer, config);
     policy_net.freeze_achf_for_inference();
     policy_net
 }
@@ -2941,5 +3269,61 @@ mod tests {
                 "idx {idx}: inference_target={actual}, tensor_target={expected}"
             );
         }
+    }
+
+    #[test]
+    fn dqn_candidate_calibration_uses_replay_without_mutating_reference() {
+        let mut config = small_dqn_config();
+        config.achf = AchfConfig {
+            enabled: true,
+            apply_dqn: true,
+            candidate_mode: "sparse".to_string(),
+            candidate_target_sparsity: 0.75,
+            prune_threshold: 0.0,
+            candidate_min_sparsity: 0.5,
+            candidate_max_output_relative_error: 1.0,
+            candidate_min_calibration_samples: 1,
+            candidate_calibration_steps: 2,
+            candidate_calibration_max_samples: 16,
+            ..Default::default()
+        };
+        let mut policy = DuelingQNetwork::new_with_config(&config, 17);
+        let reference_before = policy
+            .achf
+            .as_ref()
+            .unwrap()
+            .weight
+            .weight
+            .data_to_f32_vec();
+        let mut replay = ReplayBuffer::new(32);
+        for sample in 0..8 {
+            let state: Vec<f64> = (0..DIM)
+                .map(|index| (sample * DIM + index) as f64 / 64.0)
+                .collect();
+            let next_state: Vec<f64> = state.iter().map(|value| value + 0.01).collect();
+            replay.push(Experience {
+                state,
+                action: sample % ACTION_SPACE,
+                reward: 0.0,
+                next_state,
+                done: false,
+            });
+        }
+
+        calibrate_dqn_achf_candidate(&mut policy, &replay, &config);
+
+        let layer = policy.achf.as_ref().unwrap();
+        assert_eq!(layer.weight.weight.data_to_f32_vec(), reference_before);
+        assert!(layer.candidate_calibration.calibrated);
+        assert_eq!(layer.candidate_calibration.steps, 1);
+        assert!(
+            layer.candidate_calibration.output_relative_error
+                <= config.achf.candidate_max_output_relative_error
+        );
+        assert!(layer.candidate_calibration.output_samples > 0);
+        assert!(layer.candidate_calibration.trace.len() >= 2);
+        assert_eq!(layer.candidate_calibration.masked_weight_max_abs, 0.0);
+        assert_eq!(layer.candidate_calibration.masked_gradient_max_abs, 0.0);
+        assert_eq!(layer.candidate_calibration.masked_moment_max_abs, 0.0);
     }
 }

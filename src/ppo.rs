@@ -264,6 +264,52 @@ impl ActorCritic {
         self.backbone.freeze_achf_for_inference();
     }
 
+    pub fn begin_achf_candidate_calibration(&mut self) -> usize {
+        self.backbone.begin_achf_candidate_calibration()
+    }
+
+    pub fn set_achf_candidate_calibration_training(&self) {
+        self.backbone.set_achf_candidate_calibration_training();
+    }
+
+    pub fn set_achf_candidate_calibration_validation(&self) {
+        self.backbone.set_achf_candidate_calibration_validation();
+    }
+
+    pub fn achf_candidate_calibration_parameters(&self) -> Vec<Tensor> {
+        self.backbone.achf_candidate_calibration_parameters()
+    }
+
+    pub fn achf_candidate_calibration_parameter_masks(&self) -> Vec<Option<Vec<u8>>> {
+        self.backbone.achf_candidate_calibration_parameter_masks()
+    }
+
+    pub fn achf_candidate_calibration_records(&self) -> Vec<crate::achf::AchfCandidateCalibration> {
+        self.backbone.achf_candidate_calibration_records()
+    }
+
+    pub fn take_achf_candidate_calibration_loss(&self) -> Option<Tensor> {
+        self.backbone.take_achf_candidate_calibration_loss()
+    }
+
+    pub fn enforce_achf_candidate_masks(&mut self) {
+        self.backbone.enforce_achf_candidate_masks();
+    }
+
+    pub fn record_achf_candidate_calibration_checkpoint(&mut self, step: usize) {
+        self.backbone
+            .record_achf_candidate_calibration_checkpoint(step);
+    }
+
+    pub fn finalize_achf_candidate_calibration(
+        &mut self,
+        steps: usize,
+        masked_moment_max_abs: f64,
+    ) {
+        self.backbone
+            .finalize_achf_candidate_calibration(steps, masked_moment_max_abs);
+    }
+
     pub fn achf_orthogonal_penalty(&self) -> Option<Tensor> {
         self.backbone.achf_orthogonal_penalty()
     }
@@ -405,8 +451,9 @@ impl ActorCritic {
         self.backbone.set_achf_inference_mode(mode, sample_every);
     }
 
-    pub fn rebuild_achf_inference_candidates(&mut self, threshold: f64) {
-        self.backbone.rebuild_achf_inference_candidates(threshold);
+    pub fn rebuild_achf_inference_candidates_target(&mut self, target_sparsity: f64) {
+        self.backbone
+            .rebuild_achf_inference_candidates_target(target_sparsity);
     }
 
     pub fn disable_achf_runtime(&mut self) {
@@ -596,6 +643,30 @@ impl Adam {
             p.zero_grad();
         }
     }
+
+    fn masked_moment_max_abs(&self, masks: &[Option<Vec<u8>>]) -> f64 {
+        let mut maximum = 0.0f64;
+        for ((first_moment, second_moment), mask) in
+            self.m.iter().zip(self.v.iter()).zip(masks.iter())
+        {
+            let Some(mask) = mask else {
+                continue;
+            };
+            for ((first, second), keep) in first_moment
+                .iter()
+                .zip(second_moment.iter())
+                .zip(mask.iter())
+            {
+                if *keep == 0 {
+                    if !first.is_finite() || !second.is_finite() {
+                        return f64::INFINITY;
+                    }
+                    maximum = maximum.max(first.abs() as f64).max(second.abs() as f64);
+                }
+            }
+        }
+        maximum
+    }
 }
 
 #[cfg(cuda)]
@@ -760,6 +831,54 @@ impl GpuAdam {
             p.zero_grad();
         }
     }
+
+    fn masked_moment_max_abs(&self, masks: &[Option<Vec<u8>>]) -> f64 {
+        use crate::cuda::memory::{copy_d2h, CudaBuffer};
+        let mut maximum = 0.0f64;
+        for ((first_moment, second_moment), mask) in
+            self.m.iter().zip(self.v.iter()).zip(masks.iter())
+        {
+            let Some(mask) = mask else {
+                continue;
+            };
+            let (first, second): (Vec<f64>, Vec<f64>) =
+                match (first_moment.as_ref(), second_moment.as_ref()) {
+                    (CudaBuffer::F32(first), CudaBuffer::F32(second)) => {
+                        let mut first_host = vec![0.0f32; first.len()];
+                        let mut second_host = vec![0.0f32; second.len()];
+                        if copy_d2h(&mut first_host, first).is_err()
+                            || copy_d2h(&mut second_host, second).is_err()
+                        {
+                            return f64::INFINITY;
+                        }
+                        (
+                            first_host.into_iter().map(f64::from).collect(),
+                            second_host.into_iter().map(f64::from).collect(),
+                        )
+                    }
+                    (CudaBuffer::F64(first), CudaBuffer::F64(second)) => {
+                        let mut first_host = vec![0.0f64; first.len()];
+                        let mut second_host = vec![0.0f64; second.len()];
+                        if copy_d2h(&mut first_host, first).is_err()
+                            || copy_d2h(&mut second_host, second).is_err()
+                        {
+                            return f64::INFINITY;
+                        }
+                        (first_host, second_host)
+                    }
+                    _ => return f64::INFINITY,
+                };
+            for ((first, second), keep) in first.iter().zip(second.iter()).zip(mask.iter()) {
+                if *keep == 0 {
+                    if !first.is_finite() || !second.is_finite() {
+                        return f64::INFINITY;
+                    }
+                    maximum = maximum.max(first.abs()).max(second.abs());
+                }
+            }
+        }
+        maximum
+    }
 }
 
 enum Optimizer {
@@ -769,6 +888,19 @@ enum Optimizer {
 }
 
 impl Optimizer {
+    fn new(params: Vec<Tensor>, lr: f64) -> Self {
+        #[cfg(cuda)]
+        {
+            GpuAdam::new(params.clone(), lr)
+                .map(Optimizer::Gpu)
+                .unwrap_or_else(|| Optimizer::Cpu(Adam::new(params, lr)))
+        }
+        #[cfg(not(cuda))]
+        {
+            Optimizer::Cpu(Adam::new(params, lr))
+        }
+    }
+
     fn set_lr(&mut self, lr: f64) {
         match self {
             Optimizer::Cpu(o) => o.set_lr(lr),
@@ -790,6 +922,14 @@ impl Optimizer {
             Optimizer::Cpu(o) => o.zero_grad(),
             #[cfg(cuda)]
             Optimizer::Gpu(o) => o.zero_grad(),
+        }
+    }
+
+    fn masked_moment_max_abs(&self, masks: &[Option<Vec<u8>>]) -> f64 {
+        match self {
+            Optimizer::Cpu(optimizer) => optimizer.masked_moment_max_abs(masks),
+            #[cfg(cuda)]
+            Optimizer::Gpu(optimizer) => optimizer.masked_moment_max_abs(masks),
         }
     }
 }
@@ -857,6 +997,8 @@ pub struct Ppo {
     distill_update_counter: usize,
     optimizer_step_counter: usize,
     achf_orthogonal_penalty_interval: usize,
+    achf_calibration_states: Vec<(Vec<f64>, usize)>,
+    achf_calibration_seen: usize,
     #[cfg(cuda)]
     cuda_update_cache: PpoCudaUpdateCache,
 }
@@ -926,6 +1068,8 @@ impl Ppo {
             distill_update_counter: 0,
             optimizer_step_counter: 0,
             achf_orthogonal_penalty_interval,
+            achf_calibration_states: Vec::new(),
+            achf_calibration_seen: 0,
             #[cfg(cuda)]
             cuda_update_cache: PpoCudaUpdateCache {
                 ones_action_1: None,
@@ -1005,6 +1149,193 @@ impl Ppo {
         ema.refresh_achf_after_optimizer_step();
     }
 
+    fn achf_calibration_batch(corpus: &[(Vec<f64>, usize)], indices: &[usize]) -> Option<Tensor> {
+        if indices.is_empty() {
+            return None;
+        }
+        let max_sequence_length = indices
+            .iter()
+            .filter_map(|&index| corpus.get(index).map(|entry| entry.1))
+            .max()?
+            .max(1);
+        let mut batch_data = Vec::with_capacity(indices.len() * max_sequence_length * DIM);
+        for &index in indices {
+            let (state, sequence_length) = corpus.get(index)?;
+            if *sequence_length == 0 || state.len() != sequence_length.saturating_mul(DIM) {
+                return None;
+            }
+            batch_data.extend_from_slice(state);
+            if *sequence_length < max_sequence_length {
+                batch_data.resize(
+                    batch_data.len() + (max_sequence_length - sequence_length) * DIM,
+                    0.0,
+                );
+            }
+        }
+        let batch = Tensor::new_f32(batch_data, vec![indices.len(), max_sequence_length, DIM]);
+        #[cfg(cuda)]
+        {
+            Some(batch.to_cuda().unwrap_or(batch))
+        }
+        #[cfg(not(cuda))]
+        {
+            Some(batch)
+        }
+    }
+
+    fn validate_achf_candidates(
+        policy: &mut ActorCritic,
+        corpus: &[(Vec<f64>, usize)],
+        validation_indices: &[usize],
+        batch_size: usize,
+        step: usize,
+    ) {
+        policy.set_achf_candidate_calibration_validation();
+        for chunk in validation_indices.chunks(batch_size.max(1)) {
+            if let Some(batch) = Self::achf_calibration_batch(corpus, chunk) {
+                let _ = policy.forward_actor_critic_batch(&batch);
+            }
+        }
+        policy.record_achf_candidate_calibration_checkpoint(step);
+    }
+
+    fn achf_candidate_calibration_target_met(
+        policy: &ActorCritic,
+        minimum_samples: usize,
+        maximum_relative_error: f64,
+    ) -> bool {
+        let records = policy.achf_candidate_calibration_records();
+        !records.is_empty()
+            && records.iter().all(|record| {
+                record.trace.last().is_some_and(|point| {
+                    point.samples >= minimum_samples
+                        && point.output_relative_error.is_finite()
+                        && point.output_relative_error <= maximum_relative_error
+                })
+            })
+    }
+
+    fn calibrate_achf_candidates(&mut self) {
+        let Some(config) = self.policy.achf_config() else {
+            return;
+        };
+        if !config.enabled
+            || config.candidate_mode != "sparse"
+            || config.candidate_train_from_scratch
+            || config.candidate_calibration_steps == 0
+            || config.candidate_calibration_max_samples == 0
+        {
+            return;
+        }
+        let corpus: Vec<(Vec<f64>, usize)> = self
+            .achf_calibration_states
+            .iter()
+            .filter(|(state, sequence_length)| {
+                *sequence_length > 0 && state.len() == sequence_length.saturating_mul(DIM)
+            })
+            .cloned()
+            .collect();
+        if corpus.len() < 2 {
+            eprintln!("[ACHF] Candidate calibration skipped: fewer than two valid rollout states");
+            return;
+        }
+        let active_layers = self.policy.begin_achf_candidate_calibration();
+        if active_layers == 0 {
+            return;
+        }
+        let parameters = self.policy.achf_candidate_calibration_parameters();
+        let parameter_masks = self.policy.achf_candidate_calibration_parameter_masks();
+        assert_eq!(
+            parameters.len(),
+            parameter_masks.len(),
+            "ACHF candidate calibration parameter/mask topology mismatch"
+        );
+        let mut optimizer = Optimizer::new(parameters, config.candidate_calibration_lr);
+
+        let mut training_indices = Vec::new();
+        let mut validation_indices = Vec::new();
+        for index in 0..corpus.len() {
+            if index % 4 == 0 {
+                validation_indices.push(index);
+            } else {
+                training_indices.push(index);
+            }
+        }
+        if training_indices.is_empty() {
+            training_indices.push(validation_indices[0]);
+        }
+        if validation_indices.is_empty() {
+            validation_indices.push(training_indices[0]);
+        }
+
+        let total_steps = config.candidate_calibration_steps;
+        let checkpoint_interval = (total_steps / 4).max(1);
+        Self::validate_achf_candidates(
+            &mut self.policy,
+            &corpus,
+            &validation_indices,
+            self.batch_size,
+            0,
+        );
+        let mut completed_steps = 0usize;
+        for step in 1..=total_steps {
+            let start = ((step - 1) * self.batch_size) % training_indices.len();
+            let count = self.batch_size.min(training_indices.len()).max(1);
+            let batch_indices: Vec<usize> = (0..count)
+                .map(|offset| training_indices[(start + offset) % training_indices.len()])
+                .collect();
+            self.policy.set_achf_candidate_calibration_training();
+            optimizer.zero_grad();
+            let Some(batch) = Self::achf_calibration_batch(&corpus, &batch_indices) else {
+                continue;
+            };
+            let _ = self.policy.forward_actor_critic_batch(&batch);
+            let Some(loss) = self.policy.take_achf_candidate_calibration_loss() else {
+                continue;
+            };
+            loss.backward();
+            optimizer.step();
+            self.policy.enforce_achf_candidate_masks();
+            completed_steps = step;
+            if step.is_multiple_of(checkpoint_interval) || step == total_steps {
+                Self::validate_achf_candidates(
+                    &mut self.policy,
+                    &corpus,
+                    &validation_indices,
+                    self.batch_size,
+                    step,
+                );
+                if Self::achf_candidate_calibration_target_met(
+                    &self.policy,
+                    config.candidate_min_calibration_samples,
+                    config.candidate_max_output_relative_error,
+                ) {
+                    break;
+                }
+            }
+        }
+        if completed_steps != total_steps {
+            Self::validate_achf_candidates(
+                &mut self.policy,
+                &corpus,
+                &validation_indices,
+                self.batch_size,
+                completed_steps,
+            );
+        }
+        let masked_moment_max_abs = optimizer.masked_moment_max_abs(&parameter_masks);
+        self.policy
+            .finalize_achf_candidate_calibration(completed_steps, masked_moment_max_abs);
+        let memory = self.policy.achf_memory_stats_aggregate();
+        println!(
+            "[ACHF] Candidate calibration: layers={active_layers}, steps={completed_steps}, validation_samples={}, output_error={:.6}, eligible={}/{}",
+            memory.candidate_output_samples,
+            memory.candidate_output_relative_error().unwrap_or(f64::INFINITY),
+            memory.eligible_candidate_layers,
+            memory.candidate_layers,
+        );
+    }
+
     pub(crate) fn store_raw(&mut self, input: PpoStoreRawInput) {
         let PpoStoreRawInput {
             state,
@@ -1032,6 +1363,31 @@ impl Ppo {
         self.update_with_progress(current_lr, |_, _, _, _| {})
     }
 
+    fn capture_achf_calibration_states(&mut self) {
+        let maximum = self
+            .policy
+            .achf_config()
+            .map_or(0, |config| config.candidate_calibration_max_samples);
+        if maximum == 0 {
+            return;
+        }
+        for (state, &sequence_length) in self
+            .memory
+            .states_raw
+            .iter()
+            .zip(self.memory.state_lens.iter())
+        {
+            let slot = self.achf_calibration_seen % maximum;
+            if self.achf_calibration_states.len() < maximum {
+                self.achf_calibration_states
+                    .push((state.clone(), sequence_length));
+            } else {
+                self.achf_calibration_states[slot] = (state.clone(), sequence_length);
+            }
+            self.achf_calibration_seen = self.achf_calibration_seen.saturating_add(1);
+        }
+    }
+
     fn update_with_progress<F>(&mut self, current_lr: f64, mut on_batch: F) -> f64
     where
         F: FnMut(usize, usize, usize, usize),
@@ -1044,6 +1400,7 @@ impl Ppo {
         self.optimizer.set_lr(current_lr);
 
         let len = self.memory.states_raw.len();
+        self.capture_achf_calibration_states();
         let states_raw = std::mem::take(&mut self.memory.states_raw);
         let state_lens = std::mem::take(&mut self.memory.state_lens);
         let _pities = std::mem::take(&mut self.memory.pities);
@@ -1906,6 +2263,7 @@ fn train_ppo_impl(
         }
     }
     pb.finish_with_message("PPO Training Complete.");
+    ppo.calibrate_achf_candidates();
     ppo.policy.freeze_achf_for_inference();
     ppo.policy
 }
@@ -2519,5 +2877,57 @@ mod tests {
         assert_eq!(stats.cache_hits, 2);
         assert_eq!(stats.dense_paths, 0);
         assert_eq!(stats.sparse_paths, 0);
+    }
+
+    #[test]
+    fn ppo_candidate_calibration_uses_rollouts_and_preserves_reference() {
+        let achf = crate::config::AchfConfig {
+            enabled: true,
+            candidate_mode: "sparse".to_string(),
+            candidate_target_sparsity: 0.75,
+            prune_threshold: 0.0,
+            candidate_min_sparsity: 0.5,
+            candidate_max_output_relative_error: 1.0,
+            candidate_min_calibration_samples: 1,
+            candidate_calibration_steps: 2,
+            candidate_calibration_max_samples: 16,
+            apply_attn: false,
+            apply_ffn: true,
+            ..Default::default()
+        };
+        let policy = ActorCritic::new(21, &achf, 16, 1);
+        let reference_before = policy.backbone.blocks[0]
+            .achf_ffn
+            .as_ref()
+            .unwrap()
+            .weight
+            .weight
+            .data_to_f32_vec();
+        let mut ppo = Ppo::from_policy(policy, 1, 4);
+        ppo.achf_calibration_states = (0..12)
+            .map(|sample| {
+                let sequence_length = 1 + sample % 3;
+                (
+                    vec![0.01 * (sample as f64 + 1.0); sequence_length * DIM],
+                    sequence_length,
+                )
+            })
+            .collect();
+
+        ppo.calibrate_achf_candidates();
+
+        let layer = ppo.policy.backbone.blocks[0].achf_ffn.as_ref().unwrap();
+        assert_eq!(layer.weight.weight.data_to_f32_vec(), reference_before);
+        assert!(layer.candidate_calibration.calibrated);
+        assert_eq!(layer.candidate_calibration.steps, 1);
+        assert!(
+            layer.candidate_calibration.output_relative_error
+                <= achf.candidate_max_output_relative_error
+        );
+        assert!(layer.candidate_calibration.output_samples > 0);
+        assert!(layer.candidate_calibration.trace.len() >= 2);
+        assert_eq!(layer.candidate_calibration.masked_weight_max_abs, 0.0);
+        assert_eq!(layer.candidate_calibration.masked_gradient_max_abs, 0.0);
+        assert_eq!(layer.candidate_calibration.masked_moment_max_abs, 0.0);
     }
 }
