@@ -4,20 +4,20 @@
 [![Rust](https://img.shields.io/badge/rustc-1.89.0+-blue.svg)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**A neural network-driven gacha pull simulator for Arknights: Endfield.**
+**A Rust-developed deep learning framework.**
 
 ---
 
-Most gacha simulators only roll dice according to a probability table. Talos-XII can additionally run policy-adjusted experiments.
+Many simulation tools rely on fixed stochastic rules. Talos-XII can additionally run policy-adjusted experiments.
 
-Before a model-driven simulation, Talos-XII loads or trains EnvNet, NeuralLuckOptimizer, DQN, and PPO. EnvNet derives synthetic environment features, while DQN and PPO select one of five discrete luck modifiers under a bounded luck budget. These models do not decide whether to pull or wait; they redistribute the configured per-pull probability inside the simulator. Results therefore describe the selected simulation policy, not undisclosed in-game mechanics.
+Before a model-driven simulation, Talos-XII loads or trains EnvNet, NeuralLuckOptimizer, DQN, and PPO. EnvNet derives synthetic environment features, while DQN and PPO select one of five discrete modifiers under a bounded budget. These models do not decide whether to execute a task or wait; they redistribute configured parameters inside the simulator. Results therefore describe the selected simulation policy, not external system behavior.
 
 Technically, Talos-XII is a single Rust binary. It accelerates matrix operations via SIMD (AVX2/AVX-512/NEON) and parallelizes simulation tasks using Rayon, achieving over 10,000 simulations per second on mainstream hardware while maintaining statistical reliability.
 
 ---
 
-**由深度学习为基础开发的《明日方舟：终末地》抽卡模拟框架。**
-Talos-XII 在模型驱动模拟前加载或训练 EnvNet、NeuralLuckOptimizer、DQN 和 PPO。EnvNet 生成合成环境特征，DQN 与 PPO 在受限运势预算内选择五种离散概率修正动作。模型不会决定是否抽卡，而是在模拟器内部重新分配逐抽概率；结果表示所选模拟策略，不代表未公开的游戏机制。
+**由Rust开发的深度学习框架。**
+Talos-XII 在模型驱动运行前加载或训练 EnvNet、NeuralLuckOptimizer、DQN 和 PPO。EnvNet 生成合成环境特征，DQN 与 PPO 在受限预算内选择五种离散修正动作；结果描述所选模拟策略，不代表外部系统行为。
 
 ---
 
@@ -76,34 +76,16 @@ All subcommands support `-c <path>` for config, `-s <seed>` for repeatable runs 
 ```bash
 cargo run --release                              # interactive mode
 cargo run --release -- simulate -n 1000 -p 100   # batch simulation
-cargo run --release -- f2p                        # F2P UP-probability analysis
 cargo run --release -- benchmark                  # quick built-in benchmark
 ```
 
-See **[docs/USAGE.md](docs/USAGE.md)** for the full command reference — interactive commands, F2P output fields, the optional Python (PyO3) scripting bridge, data collection & model calibration, and the paper-grade ACHF benchmark suite.
+See **[docs/USAGE.md](docs/USAGE.md)** for the full command reference — interactive commands, the optional Python (PyO3) scripting bridge, data collection & model calibration, and the paper-grade ACHF benchmark suite.
 
 ---
 
-## Pools & Configuration
+## Model Parameter Configuration
 
-Configuration is split into two files, each with field-level documentation in its `_comment` entries:
-
-- **[data/config.json](data/config.json)** — model, training (PPO/DQN/luck-budget), worker, and ACHF parameters.
-- **[data/pools.json](data/pools.json)** — all gacha pool definitions. The path is set by `pools_path` in `config.json`.
-
-(For backward compatibility, a `pools` array embedded directly in `config.json` still takes precedence over the external file if present.)
-
-### Pool System
-
-Talos-XII supports four pool types: **character UP** (limited rate-up), **weapon UP** (weapon rate-up), **standard** (regular banner), and **beginner**. Each pool has independent ID, name, UP targets, and probability parameters. In `pools.json`, the `active_pool` field selects the current pool; archived pools (`is_archived: true`) can still be switched to manually for retrospective analysis.
-
-### Probabilities & Pity
-
-Pool rules are data-driven. `data/pools.json` is the canonical source; individual pools may override every probability and pity field.
-
-Shipped active pool contract: `char_up_20260716` uses **50%** (`up_rate = 0.5`). This active character UP pool has a 0.8% base 6-star rate, soft pity at 65, hard pity at 80, and cumulative UP guarantee at 120. Special or archived pools may use different values.
-
-Weapon UP pool: 4% base 6-star rate, hard pity at 40, mega pity at 180, UP weapon rate 50%.
+Configuration is documented in the `_comment` fields of **[data/config.json](data/config.json)**, covering model architecture, training, worker, and ACHF parameters.
 
 ---
 
@@ -111,7 +93,7 @@ Weapon UP pool: 4% base 6-star rate, hard pity at 40, mega pity at 180, UP weapo
 
 ### Simulation Engine (`src/sim.rs`)
 
-Each simulation constructs a 32-dimensional feature vector (pity progress, env noise, consecutive non-UP count, engineered interaction terms, etc.) and feeds it to the neural network for decision guidance. Three modes:
+Each simulation constructs a 32-dimensional feature vector (state, environment noise, history, engineered interaction terms, etc.) and feeds it to the neural network for decision guidance. Three modes:
 - **probability** — historical name for the NeuralLuckOptimizer path; it predicts a bounded luck modifier and is not an unmodified probability baseline
 - **dqn** — Dueling Q-Network selects one of five discrete luck modifiers
 - **ppo** — Actor-Critic with sequence context selects from the same discrete modifier set
@@ -122,12 +104,12 @@ The engine also supports a fast inference path (`fast_inference`) that skips ful
 
 On first run, four components are trained or loaded sequentially:
 
-1. **EnvNet** (5→64→32→16→2) — models gacha environment noise/bias from RNG, pity, pull count, streak, and loss streak inputs; samples (env_noise, env_bias) per simulation as environment parameters
+1. **EnvNet** (5→64→32→16→2) — models environment noise/bias from random inputs, state, and history; samples (env_noise, env_bias) per simulation as environment parameters
 2. **NeuralLuckOptimizer** — evolutionary training + linear regression + manifold RL on EnvNet-provided environment; learns 32-dim → "luck value" mapping
 3. **DQN** (Dueling, 50k steps) — maps state to Q-values over five discrete luck modifiers
 4. **PPO** (Actor-Critic + MLA Transformer) — learns a categorical policy over the same five modifiers with sequence context; its schedule is controlled by `ppo_total_steps`
 
-Model cache manifests fingerprint probability, pity, luck-budget, architecture, training, and ACHF settings. Calibrated parameters are applied before this fingerprint is computed. Character-name-only updates can reuse a cache; probability, pity, calibration, feature, architecture, or training changes rebuild incompatible caches on the next initialization. Use `-f` to force retraining.
+Model cache manifests fingerprint luck-budget, architecture, training, feature, and ACHF settings. Calibrated parameters are applied before this fingerprint is computed. Changes to these settings rebuild incompatible caches on the next initialization. Use `-f` to force retraining.
 
 ### ACHF (Adaptive Cache-aware Hyper-Connections)
 
@@ -206,7 +188,7 @@ Runtime CPU capability detection with automatic dispatch: Scalar → AVX2 → AV
 cargo test
 ```
 
-Covers: pity logic, probability monotonicity, F2P verification, DQN/Q-value validation, PPO fast/slow alignment, Actor-Critic shapes, ACHF consistency, Transformer MLA/RoPE/RMSNorm, binary codec, config parsing, Beta calibration, EnvNet serialization/training, autograd gradient checks, and more.
+Covers: state-transition logic, parameter validation, DQN/Q-value validation, PPO fast/slow alignment, Actor-Critic shapes, ACHF consistency, Transformer MLA/RoPE/RMSNorm, binary codec, config parsing, Beta calibration, EnvNet serialization/training, autograd gradient checks, and more.
 
 CI runs on Ubuntu, Windows, and macOS with ARM64 cross-compilation validation.
 
@@ -227,11 +209,9 @@ Branch strategy: `main` is production (merged from release/hotfix only), `dev` i
 **Why is first launch so slow?**
 Training EnvNet, NeuralLuckOptimizer, DQN, and PPO models takes ~30–45 seconds. Results are cached; subsequent launches take under 1 second. Enable `fast_init` in config to use shorter training settings during development.
 
-**What does "Avg Extra Jade Cost: N/A" mean in F2P analysis?**
-All simulations obtained UP within the free pull budget — no paid spending was required. This means free resources are sufficient under current pool conditions.
 
 **Can I delete the cache files?**
-Yes. These files are stored beside the executable by default. Deleting `env_net.cache`, `neural.cache`, `dqn.cache.bin`, or `ppo.cache.bin` triggers retraining for the corresponding model on next run. Deleting `dqn.cache.bf16.bin` or `ppo.cache.bf16.bin` only rebuilds the BF16 inference cache from the master model. Usually only needed when pity/probability mechanics, model architecture, feature construction, or training configuration changes.
+Yes. These files are stored beside the executable by default. Deleting `env_net.cache`, `neural.cache`, `dqn.cache.bin`, or `ppo.cache.bin` triggers retraining for the corresponding model on next run. Deleting `dqn.cache.bf16.bin` or `ppo.cache.bf16.bin` only rebuilds the BF16 inference cache from the master model. Usually only needed when model architecture, feature construction, or training configuration changes.
 
 ---
 
@@ -245,13 +225,10 @@ Yes. These files are stored beside the executable by default. Deleting `env_net.
 
 ## Disclaimer
 
-This project has no affiliation with Arknights: Endfield or Hypergryph Co., Ltd. This software is for simulation and educational purposes only. Simulation results are for reference and do not represent actual in-game probabilities. Do not use for gambling, superstition, or any illegal activities. Users bear their own risk.
+This software is provided "as is," without warranty of any kind, express or implied, including but not limited to warranties of merchantability, fitness for a particular purpose, and non-infringement. In no event shall the authors or copyright holders be liable for any claim, damages, or other liability, whether in an action of contract, tort, or otherwise, arising from, out of, or in connection with the software or the use or other dealings in the software.
 
 ---
 
-**Copyright 2026 zayoka.** MIT licensed.
-
-Contact: into@zayoka.com
 ---
 
 ## 系统要求
@@ -309,34 +286,16 @@ CUDA_ARCH=sm_89 cargo build --release --features cuda
 ```bash
 cargo run --release                              # 交互模式
 cargo run --release -- simulate -n 1000 -p 100   # 批量模拟
-cargo run --release -- f2p                        # F2P 获取 UP 概率分析
 cargo run --release -- benchmark                  # 快速内置基准
 ```
 
-完整命令参考见 **[docs/USAGE.md](docs/USAGE.md)** —— 交互指令、F2P 输出字段、可选的 Python（PyO3）脚本桥接、数据采集与模型校准，以及论文级 ACHF Benchmark 套件。
+完整命令参考见 **[docs/USAGE.md](docs/USAGE.md)** —— 交互指令、可选的 Python（PyO3）脚本桥接、数据采集与模型校准，以及论文级 ACHF Benchmark 套件。
 
 ---
 
-## 卡池与配置
+## 模型参数配置
 
-配置拆分为两个文件，各自的 `_comment` 字段有逐项说明：
-
-- **[data/config.json](data/config.json)** — 模型、训练（PPO/DQN/运势预算）、线程和 ACHF 参数。
-- **[data/pools.json](data/pools.json)** — 所有抽卡卡池定义，路径由 `config.json` 中的 `pools_path` 指定。
-
-（为向后兼容，若 `config.json` 里仍直接内嵌 `pools` 数组，则优先使用内嵌的，忽略外部文件。）
-
-### 卡池系统
-
-四种卡池类型：**角色 UP 池**、**武器 UP 池**、**常驻池**和**新手池**。每个池有独立 ID、名称、UP 对象和概率参数。在 `pools.json` 中，`active_pool` 决定当前激活的池，`pools` 数组包含所有可切换的池定义。已归档的池（`is_archived: true`）仍可在交互模式中手动切换用于回溯分析。
-
-### 概率与保底
-
-卡池规则完全由数据驱动，`data/pools.json` 是权威来源；每个卡池都可以覆盖全部概率和保底字段。
-
-随附激活卡池约定：`char_up_20260716` 使用 **50%**（`up_rate = 0.5`）。该激活角色 UP 池的基础 6 星概率为 0.8%，65 抽起软保底，80 抽硬保底，120 抽累计保底必出 UP；特殊或归档卡池可以使用不同数值。
-
-武器 UP 池：基础 6 星概率 4%，40 抽硬保底，180 抽大保底，UP 武器占 50%。
+模型参数集中记录在 **[data/config.json](data/config.json)** 的 `_comment` 字段中，涵盖模型结构、训练、线程和 ACHF 参数。
 
 ---
 
@@ -344,8 +303,8 @@ cargo run --release -- benchmark                  # 快速内置基准
 
 ### 模拟引擎（`src/sim.rs`）
 
-每次模拟构建 32 维特征向量（保底进度、环境噪声、连续未出 UP 次数以及工程化交互特征等），送入神经网络获取决策建议。三种模式：
-- **probability** — NeuralLuckOptimizer 路径的历史名称；它会预测受运势预算约束的概率修正值，并非不加修正的纯概率基线
+每次模拟构建 32 维特征向量（状态、环境噪声、历史信息以及工程化交互特征等），送入神经网络获取决策建议。三种模式：
+- **probability** — NeuralLuckOptimizer 路径的历史名称；它会预测受运势预算约束的修正值
 - **dqn** — Dueling Q-Network 从五种离散运势修正动作中选择
 - **ppo** — 带序列上下文的 Actor-Critic 从同一组离散修正动作中选择
 
@@ -355,12 +314,12 @@ cargo run --release -- benchmark                  # 快速内置基准
 
 初始化时依次训练或加载四个组件：
 
-1. **EnvNet**（5→64→32→16→2）— 基于 RNG、保底、总抽数、连抽星级和歪 UP 次数建模环境噪声/偏置，每次模拟采样一组 (env_noise, env_bias) 作为环境参数
+1. **EnvNet**（5→64→32→16→2）— 基于随机输入、状态与历史信息建模环境噪声/偏置，每次模拟采样一组 (env_noise, env_bias) 作为环境参数
 2. **NeuralLuckOptimizer** — 在 EnvNet 提供的环境上做进化训练、线性回归与流形 RL 优化，学习 32 维特征到"运气值"的映射
 3. **DQN**（Dueling，50k 步）— 将状态映射为五种离散运势修正动作的 Q 值
 4. **PPO**（Actor-Critic + MLA Transformer）— 利用序列上下文学习同一组五种修正动作上的分类策略，训练计划由 `ppo_total_steps` 控制
 
-模型缓存清单会对概率、保底、运势预算、模型结构、训练参数和 ACHF 设置生成指纹，校准参数会在计算该指纹前应用。仅修改角色名称可以复用缓存；概率、保底、校准、特征、模型结构或训练参数变化时，下次初始化会重建不兼容缓存。使用 `-f` 可强制重训。
+模型缓存清单会对运势预算、模型结构、训练参数、特征和 ACHF 设置生成指纹，校准参数会在计算该指纹前应用。上述设置变化时，下次初始化会重建不兼容缓存。使用 `-f` 可强制重训。
 
 ### ACHF（Adaptive Cache-aware Hyper-Connections）
 
@@ -439,7 +398,7 @@ AMA 是第三层内部的延迟调度器。正常情况下，只有质量层已�
 cargo test
 ```
 
-覆盖：保底逻辑、概率单调性、F2P 验证、DQN Q 值有效性、PPO 快慢路径对齐、Actor-Critic 形状、ACHF 一致性、Transformer MLA/RoPE/RMSNorm、二进制编解码、配置解析、Beta 校准、EnvNet 序列化/训练、autograd 梯度检查等。CI 在 Ubuntu、Windows、macOS 上执行，并验证 ARM64 交叉编译。
+覆盖：状态转移逻辑、参数校验、DQN Q 值有效性、PPO 快慢路径对齐、Actor-Critic 形状、ACHF 一致性、Transformer MLA/RoPE/RMSNorm、二进制编解码、配置解析、Beta 校准、EnvNet 序列化/训练、autograd 梯度检查等。CI 在 Ubuntu、Windows、macOS 上执行，并验证 ARM64 交叉编译。
 
 ---
 
@@ -458,11 +417,9 @@ cargo test
 **首次启动为什么要等很久？**
 需要训练 EnvNet、NeuralLuckOptimizer、DQN、PPO 四个模型。完成后写入缓存，之后启动不到 1 秒。开发调试可开启配置中的 `fast_init` 使用更短的训练设置。
 
-**F2P 分析的 "Avg Extra Jade Cost: N/A" 是什么意思？**
-所有模拟都在免费抽数内出了 UP，没有产生需要额外付费的样本，说明当前卡池条件下免费资源够用。
 
 **可以删除缓存文件吗？**
-可以。缓存文件默认在 exe 所在目录。删除 `env_net.cache`、`neural.cache`、`dqn.cache.bin` 或 `ppo.cache.bin` 后，下次运行会重训对应模型。删除 `dqn.cache.bf16.bin` 或 `ppo.cache.bf16.bin` 只会从主模型重建 BF16 推理缓存。一般只在保底/概率机制、模型结构、特征构造或训练配置变化时才需要清缓存。
+可以。缓存文件默认在 exe 所在目录。删除 `env_net.cache`、`neural.cache`、`dqn.cache.bin` 或 `ppo.cache.bin` 后，下次运行会重训对应模型。删除 `dqn.cache.bf16.bin` 或 `ppo.cache.bf16.bin` 只会从主模型重建 BF16 推理缓存。一般只在模型结构、特征构造或训练配置变化时才需要清缓存。
 
 ---
 
@@ -476,8 +433,9 @@ cargo test
 
 ## 免责声明
 
-本项目与《明日方舟：终末地》官方、上海鹰角网络科技有限公司无任何关联。本软件仅用于模拟与学习交流，模拟结果仅供参考，不代表游戏内实际概率。
+本软件按“原样”提供，不作任何形式的明示或暗示保证，包括但不限于适销性、特定用途的适用性和不侵权的保证。在任何情况下，无论是因为合同、侵权或其他原因，只要是由本软件、本软件的使用或其他与本软件有关的活动引起的索赔、损害赔偿或其他责任，作者或版权持有人均不承担任何责任。
 
 ---
+**Copyright 2026 zayoka.**
 
-联系方式：into@zayoka.com
+Contact: into@zayoka.com
