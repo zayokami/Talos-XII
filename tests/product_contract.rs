@@ -24,33 +24,33 @@ fn pool_by_id<'a>(pools: &'a Value, id: &str) -> &'a Value {
 }
 
 #[test]
-fn product_docs_match_the_shipped_active_pool_contract() {
-    let pools = shipped_pool_data();
-    let active_id = pools["active_pool"]
-        .as_str()
-        .expect("active_pool must be a string");
-    let active_pool = pool_by_id(&pools, active_id);
-    let up_rate = active_pool["up_rate"]
-        .as_f64()
-        .expect("active pool up_rate must be numeric");
-    let percent = up_rate * 100.0;
+fn product_docs_describe_model_parameter_configuration() {
     let readme = read("README.md");
 
-    let english_contract = format!(
-        "Shipped active pool contract: `{active_id}` uses **{percent:.0}%** (`up_rate = {up_rate}`)."
-    );
-    let chinese_contract = format!(
-        "随附激活卡池约定：`{active_id}` 使用 **{percent:.0}%**（`up_rate = {up_rate}`）。"
-    );
-
     assert!(
-        readme.contains(&english_contract),
-        "README must state the active pool value derived from data/pools.json: {english_contract}"
+        readme.contains("## Model Parameter Configuration"),
+        "README must describe model parameter configuration"
     );
     assert!(
-        readme.contains(&chinese_contract),
-        "README must state the active pool value derived from data/pools.json: {chinese_contract}"
+        readme.contains("## 模型参数配置"),
+        "README must include the Chinese model parameter configuration section"
     );
+    assert!(
+        readme.contains("data/config.json"),
+        "README must link to the model configuration file"
+    );
+    for removed_pool_text in [
+        "data/pools.json",
+        "Shipped active pool contract",
+        "随附激活卡池约定",
+        "## Pools & Configuration",
+        "## 卡池与配置",
+    ] {
+        assert!(
+            !readme.contains(removed_pool_text),
+            "README must not contain removed pool information: {removed_pool_text}"
+        );
+    }
 }
 
 #[test]
