@@ -560,10 +560,14 @@ fn validate_candidate_memory(label: &str, memory: Option<AchfMemoryStats>) {
             panic!("benchmark condition '{label}' has no aggregate candidate-error diagnostic")
         });
         assert!(
-            relative_error.is_finite()
-                && relative_error <= 1.0 + f64::EPSILON
+            memory.candidate_reference_norm_sq.is_finite()
+                && memory.candidate_reference_norm_sq >= 0.0
+                && memory.candidate_error_norm_sq.is_finite()
+                && memory.candidate_error_norm_sq >= 0.0
+                && relative_error.is_finite()
+                && relative_error >= 0.0
                 && memory.max_layer_candidate_relative_error.is_finite()
-                && memory.max_layer_candidate_relative_error <= 1.0 + f64::EPSILON,
+                && memory.max_layer_candidate_relative_error >= 0.0,
             "benchmark condition '{label}' has invalid candidate error: aggregate={relative_error}, max_layer={}",
             memory.max_layer_candidate_relative_error
         );
@@ -1219,6 +1223,56 @@ fn finalize_run_manifest(
     write_run_manifest(dir, manifest);
 }
 
+struct RunManifestGuard<'a> {
+    dir: &'a str,
+    manifest: serde_json::Value,
+    started: Instant,
+    finalized: bool,
+}
+
+impl<'a> RunManifestGuard<'a> {
+    fn new(dir: &'a str, manifest: serde_json::Value, started: Instant) -> Self {
+        Self {
+            dir,
+            manifest,
+            started,
+            finalized: false,
+        }
+    }
+
+    fn finalize(mut self) {
+        finalize_run_manifest(self.dir, &mut self.manifest, self.started.elapsed());
+        self.finalized = true;
+    }
+}
+
+impl Drop for RunManifestGuard<'_> {
+    fn drop(&mut self) {
+        if self.finalized {
+            return;
+        }
+        self.manifest["status"] = serde_json::json!("failed");
+        self.manifest["failed_unix_ms"] = serde_json::json!(unix_time_ms());
+        self.manifest["duration_seconds"] = serde_json::json!(self.started.elapsed().as_secs_f64());
+        self.manifest["failure"] = serde_json::json!({
+            "kind": if std::thread::panicking() { "panic" } else { "incomplete" },
+            "message": "benchmark exited before normal manifest finalization; inspect stderr for the originating error",
+        });
+        match serde_json::to_string_pretty(&self.manifest) {
+            Ok(json) => {
+                if let Err(error) =
+                    try_write_text_file(&format!("{}/run_manifest.json", self.dir), &json)
+                {
+                    eprintln!("[Bench Error] failed to persist failed run manifest: {error}");
+                }
+            }
+            Err(error) => {
+                eprintln!("[Bench Error] failed to serialize failed run manifest: {error}");
+            }
+        }
+    }
+}
+
 fn chart_format_name(format: &ChartFormat) -> &'static str {
     match format {
         ChartFormat::Svg => "svg",
@@ -1565,12 +1619,13 @@ pub fn run_achf_benchmarks(base_config: &Config, seed: u64, bench_cfg: &BenchCon
     let nt = bench_cfg.num_trials;
     prepare_output_directory(dir);
     let run_started = Instant::now();
-    let mut run_manifest = build_run_manifest(base_config, seed, bench_cfg);
+    let run_manifest = build_run_manifest(base_config, seed, bench_cfg);
     let source_reproducible_from_commit = run_manifest
         .pointer("/source/source_reproducible_from_commit")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     write_run_manifest(dir, &run_manifest);
+    let manifest_guard = RunManifestGuard::new(dir, run_manifest, run_started);
 
     println!("\n========================================");
     println!("  ACHF Benchmark Suite");
@@ -1696,7 +1751,7 @@ pub fn run_achf_benchmarks(base_config: &Config, seed: u64, bench_cfg: &BenchCon
         dir,
     );
     write_csvs(&all_agg, dir);
-    finalize_run_manifest(dir, &mut run_manifest, run_started.elapsed());
+    manifest_guard.finalize();
 
     println!("\n========================================");
     println!("  All benchmarks complete.");
@@ -3278,70 +3333,41 @@ fn chart_regime(rows: &[RegimeRow], dir: &str, ext: &str) {
     if rows.is_empty() {
         return;
     }
-    let labels: Vec<String> = rows
-        .iter()
-        .flat_map(|r| {
-            [
-                format!(
-                    "wsp{:.2} b{} AMA(oracle={})",
-                    r.actual_sparsity, r.small.batch, r.small.oracle_path
-                ),
-                format!(
-                    "wsp{:.2} b{} EMA(oracle={})",
-                    r.actual_sparsity, r.small.batch, r.small.oracle_path
-                ),
-                format!(
-                    "wsp{:.2} b{} AMA(oracle={})",
-                    r.actual_sparsity, r.large.batch, r.large.oracle_path
-                ),
-                format!(
-                    "wsp{:.2} b{} EMA(oracle={})",
-                    r.actual_sparsity, r.large.batch, r.large.oracle_path
-                ),
-            ]
-        })
-        .collect();
-    let mut bars: Vec<(&str, f64, f64, f64)> = Vec::with_capacity(labels.len());
-    for (i, r) in rows.iter().enumerate() {
-        let (small_low, small_high) = ci_bounds(&r.small.oracle_gap);
-        let (small_ema_low, small_ema_high) = ci_bounds(&r.small.plain_ema_oracle_gap);
-        let (large_low, large_high) = ci_bounds(&r.large.oracle_gap);
-        let (large_ema_low, large_ema_high) = ci_bounds(&r.large.plain_ema_oracle_gap);
-        bars.push((
-            labels[4 * i].as_str(),
-            r.small.oracle_gap.mean,
-            small_low,
-            small_high,
-        ));
-        bars.push((
-            labels[4 * i + 1].as_str(),
-            r.small.plain_ema_oracle_gap.mean,
-            small_ema_low,
-            small_ema_high,
-        ));
-        bars.push((
-            labels[4 * i + 2].as_str(),
-            r.large.oracle_gap.mean,
-            large_low,
-            large_high,
-        ));
-        bars.push((
-            labels[4 * i + 3].as_str(),
-            r.large.plain_ema_oracle_gap.mean,
-            large_ema_low,
-            large_ema_high,
-        ));
-    }
+    let points = |metric: fn(&RegimeRow) -> &TrialStats| {
+        rows.iter()
+            .map(|row| {
+                let stats = metric(row);
+                let (low, high) = ci_bounds(stats);
+                (row.actual_sparsity, stats.mean, low, high)
+            })
+            .collect::<Vec<_>>()
+    };
+    let small_ama = points(|row| &row.small.oracle_gap);
+    let small_ema = points(|row| &row.small.plain_ema_oracle_gap);
+    let large_ama = points(|row| &row.large.oracle_gap);
+    let large_ema = points(|row| &row.large.plain_ema_oracle_gap);
+    let labels = [
+        format!("Batch {} Guarded AMA", rows[0].small.batch),
+        format!("Batch {} Plain EMA", rows[0].small.batch),
+        format!("Batch {} Guarded AMA", rows[0].large.batch),
+        format!("Batch {} Plain EMA", rows[0].large.batch),
+    ];
+    let series: Vec<chart::CiSeries<'_>> = vec![
+        (labels[0].as_str(), &small_ama),
+        (labels[1].as_str(), &small_ema),
+        (labels[2].as_str(), &large_ama),
+        (labels[3].as_str(), &large_ema),
+    ];
     let path = format!("{}/regime_adaptation.{}", dir, ext);
     write_chart(
         &path,
-        chart::draw_bar_chart_with_ci(
+        chart::draw_line_chart_with_ci(
             &path,
             "Guarded AMA vs Plain EMA Oracle-Gap (mean and 95% CI)",
-            "Weight Sparsity x Batch x Selector",
+            "Actual Weight Sparsity",
             "Selector / Oracle Latency",
-            &bars,
-            1500,
+            &series,
+            1100,
             600,
         ),
     );
@@ -5090,6 +5116,45 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn manifest_guard_marks_panicked_run_as_failed() {
+        let dir = unique_temp_dir("failed_manifest");
+        let output_dir = dir.to_string_lossy().to_string();
+        let manifest = serde_json::json!({"status": "running"});
+        write_run_manifest(&output_dir, &manifest);
+
+        let result = std::panic::catch_unwind(|| {
+            let _guard = RunManifestGuard::new(&output_dir, manifest, Instant::now());
+            panic!("intentional benchmark failure");
+        });
+
+        assert!(result.is_err());
+        let persisted: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("run_manifest.json")).unwrap())
+                .unwrap();
+        assert_eq!(persisted["status"], "failed");
+        assert_eq!(persisted["failure"]["kind"], "panic");
+        assert!(persisted["failed_unix_ms"].as_u64().is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn candidate_validation_accepts_relative_frobenius_error_above_one() {
+        let memory = AchfMemoryStats {
+            layers: 1,
+            candidate_layers: 1,
+            candidate_total_weights: 4,
+            candidate_nonzero_weights: 1,
+            candidate_reference_norm_sq: 1.0,
+            candidate_error_norm_sq: 4.0,
+            max_layer_candidate_relative_error: 2.0,
+            ..Default::default()
+        };
+
+        assert_eq!(memory.candidate_relative_error(), Some(2.0));
+        validate_candidate_memory("high-error rejected candidate", Some(memory));
+    }
+
     fn bench_config_with_only(only: Option<Vec<String>>) -> BenchConfig {
         BenchConfig {
             output_dir: "unused".to_string(),
@@ -5771,6 +5836,12 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(dir.join("summary.json")).unwrap())
                 .unwrap();
         assert_eq!(summary["regime"][1]["oracle_path_by_majority"], "Cached");
+        chart_regime(&rows, &output_dir, "svg");
+        let svg = std::fs::read_to_string(dir.join("regime_adaptation.svg")).unwrap();
+        assert!(svg.contains("Actual Weight Sparsity"));
+        assert!(svg.contains("Batch 1 Guarded AMA"));
+        assert!(svg.contains("Batch 128 Plain EMA"));
+        assert!(!svg.contains("wsp0.90"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
