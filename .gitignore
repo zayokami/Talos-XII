@@ -4,6 +4,7 @@ debug/
 target/
 dist/
 **/__pycache__/
+**/.pytest_cache/
 *.whl
 bindings/python/python/talos_xii/_native.*
 
