@@ -384,17 +384,19 @@ impl PyTensor {
         }
         validate_export_len(self.inner.numel(), "grad")?;
         let grad_dtype = self.inner.grad.dtype();
-        let mut grad = AutoTensor::with_dtype(
+        let grad = AutoTensor::with_dtype(
             self.inner.grad_to_f64_vec(),
             self.inner.shape.clone(),
             grad_dtype,
         );
         #[cfg(cuda)]
-        if self.inner.device == Device::Cuda {
-            grad = grad.to_cuda().map_err(|error| {
+        let grad = if self.inner.device == Device::Cuda {
+            grad.to_cuda().map_err(|error| {
                 PyRuntimeError::new_err(format!("CUDA gradient export failed: {error}"))
-            })?;
-        }
+            })?
+        } else {
+            grad
+        };
         Ok(Some(Self::from_leaf(grad, false)))
     }
 
