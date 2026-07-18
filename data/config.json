@@ -117,7 +117,7 @@
     "apply_dqn": "是否在 DQN 输出层应用 ACHF",
     "infer_gate": "冻结推理的质量选择：candidate/reference 为硬选择，last/g_min 为连接图调制的软门控；candidate 仍必须先通过生产准入"
   },
-  "pools_path": "data/pools.json",
+  "pools_path": "pools.json",
   "luck_mode": "ppo",
   "fast_init": false,
   "device": "auto",

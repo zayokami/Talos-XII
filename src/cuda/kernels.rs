@@ -7,6 +7,37 @@ use crate::cuda::bindings;
 use crate::cuda::error::{CudaError, CudaResult};
 use crate::cuda::memory::DevicePtr;
 
+#[cfg(test)]
+thread_local! {
+    static INJECT_ADAM_FAILURE_AFTER: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn inject_adam_failure_once() {
+    inject_adam_failure_after(0);
+}
+
+#[cfg(test)]
+pub(crate) fn inject_adam_failure_after(successful_launches: usize) {
+    INJECT_ADAM_FAILURE_AFTER.with(|remaining| remaining.set(Some(successful_launches)));
+}
+
+#[cfg(test)]
+fn take_injected_adam_failure() -> bool {
+    INJECT_ADAM_FAILURE_AFTER.with(|remaining| match remaining.get() {
+        None => false,
+        Some(0) => {
+            remaining.set(None);
+            true
+        }
+        Some(count) => {
+            remaining.set(Some(count - 1));
+            false
+        }
+    })
+}
+
 fn to_i32_len(op: &'static str, value: usize) -> CudaResult<i32> {
     i32::try_from(value).map_err(|_| CudaError::SizeOverflow {
         op,
@@ -977,7 +1008,7 @@ define_elementwise_forward!(div_forward, cuda_div_forward, "div_forward");
 pub fn fill(data: &DevicePtr<f64>, value: f64) -> CudaResult<()> {
     crate::cuda::init()?;
     let size_i32 = to_i32_len("cuda::kernels::fill(size)", data.len())?;
-    if data.len() == 0 {
+    if data.is_empty() {
         return Ok(());
     }
     let status = unsafe {
@@ -1754,6 +1785,13 @@ pub fn adam_step(
     bias_correction2: f64,
     clip_coef: f64,
 ) -> CudaResult<()> {
+    #[cfg(test)]
+    if take_injected_adam_failure() {
+        return Err(CudaError::Runtime {
+            op: "cuda::kernels::adam_step(injected)",
+            code: u32::MAX,
+        });
+    }
     crate::cuda::init()?;
     let size_i32 = to_i32_len("cuda::kernels::adam_step(size)", size)?;
     if size == 0 {
@@ -3028,6 +3066,13 @@ pub fn adam_step_f32(
     bias_correction2: f32,
     clip_coef: f32,
 ) -> CudaResult<()> {
+    #[cfg(test)]
+    if take_injected_adam_failure() {
+        return Err(CudaError::Runtime {
+            op: "cuda::kernels::adam_step_f32(injected)",
+            code: u32::MAX,
+        });
+    }
     crate::cuda::init()?;
     let size_i32 = to_i32_len("cuda::kernels::adam_step_f32(size)", size)?;
     if size == 0 {
@@ -3068,7 +3113,7 @@ pub fn adam_step_f32(
 pub fn fill_f32(data: &DevicePtr<f32>, value: f32) -> CudaResult<()> {
     crate::cuda::init()?;
     let size_i32 = to_i32_len("cuda::kernels::fill_f32(size)", data.len())?;
-    if data.len() == 0 {
+    if data.is_empty() {
         return Ok(());
     }
     let status = unsafe {

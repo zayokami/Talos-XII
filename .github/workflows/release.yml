@@ -1,0 +1,164 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  native:
+    name: Native package (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            binary: target/x86_64-unknown-linux-gnu/release/talos_xii
+            format: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: target/x86_64-pc-windows-msvc/release/talos_xii.exe
+            format: zip
+          - os: macos-14
+            target: aarch64-apple-darwin
+            binary: target/aarch64-apple-darwin/release/talos_xii
+            format: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - name: Install Linux chart dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libfontconfig1-dev libfreetype6-dev
+      - name: Verify tag and package version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $expected = "${{ github.ref_name }}"
+          $actual = "v" + (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ($actual -ne $expected) { throw "tag $expected does not match package $actual" }
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package archive and checksum
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          ./scripts/package-release.ps1 -Binary "${{ matrix.binary }}" -Target "${{ matrix.target }}" -Version $version -OutputDirectory dist -ArchiveFormat "${{ matrix.format }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.target }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  python:
+    name: Python wheel (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux chart dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libfontconfig1-dev libfreetype6-dev
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --locked --out dist
+      - name: Smoke-test wheel
+        shell: pwsh
+        run: |
+          $wheel = (Get-ChildItem -LiteralPath dist -Filter *.whl).FullName
+          python -m pip install $wheel
+          python -c "import talos_xii as tx; assert tx.ones([2]).to_list() == [1.0, 1.0]"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-${{ runner.os }}-${{ runner.arch }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  cuda-linux-build:
+    name: CUDA 12 Linux build
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.8.1-devel-ubuntu22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y curl build-essential pkg-config libfontconfig1-dev libfreetype6-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-cuda12-linux
+      - run: cargo build --release --locked --features cuda
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cuda12-linux-binary
+          path: target/release/talos_xii
+          if-no-files-found: error
+
+  cuda-linux:
+    name: CUDA 12 Linux package
+    needs: cuda-linux-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          name: cuda12-linux-binary
+          path: cuda-bin
+      - run: chmod +x cuda-bin/talos_xii
+      - name: Package CUDA archive and checksum
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          ./scripts/package-release.ps1 -Binary cuda-bin/talos_xii -Target x86_64-unknown-linux-gnu-cuda12 -Version $version -OutputDirectory dist -ArchiveFormat tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cuda12-linux
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [native, python, cuda-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Build aggregate checksums
+        shell: bash
+        run: |
+          find artifacts -maxdepth 1 -type f ! -name '*.sha256' ! -name 'SHA256SUMS' -print0 \
+            | sort -z | xargs -0 sha256sum > artifacts/SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/*

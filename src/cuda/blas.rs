@@ -40,20 +40,21 @@ impl Cublas {
 
     /// Set the CUDA stream for cuBLAS operations
     pub fn set_stream(&mut self, stream: &crate::cuda::stream::CudaStream) -> CudaResult<()> {
-        self.set_stream_raw(stream.as_raw())
+        unsafe { self.set_stream_raw(stream.as_raw()) }
     }
 
     /// Set the CUDA stream for cuBLAS operations from a raw stream handle.
     /// Used to bind thread-local handles to the global transfer stream.
-    pub fn set_stream_raw(&mut self, stream: crate::cuda::bindings::CUstream) -> CudaResult<()> {
-        unsafe {
-            let result = cublasSetStream_v2(self.handle, stream);
-            if result != 0 {
-                return Err(CudaError::Blas {
-                    op: "cublasSetStream_v2",
-                    code: result,
-                });
-            }
+    pub(crate) unsafe fn set_stream_raw(
+        &mut self,
+        stream: crate::cuda::bindings::CUstream,
+    ) -> CudaResult<()> {
+        let result = cublasSetStream_v2(self.handle, stream);
+        if result != 0 {
+            return Err(CudaError::Blas {
+                op: "cublasSetStream_v2",
+                code: result,
+            });
         }
         Ok(())
     }
@@ -241,7 +242,7 @@ static CUBLAS_STREAM_BIND_WARNED: std::sync::atomic::AtomicBool =
 fn new_thread_cublas() -> CudaResult<Cublas> {
     let mut cublas = Cublas::new()?;
     if let Some(stream) = crate::cuda::stream::global_transfer_stream() {
-        if let Err(err) = cublas.set_stream_raw(stream) {
+        if let Err(err) = unsafe { cublas.set_stream_raw(stream) } {
             if !CUBLAS_STREAM_BIND_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 log::warn!(
                     "[CUDA] failed to bind a thread-local cuBLAS handle to the global \

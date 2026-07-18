@@ -24,7 +24,12 @@ enum CudaBinaryOp {
 }
 
 #[cfg(cuda)]
-pub(crate) fn cuda_clip_gradients_in_place(params: &[Tensor], max_norm: f64, eps: f64) -> bool {
+pub(crate) fn cuda_clip_gradients_in_place(
+    params: &[Tensor],
+    max_norm: f64,
+    eps: f64,
+) -> crate::cuda::error::CudaResult<()> {
+    use crate::cuda::error::CudaError;
     use crate::cuda::memory::{alloc_pooled, CudaBuffer};
 
     let dtype = params
@@ -32,125 +37,109 @@ pub(crate) fn cuda_clip_gradients_in_place(params: &[Tensor], max_norm: f64, eps
         .find(|p| p.cuda_storage_len() > 0)
         .map(|p| p.grad.dtype());
     let Some(dtype) = dtype else {
-        return true;
+        return Ok(());
     };
     if !matches!(dtype, Dtype::F32 | Dtype::F64) {
-        return false;
+        return Err(CudaError::InvalidInput {
+            op: "cuda_clip_gradients_in_place",
+            message: "gradient dtype must be f32 or f64",
+        });
     }
     if params
         .iter()
         .any(|p| p.cuda_storage_len() > 0 && p.grad.dtype() != dtype)
     {
-        return false;
+        return Err(CudaError::InvalidInput {
+            op: "cuda_clip_gradients_in_place",
+            message: "all gradient buffers must use the same dtype",
+        });
     }
 
     match dtype {
         Dtype::F32 => {
-            let sumsq = match alloc_pooled::<f32>(1) {
-                Ok(buf) => buf,
-                Err(_) => return false,
-            };
-            let coef = match alloc_pooled::<f32>(1) {
-                Ok(buf) => buf,
-                Err(_) => return false,
-            };
-            if crate::cuda::kernels::fill_f32(&sumsq, 0.0).is_err() {
-                return false;
-            }
+            let sumsq = alloc_pooled::<f32>(1)?;
+            let coef = alloc_pooled::<f32>(1)?;
+            crate::cuda::kernels::fill_f32(&sumsq, 0.0)?;
             for param in params {
                 let len = param.cuda_storage_len();
                 if len == 0 {
                     continue;
                 }
-                let grad = match param.cuda_grad_get_or_upload_buffer() {
-                    Ok(buf) => buf,
-                    Err(_) => return false,
-                };
+                let grad = param
+                    .cuda_grad_get_or_upload_buffer()
+                    .map_err(|(_, error)| error)?;
                 let CudaBuffer::F32(grad) = &*grad else {
-                    return false;
+                    return Err(CudaError::InvalidInput {
+                        op: "cuda_clip_gradients_in_place",
+                        message: "f32 gradient expected",
+                    });
                 };
-                if crate::cuda::kernels::sumsq_accum_f32(grad, &sumsq, len).is_err() {
-                    return false;
-                }
+                crate::cuda::kernels::sumsq_accum_f32(grad, &sumsq, len)?;
             }
-            if crate::cuda::kernels::clip_coef_from_sumsq_f32(
+            crate::cuda::kernels::clip_coef_from_sumsq_f32(
                 &sumsq,
                 &coef,
                 max_norm as f32,
                 eps as f32,
-            )
-            .is_err()
-            {
-                return false;
-            }
+            )?;
             for param in params {
                 let len = param.cuda_storage_len();
                 if len == 0 {
                     continue;
                 }
-                let grad = match param.cuda_grad_get_or_upload_buffer() {
-                    Ok(buf) => buf,
-                    Err(_) => return false,
-                };
+                let grad = param
+                    .cuda_grad_get_or_upload_buffer()
+                    .map_err(|(_, error)| error)?;
                 let CudaBuffer::F32(grad) = &*grad else {
-                    return false;
+                    return Err(CudaError::InvalidInput {
+                        op: "cuda_clip_gradients_in_place",
+                        message: "f32 gradient expected",
+                    });
                 };
-                if crate::cuda::kernels::scale_inplace_by_scalar_f32(grad, &coef, len).is_err() {
-                    return false;
-                }
+                crate::cuda::kernels::scale_inplace_by_scalar_f32(grad, &coef, len)?;
             }
-            true
+            Ok(())
         }
         Dtype::F64 => {
-            let sumsq = match alloc_pooled::<f64>(1) {
-                Ok(buf) => buf,
-                Err(_) => return false,
-            };
-            let coef = match alloc_pooled::<f64>(1) {
-                Ok(buf) => buf,
-                Err(_) => return false,
-            };
-            if crate::cuda::kernels::fill(&sumsq, 0.0).is_err() {
-                return false;
-            }
+            let sumsq = alloc_pooled::<f64>(1)?;
+            let coef = alloc_pooled::<f64>(1)?;
+            crate::cuda::kernels::fill(&sumsq, 0.0)?;
             for param in params {
                 let len = param.cuda_storage_len();
                 if len == 0 {
                     continue;
                 }
-                let grad = match param.cuda_grad_get_or_upload_buffer() {
-                    Ok(buf) => buf,
-                    Err(_) => return false,
-                };
+                let grad = param
+                    .cuda_grad_get_or_upload_buffer()
+                    .map_err(|(_, error)| error)?;
                 let CudaBuffer::F64(grad) = &*grad else {
-                    return false;
+                    return Err(CudaError::InvalidInput {
+                        op: "cuda_clip_gradients_in_place",
+                        message: "f64 gradient expected",
+                    });
                 };
-                if crate::cuda::kernels::sumsq_accum(grad, &sumsq, len).is_err() {
-                    return false;
-                }
+                crate::cuda::kernels::sumsq_accum(grad, &sumsq, len)?;
             }
-            if crate::cuda::kernels::clip_coef_from_sumsq(&sumsq, &coef, max_norm, eps).is_err() {
-                return false;
-            }
+            crate::cuda::kernels::clip_coef_from_sumsq(&sumsq, &coef, max_norm, eps)?;
             for param in params {
                 let len = param.cuda_storage_len();
                 if len == 0 {
                     continue;
                 }
-                let grad = match param.cuda_grad_get_or_upload_buffer() {
-                    Ok(buf) => buf,
-                    Err(_) => return false,
-                };
+                let grad = param
+                    .cuda_grad_get_or_upload_buffer()
+                    .map_err(|(_, error)| error)?;
                 let CudaBuffer::F64(grad) = &*grad else {
-                    return false;
+                    return Err(CudaError::InvalidInput {
+                        op: "cuda_clip_gradients_in_place",
+                        message: "f64 gradient expected",
+                    });
                 };
-                if crate::cuda::kernels::scale_inplace_by_scalar(grad, &coef, len).is_err() {
-                    return false;
-                }
+                crate::cuda::kernels::scale_inplace_by_scalar(grad, &coef, len)?;
             }
-            true
+            Ok(())
         }
-        _ => false,
+        _ => unreachable!("dtype validated above"),
     }
 }
 

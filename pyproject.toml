@@ -1,0 +1,27 @@
+[build-system]
+requires = ["maturin>=1.8,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "talos-xii"
+version = "0.8.0"
+description = "A Rust deep-learning framework with autograd and optional CUDA"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["deep-learning", "autograd", "cuda", "transformer"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+
+[tool.maturin]
+manifest-path = "bindings/python/Cargo.toml"
+python-source = "bindings/python/python"
+module-name = "talos_xii._native"
+bindings = "pyo3"

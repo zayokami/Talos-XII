@@ -1,0 +1,54 @@
+use std::path::{Path, PathBuf};
+
+fn repo_path(relative: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
+}
+
+fn section_version(contents: &str, section: &str) -> Option<String> {
+    let mut in_section = false;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_section = trimmed == format!("[{section}]");
+            continue;
+        }
+        if in_section {
+            if let Some(value) = trimmed.strip_prefix("version = ") {
+                return Some(value.trim_matches('"').to_string());
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn rust_and_python_package_versions_stay_in_sync() {
+    let version = env!("CARGO_PKG_VERSION");
+    let binding_manifest =
+        std::fs::read_to_string(repo_path("bindings/python/Cargo.toml")).unwrap();
+    let pyproject = std::fs::read_to_string(repo_path("pyproject.toml")).unwrap();
+
+    assert_eq!(
+        section_version(&binding_manifest, "package").as_deref(),
+        Some(version)
+    );
+    assert_eq!(
+        section_version(&pyproject, "project").as_deref(),
+        Some(version)
+    );
+}
+
+#[test]
+fn release_packaging_contains_runtime_contract_files() {
+    for relative in [
+        "LICENSE",
+        "README.md",
+        "data/config.json",
+        "data/pools.json",
+        "docs/REQUIREMENTS.md",
+        "docs/USAGE.md",
+        "scripts/package-release.ps1",
+    ] {
+        assert!(repo_path(relative).is_file(), "missing {relative}");
+    }
+}

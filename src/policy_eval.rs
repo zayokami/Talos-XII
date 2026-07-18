@@ -93,7 +93,10 @@ pub fn evaluate_dqn_policy(
     episodes: usize,
     seed: u64,
 ) -> PolicyEvalStats {
-    let mut selector = DqnEvalSelector { policy };
+    let mut selector = DqnEvalSelector {
+        policy,
+        use_cuda: policy.uses_cuda(),
+    };
     evaluate_policy(
         env_net,
         config,
@@ -155,6 +158,7 @@ trait EvalActionSelector {
 
 struct DqnEvalSelector<'a> {
     policy: &'a DuelingQNetwork,
+    use_cuda: bool,
 }
 
 impl EvalActionSelector for DqnEvalSelector<'_> {
@@ -163,10 +167,15 @@ impl EvalActionSelector for DqnEvalSelector<'_> {
     fn select_action(&mut self, features: &[f64; DIM], _pulls_done: usize) -> (usize, f64) {
         let current_state_tensor = Tensor::new_f32(features.to_vec(), vec![1, DIM]);
         #[cfg(cuda)]
-        let current_state_tensor = match current_state_tensor.to_cuda() {
-            Ok(t) => t,
-            Err(_) => current_state_tensor,
+        let current_state_tensor = if self.use_cuda {
+            current_state_tensor
+                .to_cuda()
+                .unwrap_or(current_state_tensor)
+        } else {
+            current_state_tensor
         };
+        #[cfg(not(cuda))]
+        let _ = self.use_cuda;
         let (action, requested_luck_modifier) = self.policy.predict_action(&current_state_tensor);
         checked_policy_action(action, requested_luck_modifier as f64)
     }

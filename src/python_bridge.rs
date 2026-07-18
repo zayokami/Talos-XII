@@ -1538,7 +1538,8 @@ fn batch_norm2d(
 }
 
 #[pymodule]
-fn talos_xii(m: &Bound<'_, PyModule>) -> PyResult<()> {
+pub fn talos_xii(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("F32", "f32")?;
     m.add("F64", "f64")?;
     m.add("BF16", "bf16")?;

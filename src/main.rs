@@ -1,41 +1,13 @@
 #![allow(clippy::wrong_self_convention)]
 
-mod achf;
-mod autograd;
-mod bench;
-mod binary_codec;
-mod calibrate;
-mod chart;
-mod collect;
-mod config;
-#[cfg(cuda)]
-mod cuda;
-mod dbn;
-mod dqn;
-mod dtype;
-mod env_net;
-mod gacha_env;
-#[cfg(test)]
-mod grad_check;
-mod i18n;
-mod model_init;
-mod model_io;
-mod neural;
-mod nn;
-mod panic_guard;
-mod policy_eval;
-mod ppo;
 #[cfg(feature = "python")]
-mod python_bridge;
-mod rng;
-mod sim;
-mod simd;
-mod strategy;
-mod trainer;
-mod training_metrics;
-mod transformer;
-mod utils;
-mod worker;
+use talos_xii::python_bridge;
+use talos_xii::{
+    autograd, bench, calibrate, collect, config, diagnostics, dqn, env_net, i18n, model_init,
+    model_io, neural, panic_guard, ppo, rng, sim, trainer, utils, worker,
+};
+#[cfg(test)]
+use talos_xii::{dtype, nn};
 
 use autograd::Tensor as AutoTensor;
 use calibrate::run_calibration;
@@ -134,6 +106,20 @@ enum Commands {
     },
     /// Train/calibrate model using collected player data
     Train,
+    /// Validate configuration without initializing models
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+    /// Inspect build features, device selection, and CUDA execution health
+    Doctor {
+        /// Report metadata only; skip CUDA operator self-tests
+        #[arg(long, default_value_t = false)]
+        no_self_test: bool,
+        /// Emit a machine-readable JSON report
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Run a custom Python script with the embedded PyO3 interpreter
     Python {
         /// Python script to execute
@@ -145,6 +131,12 @@ enum Commands {
         #[arg(last = true)]
         args: Vec<String>,
     },
+}
+
+#[derive(Subcommand, Clone)]
+enum ConfigAction {
+    /// Parse all configuration resources and enforce every invariant
+    Validate,
 }
 
 #[derive(Subcommand, Clone)]
@@ -659,6 +651,42 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
 
+    if let Some(Commands::Config {
+        action: ConfigAction::Validate,
+    }) = &args.command
+    {
+        let config = load_config_or_exit(&args.config);
+        println!("Configuration is valid.");
+        println!("  device: {}", config.device.as_str());
+        println!(
+            "  active pool: {}",
+            config.active_pool.as_deref().unwrap_or("<none>")
+        );
+        println!("  pools: {}", config.pools.len());
+        println!("  pools file: {}", config.pools_path);
+        return;
+    }
+
+    if let Some(Commands::Doctor { no_self_test, json }) = &args.command {
+        let config = load_config_or_exit(&args.config);
+        let report = diagnostics::run(&config, !no_self_test);
+        if *json {
+            match report.to_json_pretty() {
+                Ok(output) => println!("{output}"),
+                Err(error) => {
+                    eprintln!("\x1b[1;31m[Doctor Error]\x1b[0m {error}");
+                    std::process::exit(2);
+                }
+            }
+        } else {
+            print!("{}", report.render_text());
+        }
+        if !report.status.is_success() {
+            std::process::exit(2);
+        }
+        return;
+    }
+
     if let Some(Commands::Python {
         script,
         cwd,
@@ -691,7 +719,7 @@ fn main() {
         args.command,
         Some(Commands::Collect { .. }) | Some(Commands::Train)
     ) {
-        let config = Config::load(&args.config);
+        let config = load_config_or_exit(&args.config);
         let lang = Language::from_config(&config);
         match args.command.clone().unwrap() {
             Commands::Collect { action } => {
@@ -776,7 +804,7 @@ fn main() {
             eprintln!("\x1b[1;31m[Benchmark Error]\x1b[0m {}", err);
             std::process::exit(2);
         });
-        let config = Config::load(&args.config);
+        let config = load_config_or_exit(&args.config);
         let seed = args.seed.unwrap_or(42);
         if bench_cfg.process_repetitions > 1 && bench_cfg.process_index.is_none() {
             bench::run_achf_benchmark_processes(&args.config, seed, &bench_cfg).unwrap_or_else(
@@ -797,7 +825,10 @@ fn main() {
         allow_online_bootstrap: matches!(command, Commands::Interactive),
     };
     let (config, env_net, trained_neural_opt, dqn_policy, ppo_policy, worker, mut rng) =
-        initialize_system(&args.config, args.seed, init_options);
+        initialize_system(&args.config, args.seed, init_options).unwrap_or_else(|error| {
+            eprintln!("\x1b[1;31m[Initialization Error]\x1b[0m {error}");
+            std::process::exit(2);
+        });
     let lang = Language::from_config(&config);
 
     match command {
@@ -927,8 +958,19 @@ fn main() {
             };
             run_jade_budget_analysis(&f2p_ctx, &mut rng, jade, sims, welfare);
         }
-        Commands::Collect { .. } | Commands::Train | Commands::Python { .. } => unreachable!(),
+        Commands::Collect { .. }
+        | Commands::Train
+        | Commands::Python { .. }
+        | Commands::Config { .. }
+        | Commands::Doctor { .. } => unreachable!(),
     }
+}
+
+fn load_config_or_exit(path: &str) -> Config {
+    Config::try_load(path).unwrap_or_else(|error| {
+        eprintln!("\x1b[1;31m[Configuration Error]\x1b[0m {error}");
+        std::process::exit(2);
+    })
 }
 
 struct RunInteractiveArgs {
@@ -983,7 +1025,8 @@ fn run_interactive(args: RunInteractiveArgs) {
             master.load_state_dict(&dqn_policy);
             master
         });
-        let mut trainer = OnlineDqnTrainer::from_policy(dqn_train_master, trainer_seed);
+        let mut trainer =
+            OnlineDqnTrainer::from_policy(dqn_train_master, trainer_seed, config.device);
         let dqn_manifest = dqn_manifest
             .clone()
             .with_quality(CacheQualitySummary::online_updated(
@@ -995,7 +1038,8 @@ fn run_interactive(args: RunInteractiveArgs) {
             let mut last_report = Instant::now();
             let mut last_sync = Instant::now();
             let max_drain = MAX_DRAIN_PER_TICK;
-            loop {
+            let mut training_failed = false;
+            'training: loop {
                 if stop.load(Ordering::Relaxed) || max_steps == 0 {
                     break;
                 }
@@ -1009,10 +1053,14 @@ fn run_interactive(args: RunInteractiveArgs) {
                 }
                 let mut steps = 0usize;
                 while steps < max_steps {
-                    if trainer.train_step(&mut local_rng) {
-                        steps += 1;
-                    } else {
-                        break;
+                    match trainer.train_step(&mut local_rng) {
+                        Ok(true) => steps += 1,
+                        Ok(false) => break,
+                        Err(error) => {
+                            eprintln!("[Online DQN Error] {error}");
+                            training_failed = true;
+                            break 'training;
+                        }
                     }
                 }
                 if steps > 0 && last_sync.elapsed() >= Duration::from_millis(interval_ms) {
@@ -1030,7 +1078,9 @@ fn run_interactive(args: RunInteractiveArgs) {
                 thread::sleep(Duration::from_millis(interval_ms));
             }
             let master = trainer.policy();
-            if save_model_with_manifest(master, DQN_MASTER_CACHE_PATH, "DQN", dqn_manifest) {
+            if !training_failed
+                && save_model_with_manifest(master, DQN_MASTER_CACHE_PATH, "DQN", dqn_manifest)
+            {
                 let bf16 = master.to_inference_bf16();
                 let manifest =
                     dqn_inference_cache_manifest(&config_for_dqn, serialized_model_hash(master));
@@ -1096,7 +1146,12 @@ fn run_interactive(args: RunInteractiveArgs) {
             &ppo_manifest,
         )
         .unwrap_or_else(|| ActorCritic::new_with_config(&config, rng.next_u64()));
-        let mut trainer = OnlinePpoTrainer::from_policy(ppo_train_master, k_epochs, batch_size);
+        let mut trainer = OnlinePpoTrainer::from_policy_on_device(
+            ppo_train_master,
+            k_epochs,
+            batch_size,
+            config.device,
+        );
         let ppo_manifest = ppo_manifest
             .clone()
             .with_quality(CacheQualitySummary::online_updated(
@@ -1107,7 +1162,8 @@ fn run_interactive(args: RunInteractiveArgs) {
             let mut last_report = Instant::now();
             let mut last_sync = Instant::now();
             let max_drain = MAX_DRAIN_PER_TICK;
-            loop {
+            let mut training_failed = false;
+            'training: loop {
                 if stop.load(Ordering::Relaxed) || max_steps == 0 {
                     break;
                 }
@@ -1121,10 +1177,14 @@ fn run_interactive(args: RunInteractiveArgs) {
                 }
                 let mut steps = 0usize;
                 while steps < max_steps {
-                    if trainer.train_step(PPO_ONLINE_LR) {
-                        steps += 1;
-                    } else {
-                        break;
+                    match trainer.train_step(PPO_ONLINE_LR) {
+                        Ok(true) => steps += 1,
+                        Ok(false) => break,
+                        Err(error) => {
+                            eprintln!("[Online PPO Error] {error}");
+                            training_failed = true;
+                            break 'training;
+                        }
                     }
                 }
                 if steps > 0 && last_sync.elapsed() >= Duration::from_millis(interval_ms) {
@@ -1142,7 +1202,9 @@ fn run_interactive(args: RunInteractiveArgs) {
                 thread::sleep(Duration::from_millis(interval_ms));
             }
             let master = trainer.policy();
-            if save_model_with_manifest(master, PPO_MASTER_CACHE_PATH, "PPO", ppo_manifest) {
+            if !training_failed
+                && save_model_with_manifest(master, PPO_MASTER_CACHE_PATH, "PPO", ppo_manifest)
+            {
                 let bf16 = master.to_inference_bf16();
                 let manifest =
                     ppo_inference_cache_manifest(&config_for_ppo, serialized_model_hash(master));
@@ -2451,7 +2513,7 @@ mod tests {
         config.model_hidden_dim = 64;
         config.model_num_layers = 2;
         let mut rng = Rng::from_seed(7777);
-        let dqn = train_dqn(&neural_opt, &mut rng, &env_net, &config);
+        let dqn = train_dqn(&neural_opt, &mut rng, &env_net, &config).unwrap();
         let state = AutoTensor::new(vec![0.5; DIM], vec![DIM]);
         let q_values = dqn.forward(&state);
         let q_data = q_values.data_f64();

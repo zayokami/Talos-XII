@@ -19,7 +19,10 @@ pub mod memory;
 pub mod stream;
 
 use self::error::{CudaError, CudaResult};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use serde::Serialize;
+#[cfg(cuda)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(cuda)]
 use std::sync::Mutex;
 #[cfg(cuda)]
@@ -65,7 +68,7 @@ static CUDA_OPTIMIZER_SUCCESSES: AtomicU64 = AtomicU64::new(0);
 static CUDA_OPTIMIZER_FALLBACK_PARAM: AtomicU64 = AtomicU64::new(0);
 
 /// Runtime observability counters for CUDA matmul routing.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct CudaRuntimeStats {
     pub matmul_attempts: u64,
     pub matmul_successes: u64,
@@ -89,6 +92,27 @@ pub struct CudaRuntimeStats {
     pub optimizer_attempts: u64,
     pub optimizer_successes: u64,
     pub optimizer_fallback_param: u64,
+}
+
+impl CudaRuntimeStats {
+    pub fn matmul_fallbacks(self) -> u64 {
+        self.matmul_fallback_init
+            + self.matmul_fallback_alloc
+            + self.matmul_fallback_copy
+            + self.matmul_fallback_gemm
+    }
+
+    pub fn activation_fallbacks(self) -> u64 {
+        self.activation_fallback_alloc
+            + self.activation_fallback_copy
+            + self.activation_fallback_kernel
+    }
+
+    pub fn log_softmax_fallbacks(self) -> u64 {
+        self.log_softmax_fallback_alloc
+            + self.log_softmax_fallback_copy
+            + self.log_softmax_fallback_kernel
+    }
 }
 
 pub fn record_matmul_attempt() {
@@ -215,10 +239,12 @@ pub fn runtime_stats() -> CudaRuntimeStats {
 }
 
 /// Device information
+#[derive(Debug, Clone, Serialize)]
 pub struct CudaDevice {
     pub id: usize,
     pub name: String,
     pub compute_capability: (u32, u32),
+    pub free_memory: usize,
     pub total_memory: usize,
 }
 
@@ -450,13 +476,24 @@ pub fn get_device_info(device_id: usize) -> CudaResult<CudaDevice> {
             });
         }
 
+        let mut free_memory = 0usize;
+        let mut runtime_total_memory = 0usize;
+        let runtime_mem_result = cudaMemGetInfo(&mut free_memory, &mut runtime_total_memory);
+        if runtime_mem_result != 0 {
+            return Err(CudaError::Runtime {
+                op: "cudaMemGetInfo",
+                code: runtime_mem_result as u32,
+            });
+        }
+
         let name_str = CStr::from_ptr(name.as_ptr()).to_string_lossy().into_owned();
 
         Ok(CudaDevice {
             id: device_id,
             name: name_str,
             compute_capability: (cc_major as u32, cc_minor as u32),
-            total_memory: total_mem,
+            free_memory,
+            total_memory: runtime_total_memory.max(total_mem),
         })
     }
 }

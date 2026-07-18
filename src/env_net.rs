@@ -101,7 +101,7 @@ impl BatchNorm1d {
     }
 
     /// Forward pass writing into a pre-allocated buffer. Returns stats for backward.
-    pub fn forward_into(&mut self, x: &[f64], output: &mut [f64]) -> BnStats {
+    pub(crate) fn forward_into(&mut self, x: &[f64], output: &mut [f64]) -> BnStats {
         let dim = x.len();
         assert_eq!(self.gamma.len(), dim);
         assert_eq!(output.len(), dim);

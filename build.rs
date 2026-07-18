@@ -1,193 +1,379 @@
-// build.rs - Compile CUDA .cu files with NVCC
-// Usage: This file is automatically invoked by cargo before compiling the Rust code
-
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::path::Path;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 
-fn parse_cuda_arch_token(token: &str) -> Option<(u32, u32, String)> {
-    let raw = token.trim();
-    let stripped = raw
-        .strip_prefix("sm_")
-        .or_else(|| raw.strip_prefix("compute_"))
-        .unwrap_or(raw);
-    let digits: String = stripped.chars().filter(|c| c.is_ascii_digit()).collect();
-    if digits.len() < 2 {
-        return None;
-    }
-    let (major, minor) = if digits.len() == 2 {
-        (
-            digits[0..1].parse::<u32>().ok()?,
-            digits[1..2].parse::<u32>().ok()?,
-        )
-    } else {
-        let split = digits.len() - 1;
-        (
-            digits[..split].parse::<u32>().ok()?,
-            digits[split..].parse::<u32>().ok()?,
-        )
-    };
-    Some((major, minor, format!("{major}{minor}")))
+const DEFAULT_CUDA_ARCH: &str = "sm_75,sm_80,sm_86,sm_89";
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ArchCode {
+    sass: bool,
+    ptx: bool,
 }
 
-fn cuda_gencode_flags(cuda_arch_spec: &str) -> (Vec<String>, (u32, u32), String) {
-    let mut flags = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    let mut primary = (7, 5);
-    let mut primary_set = false;
+fn build_error(message: impl AsRef<str>) -> ! {
+    panic!("CUDA build configuration error: {}", message.as_ref());
+}
 
-    for token in cuda_arch_spec
+fn parse_compute_capability(token: &str) -> Result<u32, String> {
+    let raw = token.trim().to_ascii_lowercase();
+    let digits = raw
+        .strip_prefix("sm_")
+        .or_else(|| raw.strip_prefix("compute_"))
+        .unwrap_or(&raw);
+
+    if digits.len() < 2 || !digits.chars().all(|character| character.is_ascii_digit()) {
+        return Err(format!(
+            "invalid CUDA architecture '{token}'; expected values such as sm_86 or compute_89"
+        ));
+    }
+
+    let capability = digits
+        .parse::<u32>()
+        .map_err(|_| format!("invalid CUDA architecture '{token}'"))?;
+    if !(75..=999).contains(&capability) {
+        return Err(format!(
+            "CUDA architecture '{token}' is below the project minimum sm_75"
+        ));
+    }
+    Ok(capability)
+}
+
+fn cuda_gencode_flags(specification: &str) -> Result<(Vec<String>, String), String> {
+    let tokens = specification
         .split([',', ';', ' '])
         .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        let Some((major, minor, cc)) = parse_cuda_arch_token(token) else {
-            eprintln!("[build.rs] Warning: ignoring invalid CUDA_ARCH token '{token}'");
-            continue;
-        };
-        if !primary_set {
-            primary = (major, minor);
-            primary_set = true;
-        }
-
-        if token.starts_with("compute_") {
-            let key = format!("compute_{cc}");
-            if seen.insert(key.clone()) {
-                flags.push(format!("-gencode=arch=compute_{cc},code={key}"));
-            }
-        } else {
-            let sass_key = format!("sm_{cc}");
-            if seen.insert(sass_key.clone()) {
-                flags.push(format!("-gencode=arch=compute_{cc},code={sass_key}"));
-            }
-            let ptx_key = format!("compute_{cc}");
-            if seen.insert(ptx_key.clone()) {
-                flags.push(format!("-gencode=arch=compute_{cc},code={ptx_key}"));
-            }
-        }
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return Err("CUDA_ARCH cannot be empty".to_string());
     }
 
-    if flags.is_empty() {
-        flags.push("-gencode=arch=compute_75,code=sm_75".to_string());
-        flags.push("-gencode=arch=compute_75,code=compute_75".to_string());
-        primary = (7, 5);
-    }
-
-    let display = flags
+    let explicitly_requests_ptx = tokens
         .iter()
-        .map(|flag| flag.trim_start_matches("-gencode=arch="))
+        .any(|token| token.to_ascii_lowercase().starts_with("compute_"));
+    let mut codes = BTreeMap::<u32, ArchCode>::new();
+    for token in tokens {
+        let normalized = token.to_ascii_lowercase();
+        let capability = parse_compute_capability(&normalized)?;
+        let code = codes.entry(capability).or_default();
+        if normalized.starts_with("compute_") {
+            code.ptx = true;
+        } else {
+            code.sass = true;
+        }
+    }
+
+    if !explicitly_requests_ptx {
+        let highest_sass = codes
+            .iter()
+            .rev()
+            .find_map(|(capability, code)| code.sass.then_some(*capability))
+            .ok_or_else(|| "CUDA_ARCH did not request any SASS or PTX code".to_string())?;
+        codes.entry(highest_sass).or_default().ptx = true;
+    }
+
+    let mut flags = Vec::new();
+    let mut display = Vec::new();
+    for (capability, code) in codes {
+        if code.sass {
+            flags.push(format!(
+                "-gencode=arch=compute_{capability},code=sm_{capability}"
+            ));
+            display.push(format!("sm_{capability}"));
+        }
+        if code.ptx {
+            flags.push(format!(
+                "-gencode=arch=compute_{capability},code=compute_{capability}"
+            ));
+            display.push(format!("compute_{capability}(PTX)"));
+        }
+    }
+    Ok((flags, display.join(",")))
+}
+
+fn command_output(program: &Path, argument: &str) -> Result<Output, String> {
+    Command::new(program)
+        .arg(argument)
+        .output()
+        .map_err(|error| format!("failed to execute '{}': {error}", program.display()))
+}
+
+fn resolve_nvcc() -> PathBuf {
+    if let Some(configured) = env::var_os("NVCC").filter(|value| !value.is_empty()) {
+        return PathBuf::from(configured);
+    }
+
+    for variable in ["CUDA_PATH", "CUDA_HOME"] {
+        if let Some(root) = env::var_os(variable).filter(|value| !value.is_empty()) {
+            let executable = if cfg!(windows) { "nvcc.exe" } else { "nvcc" };
+            let candidate = PathBuf::from(root).join("bin").join(executable);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+
+    PathBuf::from(if cfg!(windows) { "nvcc.exe" } else { "nvcc" })
+}
+
+fn validate_nvcc(nvcc: &Path) -> String {
+    let output = command_output(nvcc, "--version").unwrap_or_else(|error| {
+        build_error(format!(
+            "{error}. Install CUDA Toolkit 12+, add nvcc to PATH, or set NVCC/CUDA_PATH"
+        ))
+    });
+    if !output.status.success() {
+        build_error(format!(
+            "'{} --version' failed with status {}: {}",
+            nvcc.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let release = stdout
+        .lines()
+        .find_map(|line| line.split_once("release ").map(|(_, value)| value))
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            build_error(format!(
+                "could not determine CUDA Toolkit version from '{} --version'",
+                nvcc.display()
+            ))
+        });
+    let major = release
+        .split('.')
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or_else(|| build_error(format!("invalid NVCC release version '{release}'")));
+    if major < 12 {
+        build_error(format!(
+            "CUDA Toolkit {release} is unsupported; install CUDA Toolkit 12.0 or newer"
+        ));
+    }
+
+    stdout
+        .lines()
+        .last()
+        .unwrap_or("unknown nvcc version")
+        .trim()
+        .to_string()
+}
+
+#[cfg(windows)]
+fn latest_msvc_bin(installation_root: &Path) -> Option<PathBuf> {
+    let toolchains = installation_root.join("VC").join("Tools").join("MSVC");
+    let mut versions = std::fs::read_dir(toolchains)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .collect::<Vec<_>>();
+    versions.sort_by_key(|entry| entry.file_name());
+    versions
+        .into_iter()
+        .rev()
+        .map(|entry| entry.path().join("bin").join("Hostx64").join("x64"))
+        .find(|candidate| candidate.join("cl.exe").is_file())
+}
+
+#[cfg(windows)]
+fn discover_msvc_bin() -> Option<PathBuf> {
+    if let Some(configured) = env::var_os("MSVC_BIN_DIR").filter(|value| !value.is_empty()) {
+        let configured = PathBuf::from(configured);
+        if configured.join("cl.exe").is_file() {
+            return Some(configured);
+        }
+        build_error(format!(
+            "MSVC_BIN_DIR '{}' does not contain cl.exe",
+            configured.display()
+        ));
+    }
+
+    if let Some(tools_root) = env::var_os("VCToolsInstallDir").filter(|value| !value.is_empty()) {
+        let candidate = PathBuf::from(tools_root)
+            .join("bin")
+            .join("Hostx64")
+            .join("x64");
+        if candidate.join("cl.exe").is_file() {
+            return Some(candidate);
+        }
+    }
+
+    let program_files_x86 = env::var_os("ProgramFiles(x86)")?;
+    let vswhere = PathBuf::from(program_files_x86)
+        .join("Microsoft Visual Studio")
+        .join("Installer")
+        .join("vswhere.exe");
+    let output = Command::new(vswhere)
+        .args([
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property",
+            "installationPath",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let installation = String::from_utf8_lossy(&output.stdout);
+    latest_msvc_bin(Path::new(installation.trim()))
+}
+
+#[cfg(windows)]
+fn prepend_msvc_to_path() {
+    if Command::new("cl.exe").arg("/?").output().is_ok() {
+        return;
+    }
+
+    if let Some(msvc_bin) = discover_msvc_bin() {
+        let mut paths = vec![msvc_bin];
+        paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
+        let joined = env::join_paths(paths)
+            .unwrap_or_else(|error| build_error(format!("invalid MSVC PATH: {error}")));
+        env::set_var("PATH", joined);
+    }
+    if Command::new("cl.exe").arg("/?").output().is_err() {
+        build_error("MSVC cl.exe was not found. Install the Visual Studio C++ build tools or set MSVC_BIN_DIR to VC/Tools/MSVC/<version>/bin/Hostx64/x64");
+    }
+}
+
+#[cfg(not(windows))]
+fn prepend_msvc_to_path() {}
+
+fn nvcc_root(nvcc: &Path) -> Option<PathBuf> {
+    let absolute = if nvcc.is_absolute() {
+        nvcc.to_path_buf()
+    } else {
+        let path = env::var_os("PATH")?;
+        env::split_paths(&path)
+            .map(|directory| directory.join(nvcc))
+            .find(|candidate| candidate.is_file())?
+    };
+    absolute.parent()?.parent().map(Path::to_path_buf)
+}
+
+fn cuda_library_candidates(nvcc: &Path) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for variable in ["CUDA_PATH", "CUDA_HOME"] {
+        if let Some(root) = env::var_os(variable).filter(|value| !value.is_empty()) {
+            roots.push(PathBuf::from(root));
+        }
+    }
+    if let Some(root) = nvcc_root(nvcc) {
+        roots.push(root);
+    }
+    if cfg!(unix) {
+        roots.push(PathBuf::from("/usr/local/cuda"));
+    }
+
+    let mut candidates = Vec::new();
+    if let Some(explicit) = env::var_os("CUDA_LIB_DIR").filter(|value| !value.is_empty()) {
+        candidates.push(PathBuf::from(explicit));
+    }
+    for root in roots {
+        if cfg!(windows) {
+            candidates.push(root.join("lib").join("x64"));
+        } else {
+            candidates.push(root.join("lib64"));
+            candidates.push(root.join("targets").join("x86_64-linux").join("lib"));
+            candidates.push(root.join("targets").join("aarch64-linux").join("lib"));
+        }
+    }
+
+    let mut seen = BTreeSet::<OsString>::new();
+    candidates
+        .into_iter()
+        .filter(|candidate| seen.insert(candidate.as_os_str().to_os_string()))
+        .collect()
+}
+
+fn resolve_cuda_library_dir(nvcc: &Path) -> PathBuf {
+    let candidates = cuda_library_candidates(nvcc);
+    if let Some(directory) = candidates.iter().find(|candidate| candidate.is_dir()) {
+        return directory.clone();
+    }
+    let searched = candidates
+        .iter()
+        .map(|path| format!("'{}'", path.display()))
         .collect::<Vec<_>>()
         .join(", ");
-    (flags, primary, display)
+    build_error(format!(
+        "CUDA runtime library directory was not found (searched {searched}). Set CUDA_LIB_DIR"
+    ));
+}
+
+fn run_checked(command: &mut Command, operation: &str) {
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| build_error(format!("failed to {operation}: {error}")));
+    if !output.status.success() {
+        build_error(format!(
+            "failed to {operation}\ncommand: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
 }
 
 fn main() {
-    // Declare expected cfgs unconditionally so rustc/rust-analyzer don't warn
     println!("cargo::rustc-check-cfg=cfg(cuda)");
-    println!("cargo:rerun-if-changed=cuda/");
+    println!("cargo:rerun-if-changed=cuda");
+    for variable in [
+        "CUDA_ARCH",
+        "CUDA_FAST_MATH",
+        "CUDA_HOME",
+        "CUDA_LIB_DIR",
+        "CUDA_PATH",
+        "MSVC_BIN_DIR",
+        "NVCC",
+    ] {
+        println!("cargo:rerun-if-env-changed={variable}");
+    }
 
-    // Only compile CUDA code when the "cuda" feature is enabled
-    if env::var("CARGO_FEATURE_CUDA").is_err() {
+    if env::var_os("CARGO_FEATURE_CUDA").is_none() {
+        println!("cargo:rustc-env=TALOS_CUDA_ARCH=disabled");
+        println!("cargo:rustc-env=TALOS_CUDA_NVCC=disabled");
         return;
+    }
+    if cfg!(target_os = "macos") {
+        build_error("CUDA builds are unsupported on macOS");
     }
     println!("cargo:rustc-cfg=cuda");
 
-    println!("Building with CUDA support...");
-
-    // On Windows, NVCC requires MSVC's cl.exe in PATH.
-    // Set the PATH to include MSVC bin directory before running NVCC.
-    if cfg!(windows) {
-        let msvc_bin = env::var("MSVC_BIN_DIR").unwrap_or_else(|_| {
-            // Try to find MSVC automatically via VSINSTALLDIR
-            let vs_install_dir = env::var("VSINSTALLDIR").ok();
-            let toolset_version = env::var("VCToolsVersion").ok();
-
-            if let (Some(vs_dir), Some(toolset)) = (&vs_install_dir, &toolset_version) {
-                let path = format!(
-                    "{}/VC/Tools/MSvc/{}/bin/Hostx64/x64",
-                    vs_dir.trim_end_matches('\\'),
-                    toolset
-                );
-                if Path::new(&path).exists() {
-                    return path;
-                }
-            }
-
-            // Fallback: search standard installation paths
-            let possible_paths = [
-                "C:/Program Files/Microsoft Visual Studio/2022/Enterprise/VC/Tools/MSvc",
-                "C:/Program Files/Microsoft Visual Studio/2022/Professional/VC/Tools/MSvc",
-                "C:/Program Files/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSvc",
-                "C:/Program Files (x86)/Microsoft Visual Studio/2019/BuildTools/VC/Tools/MSvc",
-            ];
-
-            for base in possible_paths {
-                if let Ok(entries) = std::fs::read_dir(base) {
-                    for entry in entries.flatten() {
-                        if let Ok(name) = entry.file_name().into_string() {
-                            let candidate = format!("{}/{}/bin/Hostx64/x64", base, name);
-                            if Path::new(&candidate).exists() {
-                                return candidate;
-                            }
-                        }
-                    }
-                }
-            }
-
-            eprintln!(
-                "[build.rs] Warning: Could not find MSVC bin directory. Set MSVC_BIN_DIR environment variable."
-            );
-            String::new()
-        });
-
-        if !msvc_bin.is_empty() {
-            let current_path = env::var("PATH").unwrap_or_default();
-            let new_path = format!("{};{}", msvc_bin, current_path);
-            env::set_var("PATH", new_path);
-            println!("Updated PATH with MSVC: {}", msvc_bin);
-        }
-    }
-
-    // Find NVCC - use NVCC env var or CUDA_PATH, or rely on PATH
-    let nvcc = env::var("NVCC").unwrap_or_else(|_| {
-        if cfg!(windows) {
-            // Try CUDA_PATH environment variable first
-            if let Ok(cuda_path) = env::var("CUDA_PATH") {
-                format!("{}/bin/nvcc.exe", cuda_path)
-            } else {
-                // Fall back to PATH
-                "nvcc".to_string()
-            }
-        } else {
-            // Unix: rely on PATH
-            "nvcc".to_string()
-        }
-    });
-
-    println!("Using NVCC: {}", nvcc);
-
-    let cuda_arch = env::var("CUDA_ARCH")
+    prepend_msvc_to_path();
+    let nvcc = resolve_nvcc();
+    let nvcc_version = validate_nvcc(&nvcc);
+    let cuda_lib_dir = resolve_cuda_library_dir(&nvcc);
+    let architecture_specification = env::var("CUDA_ARCH")
         .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "sm_75".to_string());
-    let (cuda_arch_flags, (arch_major, arch_minor), cuda_arch_display) =
-        cuda_gencode_flags(&cuda_arch);
-    println!("cargo:rerun-if-env-changed=CUDA_ARCH");
-    println!(
-        "cargo:warning=Using CUDA code generation: {}",
-        cuda_arch_display
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_CUDA_ARCH.to_string());
+    let (architecture_flags, architecture_display) =
+        cuda_gencode_flags(&architecture_specification).unwrap_or_else(|error| build_error(error));
+    let fast_math = matches!(
+        env::var("CUDA_FAST_MATH").as_deref(),
+        Ok("1" | "true" | "TRUE" | "on" | "ON")
     );
 
-    let arch_defines = format!(
-        "-DCUDA_ARCH_MAJOR={} -DCUDA_ARCH_MINOR={}",
-        arch_major, arch_minor
-    );
+    println!("cargo:rustc-env=TALOS_CUDA_ARCH={architecture_display}");
+    println!("cargo:rustc-env=TALOS_CUDA_NVCC={nvcc_version}");
+    println!("cargo:warning=CUDA code generation: {architecture_display}");
     println!(
-        "Defining CUDA arch constants: major={}, minor={}",
-        arch_major, arch_minor
+        "cargo:warning=CUDA fast math: {}",
+        if fast_math { "enabled" } else { "disabled" }
     );
 
-    // CUDA source files
-    let cuda_files = &[
+    let cuda_files = [
         "cuda/common.cu",
         "cuda/matmul.cu",
         "cuda/softmax.cu",
@@ -199,121 +385,58 @@ fn main() {
         "cuda/sparse.cu",
         "cuda/tensor_ops.cu",
     ];
+    let out_dir = PathBuf::from(
+        env::var_os("OUT_DIR").unwrap_or_else(|| build_error("Cargo did not provide OUT_DIR")),
+    );
+    let object_extension = if cfg!(windows) { "obj" } else { "o" };
+    let mut objects = Vec::with_capacity(cuda_files.len());
 
-    // Output directory for compiled objects
-    let out_dir = env::var("OUT_DIR").unwrap();
-    let obj_files: Vec<String> = cuda_files
-        .iter()
-        .map(|f| {
-            let base = Path::file_stem(Path::new(f))
-                .and_then(|s| s.to_str())
-                .unwrap();
-            let obj = format!("{}/{}.o", out_dir, base);
-            let mut cmd = std::process::Command::new(&nvcc);
-            cmd.arg("--compile")
-                .arg("-x")
-                .arg("cu")
-                .arg("-O3")
-                .arg("--use_fast_math")
-                .arg("-I")
-                .arg("cuda")
-                .arg("-o")
-                .arg(&obj)
-                .arg(f);
-            // Generate SASS and PTX code for selected architecture targets.
-            for flag in &cuda_arch_flags {
-                cmd.arg(flag);
-            }
-            // Add defines
-            cmd.arg("-D").arg("CUDA_VERSION=12000");
-            // Pass CUDA arch as preprocessor constants (major/minor)
-            for def in arch_defines.split_whitespace() {
-                cmd.arg(def);
-            }
-
-            println!("Compiling {}...", f);
-            let output = cmd.output().expect("Failed to execute nvcc");
-            if !output.status.success() {
-                eprintln!(
-                    "NVCC Error compiling {}: {}",
-                    f,
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                eprintln!("NVCC stdout: {}", String::from_utf8_lossy(&output.stdout));
-                std::process::exit(1);
-            }
-            obj
-        })
-        .collect();
-
-    // Build CUDA kernel library from object files
-    let lib_path = if cfg!(windows) {
-        format!("{}/cuda_lib.lib", out_dir)
-    } else {
-        format!("{}/libcuda_lib.so", out_dir)
-    };
-
-    // Find CUDA lib directory - use CUDA_LIB_DIR env var or CUDA_PATH.
-    // Needed for runtime driver/cuBLAS linking from Rust target.
-    let cuda_lib_dir = env::var("CUDA_LIB_DIR").unwrap_or_else(|_| {
-        if cfg!(windows) {
-            if let Ok(cuda_path) = env::var("CUDA_PATH") {
-                format!("{}/lib/x64", cuda_path)
-            } else {
-                "D:/NvidiaDevTool/NVIDIA GPU Computing Toolkit/CUDA/lib/x64".to_string()
-            }
-        } else {
-            "/usr/local/cuda/lib64".to_string()
+    for source in cuda_files {
+        let stem = Path::new(source)
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or_else(|| build_error(format!("invalid CUDA source path '{source}'")));
+        let object = out_dir.join(format!("{stem}.{object_extension}"));
+        let mut command = Command::new(&nvcc);
+        command
+            .arg("--compile")
+            .arg("-x")
+            .arg("cu")
+            .arg("-O3")
+            .arg("-I")
+            .arg("cuda")
+            .arg("-o")
+            .arg(&object)
+            .arg(source);
+        if fast_math {
+            command.arg("--use_fast_math");
         }
-    });
+        if cfg!(unix) {
+            command.arg("-Xcompiler=-fPIC");
+        }
+        command.args(&architecture_flags);
+        run_checked(&mut command, &format!("compile {source}"));
+        println!("cargo:rerun-if-changed={source}");
+        objects.push(object);
+    }
 
-    println!("Building CUDA kernel library {}...", lib_path);
-    let mut link_cmd = std::process::Command::new(&nvcc);
-    if cfg!(windows) {
-        link_cmd
-            .arg("-lib")
-            .arg("-o")
-            .arg(&lib_path)
-            .args(&obj_files);
+    let library = if cfg!(windows) {
+        out_dir.join("cuda_lib.lib")
     } else {
-        link_cmd
-            .arg("-shared")
-            .arg("-o")
-            .arg(&lib_path)
-            .args(&obj_files);
-    }
+        out_dir.join("libcuda_lib.a")
+    };
+    let mut archive = Command::new(&nvcc);
+    archive.arg("--lib").arg("-o").arg(&library).args(&objects);
+    run_checked(&mut archive, "archive CUDA kernels");
 
-    println!("Link command: {:?}", link_cmd);
-    let output = link_cmd.output().expect("Failed to link CUDA library");
-    if !output.status.success() {
-        eprintln!(
-            "NVCC Link Error: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        eprintln!(
-            "NVCC Link stdout: {}",
-            String::from_utf8_lossy(&output.stdout)
-        );
-        std::process::exit(1);
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-search=native={}", cuda_lib_dir.display());
+    let stubs = cuda_lib_dir.join("stubs");
+    if stubs.is_dir() {
+        println!("cargo:rustc-link-search=native={}", stubs.display());
     }
-
-    // Tell cargo to link against the library
-    println!("cargo:rustc-link-search=native={}", out_dir);
-    // Add CUDA lib directory to search path
-    if cfg!(windows) {
-        println!("cargo:rustc-link-search=native={}", cuda_lib_dir);
-    }
-    if cfg!(windows) {
-        println!("cargo:rustc-link-lib=static=cuda_lib");
-    } else {
-        println!("cargo:rustc-link-lib=dylib=cuda_lib");
-    }
+    println!("cargo:rustc-link-lib=static=cuda_lib");
     println!("cargo:rustc-link-lib=dylib=cudart");
     println!("cargo:rustc-link-lib=dylib=cuda");
     println!("cargo:rustc-link-lib=dylib=cublas");
-
-    // Rebuild if CUDA files change
-    for f in cuda_files {
-        println!("cargo:rerun-if-changed={}", f);
-    }
 }

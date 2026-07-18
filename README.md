@@ -12,7 +12,7 @@ Many simulation tools rely on fixed stochastic rules. Talos-XII can additionally
 
 Before a model-driven simulation, Talos-XII loads or trains EnvNet, NeuralLuckOptimizer, DQN, and PPO. EnvNet derives synthetic environment features, while DQN and PPO select one of five discrete modifiers under a bounded budget. These models do not decide whether to execute a task or wait; they redistribute configured parameters inside the simulator. Results therefore describe the selected simulation policy, not external system behavior.
 
-Technically, Talos-XII is a single Rust binary. It accelerates matrix operations via SIMD (AVX2/AVX-512/NEON) and parallelizes simulation tasks using Rayon, achieving over 10,000 simulations per second on mainstream hardware while maintaining statistical reliability.
+Talos-XII is a reusable Rust library, a CLI application built on that library, and an optional Python extension. The framework provides typed tensors, reverse-mode autograd, neural-network modules, Transformer/MLA components, ACHF layers, CPU SIMD kernels, and optional CUDA kernels. The simulator is a production application and benchmark workload for the framework rather than the framework's only interface.
 
 ---
 
@@ -51,21 +51,45 @@ cargo check --features cuda
 cargo run --features cuda -- simulate -n 1000 -p 100
 ```
 
-Set the NVCC target architecture via `CUDA_ARCH`. By default, the build emits
-`sm_75` SASS plus `compute_75` PTX for forward-compatible JIT. For Ada GPUs
-such as RTX 4060, prefer `sm_89`:
+The default release build is a fat binary containing native SASS for `sm_75`,
+`sm_80`, `sm_86`, and `sm_89`, plus `compute_89` PTX for forward-compatible
+JIT. Override the complete target set with `CUDA_ARCH` when building a
+hardware-specific package:
 
 ```bash
 CUDA_ARCH=sm_86 cargo check --features cuda
-CUDA_ARCH=sm_89 cargo build --release --features cuda
+CUDA_ARCH="sm_86,sm_89" cargo build --release --features cuda
 ```
+
+Numerically safer CUDA math is the default. `CUDA_FAST_MATH=1` explicitly opts
+into NVCC fast-math transformations. `NVCC`, `CUDA_PATH`/`CUDA_HOME`,
+`CUDA_LIB_DIR`, and `MSVC_BIN_DIR` are supported build overrides; invalid or
+missing toolchain paths are hard build errors.
 
 Control device selection in `data/config.json` via the `device` field:
 - `cpu` — force CPU
-- `cuda` — prefer CUDA, fall back to CPU if unavailable
+- `cuda` — request CUDA; initialization failure is reported before CPU fallback
 - `auto` — auto-detect, prefer CUDA
 
-When the binary is built without the `cuda` feature, `cuda`/`auto` fall back to CPU automatically. Device initialization and fallback reasons are logged at runtime for easy debugging. CUDA paths cover `matmul` (cuBLAS), `relu`/`gelu`/`softmax`/`rmsnorm` (CUDA kernels), and Adam optimizer (GPU kernel). Errors are logged and automatic CPU fallback is applied.
+Initialization may fall back before training starts. Forward operators retain
+explicit CPU fallback paths and increment stage-specific counters. GPU Adam is
+different: after a training step begins, any allocation, transfer, clipping, or
+kernel error aborts training, poisons the optimizer, and prevents the failed
+state from being saved. It never retries a potentially partial update on CPU.
+`device=cpu` disables CUDA replay mirrors, uploads, and policy migration.
+
+Run the production self-test after installation or on a new driver:
+
+```bash
+cargo run --features cuda -- doctor
+cargo run --features cuda -- doctor --json
+```
+
+`doctor` reports the requested and actual device, GPU name, compute capability,
+free/total memory, NVCC version, compiled SASS/PTX targets, and
+attempt/success/fallback counters. It executes and numerically checks CUDA
+matmul, GELU, log-softmax, backward, and Adam; any fallback during those checks
+is a failure, not a pass.
 
 ---
 
@@ -77,6 +101,8 @@ All subcommands support `-c <path>` for config, `-s <seed>` for repeatable runs 
 cargo run --release                              # interactive mode
 cargo run --release -- simulate -n 1000 -p 100   # batch simulation
 cargo run --release -- benchmark                  # quick built-in benchmark
+cargo run --release -- config validate            # strict config validation
+cargo run --release -- doctor                     # build/device diagnostics
 ```
 
 See **[docs/USAGE.md](docs/USAGE.md)** for the full command reference — interactive commands, the optional Python (PyO3) scripting bridge, data collection & model calibration, and the paper-grade ACHF benchmark suite.
@@ -85,7 +111,45 @@ See **[docs/USAGE.md](docs/USAGE.md)** for the full command reference — intera
 
 ## Model Parameter Configuration
 
-Configuration is documented in the `_comment` fields of **[data/config.json](data/config.json)**, covering model architecture, training, worker, and ACHF parameters.
+Configuration is documented in the `_comment` fields of **[data/config.json](data/config.json)**, covering model architecture, training, worker, and ACHF parameters. Parsing is strict: unknown fields, invalid enum strings, wrong JSON types, invalid probabilities/dimensions, incompatible ACHF modes, and cross-field invariant violations return a non-zero exit code. Only `_comment*` documentation fields are ignored. Relative resource and cache paths are resolved from the configuration file's directory. The shipped config and pool catalog are embedded so the default executable remains bootstrappable when external data files are absent.
+
+---
+
+## Framework APIs
+
+Use the Rust library directly:
+
+```rust
+use talos_xii::prelude::*;
+
+let input = Tensor::new_f32(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
+let layer = Linear::new(2, 3, true, 42);
+let loss = layer.forward(&input).gelu().mean();
+loss.backward();
+```
+
+The stable entry points re-export `Tensor`, `Device`, `Dtype`, `Module`,
+`Linear`, `RMSNorm`, Transformer/MLA types, `AchfLayer`, configuration types,
+and CUDA diagnostics.
+
+For an installable Python extension (Python 3.9+ abi3):
+
+```bash
+python -m pip install maturin
+maturin develop --release
+python -c "import talos_xii as tx; print(tx.ones([2]).to_list())"
+```
+
+The existing embedded interpreter remains available through
+`cargo run --features python -- python <script> -- <args>`. CPU wheels are the
+portable default. A CUDA Python build must be built on a CUDA 12 toolchain with
+`maturin build --release --features cuda`; NVIDIA runtime libraries are not
+bundled into the wheel.
+
+Tagged releases produce Windows ZIP, Linux/macOS `tar.gz`, a Linux CUDA 12
+archive, abi3 wheels, per-artifact `.sha256` files, and an aggregate
+`SHA256SUMS`. Native archives contain the binary, README, license, docs, and
+example config/pool files.
 
 ---
 
@@ -186,11 +250,17 @@ Runtime CPU capability detection with automatic dispatch: Scalar → AVX2 → AV
 
 ```bash
 cargo test
+cargo test --features python
+cargo test --features cuda
+cargo clippy --all-targets -- -D warnings
+cargo package --locked
 ```
 
 Covers: state-transition logic, parameter validation, DQN/Q-value validation, PPO fast/slow alignment, Actor-Critic shapes, ACHF consistency, Transformer MLA/RoPE/RMSNorm, binary codec, config parsing, Beta calibration, EnvNet serialization/training, autograd gradient checks, and more.
 
-CI runs on Ubuntu, Windows, and macOS with ARM64 cross-compilation validation.
+CI runs on Ubuntu, Windows, and macOS, validates MSRV and ARM64 cross
+compilation, builds the Python extension, compiles CUDA in a CUDA 12 container,
+and supports opt-in runtime tests on a self-hosted GPU runner.
 
 ---
 
@@ -261,21 +331,40 @@ cargo check --features cuda
 cargo run --features cuda -- simulate -n 1000 -p 100
 ```
 
-通过 `CUDA_ARCH` 环境变量指定 NVCC 架构。默认会生成 `sm_75` SASS 和
-`compute_75` PTX，方便驱动做向前兼容 JIT。RTX 4060 这类 Ada 显卡建议指定
-`sm_89`：
+默认发布构建是 fat binary：包含 `sm_75`、`sm_80`、`sm_86`、`sm_89`
+原生 SASS，并附带 `compute_89` PTX 供新架构向前兼容 JIT。只有制作特定硬件
+包时才建议用 `CUDA_ARCH` 覆盖完整目标集合：
 
 ```bash
 CUDA_ARCH=sm_86 cargo check --features cuda
-CUDA_ARCH=sm_89 cargo build --release --features cuda
+CUDA_ARCH="sm_86,sm_89" cargo build --release --features cuda
 ```
+
+默认不启用 NVCC fast math；只有显式设置 `CUDA_FAST_MATH=1` 才接受其数值
+语义变化。可通过 `NVCC`、`CUDA_PATH`/`CUDA_HOME`、`CUDA_LIB_DIR`、
+`MSVC_BIN_DIR` 覆盖工具链位置，路径缺失或非法会直接导致构建失败。
 
 在 `data/config.json` 中通过 `device` 字段控制设备：
 - `cpu` — 强制 CPU
-- `cuda` — 优先 CUDA，不可用时自动回退 CPU
+- `cuda` — 请求 CUDA；初始化失败会明确报告后再回退 CPU
 - `auto` — 自动探测，优先 CUDA
 
-未启用 `cuda` feature 时，`cuda`/`auto` 自动回退 CPU。设备初始化和回退原因会在运行时明确记录。CUDA 路径覆盖 `matmul`（cuBLAS）、`relu`/`gelu`/`softmax`/`rmsnorm`（CUDA kernel）以及 Adam 优化器（GPU kernel）；遇到运行时错误会记录原因并自动回退到 CPU。
+训练开始前允许初始化级 CPU 回退；前向算子保留带分阶段计数器的 CPU fallback。
+GPU Adam 不允许这样处理：训练步一旦开始，分配、传输、裁剪或 kernel 任一失败
+都会中止训练并将优化器标记为 poisoned，失败状态不会写入缓存，也不能在 CPU
+上重试可能已经部分更新的参数。`device=cpu` 会关闭 replay mirror、batch 上传
+和策略迁移。
+
+部署或更换驱动后运行：
+
+```bash
+cargo run --features cuda -- doctor
+cargo run --features cuda -- doctor --json
+```
+
+`doctor` 会报告请求/实际设备、GPU 名称、计算能力、空闲/总显存、NVCC 版本、
+编译架构和成功/fallback 计数，并真实校验 matmul、GELU、log-softmax、backward
+与 Adam。自检过程中出现 fallback 会判定失败，不会当作 CUDA 正常。
 
 ---
 
@@ -287,6 +376,8 @@ CUDA_ARCH=sm_89 cargo build --release --features cuda
 cargo run --release                              # 交互模式
 cargo run --release -- simulate -n 1000 -p 100   # 批量模拟
 cargo run --release -- benchmark                  # 快速内置基准
+cargo run --release -- config validate            # 严格配置校验
+cargo run --release -- doctor                     # 构建与设备诊断
 ```
 
 完整命令参考见 **[docs/USAGE.md](docs/USAGE.md)** —— 交互指令、可选的 Python（PyO3）脚本桥接、数据采集与模型校准，以及论文级 ACHF Benchmark 套件。
@@ -295,7 +386,32 @@ cargo run --release -- benchmark                  # 快速内置基准
 
 ## 模型参数配置
 
-模型参数集中记录在 **[data/config.json](data/config.json)** 的 `_comment` 字段中，涵盖模型结构、训练、线程和 ACHF 参数。
+模型参数集中记录在 **[data/config.json](data/config.json)** 的 `_comment` 字段中，涵盖模型结构、训练、线程和 ACHF 参数。配置解析是严格的：未知字段、非法枚举、错误 JSON 类型、非法概率/维度、不兼容 ACHF 组合和跨字段约束都会返回非零退出码；只有 `_comment*` 文档字段会被忽略。相对路径以配置文件所在目录为基准。默认配置和卡池目录嵌入二进制，外部默认数据缺失时仍可启动。
+
+---
+
+## 框架 API
+
+Rust 用户可直接引用 `talos_xii::prelude::*`，稳定入口导出 `Tensor`、`Device`、
+`Dtype`、`Module`、`Linear`、`RMSNorm`、Transformer/MLA、`AchfLayer`、
+配置类型和 CUDA 诊断。
+
+Python 3.9+ 可构建 abi3 wheel：
+
+```bash
+python -m pip install maturin
+maturin develop --release
+python -c "import talos_xii as tx; print(tx.ones([2]).to_list())"
+```
+
+原有嵌入式入口仍保留：
+`cargo run --features python -- python <script> -- <args>`。通用预编译 wheel
+默认是 CPU 版；CUDA Python 包必须在 CUDA 12 工具链上执行
+`maturin build --release --features cuda`，wheel 不捆绑 NVIDIA 运行库。
+
+版本标签发布会生成 Windows ZIP、Linux/macOS `tar.gz`、Linux CUDA 12 包、
+abi3 wheel、每个制品的 `.sha256` 与汇总 `SHA256SUMS`。原生包包含二进制、
+README、许可证、文档和示例配置。
 
 ---
 
@@ -396,9 +512,16 @@ AMA 是第三层内部的延迟调度器。正常情况下，只有质量层已�
 
 ```bash
 cargo test
+cargo test --features python
+cargo test --features cuda
+cargo clippy --all-targets -- -D warnings
+cargo package --locked
 ```
 
-覆盖：状态转移逻辑、参数校验、DQN Q 值有效性、PPO 快慢路径对齐、Actor-Critic 形状、ACHF 一致性、Transformer MLA/RoPE/RMSNorm、二进制编解码、配置解析、Beta 校准、EnvNet 序列化/训练、autograd 梯度检查等。CI 在 Ubuntu、Windows、macOS 上执行，并验证 ARM64 交叉编译。
+覆盖：状态转移逻辑、严格配置、DQN/PPO、GPU optimizer 故障注入、ACHF、
+Transformer、autograd 与发布契约等。CI 在 Ubuntu、Windows、macOS 上执行，
+验证 MSRV/ARM64、Python extension、CUDA 12 编译，并可在 self-hosted GPU
+runner 上执行真实 CUDA 自检。
 
 ---
 

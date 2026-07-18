@@ -14,6 +14,12 @@ pub struct Rng {
     state: [u64; 4],
 }
 
+impl Default for Rng {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Rng {
     pub fn from_seed(mut seed: u64) -> Self {
         // 2. Use SplitMix64 to initialize the 4 states of Xoshiro256 from one seed

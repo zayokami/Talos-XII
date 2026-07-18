@@ -60,6 +60,10 @@ impl<T> DevicePtr<T> {
         self.size
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
     pub fn as_raw(&self) -> usize {
         self.ptr
     }
@@ -117,6 +121,10 @@ impl CudaBuffer {
             CudaBuffer::F32(b) => b.len(),
             CudaBuffer::F64(b) => b.len(),
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn as_raw(&self) -> usize {
@@ -877,6 +885,9 @@ pub struct DevicePtr<T> {
 impl<T> DevicePtr<T> {
     pub fn len(&self) -> usize {
         0
+    }
+    pub fn is_empty(&self) -> bool {
+        true
     }
     pub fn as_raw(&self) -> usize {
         0

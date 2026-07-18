@@ -73,6 +73,7 @@ extern "C" {
     pub fn cudaDeviceSynchronize() -> c_int;
     pub fn cudaMalloc(devPtr: *mut *mut std::ffi::c_void, size: usize) -> c_int;
     pub fn cudaFree(devPtr: *mut std::ffi::c_void) -> c_int;
+    pub fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> c_int;
     pub fn cudaMemcpy(
         dst: *mut std::ffi::c_void,
         src: *const std::ffi::c_void,

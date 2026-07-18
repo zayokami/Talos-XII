@@ -2,7 +2,7 @@ use crate::achf::AchfLayer;
 use crate::autograd::Tensor;
 #[cfg(test)]
 use crate::autograd::TensorReadGuard;
-use crate::config::{AchfConfig, Config};
+use crate::config::{AchfConfig, ComputeDevice, Config};
 use crate::env_net::EnvNet;
 use crate::gacha_env::{step_pull, GachaAction};
 use crate::neural::{NeuralLuckOptimizer, DIM};
@@ -10,6 +10,7 @@ use crate::nn::{Linear, Module};
 use crate::policy_eval::{evaluate_dqn_policy, format_policy_eval};
 use crate::rng::Rng;
 use crate::sim::{build_features_with_luck_budget, env_net_env, PullState};
+use crate::training_error::TrainingError;
 use crate::training_metrics::{StepSnapshot, TrainingMetrics, TrainingMetricsSink};
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -583,6 +584,19 @@ impl Module for DuelingQNetwork {
 }
 
 impl DuelingQNetwork {
+    pub fn uses_cuda(&self) -> bool {
+        #[cfg(cuda)]
+        {
+            self.parameters()
+                .first()
+                .is_some_and(|parameter| parameter.device == crate::autograd::Device::Cuda)
+        }
+        #[cfg(not(cuda))]
+        {
+            false
+        }
+    }
+
     pub fn new_with_config(config: &Config, seed: u64) -> Self {
         let hidden = config.model_hidden_dim;
         let l1 = Linear::new(DIM, hidden, true, seed);
@@ -716,6 +730,28 @@ impl DuelingQNetwork {
         } else {
             self.l3.to_cuda();
         }
+    }
+
+    #[cfg(cuda)]
+    pub fn try_to_cuda(&mut self) -> crate::cuda::error::CudaResult<()> {
+        use crate::autograd::Device;
+        use crate::cuda::error::CudaError;
+
+        crate::cuda::init()?;
+        let mut candidate = self.clone();
+        candidate.to_cuda();
+        if candidate
+            .parameters()
+            .iter()
+            .any(|parameter| parameter.device != Device::Cuda)
+        {
+            return Err(CudaError::InvalidInput {
+                op: "DuelingQNetwork::try_to_cuda",
+                message: "one or more parameters failed to migrate to CUDA",
+            });
+        }
+        *self = candidate;
+        Ok(())
     }
 
     pub fn update_achf_after_backward(&self) {
@@ -1304,42 +1340,52 @@ struct GpuAdam {
     beta2: f64,
     eps: f64,
     weight_decay: f64,
+    poisoned: bool,
 }
 
 #[cfg(cuda)]
 impl GpuAdam {
-    fn new(params: Vec<Tensor>, lr: f64) -> Option<Self> {
+    fn new(params: Vec<Tensor>, lr: f64) -> crate::cuda::error::CudaResult<Self> {
+        use crate::cuda::error::CudaError;
         use crate::cuda::memory::CudaBuffer;
         let mut m = Vec::with_capacity(params.len());
         let mut v = Vec::with_capacity(params.len());
         for p in &params {
             let len = p.cuda_storage_len();
             if p.device != crate::autograd::Device::Cuda {
-                return None;
+                return Err(CudaError::InvalidInput {
+                    op: "GpuAdam::new",
+                    message: "all parameters must reside on CUDA",
+                });
             }
             let (d_m, d_v) = match p.dtype {
                 crate::dtype::Dtype::F32 => {
-                    let dm = crate::cuda::memory::alloc::<f32>(len).ok()?;
-                    let dv = crate::cuda::memory::alloc::<f32>(len).ok()?;
+                    let dm = crate::cuda::memory::alloc::<f32>(len)?;
+                    let dv = crate::cuda::memory::alloc::<f32>(len)?;
                     let zeros = vec![0.0f32; len];
-                    crate::cuda::memory::copy_h2d(&dm, &zeros).ok()?;
-                    crate::cuda::memory::copy_h2d(&dv, &zeros).ok()?;
+                    crate::cuda::memory::copy_h2d(&dm, &zeros)?;
+                    crate::cuda::memory::copy_h2d(&dv, &zeros)?;
                     (CudaBuffer::F32(dm), CudaBuffer::F32(dv))
                 }
                 crate::dtype::Dtype::F64 => {
-                    let dm = crate::cuda::memory::alloc::<f64>(len).ok()?;
-                    let dv = crate::cuda::memory::alloc::<f64>(len).ok()?;
+                    let dm = crate::cuda::memory::alloc::<f64>(len)?;
+                    let dv = crate::cuda::memory::alloc::<f64>(len)?;
                     let zeros = vec![0.0f64; len];
-                    crate::cuda::memory::copy_h2d(&dm, &zeros).ok()?;
-                    crate::cuda::memory::copy_h2d(&dv, &zeros).ok()?;
+                    crate::cuda::memory::copy_h2d(&dm, &zeros)?;
+                    crate::cuda::memory::copy_h2d(&dv, &zeros)?;
                     (CudaBuffer::F64(dm), CudaBuffer::F64(dv))
                 }
-                _ => return None,
+                _ => {
+                    return Err(CudaError::InvalidInput {
+                        op: "GpuAdam::new",
+                        message: "only f32/f64 parameters are supported",
+                    });
+                }
             };
             m.push(std::sync::Arc::new(d_m));
             v.push(std::sync::Arc::new(d_v));
         }
-        Some(GpuAdam {
+        Ok(GpuAdam {
             params,
             m,
             v,
@@ -1349,47 +1395,55 @@ impl GpuAdam {
             beta2: 0.999,
             eps: 1e-8,
             weight_decay: 1e-4,
+            poisoned: false,
         })
     }
 
-    fn step(&mut self) {
+    fn step(&mut self) -> crate::cuda::error::CudaResult<()> {
+        use crate::cuda::error::CudaError;
         use crate::cuda::memory::CudaBuffer;
+        if self.poisoned {
+            return Err(CudaError::InvalidInput {
+                op: "GpuAdam::step",
+                message: "optimizer is poisoned after a previous CUDA failure",
+            });
+        }
         self.t += 1;
         crate::cuda::record_optimizer_attempt();
-        if !crate::autograd::cuda_clip_gradients_in_place(&self.params, 1.0, 1e-6) {
+        if let Err(error) = crate::autograd::cuda_clip_gradients_in_place(&self.params, 1.0, 1e-6) {
+            self.poisoned = true;
             crate::cuda::record_optimizer_fallback();
-            return;
+            return Err(error);
         }
 
         let bias_correction1 = 1.0 - self.beta1.powi(self.t as i32);
         let bias_correction2 = 1.0 - self.beta2.powi(self.t as i32);
 
-        let mut all_ok = true;
         for (i, param) in self.params.iter().enumerate() {
             let len = param.cuda_storage_len();
             if len == 0 {
                 continue;
             }
             let d_params = match param.cuda_get_or_upload_buffer() {
-                Ok(buf) => buf,
-                Err(_) => {
+                Ok(buffer) => buffer,
+                Err((_, error)) => {
+                    self.poisoned = true;
                     crate::cuda::record_optimizer_fallback();
-                    all_ok = false;
-                    continue;
+                    return Err(error);
                 }
             };
             let d_grads = match param.cuda_grad_get_or_upload_buffer() {
-                Ok(buf) => buf,
-                Err(_) => {
+                Ok(buffer) => buffer,
+                Err((_, error)) => {
+                    self.poisoned = true;
                     crate::cuda::record_optimizer_fallback();
-                    all_ok = false;
-                    continue;
+                    return Err(error);
                 }
             };
             let d_m = self.m[i].clone();
             let d_v = self.v[i].clone();
 
-            let step_ok = match (param.dtype, &*d_params, &*d_grads, &*d_m, &*d_v) {
+            let step_result = match (param.dtype, &*d_params, &*d_grads, &*d_m, &*d_v) {
                 (
                     crate::dtype::Dtype::F32,
                     CudaBuffer::F32(p),
@@ -1410,8 +1464,7 @@ impl GpuAdam {
                     bias_correction1 as f32,
                     bias_correction2 as f32,
                     1.0,
-                )
-                .is_ok(),
+                ),
                 (
                     crate::dtype::Dtype::F64,
                     CudaBuffer::F64(p),
@@ -1432,18 +1485,20 @@ impl GpuAdam {
                     bias_correction1,
                     bias_correction2,
                     1.0,
-                )
-                .is_ok(),
-                _ => false,
+                ),
+                _ => Err(CudaError::InvalidInput {
+                    op: "GpuAdam::step",
+                    message: "parameter/gradient/moment dtype mismatch",
+                }),
             };
-            if !step_ok {
+            if let Err(error) = step_result {
+                self.poisoned = true;
                 crate::cuda::record_optimizer_fallback();
-                all_ok = false;
+                return Err(error);
             }
         }
-        if all_ok {
-            crate::cuda::record_optimizer_success();
-        }
+        crate::cuda::record_optimizer_success();
+        Ok(())
     }
 
     fn zero_grad(&self) {
@@ -1508,24 +1563,34 @@ enum Optimizer {
 }
 
 impl Optimizer {
-    fn new(params: Vec<Tensor>, learning_rate: f64) -> Self {
+    fn new(params: Vec<Tensor>, learning_rate: f64) -> Result<Self, String> {
         #[cfg(cuda)]
         {
-            GpuAdam::new(params.clone(), learning_rate)
-                .map(Optimizer::Gpu)
-                .unwrap_or_else(|| Optimizer::Cpu(Adam::new(params, learning_rate)))
+            if params
+                .iter()
+                .any(|parameter| parameter.device == crate::autograd::Device::Cuda)
+            {
+                GpuAdam::new(params, learning_rate)
+                    .map(Optimizer::Gpu)
+                    .map_err(|error| error.to_string())
+            } else {
+                Ok(Optimizer::Cpu(Adam::new(params, learning_rate)))
+            }
         }
         #[cfg(not(cuda))]
         {
-            Optimizer::Cpu(Adam::new(params, learning_rate))
+            Ok(Optimizer::Cpu(Adam::new(params, learning_rate)))
         }
     }
 
-    fn step(&mut self) {
+    fn step(&mut self) -> Result<(), String> {
         match self {
-            Optimizer::Cpu(o) => o.step(),
+            Optimizer::Cpu(o) => {
+                o.step();
+                Ok(())
+            }
             #[cfg(cuda)]
-            Optimizer::Gpu(o) => o.step(),
+            Optimizer::Gpu(o) => o.step().map_err(|error| error.to_string()),
         }
     }
 
@@ -1661,13 +1726,19 @@ struct CudaReplayMirror {
 }
 
 impl ReplayBuffer {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, use_cuda: bool) -> Self {
+        #[cfg(not(cuda))]
+        let _ = use_cuda;
         ReplayBuffer {
             tree: SumTree::new(capacity),
             alpha: PER_ALPHA,
             max_priority: 1.0,
             #[cfg(cuda)]
-            cuda: CudaReplayMirror::new(capacity, DIM).ok(),
+            cuda: if use_cuda {
+                CudaReplayMirror::new(capacity, DIM).ok()
+            } else {
+                None
+            },
         }
     }
 
@@ -2033,7 +2104,9 @@ impl CudaReplayMirror {
 fn dqn_cpu_batch_tensors(
     per_sample: &PERSample,
     scratch: &mut DqnTrainerScratch,
-) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor) {
+    use_cuda: bool,
+    step: usize,
+) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor), TrainingError> {
     scratch.reset();
 
     for exp in &per_sample.experiences {
@@ -2067,50 +2140,42 @@ fn dqn_cpu_batch_tensors(
 
     #[cfg(cuda)]
     {
-        let batch_state = match batch_state.to_cuda() {
-            Ok(t) => t,
-            Err(_) => batch_state,
-        };
-        let batch_next_state = match batch_next_state.to_cuda() {
-            Ok(t) => t,
-            Err(_) => batch_next_state,
-        };
-        let batch_mask = match batch_mask.to_cuda() {
-            Ok(t) => t,
-            Err(_) => batch_mask,
-        };
-        let rewards_tensor = match rewards_tensor.to_cuda() {
-            Ok(t) => t,
-            Err(_) => rewards_tensor,
-        };
-        let dones_tensor = match dones_tensor.to_cuda() {
-            Ok(t) => t,
-            Err(_) => dones_tensor,
-        };
-        let is_weights_tensor = match is_weights_tensor.to_cuda() {
-            Ok(t) => t,
-            Err(_) => is_weights_tensor,
-        };
-        (
+        if use_cuda {
+            let upload = |tensor: Tensor, stage: &'static str| {
+                tensor
+                    .to_cuda()
+                    .map_err(|error| TrainingError::new("DQN", stage, step, error.to_string()))
+            };
+            return Ok((
+                upload(batch_state, "state batch upload")?,
+                upload(batch_next_state, "next-state batch upload")?,
+                upload(batch_mask, "action mask upload")?,
+                upload(rewards_tensor, "reward batch upload")?,
+                upload(dones_tensor, "terminal batch upload")?,
+                upload(is_weights_tensor, "importance-weight upload")?,
+            ));
+        }
+        Ok((
             batch_state,
             batch_next_state,
             batch_mask,
             rewards_tensor,
             dones_tensor,
             is_weights_tensor,
-        )
+        ))
     }
 
     #[cfg(not(cuda))]
     {
-        (
+        let _ = (use_cuda, step);
+        Ok((
             batch_state,
             batch_next_state,
             batch_mask,
             rewards_tensor,
             dones_tensor,
             is_weights_tensor,
-        )
+        ))
     }
 }
 
@@ -2122,7 +2187,7 @@ pub fn train_dqn(
     rng: &mut Rng,
     env_net: &EnvNet,
     config: &Config,
-) -> DuelingQNetwork {
+) -> Result<DuelingQNetwork, TrainingError> {
     train_dqn_impl(
         _initial_model,
         rng,
@@ -2132,26 +2197,38 @@ pub fn train_dqn(
     )
 }
 
-fn dqn_candidate_calibration_batch(corpus: &[Vec<f64>], indices: &[usize]) -> Option<Tensor> {
+fn dqn_candidate_calibration_batch(
+    corpus: &[Vec<f64>],
+    indices: &[usize],
+    use_cuda: bool,
+) -> Result<Option<Tensor>, TrainingError> {
     if indices.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut data = Vec::with_capacity(indices.len() * DIM);
     for &index in indices {
-        let state = corpus.get(index)?;
+        let Some(state) = corpus.get(index) else {
+            return Ok(None);
+        };
         if state.len() != DIM {
-            return None;
+            return Ok(None);
         }
         data.extend_from_slice(state);
     }
     let batch = Tensor::new_f32(data, vec![indices.len(), DIM]);
     #[cfg(cuda)]
     {
-        Some(batch.to_cuda().unwrap_or(batch))
+        if use_cuda {
+            return batch.to_cuda().map(Some).map_err(|error| {
+                TrainingError::new("DQN", "ACHF calibration upload", 0, error.to_string())
+            });
+        }
+        Ok(Some(batch))
     }
     #[cfg(not(cuda))]
     {
-        Some(batch)
+        let _ = use_cuda;
+        Ok(Some(batch))
     }
 }
 
@@ -2160,14 +2237,16 @@ fn validate_dqn_achf_candidate(
     corpus: &[Vec<f64>],
     validation_indices: &[usize],
     step: usize,
-) {
+    use_cuda: bool,
+) -> Result<(), TrainingError> {
     policy.set_achf_candidate_calibration_validation();
     for chunk in validation_indices.chunks(BATCH_SIZE) {
-        if let Some(batch) = dqn_candidate_calibration_batch(corpus, chunk) {
+        if let Some(batch) = dqn_candidate_calibration_batch(corpus, chunk, use_cuda)? {
             let _ = policy.forward(&batch);
         }
     }
     policy.record_achf_candidate_calibration_checkpoint(step);
+    Ok(())
 }
 
 fn dqn_candidate_calibration_target_met(
@@ -2190,7 +2269,7 @@ fn calibrate_dqn_achf_candidate(
     policy: &mut DuelingQNetwork,
     replay_buffer: &ReplayBuffer,
     config: &Config,
-) {
+) -> Result<(), TrainingError> {
     let calibration = &config.achf;
     if !calibration.enabled
         || !calibration.apply_dqn
@@ -2199,12 +2278,12 @@ fn calibrate_dqn_achf_candidate(
         || calibration.candidate_calibration_steps == 0
         || calibration.candidate_calibration_max_samples == 0
     {
-        return;
+        return Ok(());
     }
     let corpus = replay_buffer.calibration_states(calibration.candidate_calibration_max_samples);
     if corpus.len() < 2 || !policy.begin_achf_candidate_calibration() {
         eprintln!("[ACHF] DQN candidate calibration skipped: fewer than two valid replay states");
-        return;
+        return Ok(());
     }
     let parameters = policy.achf_candidate_calibration_parameters();
     let parameter_masks = policy.achf_candidate_calibration_parameter_masks();
@@ -2213,7 +2292,14 @@ fn calibrate_dqn_achf_candidate(
         parameter_masks.len(),
         "DQN ACHF candidate calibration parameter/mask topology mismatch"
     );
-    let mut optimizer = Optimizer::new(parameters, calibration.candidate_calibration_lr);
+    #[cfg(cuda)]
+    let use_cuda = parameters
+        .first()
+        .is_some_and(|parameter| parameter.device == crate::autograd::Device::Cuda);
+    #[cfg(not(cuda))]
+    let use_cuda = false;
+    let mut optimizer = Optimizer::new(parameters, calibration.candidate_calibration_lr)
+        .map_err(|error| TrainingError::new("DQN", "ACHF calibration setup", 0, error))?;
     let mut training_indices = Vec::new();
     let mut validation_indices = Vec::new();
     for index in 0..corpus.len() {
@@ -2232,7 +2318,7 @@ fn calibrate_dqn_achf_candidate(
 
     let total_steps = calibration.candidate_calibration_steps;
     let checkpoint_interval = (total_steps / 4).max(1);
-    validate_dqn_achf_candidate(policy, &corpus, &validation_indices, 0);
+    validate_dqn_achf_candidate(policy, &corpus, &validation_indices, 0, use_cuda)?;
     let mut completed_steps = 0usize;
     for step in 1..=total_steps {
         let start = ((step - 1) * BATCH_SIZE) % training_indices.len();
@@ -2242,7 +2328,8 @@ fn calibrate_dqn_achf_candidate(
             .collect();
         policy.set_achf_candidate_calibration_training();
         optimizer.zero_grad();
-        let Some(batch) = dqn_candidate_calibration_batch(&corpus, &batch_indices) else {
+        let Some(batch) = dqn_candidate_calibration_batch(&corpus, &batch_indices, use_cuda)?
+        else {
             continue;
         };
         let _ = policy.forward(&batch);
@@ -2250,11 +2337,13 @@ fn calibrate_dqn_achf_candidate(
             continue;
         };
         loss.backward();
-        optimizer.step();
+        optimizer
+            .step()
+            .map_err(|error| TrainingError::optimizer("DQN ACHF calibration", step, error))?;
         policy.enforce_achf_candidate_mask();
         completed_steps = step;
         if step.is_multiple_of(checkpoint_interval) || step == total_steps {
-            validate_dqn_achf_candidate(policy, &corpus, &validation_indices, step);
+            validate_dqn_achf_candidate(policy, &corpus, &validation_indices, step, use_cuda)?;
             if dqn_candidate_calibration_target_met(
                 policy,
                 calibration.candidate_min_calibration_samples,
@@ -2265,7 +2354,13 @@ fn calibrate_dqn_achf_candidate(
         }
     }
     if completed_steps != total_steps {
-        validate_dqn_achf_candidate(policy, &corpus, &validation_indices, completed_steps);
+        validate_dqn_achf_candidate(
+            policy,
+            &corpus,
+            &validation_indices,
+            completed_steps,
+            use_cuda,
+        )?;
     }
     let masked_moment_max_abs = optimizer.masked_moment_max_abs(&parameter_masks);
     policy.finalize_achf_candidate_calibration(completed_steps, masked_moment_max_abs);
@@ -2278,6 +2373,7 @@ fn calibrate_dqn_achf_candidate(
             memory.candidate_layers,
         );
     }
+    Ok(())
 }
 
 fn train_dqn_impl(
@@ -2286,27 +2382,43 @@ fn train_dqn_impl(
     env_net: &EnvNet,
     config: &Config,
     mut metrics: impl TrainingMetrics,
-) -> DuelingQNetwork {
+) -> Result<DuelingQNetwork, TrainingError> {
     println!("\n[DQN] Initializing Double Dueling DQN Training...");
 
-    let mut policy_net = DuelingQNetwork::new_with_config(config, rng.next_u64());
+    let policy_net = DuelingQNetwork::new_with_config(config, rng.next_u64());
     let mut target_net = DuelingQNetwork::new_with_config(config, rng.next_u64());
     target_net.load_state_dict(&policy_net); // Sync weights
 
     #[cfg(cuda)]
-    policy_net.to_cuda();
-    #[cfg(cuda)]
+    let (mut policy_net, mut target_net, mut optimizer, using_cuda) = if config.device
+        == ComputeDevice::Cuda
     {
-        target_net.to_cuda();
-    }
-    let params = policy_net.parameters();
-    #[cfg(cuda)]
-    let mut optimizer = GpuAdam::new(params, LEARNING_RATE)
-        .map(Optimizer::Gpu)
-        .unwrap_or_else(|| Optimizer::Cpu(Adam::new(policy_net.parameters(), LEARNING_RATE)));
+        let mut cuda_policy = policy_net.clone();
+        let mut cuda_target = target_net.clone();
+        let cuda_backend = cuda_policy
+            .try_to_cuda()
+            .and_then(|()| cuda_target.try_to_cuda())
+            .and_then(|()| GpuAdam::new(cuda_policy.parameters(), LEARNING_RATE));
+        match cuda_backend {
+            Ok(optimizer) => (cuda_policy, cuda_target, Optimizer::Gpu(optimizer), true),
+            Err(error) => {
+                eprintln!(
+                        "[CUDA] DQN training backend initialization failed ({error}); using CPU before training starts"
+                    );
+                let optimizer = Optimizer::Cpu(Adam::new(policy_net.parameters(), LEARNING_RATE));
+                (policy_net, target_net, optimizer, false)
+            }
+        }
+    } else {
+        let optimizer = Optimizer::Cpu(Adam::new(policy_net.parameters(), LEARNING_RATE));
+        (policy_net, target_net, optimizer, false)
+    };
     #[cfg(not(cuda))]
-    let mut optimizer = Optimizer::Cpu(Adam::new(params, LEARNING_RATE));
-    let mut replay_buffer = ReplayBuffer::new(BUFFER_CAPACITY);
+    let (mut policy_net, mut target_net, mut optimizer, using_cuda) = {
+        let optimizer = Optimizer::Cpu(Adam::new(policy_net.parameters(), LEARNING_RATE));
+        (policy_net, target_net, optimizer, false)
+    };
+    let mut replay_buffer = ReplayBuffer::new(BUFFER_CAPACITY, using_cuda);
 
     let total_steps = if config.fast_init { 5_000 } else { 50_000 };
     let mut epsilon = EPSILON_START;
@@ -2332,9 +2444,12 @@ fn train_dqn_impl(
     let mut scratch = DqnTrainerScratch::new();
     let ones_5_1 = Tensor::new_f32(ONES_5_1_DATA.to_vec(), vec![5, 1]);
     #[cfg(cuda)]
-    let ones_5_1 = match ones_5_1.to_cuda() {
-        Ok(t) => t,
-        Err(_) => ones_5_1,
+    let ones_5_1 = if using_cuda {
+        ones_5_1
+            .to_cuda()
+            .map_err(|error| TrainingError::new("DQN", "constant upload", 0, error.to_string()))?
+    } else {
+        ones_5_1
     };
 
     let pb = create_bar(total_steps as u64, "DQN Training");
@@ -2439,7 +2554,12 @@ fn train_dqn_impl(
                     cuda_batch.is_weights.clone(),
                 )
             } else {
-                dqn_cpu_batch_tensors(&per_sample, &mut scratch)
+                dqn_cpu_batch_tensors(
+                    &per_sample,
+                    &mut scratch,
+                    using_cuda,
+                    optimizer_step_counter,
+                )?
             };
             #[cfg(not(cuda))]
             let (
@@ -2449,7 +2569,12 @@ fn train_dqn_impl(
                 rewards_tensor,
                 dones_tensor,
                 is_weights_tensor,
-            ) = dqn_cpu_batch_tensors(&per_sample, &mut scratch);
+            ) = dqn_cpu_batch_tensors(
+                &per_sample,
+                &mut scratch,
+                using_cuda,
+                optimizer_step_counter,
+            )?;
 
             // 2. Policy Forward
             let q_values = policy_net.forward(&batch_state); // (B, 5)
@@ -2525,7 +2650,9 @@ fn train_dqn_impl(
             let backward_time = start_backward.elapsed();
 
             let start_opt = std::time::Instant::now();
-            optimizer.step();
+            optimizer.step().map_err(|error| {
+                TrainingError::optimizer("DQN", optimizer_step_counter + 1, error)
+            })?;
             policy_net.refresh_achf_after_optimizer_step();
             optimizer_step_counter += 1;
             let opt_time = start_opt.elapsed();
@@ -2665,9 +2792,9 @@ fn train_dqn_impl(
         }
     }
     pb.finish_with_message("DQN Training Complete.");
-    calibrate_dqn_achf_candidate(&mut policy_net, &replay_buffer, config);
+    calibrate_dqn_achf_candidate(&mut policy_net, &replay_buffer, config)?;
     policy_net.freeze_achf_for_inference();
-    policy_net
+    Ok(policy_net)
 }
 
 /// Train a DQN agent with optional metrics collection for benchmarking.
@@ -2677,7 +2804,7 @@ pub fn train_dqn_with_metrics(
     env_net: &EnvNet,
     config: &Config,
     metrics_tx: Option<std::sync::mpsc::Sender<StepSnapshot>>,
-) -> DuelingQNetwork {
+) -> Result<DuelingQNetwork, TrainingError> {
     train_dqn_impl(
         initial_model,
         rng,
@@ -2734,32 +2861,43 @@ pub struct OnlineDqnTrainer {
 }
 
 impl OnlineDqnTrainer {
-    pub fn from_policy(policy: DuelingQNetwork, seed: u64) -> Self {
+    pub fn from_policy(policy: DuelingQNetwork, seed: u64, device: ComputeDevice) -> Self {
         let achf = policy.achf_config();
         let mut target = DuelingQNetwork::new(seed, &achf);
         target.load_state_dict(&policy);
         #[cfg(cuda)]
-        let policy = {
-            let mut p = policy;
-            p.to_cuda();
-            p
+        let (policy, target, optimizer, using_cuda) = if device == ComputeDevice::Cuda {
+            let mut cuda_policy = policy.clone();
+            let mut cuda_target = target.clone();
+            let cuda_backend = cuda_policy
+                .try_to_cuda()
+                .and_then(|()| cuda_target.try_to_cuda())
+                .and_then(|()| GpuAdam::new(cuda_policy.parameters(), LEARNING_RATE));
+            match cuda_backend {
+                Ok(optimizer) => (cuda_policy, cuda_target, Optimizer::Gpu(optimizer), true),
+                Err(error) => {
+                    eprintln!(
+                        "[CUDA] Online DQN backend initialization failed ({error}); using CPU before training starts"
+                    );
+                    let optimizer = Optimizer::Cpu(Adam::new(policy.parameters(), LEARNING_RATE));
+                    (policy, target, optimizer, false)
+                }
+            }
+        } else {
+            let optimizer = Optimizer::Cpu(Adam::new(policy.parameters(), LEARNING_RATE));
+            (policy, target, optimizer, false)
         };
-        #[cfg(cuda)]
-        {
-            target.to_cuda();
-        }
-        let params = policy.parameters();
-        #[cfg(cuda)]
-        let optimizer = GpuAdam::new(params, LEARNING_RATE)
-            .map(Optimizer::Gpu)
-            .unwrap_or_else(|| Optimizer::Cpu(Adam::new(policy.parameters(), LEARNING_RATE)));
         #[cfg(not(cuda))]
-        let optimizer = Optimizer::Cpu(Adam::new(params, LEARNING_RATE));
+        let (policy, target, optimizer, using_cuda) = {
+            let _ = device;
+            let optimizer = Optimizer::Cpu(Adam::new(policy.parameters(), LEARNING_RATE));
+            (policy, target, optimizer, false)
+        };
         Self {
             policy,
             target,
             optimizer,
-            replay_buffer: ReplayBuffer::new(BUFFER_CAPACITY),
+            replay_buffer: ReplayBuffer::new(BUFFER_CAPACITY, using_cuda),
             steps_done: 0,
             achf_orthogonal_penalty_interval: dqn_achf_orthogonal_penalty_interval(&achf),
             scratch: DqnTrainerScratch::new(),
@@ -2770,9 +2908,9 @@ impl OnlineDqnTrainer {
         self.replay_buffer.push(exp);
     }
 
-    pub fn train_step(&mut self, rng: &mut Rng) -> bool {
+    pub fn train_step(&mut self, rng: &mut Rng) -> Result<bool, TrainingError> {
         if self.replay_buffer.len() < BATCH_SIZE {
-            return false;
+            return Ok(false);
         }
         // Beta anneals linearly from PER_BETA_START toward PER_BETA_END
         let beta = (PER_BETA_START
@@ -2799,7 +2937,12 @@ impl OnlineDqnTrainer {
                 cuda_batch.is_weights.clone(),
             )
         } else {
-            dqn_cpu_batch_tensors(&per_sample, &mut self.scratch)
+            dqn_cpu_batch_tensors(
+                &per_sample,
+                &mut self.scratch,
+                self.policy.uses_cuda(),
+                self.steps_done,
+            )?
         };
         #[cfg(not(cuda))]
         let (
@@ -2809,14 +2952,22 @@ impl OnlineDqnTrainer {
             rewards_tensor,
             dones_tensor,
             is_weights_tensor,
-        ) = dqn_cpu_batch_tensors(&per_sample, &mut self.scratch);
+        ) = dqn_cpu_batch_tensors(&per_sample, &mut self.scratch, false, self.steps_done)?;
 
         let q_values = self.policy.forward(&batch_state);
         let ones_5_1 = Tensor::new_f32(ONES_5_1_DATA.to_vec(), vec![5, 1]);
         #[cfg(cuda)]
-        let ones_5_1 = match ones_5_1.to_cuda() {
-            Ok(t) => t,
-            Err(_) => ones_5_1,
+        let ones_5_1 = if self.policy.uses_cuda() {
+            ones_5_1.to_cuda().map_err(|error| {
+                TrainingError::new(
+                    "Online DQN",
+                    "constant upload",
+                    self.steps_done,
+                    error.to_string(),
+                )
+            })?
+        } else {
+            ones_5_1
         };
         let q_actions = (&q_values * &batch_mask).matmul(&ones_5_1);
 
@@ -2875,7 +3026,9 @@ impl OnlineDqnTrainer {
         }
         loss.backward();
         self.policy.update_achf_after_backward();
-        self.optimizer.step();
+        self.optimizer
+            .step()
+            .map_err(|error| TrainingError::optimizer("Online DQN", self.steps_done + 1, error))?;
         self.policy.refresh_achf_after_optimizer_step();
 
         // Write back per-sample TD errors for priority update
@@ -2923,7 +3076,7 @@ impl OnlineDqnTrainer {
 
         self.target.soft_update(&self.policy, 0.005);
         self.steps_done += 1;
-        true
+        Ok(true)
     }
 
     pub fn sync_to(&self, shared: &std::sync::RwLock<DuelingQNetwork>) {
@@ -2984,6 +3137,66 @@ mod tests {
 
         achf.lambda_ortho = 0.0;
         assert_eq!(dqn_achf_orthogonal_penalty_interval(&achf), usize::MAX);
+    }
+
+    #[test]
+    fn cpu_device_keeps_online_dqn_entirely_on_cpu() {
+        let config = small_dqn_config();
+        let policy = DuelingQNetwork::new_with_config(&config, 17);
+        let trainer = OnlineDqnTrainer::from_policy(policy, 23, ComputeDevice::Cpu);
+
+        assert!(!trainer.policy.uses_cuda());
+        #[cfg(cuda)]
+        assert!(trainer.replay_buffer.cuda.is_none());
+    }
+
+    #[cfg(cuda)]
+    #[test]
+    fn dqn_gpu_adam_failure_is_hard_and_poisons_optimizer() {
+        if !crate::cuda::is_available() {
+            return;
+        }
+        let parameter = Tensor::new_f32(vec![1.0], vec![1]);
+        parameter.grad_write_f32()[0] = 0.25;
+        let parameter = parameter
+            .to_cuda()
+            .expect("CUDA parameter upload should succeed");
+        let mut optimizer =
+            GpuAdam::new(vec![parameter], 0.001).expect("GPU Adam should initialize");
+        let before = crate::cuda::runtime_stats();
+
+        crate::cuda::kernels::inject_adam_failure_once();
+        let failure = optimizer.step();
+        let after_failure = crate::cuda::runtime_stats();
+
+        assert!(failure.is_err(), "injected CUDA failure must be returned");
+        assert!(optimizer.poisoned);
+        assert_eq!(
+            after_failure.optimizer_attempts,
+            before.optimizer_attempts + 1
+        );
+        assert_eq!(
+            after_failure.optimizer_successes,
+            before.optimizer_successes
+        );
+        assert_eq!(
+            after_failure.optimizer_fallback_param,
+            before.optimizer_fallback_param + 1
+        );
+
+        let retry = optimizer.step();
+        let after_retry = crate::cuda::runtime_stats();
+        assert!(matches!(
+            retry,
+            Err(crate::cuda::error::CudaError::InvalidInput {
+                message: "optimizer is poisoned after a previous CUDA failure",
+                ..
+            })
+        ));
+        assert_eq!(
+            after_retry.optimizer_attempts, after_failure.optimizer_attempts,
+            "poisoned optimizer must reject retry before touching CUDA"
+        );
     }
 
     #[test]
@@ -3295,7 +3508,7 @@ mod tests {
             .weight
             .weight
             .data_to_f32_vec();
-        let mut replay = ReplayBuffer::new(32);
+        let mut replay = ReplayBuffer::new(32, false);
         for sample in 0..8 {
             let state: Vec<f64> = (0..DIM)
                 .map(|index| (sample * DIM + index) as f64 / 64.0)
@@ -3310,7 +3523,7 @@ mod tests {
             });
         }
 
-        calibrate_dqn_achf_candidate(&mut policy, &replay, &config);
+        calibrate_dqn_achf_candidate(&mut policy, &replay, &config).unwrap();
 
         let layer = policy.achf.as_ref().unwrap();
         assert_eq!(layer.weight.weight.data_to_f32_vec(), reference_before);

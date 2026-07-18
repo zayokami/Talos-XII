@@ -1,5 +1,5 @@
 use crate::calibrate::{apply_calibration, CalibrationData};
-use crate::config::{ComputeDevice, Config};
+use crate::config::{ComputeDevice, Config, ConfigError};
 use crate::dqn::{train_dqn, DuelingQNetwork};
 use crate::env_net::EnvNet;
 use crate::model_io::{
@@ -14,8 +14,11 @@ use crate::neural::NeuralLuckOptimizer;
 use crate::ppo::{train_ppo, ActorCritic};
 use crate::rng::Rng;
 use crate::trainer::{train_linear_regression, train_manifold_rl, train_neural_optimizer};
+use crate::training_error::TrainingError;
 use crate::worker::GoodJobWorker;
 use log::{error, info, warn};
+use std::error::Error;
+use std::fmt;
 
 pub const DQN_MASTER_CACHE_PATH: &str = "dqn.cache";
 pub const DQN_INFERENCE_CACHE_PATH: &str = "dqn.cache.bf16";
@@ -33,11 +36,43 @@ pub struct ModelInitOptions {
     pub allow_online_bootstrap: bool,
 }
 
-pub fn initialize_system(
-    config_path: &str,
-    seed: Option<u64>,
-    options: ModelInitOptions,
-) -> (
+#[derive(Debug)]
+pub enum InitializationError {
+    Config(ConfigError),
+    Training(TrainingError),
+}
+
+impl fmt::Display for InitializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Config(error) => error.fmt(formatter),
+            Self::Training(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for InitializationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Config(error) => Some(error),
+            Self::Training(error) => Some(error),
+        }
+    }
+}
+
+impl From<ConfigError> for InitializationError {
+    fn from(error: ConfigError) -> Self {
+        Self::Config(error)
+    }
+}
+
+impl From<TrainingError> for InitializationError {
+    fn from(error: TrainingError) -> Self {
+        Self::Training(error)
+    }
+}
+
+pub type InitializedSystem = (
     Config,
     EnvNet,
     NeuralLuckOptimizer,
@@ -45,8 +80,14 @@ pub fn initialize_system(
     ActorCritic,
     GoodJobWorker,
     Rng,
-) {
-    let mut config = resolve_runtime_config(config_path);
+);
+
+pub fn initialize_system(
+    config_path: &str,
+    seed: Option<u64>,
+    options: ModelInitOptions,
+) -> Result<InitializedSystem, InitializationError> {
+    let mut config = resolve_runtime_config(config_path)?;
     apply_compute_device_policy(&mut config);
     if config.model_hidden_dim >= 8192 {
         warn!(
@@ -75,7 +116,7 @@ pub fn initialize_system(
         &config,
         options,
         neural_hash,
-    );
+    )?;
     let dqn_policy = prepare_dqn_gpu_policy(
         &dqn_master,
         options.force || dqn_master_rebuilt,
@@ -83,7 +124,7 @@ pub fn initialize_system(
         &config,
     );
     let (ppo_master, ppo_master_rebuilt) =
-        build_ppo_master(&mut rng, &env_net, &config, options.force, env_net_hash);
+        build_ppo_master(&mut rng, &env_net, &config, options.force, env_net_hash)?;
     let ppo_policy = prepare_ppo_gpu_policy(
         &ppo_master,
         options.force || ppo_master_rebuilt,
@@ -91,7 +132,7 @@ pub fn initialize_system(
         &config,
     );
 
-    (
+    Ok((
         config,
         env_net,
         trained_neural_opt,
@@ -99,17 +140,17 @@ pub fn initialize_system(
         ppo_policy,
         worker,
         rng,
-    )
+    ))
 }
 
-fn resolve_runtime_config(config_path: &str) -> Config {
-    let config = Config::load(config_path);
+fn resolve_runtime_config(config_path: &str) -> Result<Config, ConfigError> {
+    let config = Config::try_load(config_path)?;
     if !config.use_calibrated {
-        return config;
+        return Ok(config);
     }
 
     let calibration = CalibrationData::load(&config.calibrated_path);
-    apply_runtime_calibration(config, calibration)
+    Ok(apply_runtime_calibration(config, calibration))
 }
 
 fn apply_runtime_calibration(mut config: Config, calibration: CalibrationData) -> Config {
@@ -340,7 +381,7 @@ fn build_dqn_master(
     config: &Config,
     options: ModelInitOptions,
     neural_hash: Option<String>,
-) -> (DuelingQNetwork, bool) {
+) -> Result<(DuelingQNetwork, bool), TrainingError> {
     let online_dqn_allowed =
         options.allow_online_bootstrap && config.online_train && config.online_train_dqn;
     let load_quality = if online_dqn_allowed {
@@ -361,7 +402,7 @@ fn build_dqn_master(
         ) {
             cached.freeze_achf_for_inference();
             info!("[DQN] Cached model loaded.");
-            return (cached, false);
+            return Ok((cached, false));
         }
 
         if online_dqn_allowed {
@@ -375,18 +416,18 @@ fn build_dqn_master(
                     "online training initialized from random weights",
                 )),
             );
-            return (d, true);
+            return Ok((d, true));
         }
 
         info!("[DQN] Training new model...");
-        let d = train_dqn(trained_neural_opt, rng, env_net, config);
+        let d = train_dqn(trained_neural_opt, rng, env_net, config)?;
         let _ = save_model_with_manifest(
             &d,
             DQN_MASTER_CACHE_PATH,
             "DQN",
             trained_dqn_manifest.clone(),
         );
-        return (d, true);
+        return Ok((d, true));
     }
 
     if online_dqn_allowed {
@@ -400,13 +441,13 @@ fn build_dqn_master(
                 "online training initialized from random weights",
             )),
         );
-        return (d, true);
+        return Ok((d, true));
     }
 
     info!("[DQN] Force training new model...");
-    let d = train_dqn(trained_neural_opt, rng, env_net, config);
+    let d = train_dqn(trained_neural_opt, rng, env_net, config)?;
     let _ = save_model_with_manifest(&d, DQN_MASTER_CACHE_PATH, "DQN", trained_dqn_manifest);
-    (d, true)
+    Ok((d, true))
 }
 
 #[cfg(cuda)]
@@ -418,8 +459,12 @@ fn prepare_dqn_gpu_policy(
 ) -> DuelingQNetwork {
     let mut policy = prepare_dqn_inference_cache(master, force_refresh, config);
     if device == ComputeDevice::Cuda {
-        policy.to_cuda();
-        info!("[DQN] BF16 inference cache moved to CUDA for Tensor Core matmul.");
+        match policy.try_to_cuda() {
+            Ok(()) => info!("[DQN] BF16 inference cache moved to CUDA for Tensor Core matmul."),
+            Err(error) => warn!(
+                "[DQN] CUDA inference initialization failed ({error}); retaining the complete CPU policy"
+            ),
+        }
     }
     policy
 }
@@ -473,7 +518,7 @@ fn build_ppo_master(
     config: &Config,
     force: bool,
     env_net_hash: Option<String>,
-) -> (ActorCritic, bool) {
+) -> Result<(ActorCritic, bool), TrainingError> {
     let ppo_master_manifest = ppo_master_cache_manifest(config, ppo_training_quality(config))
         .with_source_hash(env_net_hash);
     if !force {
@@ -485,11 +530,11 @@ fn build_ppo_master(
         ) {
             cached.freeze_achf_for_inference();
             info!("[PPO] Cached model loaded.");
-            return (cached, false);
+            return Ok((cached, false));
         }
 
         info!("[PPO] Training new model...");
-        let p = train_ppo(rng, env_net, config);
+        let p = train_ppo(rng, env_net, config)?;
         println!("[PPO] Saving model...");
         let _ = save_model_with_manifest(
             &p,
@@ -497,11 +542,11 @@ fn build_ppo_master(
             "PPO",
             ppo_master_manifest.clone(),
         );
-        return (p, true);
+        return Ok((p, true));
     }
 
     info!("[PPO] Force training new model...");
-    let p = train_ppo(rng, env_net, config);
+    let p = train_ppo(rng, env_net, config)?;
     println!("[PPO] Saving model...");
     let _ = save_model_with_manifest(
         &p,
@@ -509,7 +554,7 @@ fn build_ppo_master(
         "PPO",
         ppo_master_manifest.clone(),
     );
-    (p, true)
+    Ok((p, true))
 }
 
 #[cfg(cuda)]
@@ -521,8 +566,12 @@ fn prepare_ppo_gpu_policy(
 ) -> ActorCritic {
     let mut policy = prepare_ppo_inference_cache(master, force_refresh, config);
     if device == ComputeDevice::Cuda {
-        policy.to_cuda();
-        info!("[PPO] BF16 inference cache moved to CUDA for Tensor Core matmul.");
+        match policy.try_to_cuda() {
+            Ok(()) => info!("[PPO] BF16 inference cache moved to CUDA for Tensor Core matmul."),
+            Err(error) => warn!(
+                "[PPO] CUDA inference initialization failed ({error}); retaining the complete CPU policy"
+            ),
+        }
     }
     policy
 }
@@ -570,11 +619,11 @@ fn prepare_ppo_inference_cache(
     bf16
 }
 
-pub(crate) fn dqn_training_quality(config: &Config) -> CacheQualitySummary {
+pub fn dqn_training_quality(config: &Config) -> CacheQualitySummary {
     CacheQualitySummary::training_steps(if config.fast_init { 5_000 } else { 50_000 })
 }
 
-pub(crate) fn ppo_training_quality(config: &Config) -> CacheQualitySummary {
+pub fn ppo_training_quality(config: &Config) -> CacheQualitySummary {
     let fast_mode = config.fast_init || config.ppo_mode == "fast";
     let steps = if config.ppo_total_steps > 0 {
         config.ppo_total_steps

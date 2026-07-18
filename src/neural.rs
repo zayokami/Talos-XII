@@ -295,6 +295,12 @@ impl LayerNorm {
     }
 }
 
+impl Default for LayerNorm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Two-layer residual block with LayerNorm and ReLU activations.
 #[derive(Clone)]
 pub struct ResidualBlock {

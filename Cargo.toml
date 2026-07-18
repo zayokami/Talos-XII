@@ -3,6 +3,34 @@ name = "talos_xii"
 version = "0.8.0"
 edition = "2021"
 rust-version = "1.89.0"
+description = "A Rust deep-learning framework with autograd, Transformers, ACHF, and optional CUDA"
+license = "MIT"
+repository = "https://github.com/zayokami/Talos-XII"
+homepage = "https://github.com/zayokami/Talos-XII"
+readme = "README.md"
+keywords = ["deep-learning", "autograd", "cuda", "transformer", "machine-learning"]
+categories = ["science", "algorithms", "command-line-utilities"]
+default-run = "talos_xii"
+include = [
+    "src/**",
+    "cuda/**",
+    "data/config.json",
+    "data/pools.json",
+    "docs/REQUIREMENTS.md",
+    "docs/USAGE.md",
+    "examples/**",
+    "bindings/python/Cargo.toml",
+    "bindings/python/src/**",
+    "bindings/python/python/**",
+    "pyproject.toml",
+    "scripts/package-release.ps1",
+    "tests/**",
+    "build.rs",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE",
+]
 
 [dependencies]
 rayon = "1.11.0"
@@ -17,17 +45,28 @@ log = "0.4.29"
 env_logger = "0.11.9"
 colored = "3.1.1"
 indicatif = "0.18.4"
-plotters = { version = "0.3", default-features = false, features = [
+plotters = { version = "0.3", optional = true, default-features = false, features = [
     "svg_backend", "bitmap_backend", "bitmap_encoder",
     "line_series", "errorbar", "full_palette",
     "ttf", "ab_glyph",
 ] }
-pyo3 = { version = "0.29.0", optional = true, features = ["auto-initialize"] }
+pyo3 = { version = "0.29.0", optional = true }
 
 [features]
-default = []
+default = ["application"]
+application = ["dep:plotters"]
 cuda = []
-python = ["dep:pyo3"]
+python-bindings = ["dep:pyo3"]
+python = ["python-bindings", "pyo3/auto-initialize"]
+
+[[bin]]
+name = "talos_xii"
+path = "src/main.rs"
+required-features = ["application"]
+
+[package.metadata.docs.rs]
+no-default-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [profile.release]
 lto = true        # Link Time Optimization (smaller binary, faster code)

@@ -40,7 +40,7 @@ impl Tensor {
         #[cfg(cuda)]
         if self.device == Device::Cuda {
             if let Some(d_grad) = self.cuda_grad_zero_buffer() {
-                if d_grad.len() > 0 {
+                if !d_grad.is_empty() {
                     match &*d_grad {
                         crate::cuda::memory::CudaBuffer::BF16(_) => {}
                         crate::cuda::memory::CudaBuffer::I8(_) => {}

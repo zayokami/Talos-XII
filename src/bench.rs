@@ -1867,7 +1867,8 @@ fn run_static_pruning_pair(
     let mut train_rng = Rng::from_seed(derive_seed(trial_seed, SEED_PPO_TRAIN));
     let train_start = Instant::now();
     let trained_policy =
-        train_ppo_with_metrics(&mut train_rng, &env_net, training_config, Some(tx));
+        train_ppo_with_metrics(&mut train_rng, &env_net, training_config, Some(tx))
+            .unwrap_or_else(|error| panic!("PPO benchmark training failed: {error}"));
     let train_time_ms = train_start.elapsed().as_secs_f64() * 1000.0;
     let snapshots: Vec<StepSnapshot> = rx.try_iter().collect();
     assert!(
@@ -2052,7 +2053,8 @@ fn run_mode_comparison(base_config: &Config, seed: u64, nt: usize) -> Vec<Aggreg
         let mut train_rng = Rng::from_seed(derive_seed(trial_seed, SEED_PPO_TRAIN));
         let train_start = Instant::now();
         let trained_policy =
-            train_ppo_with_metrics(&mut train_rng, &env_net, &training_cfg, Some(tx));
+            train_ppo_with_metrics(&mut train_rng, &env_net, &training_cfg, Some(tx))
+                .unwrap_or_else(|error| panic!("PPO benchmark training failed: {error}"));
         let train_time_ms = train_start.elapsed().as_secs_f64() * 1000.0;
         let snapshots: Vec<StepSnapshot> = rx.try_iter().collect();
         assert!(
@@ -2134,7 +2136,8 @@ fn run_path_comparison(
         let (env_net, _neural_opt, _worker) =
             build_base_models(&cfg, derive_seed(trial_seed, SEED_BASE_MODELS));
         let mut ppo_rng = Rng::from_seed(derive_seed(trial_seed, SEED_PPO_TRAIN));
-        let ppo = train_ppo_with_metrics(&mut ppo_rng, &env_net, &cfg, None);
+        let ppo = train_ppo_with_metrics(&mut ppo_rng, &env_net, &cfg, None)
+            .unwrap_or_else(|error| panic!("PPO benchmark training failed: {error}"));
         let (achf, input_dim) = ppo
             .first_achf_layer()
             .expect("path comparison requires an ACHF layer; achf.enabled=true");
@@ -2940,7 +2943,8 @@ fn train_and_measure(label: &str, config: &Config, seed: u64) -> BenchRunResult 
             let (tx, rx) = std::sync::mpsc::channel();
             let mut train_rng = Rng::from_seed(derive_seed(seed, SEED_DQN_TRAIN));
             let train_start = Instant::now();
-            let dqn = train_dqn_with_metrics(&neural_opt, &mut train_rng, &env_net, &cfg, Some(tx));
+            let dqn = train_dqn_with_metrics(&neural_opt, &mut train_rng, &env_net, &cfg, Some(tx))
+                .unwrap_or_else(|error| panic!("DQN benchmark training failed: {error}"));
             let train_elapsed = train_start.elapsed();
             let snapshots: Vec<StepSnapshot> = rx.try_iter().collect();
             let train_loss = snapshots
@@ -2995,7 +2999,8 @@ fn train_and_measure(label: &str, config: &Config, seed: u64) -> BenchRunResult 
             let (tx, rx) = std::sync::mpsc::channel();
             let mut train_rng = Rng::from_seed(derive_seed(seed, SEED_PPO_TRAIN));
             let train_start = Instant::now();
-            let ppo = train_ppo_with_metrics(&mut train_rng, &env_net, &cfg, Some(tx));
+            let ppo = train_ppo_with_metrics(&mut train_rng, &env_net, &cfg, Some(tx))
+                .unwrap_or_else(|error| panic!("PPO benchmark training failed: {error}"));
             let train_elapsed = train_start.elapsed();
             let snapshots: Vec<StepSnapshot> = rx.try_iter().collect();
             let train_loss = snapshots

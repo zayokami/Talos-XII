@@ -4,6 +4,30 @@
 
 All subcommands support `-c <path>` for config, `-s <seed>` for repeatable runs with a fixed config and worker topology, and `-f` to force model retraining.
 
+## Configuration and Diagnostics
+
+Validate configuration without initializing or training models:
+
+```bash
+cargo run -- config validate
+```
+
+The parser rejects unknown fields, wrong types, invalid enum strings, unsafe
+dimensions/probabilities, and incompatible cross-field/ACHF combinations. Only
+`_comment*` documentation fields are ignored. Relative paths are resolved from
+the selected config file's directory.
+
+Inspect the build and selected device:
+
+```bash
+cargo run -- doctor
+cargo run --features cuda -- doctor --json
+```
+
+With CUDA enabled, the default doctor run executes matmul, GELU, log-softmax,
+backward, and Adam on the GPU and fails if any operation falls back to CPU.
+Use `--no-self-test` only when metadata-only inspection is intentional.
+
 ## Interactive Mode
 
 ```bash
@@ -43,7 +67,16 @@ If "Avg Extra Jade Cost" is N/A, all simulations cleared UP within the free pull
 
 ## Python Scripting (Optional)
 
-Enable the optional PyO3 bridge to run a Python script inside the Talos-XII process:
+The installable Python 3.9+ abi3 extension and the embedded interpreter expose
+the same tensor/autograd API. Build a local extension with:
+
+```bash
+python -m pip install maturin
+maturin develop --release
+python -c "import talos_xii as tx; print(tx.__version__)"
+```
+
+Enable the embedded PyO3 bridge to run a Python script inside the Talos-XII process:
 
 ```bash
 cargo run --features python -- python <script.py> -- <args>
@@ -83,7 +116,7 @@ Run it from the project root:
 cargo run --features python -- python scripts/my_train.py -- 1.0
 ```
 
-Think of `talos_xii` as the small tensor/autograd module provided by this binary. Use `tx.tensor(...)` for your data, `tx.zeros/full/arange/eye/randn(...)` for common inputs, and normal Python operators like `x + 1.0`, `2.0 * x`, `x ** 2.0`, `x % 2.0`, and `abs(x)` for math. Tensor methods also cover common activation/special functions (`relu`, `gelu`, `relu6`, `elu`, `selu`, `softplus`, `softsign`, `sigmoid`, `tanh`, `sin`, `cos`, `acos`, `asin`, `atan`, `erf`, `erfc`, `sqrt`, `rsqrt`, `log1p`, `expm1`) plus `concat`, `split`, `strided_slice`, `l2_normalize`, `group_norm`, `instance_norm`, `batch_norm2d`, `avg_pool2d`, `max_pool2d`, `pooling`, `conv2d`, `conv2d_transpose`, `depthwise_conv2d`, `conv3d`, and `gemm`/`matmul`.
+The `talos_xii` package is the Python surface of the framework. Use `tx.tensor(...)` for your data, `tx.zeros/full/arange/eye/randn(...)` for common inputs, and normal Python operators like `x + 1.0`, `2.0 * x`, `x ** 2.0`, `x % 2.0`, and `abs(x)` for math. Tensor methods also cover common activation/special functions (`relu`, `gelu`, `relu6`, `elu`, `selu`, `softplus`, `softsign`, `sigmoid`, `tanh`, `sin`, `cos`, `acos`, `asin`, `atan`, `erf`, `erfc`, `sqrt`, `rsqrt`, `log1p`, `expm1`) plus `concat`, `split`, `strided_slice`, `l2_normalize`, `group_norm`, `instance_norm`, `batch_norm2d`, `avg_pool2d`, `max_pool2d`, `pooling`, `conv2d`, `conv2d_transpose`, `depthwise_conv2d`, `conv3d`, and `gemm`/`matmul`.
 
 Operator names with explicit `*Grad` or `*Backprop*` are handled through autograd: call `loss.backward()` and then read `tensor.grad()`. `SoftmaxV2`/`LogSoftmaxV2` map to `softmax(dim)` and `log_softmax(dim)`. `Conv2DCompress` is currently a compatibility alias for the standard `conv2d` math path; Talos-XII does not yet store a separate compressed convolution weight format.
 
@@ -143,6 +176,28 @@ Output goes to `bench_output/` (`--output-dir` to customize).
 
 所有子命令支持 `-c <path>` 指定配置、`-s <seed>` 在配置和 worker 拓扑不变时复现实验、`-f` 强制重训模型。
 
+## 配置与诊断
+
+不初始化或训练模型，直接执行严格配置校验：
+
+```bash
+cargo run -- config validate
+```
+
+未知字段、错误类型、非法枚举、危险维度/概率以及不兼容的跨字段/ACHF 组合都会
+报错；只有 `_comment*` 文档字段会忽略。相对路径以所选配置文件目录为基准。
+
+检查构建特性和设备：
+
+```bash
+cargo run -- doctor
+cargo run --features cuda -- doctor --json
+```
+
+CUDA 版默认会在 GPU 上真实执行 matmul、GELU、log-softmax、backward 和 Adam；
+任何 CPU fallback 都会使自检失败。只有明确只看元数据时才使用
+`--no-self-test`。
+
 ## 交互模式
 
 ```bash
@@ -181,6 +236,15 @@ cargo run --release -- f2p
 "Avg Extra Jade Cost" 显示 N/A 表示所有模拟都在免费抽内出了 UP，无需额外付费。
 
 ## Python 脚本支持（可选）
+
+可安装的 Python 3.9+ abi3 extension 与嵌入式解释器暴露同一套 tensor/autograd
+API。本地构建 extension：
+
+```bash
+python -m pip install maturin
+maturin develop --release
+python -c "import talos_xii as tx; print(tx.__version__)"
+```
 
 启用可选 PyO3 桥接后，可在 Talos-XII 进程内执行 Python 脚本：
 
@@ -222,7 +286,7 @@ print("grad_w:", w.grad())
 cargo run --features python -- python scripts/my_train.py -- 1.0
 ```
 
-可以把 `talos_xii` 理解成这个二进制自带的小型张量/autograd 模块。用 `tx.tensor(...)` 放入数据，用 `tx.zeros/full/arange/eye/randn(...)` 创建常见输入，也可以直接写 `x + 1.0`、`2.0 * x`、`x ** 2.0`、`x % 2.0`、`abs(x)` 这类普通 Python 数学表达式。Tensor 方法也覆盖常见激活/特殊函数（`relu`、`gelu`、`relu6`、`elu`、`selu`、`softplus`、`softsign`、`sigmoid`、`tanh`、`sin`、`cos`、`acos`、`asin`、`atan`、`erf`、`erfc`、`sqrt`、`rsqrt`、`log1p`、`expm1`），以及 `concat`、`split`、`strided_slice`、`l2_normalize`、`group_norm`、`instance_norm`、`batch_norm2d`、`avg_pool2d`、`max_pool2d`、`pooling`、`conv2d`、`conv2d_transpose`、`depthwise_conv2d`、`conv3d`、`gemm`/`matmul`。
+`talos_xii` 是框架的 Python API。用 `tx.tensor(...)` 放入数据，用 `tx.zeros/full/arange/eye/randn(...)` 创建常见输入，也可以直接写 `x + 1.0`、`2.0 * x`、`x ** 2.0`、`x % 2.0`、`abs(x)` 这类普通 Python 数学表达式。Tensor 方法也覆盖常见激活/特殊函数（`relu`、`gelu`、`relu6`、`elu`、`selu`、`softplus`、`softsign`、`sigmoid`、`tanh`、`sin`、`cos`、`acos`、`asin`、`atan`、`erf`、`erfc`、`sqrt`、`rsqrt`、`log1p`、`expm1`），以及 `concat`、`split`、`strided_slice`、`l2_normalize`、`group_norm`、`instance_norm`、`batch_norm2d`、`avg_pool2d`、`max_pool2d`、`pooling`、`conv2d`、`conv2d_transpose`、`depthwise_conv2d`、`conv3d`、`gemm`/`matmul`。
 
 带 `*Grad` 或 `*Backprop*` 的算子通过 autograd 覆盖：调用 `loss.backward()` 后读取 `tensor.grad()`。`SoftmaxV2`/`LogSoftmaxV2` 对应 `softmax(dim)` 和 `log_softmax(dim)`。`Conv2DCompress` 目前是标准 `conv2d` 数学路径的兼容别名；Talos-XII 还没有单独的压缩卷积权重存储格式。
 

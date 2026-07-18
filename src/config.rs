@@ -1,448 +1,129 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::Read;
+use std::error::Error;
+use std::fmt;
+use std::fs;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 
-pub use serde_json::Value as JsonValue;
-
-fn json_to_string_vec(v: &JsonValue) -> Vec<String> {
-    match v {
-        JsonValue::Array(arr) => arr
-            .iter()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn strip_json_comments(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let chars: Vec<char> = input.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
-    let mut in_string = false;
-
-    while i < len {
-        if in_string {
-            out.push(chars[i]);
-            if chars[i] == '\\' && i + 1 < len {
-                i += 1;
-                out.push(chars[i]);
-            } else if chars[i] == '"' {
-                in_string = false;
-            }
-            i += 1;
-            continue;
-        }
-        if chars[i] == '"' {
-            in_string = true;
-            out.push(chars[i]);
-            i += 1;
-        } else if chars[i] == '/' && i + 1 < len && chars[i + 1] == '/' {
-            while i < len && chars[i] != '\n' {
-                i += 1;
-            }
-        } else if chars[i] == '/' && i + 1 < len && chars[i + 1] == '*' {
-            i += 2;
-            while i + 1 < len && !(chars[i] == '*' && chars[i + 1] == '/') {
-                i += 1;
-            }
-            if i + 1 < len {
-                i += 2;
-            }
-        } else {
-            out.push(chars[i]);
-            i += 1;
-        }
-    }
-    out
-}
-
+const EMBEDDED_CONFIG: &str = include_str!("../data/config.json");
+const EMBEDDED_POOLS: &str = include_str!("../data/pools.json");
+const DEFAULT_CONFIG_PATH: &str = "data/config.json";
 const DEFAULT_SOFT_PITY_START: usize = 65;
 const DEFAULT_SMALL_PITY_GUARANTEE: usize = 80;
 const DEFAULT_BIG_PITY_CUMULATIVE: usize = 120;
 const MAX_SMALL_PITY_GUARANTEE: usize = 10_000;
 const MAX_BIG_PITY_CUMULATIVE: usize = 100_000;
+const PROBABILITY_SUM_TOLERANCE: f64 = 1e-9;
 
-fn fallback_parent_path(path: &str, levels: usize) -> Option<String> {
-    let requested = Path::new(path);
-    if requested.is_absolute() || requested.components().any(|c| c == Component::ParentDir) {
-        return None;
-    }
-    let mut p = PathBuf::new();
-    for _ in 0..levels {
-        p.push("..");
-    }
-    p.push(requested);
-    Some(p.to_string_lossy().into_owned())
+#[derive(Debug)]
+pub enum ConfigError {
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
+    Json {
+        document: String,
+        source: serde_json::Error,
+    },
+    Validation {
+        document: String,
+        errors: Vec<String>,
+    },
 }
 
-fn sanitize_pity_settings(
-    soft_pity_start: &mut usize,
-    small_pity_guarantee: &mut usize,
-    big_pity_cumulative: &mut usize,
-    scope: &str,
-) {
-    if *small_pity_guarantee == 0 {
-        eprintln!(
-            "[Config Warning] {scope} small_pity_guarantee is 0, fallback to {}",
-            DEFAULT_SMALL_PITY_GUARANTEE
-        );
-        *small_pity_guarantee = DEFAULT_SMALL_PITY_GUARANTEE;
-    }
-    if *small_pity_guarantee > MAX_SMALL_PITY_GUARANTEE {
-        eprintln!(
-            "[Config Warning] {scope} small_pity_guarantee ({}) exceeds max {}, clamping",
-            *small_pity_guarantee, MAX_SMALL_PITY_GUARANTEE
-        );
-        *small_pity_guarantee = MAX_SMALL_PITY_GUARANTEE;
-    }
-
-    if *soft_pity_start == 0 {
-        eprintln!("[Config Warning] {scope} soft_pity_start is 0, fallback to 1");
-        *soft_pity_start = 1;
-    }
-
-    if *soft_pity_start > *small_pity_guarantee {
-        eprintln!(
-            "[Config Warning] {scope} soft_pity_start ({}) exceeds small_pity_guarantee ({}), clamping",
-            *soft_pity_start, *small_pity_guarantee
-        );
-        *soft_pity_start = *small_pity_guarantee;
-    }
-
-    if *big_pity_cumulative > 0 && *big_pity_cumulative < *small_pity_guarantee {
-        eprintln!(
-            "[Config Warning] {scope} big_pity_cumulative ({}) is below small_pity_guarantee ({}), clamping",
-            *big_pity_cumulative, *small_pity_guarantee
-        );
-        *big_pity_cumulative = *small_pity_guarantee;
-    }
-    if *big_pity_cumulative > MAX_BIG_PITY_CUMULATIVE {
-        eprintln!(
-            "[Config Warning] {scope} big_pity_cumulative ({}) exceeds max {}, clamping",
-            *big_pity_cumulative, MAX_BIG_PITY_CUMULATIVE
-        );
-        *big_pity_cumulative = MAX_BIG_PITY_CUMULATIVE;
-    }
-}
-
-fn sanitize_unit_interval(value: &mut f64, key: &str, default: f64) {
-    if !value.is_finite() {
-        eprintln!(
-            "[Config Warning] {key} is non-finite, fallback to {}",
-            default
-        );
-        *value = default;
-        return;
-    }
-    if *value < 0.0 {
-        eprintln!("[Config Warning] {key} ({}) below 0, clamping", *value);
-        *value = 0.0;
-    } else if *value > 1.0 {
-        eprintln!("[Config Warning] ACHF {key} ({}) above 1, clamping", *value);
-        *value = 1.0;
-    }
-}
-
-fn sanitize_non_negative(value: &mut f64, key: &str, default: f64) {
-    if !value.is_finite() {
-        eprintln!(
-            "[Config Warning] ACHF {key} is non-finite, fallback to {}",
-            default
-        );
-        *value = default;
-        return;
-    }
-    if *value < 0.0 {
-        eprintln!("[Config Warning] ACHF {key} ({}) below 0, clamping", *value);
-        *value = 0.0;
-    }
-}
-
-fn sanitize_positive(value: &mut f64, key: &str, default: f64) {
-    if !value.is_finite() || *value <= 0.0 {
-        eprintln!(
-            "[Config Warning] ACHF {key} ({}) must be > 0, fallback to {}",
-            *value, default
-        );
-        *value = default;
-    }
-}
-
-fn sanitize_finite(value: &mut f64, key: &str, default: f64) {
-    if !value.is_finite() {
-        eprintln!(
-            "[Config Warning] ACHF {key} is non-finite, fallback to {}",
-            default
-        );
-        *value = default;
-    }
-}
-
-fn sanitize_achf_config(achf: &mut AchfConfig) {
-    let defaults = AchfConfig::default();
-    let normalized_mode = achf.mode.trim().to_ascii_lowercase();
-    match normalized_mode.as_str() {
-        "lite" | "full" | "fixed_cached" | "fixed_sparse" | "fixed_dense" | "plain_ema" => {
-            achf.mode = normalized_mode
-        }
-        _ => {
-            eprintln!(
-                "[Config Warning] ACHF mode '{}' is unsupported, fallback to '{}'",
-                achf.mode, defaults.mode
-            );
-            achf.mode = defaults.mode;
+impl fmt::Display for ConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io { path, source } => {
+                write!(formatter, "failed to read '{}': {source}", path.display())
+            }
+            Self::Json { document, source } => {
+                write!(formatter, "invalid JSON/schema in {document}: {source}")
+            }
+            Self::Validation { document, errors } => {
+                writeln!(formatter, "configuration validation failed for {document}:")?;
+                for error in errors {
+                    writeln!(formatter, "  - {error}")?;
+                }
+                Ok(())
+            }
         }
     }
-    let normalized_candidate_mode = achf.candidate_mode.trim().to_ascii_lowercase();
-    match normalized_candidate_mode.as_str() {
-        "none" | "sparse" | "low_rank" => achf.candidate_mode = normalized_candidate_mode,
-        _ => {
-            eprintln!(
-                "[Config Warning] ACHF candidate_mode '{}' is unsupported, fallback to '{}'",
-                achf.candidate_mode, defaults.candidate_mode
-            );
-            achf.candidate_mode = defaults.candidate_mode.clone();
-        }
-    }
-    let normalized_projection = achf.proj_mode.trim().to_ascii_lowercase();
-    match normalized_projection.as_str() {
-        "none" | "rowcol" | "sinkhorn" => achf.proj_mode = normalized_projection,
-        _ => {
-            eprintln!(
-                "[Config Warning] ACHF proj_mode '{}' is unsupported, fallback to '{}'",
-                achf.proj_mode, defaults.proj_mode
-            );
-            achf.proj_mode = defaults.proj_mode.clone();
-        }
-    }
-    sanitize_non_negative(
-        &mut achf.lambda_ortho,
-        "lambda_ortho",
-        defaults.lambda_ortho,
-    );
-    sanitize_finite(&mut achf.gate_alpha, "gate_alpha", defaults.gate_alpha);
-    sanitize_finite(&mut achf.gate_beta, "gate_beta", defaults.gate_beta);
-    if achf.proj_mode != "none" && achf.lambda_ortho > 0.0 {
-        eprintln!(
-            "[Config Warning] ACHF lambda_ortho cannot be stacked with '{}' on the dedicated connection map; disabling lambda_ortho",
-            achf.proj_mode
-        );
-        achf.lambda_ortho = 0.0;
-    }
-    if achf.candidate_mode == "sparse" && achf.rank > 0 {
-        eprintln!(
-            "[Config Warning] ACHF rank is a low-rank candidate setting and cannot be stacked with sparse pruning; disabling rank"
-        );
-        achf.rank = 0;
-    }
-    if achf.candidate_mode == "low_rank" && achf.prune_threshold > 0.0 {
-        eprintln!(
-            "[Config Warning] ACHF prune_threshold cannot be stacked with a low-rank candidate; disabling pruning"
-        );
-        achf.prune_threshold = 0.0;
-    }
-    if achf.candidate_mode == "low_rank" && achf.candidate_target_sparsity > 0.0 {
-        eprintln!(
-            "[Config Warning] ACHF candidate_target_sparsity applies only to sparse candidates; disabling it"
-        );
-        achf.candidate_target_sparsity = 0.0;
-    }
-    if achf.candidate_mode != "sparse" && achf.candidate_train_from_scratch {
-        eprintln!(
-            "[Config Warning] ACHF candidate_train_from_scratch requires candidate_mode='sparse'; disabling it"
-        );
-        achf.candidate_train_from_scratch = false;
-    }
-    if achf.candidate_train_from_scratch {
-        if achf.candidate_min_calibration_samples > 0 || achf.candidate_calibration_steps > 0 {
-            eprintln!(
-                "[Config Warning] ACHF sparse-training baseline is independent of post-training candidate calibration; disabling calibration"
-            );
-        }
-        achf.candidate_min_calibration_samples = 0;
-        achf.candidate_calibration_steps = 0;
-    }
-    if achf.adaptive_inference && achf.mode != "full" {
-        eprintln!(
-            "[Config Warning] ACHF adaptive_inference=true is a legacy alias for mode='full'"
-        );
-        achf.mode = "full".to_string();
-    }
-    // The mode is canonical after sanitization. Clear the legacy alias so a
-    // later runtime switch from full back to lite cannot remain stuck in AMA.
-    achf.adaptive_inference = false;
-    sanitize_unit_interval(
-        &mut achf.gate_momentum,
-        "gate_momentum",
-        defaults.gate_momentum,
-    );
-    sanitize_unit_interval(&mut achf.g_min, "g_min", defaults.g_min);
-    sanitize_unit_interval(
-        &mut achf.g_target_min,
-        "g_target_min",
-        defaults.g_target_min,
-    );
-    sanitize_unit_interval(
-        &mut achf.g_target_max,
-        "g_target_max",
-        defaults.g_target_max,
-    );
-    if achf.g_target_max < achf.g_target_min {
-        eprintln!(
-            "[Config Warning] ACHF g_target_max ({}) below g_target_min ({}), clamping",
-            achf.g_target_max, achf.g_target_min
-        );
-        achf.g_target_max = achf.g_target_min;
-    }
-    sanitize_non_negative(
-        &mut achf.g_min_adapt_rate,
-        "g_min_adapt_rate",
-        defaults.g_min_adapt_rate,
-    );
-    sanitize_unit_interval(
-        &mut achf.g_min_momentum,
-        "g_min_momentum",
-        defaults.g_min_momentum,
-    );
-    sanitize_non_negative(&mut achf.gate_k_clip, "gate_k_clip", defaults.gate_k_clip);
-    sanitize_unit_interval(
-        &mut achf.cache_min_nonzero_ratio,
-        "cache_min_nonzero_ratio",
-        defaults.cache_min_nonzero_ratio,
-    );
-    sanitize_positive(
-        &mut achf.cache_cost_bias,
-        "cache_cost_bias",
-        defaults.cache_cost_bias,
-    );
-    sanitize_non_negative(
-        &mut achf.cache_adapt_rate,
-        "cache_adapt_rate",
-        defaults.cache_adapt_rate,
-    );
-    sanitize_positive(
-        &mut achf.cache_bias_min,
-        "cache_bias_min",
-        defaults.cache_bias_min,
-    );
-    sanitize_positive(
-        &mut achf.cache_bias_max,
-        "cache_bias_max",
-        defaults.cache_bias_max,
-    );
-    if achf.cache_bias_max < achf.cache_bias_min {
-        eprintln!(
-            "[Config Warning] ACHF cache_bias_max ({}) below cache_bias_min ({}), clamping",
-            achf.cache_bias_max, achf.cache_bias_min
-        );
-        achf.cache_bias_max = achf.cache_bias_min;
-    }
-    sanitize_unit_interval(
-        &mut achf.cache_latency_ema,
-        "cache_latency_ema",
-        defaults.cache_latency_ema,
-    );
-    sanitize_unit_interval(
-        &mut achf.cache_latency_long_ema,
-        "cache_latency_long_ema",
-        defaults.cache_latency_long_ema,
-    );
-    sanitize_unit_interval(
-        &mut achf.cache_adapt_blend,
-        "cache_adapt_blend",
-        defaults.cache_adapt_blend,
-    );
-    sanitize_non_negative(
-        &mut achf.prune_threshold,
-        "prune_threshold",
-        defaults.prune_threshold,
-    );
-    sanitize_unit_interval(
-        &mut achf.candidate_target_sparsity,
-        "candidate_target_sparsity",
-        defaults.candidate_target_sparsity,
-    );
-    if achf.candidate_mode == "sparse"
-        && achf.candidate_target_sparsity > 0.0
-        && achf.prune_threshold > 0.0
-    {
-        eprintln!(
-            "[Config Warning] ACHF candidate_target_sparsity supersedes prune_threshold; disabling the legacy absolute threshold"
-        );
-        achf.prune_threshold = 0.0;
-    }
-    sanitize_unit_interval(
-        &mut achf.candidate_min_sparsity,
-        "candidate_min_sparsity",
-        defaults.candidate_min_sparsity,
-    );
-    sanitize_unit_interval(
-        &mut achf.candidate_max_relative_error,
-        "candidate_max_relative_error",
-        defaults.candidate_max_relative_error,
-    );
-    sanitize_unit_interval(
-        &mut achf.candidate_max_output_relative_error,
-        "candidate_max_output_relative_error",
-        defaults.candidate_max_output_relative_error,
-    );
-    sanitize_positive(
-        &mut achf.candidate_calibration_lr,
-        "candidate_calibration_lr",
-        defaults.candidate_calibration_lr,
-    );
-    if achf.candidate_min_calibration_samples > achf.candidate_calibration_max_samples {
-        eprintln!(
-            "[Config Warning] ACHF candidate_min_calibration_samples ({}) exceeds candidate_calibration_max_samples ({}), clamping",
-            achf.candidate_min_calibration_samples, achf.candidate_calibration_max_samples
-        );
-        achf.candidate_min_calibration_samples = achf.candidate_calibration_max_samples;
-    }
-    if achf.candidate_mode != "sparse" && achf.candidate_min_calibration_samples > 0 {
-        eprintln!(
-            "[Config Warning] ACHF candidate calibration currently applies only to sparse candidates; disabling the calibration requirement"
-        );
-        achf.candidate_min_calibration_samples = 0;
-    }
-    sanitize_unit_interval(
-        &mut achf.candidate_weight_error_momentum,
-        "candidate_weight_error_momentum",
-        defaults.candidate_weight_error_momentum,
-    );
-    let normalized_infer_gate = achf.infer_gate.trim().to_ascii_lowercase();
-    achf.infer_gate = match normalized_infer_gate.as_str() {
-        "candidate" | "reference" | "last" | "g_min" => normalized_infer_gate,
-        "one" => "candidate".to_string(),
-        _ => defaults.infer_gate,
-    };
 }
+
+impl Error for ConfigError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::Json { source, .. } => Some(source),
+            Self::Validation { .. } => None,
+        }
+    }
+}
+
+fn strip_json_comments(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let characters: Vec<char> = input.chars().collect();
+    let mut index = 0;
+    let mut in_string = false;
+
+    while index < characters.len() {
+        if in_string {
+            output.push(characters[index]);
+            if characters[index] == '\\' && index + 1 < characters.len() {
+                index += 1;
+                output.push(characters[index]);
+            } else if characters[index] == '"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+
+        if characters[index] == '"' {
+            in_string = true;
+            output.push(characters[index]);
+            index += 1;
+        } else if characters[index] == '/'
+            && index + 1 < characters.len()
+            && characters[index + 1] == '/'
+        {
+            while index < characters.len() && characters[index] != '\n' {
+                index += 1;
+            }
+        } else if characters[index] == '/'
+            && index + 1 < characters.len()
+            && characters[index + 1] == '*'
+        {
+            index += 2;
+            while index + 1 < characters.len()
+                && !(characters[index] == '*' && characters[index + 1] == '/')
+            {
+                index += 1;
+            }
+            index = (index + 2).min(characters.len());
+        } else {
+            output.push(characters[index]);
+            index += 1;
+        }
+    }
+
+    output
+}
+
 /// Determines which policy drives the luck factor during simulation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum LuckMode {
-    /// Default mode: neural network probability adjustment.
     Probability,
-    /// Deep Q-Network selects discrete luck actions.
     Dqn,
-    /// Proximal Policy Optimization (Actor-Critic) selects actions.
     Ppo,
 }
 
 impl LuckMode {
-    /// Parse from a config string. Unrecognized values map to `Probability`.
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "dqn" => Self::Dqn,
-            "ppo" => Self::Ppo,
-            _ => Self::Probability,
-        }
-    }
-
-    /// Return the canonical string representation.
-    #[allow(dead_code)]
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Probability => "probability",
             Self::Dqn => "dqn",
@@ -451,30 +132,17 @@ impl LuckMode {
     }
 }
 
-/// Compute device for neural network operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// Requested compute device for neural-network operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ComputeDevice {
-    /// CPU (default).
     Cpu,
-    /// NVIDIA CUDA GPU (when available).
     Cuda,
-    /// Auto-select: CUDA if available, otherwise CPU.
     Auto,
 }
 
 impl ComputeDevice {
-    /// Parse from a config string. Unrecognized values map to `Cpu`.
-    pub fn from_str(s: &str) -> Self {
-        match s {
-            "cuda" => Self::Cuda,
-            "auto" => Self::Auto,
-            _ => Self::Cpu,
-        }
-    }
-
-    /// Return the canonical string representation.
-    #[allow(dead_code)]
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Cpu => "cpu",
             Self::Cuda => "cuda",
@@ -483,19 +151,16 @@ impl ComputeDevice {
     }
 }
 
-// --- Configuration (Data-Driven) ---
-
 /// Configuration for Adaptive Cache-aware Hyper-Connections (ACHF).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct AchfConfig {
     pub enabled: bool,
     pub mode: String,
-    #[serde(default = "default_achf_candidate_mode")]
     pub candidate_mode: String,
-    #[serde(default = "default_achf_candidate_refresh_freq")]
     pub candidate_refresh_freq: usize,
     pub proj_mode: String,
-    #[serde(default = "default_achf_ortho_penalty_freq", alias = "proj_freq")]
+    #[serde(alias = "proj_freq")]
     pub ortho_penalty_freq: usize,
     pub proj_steps: usize,
     pub lambda_ortho: f64,
@@ -514,9 +179,7 @@ pub struct AchfConfig {
     pub cache_min_rows: usize,
     pub cache_min_nonzero_ratio: f64,
     pub cache_min_reuse: usize,
-    #[serde(default = "default_achf_path_warmup_samples")]
     pub path_warmup_samples: usize,
-    #[serde(default = "default_achf_path_min_dwell")]
     pub path_min_dwell: usize,
     pub cache_sparsity_sample_rows: usize,
     pub cache_cost_bias: f64,
@@ -532,48 +195,33 @@ pub struct AchfConfig {
     pub diagnostics_enabled: bool,
     pub rank: usize,
     pub prune_threshold: f64,
-    #[serde(default = "default_achf_candidate_target_sparsity")]
     pub candidate_target_sparsity: f64,
-    #[serde(default = "default_achf_candidate_min_sparsity")]
     pub candidate_min_sparsity: f64,
-    #[serde(default = "default_achf_candidate_max_relative_error")]
     pub candidate_max_relative_error: f64,
-    #[serde(default = "default_achf_candidate_max_output_relative_error")]
     pub candidate_max_output_relative_error: f64,
-    #[serde(default = "default_achf_candidate_min_calibration_samples")]
     pub candidate_min_calibration_samples: usize,
-    #[serde(default = "default_achf_candidate_calibration_steps")]
     pub candidate_calibration_steps: usize,
-    #[serde(default = "default_achf_candidate_calibration_lr")]
     pub candidate_calibration_lr: f64,
-    #[serde(default = "default_achf_candidate_calibration_max_samples")]
     pub candidate_calibration_max_samples: usize,
-    #[serde(default)]
     pub candidate_train_from_scratch: bool,
-    #[serde(
-        default = "default_achf_candidate_weight_error_momentum",
-        alias = "candidate_discrepancy_momentum"
-    )]
+    #[serde(alias = "candidate_discrepancy_momentum")]
     pub candidate_weight_error_momentum: f64,
     pub apply_attn: bool,
     pub apply_ffn: bool,
     pub apply_dqn: bool,
     pub infer_gate: String,
-    /// Legacy compatibility alias for `mode = "full"`. Config sanitization
-    /// migrates this flag into `mode` and clears it; new callers should set
-    /// `mode` directly.
     pub adaptive_inference: bool,
 }
 
 impl Default for AchfConfig {
     fn default() -> Self {
-        AchfConfig {
+        Self {
             enabled: false,
             mode: "lite".to_string(),
-            candidate_mode: default_achf_candidate_mode(),
-            candidate_refresh_freq: default_achf_candidate_refresh_freq(),
+            candidate_mode: "sparse".to_string(),
+            candidate_refresh_freq: 1,
             proj_mode: "sinkhorn".to_string(),
-            ortho_penalty_freq: default_achf_ortho_penalty_freq(),
+            ortho_penalty_freq: 8,
             proj_steps: 0,
             lambda_ortho: 0.0,
             gate_mode: "grad_ema".to_string(),
@@ -591,8 +239,8 @@ impl Default for AchfConfig {
             cache_min_rows: 1,
             cache_min_nonzero_ratio: 0.0,
             cache_min_reuse: 2,
-            path_warmup_samples: default_achf_path_warmup_samples(),
-            path_min_dwell: default_achf_path_min_dwell(),
+            path_warmup_samples: 2,
+            path_min_dwell: 2,
             cache_sparsity_sample_rows: 0,
             cache_cost_bias: 1.0,
             cache_adapt_rate: 0.0,
@@ -607,16 +255,16 @@ impl Default for AchfConfig {
             diagnostics_enabled: false,
             rank: 0,
             prune_threshold: 0.01,
-            candidate_target_sparsity: default_achf_candidate_target_sparsity(),
-            candidate_min_sparsity: default_achf_candidate_min_sparsity(),
-            candidate_max_relative_error: default_achf_candidate_max_relative_error(),
-            candidate_max_output_relative_error: default_achf_candidate_max_output_relative_error(),
-            candidate_min_calibration_samples: default_achf_candidate_min_calibration_samples(),
-            candidate_calibration_steps: default_achf_candidate_calibration_steps(),
-            candidate_calibration_lr: default_achf_candidate_calibration_lr(),
-            candidate_calibration_max_samples: default_achf_candidate_calibration_max_samples(),
+            candidate_target_sparsity: 0.0,
+            candidate_min_sparsity: 0.5,
+            candidate_max_relative_error: 0.05,
+            candidate_max_output_relative_error: 0.05,
+            candidate_min_calibration_samples: 0,
+            candidate_calibration_steps: 256,
+            candidate_calibration_lr: 1e-3,
+            candidate_calibration_max_samples: 256,
             candidate_train_from_scratch: false,
-            candidate_weight_error_momentum: default_achf_candidate_weight_error_momentum(),
+            candidate_weight_error_momentum: 0.9,
             apply_attn: true,
             apply_ffn: true,
             apply_dqn: false,
@@ -626,84 +274,179 @@ impl Default for AchfConfig {
     }
 }
 
-fn default_achf_candidate_mode() -> String {
-    "sparse".to_string()
-}
-
-fn default_achf_candidate_refresh_freq() -> usize {
-    1
-}
-
-fn default_achf_ortho_penalty_freq() -> usize {
-    8
-}
-
-fn default_achf_path_warmup_samples() -> usize {
-    2
-}
-
-fn default_achf_path_min_dwell() -> usize {
-    2
-}
-
-fn default_achf_candidate_min_sparsity() -> f64 {
-    0.5
-}
-
-fn default_achf_candidate_target_sparsity() -> f64 {
-    0.0
-}
-
-fn default_achf_candidate_max_relative_error() -> f64 {
-    0.05
-}
-
-fn default_achf_candidate_max_output_relative_error() -> f64 {
-    0.05
-}
-
-fn default_achf_candidate_min_calibration_samples() -> usize {
-    0
-}
-
-fn default_achf_candidate_calibration_steps() -> usize {
-    256
-}
-
-fn default_achf_candidate_calibration_lr() -> f64 {
-    1e-3
-}
-
-fn default_achf_candidate_calibration_max_samples() -> usize {
-    256
-}
-
-fn default_achf_candidate_weight_error_momentum() -> f64 {
-    0.9
-}
-
 impl AchfConfig {
-    /// Whether frozen inference should keep the latency-adaptive AMA selector
-    /// active. `adaptive_inference` remains a compatibility alias for configs
-    /// constructed by older callers; sanitized configs canonicalize it to
-    /// `mode = "full"`.
     pub fn uses_adaptive_inference(&self) -> bool {
-        matches!(
-            self.mode.trim().to_ascii_lowercase().as_str(),
-            "full" | "plain_ema"
-        ) || self.adaptive_inference
+        matches!(self.mode.as_str(), "full" | "plain_ema") || self.adaptive_inference
     }
 
     pub fn uses_frozen_cached_fast_path(&self) -> bool {
-        matches!(
-            self.mode.trim().to_ascii_lowercase().as_str(),
-            "lite" | "fixed_cached"
-        ) && !self.adaptive_inference
+        matches!(self.mode.as_str(), "lite" | "fixed_cached") && !self.adaptive_inference
+    }
+
+    fn validate(&self, errors: &mut Vec<String>) {
+        validate_choice(
+            errors,
+            "achf.mode",
+            &self.mode,
+            &[
+                "lite",
+                "full",
+                "fixed_cached",
+                "fixed_sparse",
+                "fixed_dense",
+                "plain_ema",
+            ],
+        );
+        validate_choice(
+            errors,
+            "achf.candidate_mode",
+            &self.candidate_mode,
+            &["none", "sparse", "low_rank"],
+        );
+        validate_choice(
+            errors,
+            "achf.proj_mode",
+            &self.proj_mode,
+            &["none", "rowcol", "sinkhorn"],
+        );
+        validate_choice(
+            errors,
+            "achf.gate_mode",
+            &self.gate_mode,
+            &["grad_ema", "fim_trace"],
+        );
+        validate_choice(
+            errors,
+            "achf.infer_gate",
+            &self.infer_gate,
+            &["candidate", "reference", "last", "g_min"],
+        );
+
+        validate_non_negative(errors, "achf.lambda_ortho", self.lambda_ortho);
+        validate_finite(errors, "achf.gate_alpha", self.gate_alpha);
+        validate_finite(errors, "achf.gate_beta", self.gate_beta);
+        validate_unit(errors, "achf.gate_momentum", self.gate_momentum);
+        validate_unit(errors, "achf.g_min", self.g_min);
+        validate_non_negative(errors, "achf.gate_k_clip", self.gate_k_clip);
+        validate_unit(errors, "achf.g_target_min", self.g_target_min);
+        validate_unit(errors, "achf.g_target_max", self.g_target_max);
+        validate_non_negative(errors, "achf.g_min_adapt_rate", self.g_min_adapt_rate);
+        validate_unit(errors, "achf.g_min_momentum", self.g_min_momentum);
+        validate_unit(
+            errors,
+            "achf.cache_min_nonzero_ratio",
+            self.cache_min_nonzero_ratio,
+        );
+        validate_positive(errors, "achf.cache_cost_bias", self.cache_cost_bias);
+        validate_non_negative(errors, "achf.cache_adapt_rate", self.cache_adapt_rate);
+        validate_positive(errors, "achf.cache_bias_min", self.cache_bias_min);
+        validate_positive(errors, "achf.cache_bias_max", self.cache_bias_max);
+        validate_unit(errors, "achf.cache_latency_ema", self.cache_latency_ema);
+        validate_unit(
+            errors,
+            "achf.cache_latency_long_ema",
+            self.cache_latency_long_ema,
+        );
+        validate_unit(errors, "achf.cache_adapt_blend", self.cache_adapt_blend);
+        validate_non_negative(errors, "achf.prune_threshold", self.prune_threshold);
+        validate_unit(
+            errors,
+            "achf.candidate_target_sparsity",
+            self.candidate_target_sparsity,
+        );
+        validate_unit(
+            errors,
+            "achf.candidate_min_sparsity",
+            self.candidate_min_sparsity,
+        );
+        validate_unit(
+            errors,
+            "achf.candidate_max_relative_error",
+            self.candidate_max_relative_error,
+        );
+        validate_unit(
+            errors,
+            "achf.candidate_max_output_relative_error",
+            self.candidate_max_output_relative_error,
+        );
+        validate_positive(
+            errors,
+            "achf.candidate_calibration_lr",
+            self.candidate_calibration_lr,
+        );
+        validate_unit(
+            errors,
+            "achf.candidate_weight_error_momentum",
+            self.candidate_weight_error_momentum,
+        );
+
+        if self.g_target_max < self.g_target_min {
+            errors.push("achf.g_target_max must be >= achf.g_target_min".to_string());
+        }
+        if self.cache_bias_max < self.cache_bias_min {
+            errors.push("achf.cache_bias_max must be >= achf.cache_bias_min".to_string());
+        }
+        if self.candidate_min_calibration_samples > self.candidate_calibration_max_samples {
+            errors.push(
+                "achf.candidate_min_calibration_samples must be <= achf.candidate_calibration_max_samples"
+                    .to_string(),
+            );
+        }
+        if self.proj_mode != "none" && self.lambda_ortho > 0.0 {
+            errors.push(
+                "achf.lambda_ortho cannot be combined with rowcol/sinkhorn projection".to_string(),
+            );
+        }
+        if self.candidate_mode == "sparse" && self.rank > 0 {
+            errors.push("achf.rank is only valid for candidate_mode=low_rank".to_string());
+        }
+        if self.candidate_mode == "low_rank"
+            && (self.prune_threshold > 0.0 || self.candidate_target_sparsity > 0.0)
+        {
+            errors.push(
+                "low-rank candidates cannot use sparse pruning or target sparsity".to_string(),
+            );
+        }
+        if self.candidate_mode != "sparse" && self.candidate_train_from_scratch {
+            errors.push(
+                "achf.candidate_train_from_scratch requires candidate_mode=sparse".to_string(),
+            );
+        }
+        if self.candidate_train_from_scratch
+            && (self.candidate_min_calibration_samples > 0 || self.candidate_calibration_steps > 0)
+        {
+            errors.push(
+                "sparse training from scratch cannot be combined with post-training calibration"
+                    .to_string(),
+            );
+        }
+        if self.candidate_mode != "sparse" && self.candidate_min_calibration_samples > 0 {
+            errors.push(
+                "ACHF candidate calibration currently requires candidate_mode=sparse".to_string(),
+            );
+        }
+        if self.candidate_target_sparsity > 0.0 && self.prune_threshold > 0.0 {
+            errors.push(
+                "achf.candidate_target_sparsity and achf.prune_threshold are mutually exclusive"
+                    .to_string(),
+            );
+        }
+        if self.adaptive_inference {
+            errors.push(
+                "achf.adaptive_inference is a legacy alias; use achf.mode=full explicitly"
+                    .to_string(),
+            );
+        }
     }
 }
 
+fn default_soft_pity_slope() -> f64 {
+    0.05
+}
+
 /// Per-pool configuration defining gacha rules and operator rosters.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PoolConfig {
     pub id: String,
     pub name: String,
@@ -714,6 +457,7 @@ pub struct PoolConfig {
     pub prob_5_base: f64,
     pub prob_4_base: f64,
     pub soft_pity_start: usize,
+    #[serde(default = "default_soft_pity_slope")]
     pub soft_pity_slope: f64,
     pub small_pity_guarantee: usize,
     pub big_pity_cumulative: usize,
@@ -724,11 +468,13 @@ pub struct PoolConfig {
     pub six_stars: Vec<String>,
     pub five_stars: Vec<String>,
     pub four_stars: Vec<String>,
+    #[serde(default)]
     pub is_archived: bool,
 }
 
-/// Configuration for the gacha simulation, loaded from JSON.
-#[derive(Debug, Clone, Serialize)]
+/// Complete runtime configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub pool_name: String,
     pub up_six: Vec<String>,
@@ -805,31 +551,31 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config {
+        Self {
             pool_name: "Unknown".to_string(),
-            up_six: vec![],
+            up_six: Vec::new(),
             up_rate: 0.5,
             prob_6_base: 0.008,
             prob_5_base: 0.08,
             prob_4_base: 0.912,
             soft_pity_start: DEFAULT_SOFT_PITY_START,
-            soft_pity_slope: 0.05,
+            soft_pity_slope: default_soft_pity_slope(),
             small_pity_guarantee: DEFAULT_SMALL_PITY_GUARANTEE,
             big_pity_cumulative: DEFAULT_BIG_PITY_CUMULATIVE,
             up_pity_soft: 0,
             five_star_pity: 10,
             always_5_star: false,
             big_pity_requires_not_up: true,
-            six_stars: vec![],
-            five_stars: vec![],
-            four_stars: vec![],
-            pools: vec![],
+            six_stars: Vec::new(),
+            five_stars: Vec::new(),
+            four_stars: Vec::new(),
+            pools: Vec::new(),
             active_pool: None,
-            pools_path: "data/pools.json".to_string(),
+            pools_path: "pools.json".to_string(),
             luck_mode: LuckMode::Probability,
             use_calibrated: true,
-            calibrated_path: "data/calibrated.json".to_string(),
-            player_data_path: "data/player_data.json".to_string(),
+            calibrated_path: "calibrated.json".to_string(),
+            player_data_path: "player_data.json".to_string(),
             fast_init: false,
             device: ComputeDevice::Auto,
             ppo_mode: "balanced".to_string(),
@@ -839,7 +585,7 @@ impl Default for Config {
             ppo_batch_size: 0,
             ppo_context_len: 0,
             ppo_num_envs: 1,
-            ppo_top_k: 0, // 0 = disabled (full softmax), >0 = top-k truncation
+            ppo_top_k: 0,
             luck_action_cost: 8.0,
             luck_budget_enabled: true,
             luck_budget_max: 0.045,
@@ -881,542 +627,166 @@ impl Default for Config {
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct PoolsDocument {
+    active_pool: Option<String>,
+    pools: Vec<PoolConfig>,
+}
+
 impl Config {
-    /// Load configuration from a JSON file path, falling back to defaults.
+    /// Load and validate a configuration. Only the standard default path may
+    /// fall back to the resources embedded in the executable.
+    pub fn try_load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let requested = path.as_ref();
+        let use_embedded = requested == Path::new("default");
+        let is_standard_path = requested == Path::new(DEFAULT_CONFIG_PATH);
+
+        if use_embedded {
+            return Self::load_documents(
+                EMBEDDED_CONFIG,
+                "<embedded config>",
+                Path::new("data"),
+                true,
+            );
+        }
+
+        match fs::read_to_string(requested) {
+            Ok(contents) => {
+                let base_dir = requested.parent().unwrap_or_else(|| Path::new("."));
+                Self::load_documents(
+                    &contents,
+                    &requested.display().to_string(),
+                    base_dir,
+                    is_standard_path,
+                )
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound && is_standard_path => {
+                Self::load_documents(
+                    EMBEDDED_CONFIG,
+                    "<embedded config: data/config.json missing>",
+                    Path::new("data"),
+                    true,
+                )
+            }
+            Err(source) => Err(ConfigError::Io {
+                path: requested.to_path_buf(),
+                source,
+            }),
+        }
+    }
+
+    /// Parse a validated configuration from memory. Relative paths are
+    /// resolved against `base_dir`; omitted pool data uses embedded defaults.
+    pub fn try_from_json(contents: &str, base_dir: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        Self::load_documents(contents, "<in-memory config>", base_dir.as_ref(), true)
+    }
+
+    /// Compatibility convenience for internal callers and tests. Unlike the
+    /// previous loader, this never returns a silently repaired configuration.
     pub fn load(path: &str) -> Self {
-        if path == "default" {
-            eprintln!("[System] Using built-in default configuration.");
-            return Config::default();
+        Self::try_load(path).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    fn load_documents(
+        contents: &str,
+        document: &str,
+        base_dir: &Path,
+        allow_embedded_pools: bool,
+    ) -> Result<Self, ConfigError> {
+        let mut root = parse_json(contents, document)?;
+        let root_object = root_object_mut(&mut root, document)?;
+        remove_documentation_fields(root_object);
+        let pools_path_was_explicit = root_object.contains_key("pools_path");
+        let has_embedded_pools = root_object.contains_key("pools");
+        let language = root_object
+            .get("language")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        prepare_localized_fields(root_object, language.as_deref());
+
+        let mut config: Config =
+            serde_json::from_value(root).map_err(|source| ConfigError::Json {
+                document: document.to_string(),
+                source,
+            })?;
+
+        if config.pools_path.trim().is_empty() {
+            return Err(ConfigError::Validation {
+                document: document.to_string(),
+                errors: vec!["pools_path must not be empty".to_string()],
+            });
         }
 
-        let file_result = File::open(path);
-
-        // Robustness: If file not found, try to look in parent directories
-        // (useful for IDE/target builds: target/release/exe, target/cuda/release/exe, target/python/release/exe)
-        let mut file = match file_result {
-            Ok(f) => f,
-            Err(_) => {
-                // Try 2 and 3 levels up (standard cargo layout with custom target-dir)
-                let mut found = None;
-                for levels in [2, 3] {
-                    if let Some(fallback) = fallback_parent_path(path, levels) {
-                        if let Ok(f) = File::open(&fallback) {
-                            println!(
-                                "[System] Config found in parent directory ({} levels up).",
-                                levels
-                            );
-                            found = Some(f);
-                            break;
-                        }
-                    }
-                }
-                match found {
-                    Some(f) => f,
-                    None => {
-                        eprintln!("\x1b[1;31m[Error]\x1b[0m Configuration file not found.");
-                        eprintln!("  Looked at: './{path}' and parent directories (2-3 levels up)");
-                        eprintln!(
-                            "  Tip: Use --config <path> or --config default for built-in defaults."
-                        );
-                        if path == "data/config.json" {
-                            eprintln!(
-                                "\x1b[33m[Warning]\x1b[0m Missing data/config.json. Falling back to built-in defaults."
-                            );
-                            return Config::default();
-                        }
-                        std::process::exit(1);
-                    }
-                }
-            }
-        };
-
-        let mut contents = String::new();
-        if let Err(err) = file.read_to_string(&mut contents) {
-            log::error!("Failed to read config file '{}': {}", path, err);
-            log::warn!("Falling back to default configuration.");
-            return Config::default();
-        }
-
-        let stripped = strip_json_comments(&contents);
-        let root: JsonValue = match serde_json::from_str(&stripped) {
-            Ok(value) => value,
-            Err(err) => {
-                eprintln!("\x1b[1;31m[Error]\x1b[0m JSON parse error: {}", err);
-                eprintln!("  Tip: Check for trailing commas, missing quotes, or invalid syntax.");
-                std::process::exit(1);
-            }
-        };
-
-        let mut config = Config::default();
-
-        if let JsonValue::Object(ref map) = root {
-            warn_unknown_fields(map);
-            if let Some(v) = map.get("pools_path") {
-                config.pools_path = v.as_str().unwrap_or("data/pools.json").to_string();
-            }
-            if let Some(v) = map.get("luck_mode") {
-                config.luck_mode = LuckMode::from_str(v.as_str().unwrap_or("probability"));
-            }
-            if let Some(v) = map.get("fast_init") {
-                config.fast_init = v.as_bool().unwrap_or(false);
-            }
-            if let Some(v) = map.get("device") {
-                config.device = ComputeDevice::from_str(v.as_str().unwrap_or("cpu"));
-            }
-            if let Some(v) = map.get("ppo_mode") {
-                config.ppo_mode = v.as_str().unwrap_or("balanced").to_string();
-            }
-            if let Some(v) = map.get("ppo_total_steps") {
-                config.ppo_total_steps = v.as_f64().unwrap_or(0.0).round() as usize;
-            }
-            if let Some(v) = map.get("ppo_steps_per_update") {
-                config.ppo_steps_per_update = v.as_f64().unwrap_or(0.0).round() as usize;
-            }
-            if let Some(v) = map.get("ppo_k_epochs") {
-                config.ppo_k_epochs = v.as_f64().unwrap_or(0.0).round() as usize;
-            }
-            if let Some(v) = map.get("ppo_batch_size") {
-                config.ppo_batch_size = v.as_f64().unwrap_or(0.0).round() as usize;
-            }
-            if let Some(v) = map.get("ppo_context_len") {
-                config.ppo_context_len = v.as_f64().unwrap_or(0.0).round() as usize;
-            }
-            if let Some(v) = map.get("ppo_num_envs") {
-                config.ppo_num_envs = v.as_f64().unwrap_or(1.0).round() as usize;
-            }
-            if let Some(v) = map.get("ppo_top_k") {
-                config.ppo_top_k = v.as_f64().unwrap_or(0.0).round() as usize;
-            }
-            if let Some(v) = map.get("luck_action_cost") {
-                config.luck_action_cost = v.as_f64().unwrap_or(8.0);
-            }
-            if let Some(v) = map.get("luck_budget_enabled") {
-                config.luck_budget_enabled = v.as_bool().unwrap_or(true);
-            }
-            if let Some(v) = map.get("luck_budget_max") {
-                config.luck_budget_max = v.as_f64().unwrap_or(0.045);
-            }
-            if let Some(v) = map.get("luck_budget_initial") {
-                config.luck_budget_initial = v.as_f64().unwrap_or(0.03);
-            }
-            if let Some(v) = map.get("luck_budget_recovery_per_pull") {
-                config.luck_budget_recovery_per_pull = v.as_f64().unwrap_or(0.001);
-            }
-            if let Some(v) = map.get("luck_budget_negative_refund") {
-                config.luck_budget_negative_refund = v.as_f64().unwrap_or(1.0);
-            }
-            if let Some(v) = map.get("policy_eval_interval") {
-                config.policy_eval_interval = v.as_f64().unwrap_or(0.0).round() as usize;
-            }
-            if let Some(v) = map.get("policy_eval_episodes") {
-                config.policy_eval_episodes = v.as_f64().unwrap_or(128.0).round() as usize;
-            }
-            if let Some(v) = map.get("policy_eval_seed") {
-                config.policy_eval_seed = v.as_f64().unwrap_or(0x5EED_1234 as f64).round() as u64;
-            }
-            if let Some(v) = map.get("distill_enabled") {
-                config.distill_enabled = v.as_bool().unwrap_or(false);
-            }
-            if let Some(v) = map.get("distill_ema_decay") {
-                config.distill_ema_decay = v.as_f64().unwrap_or(0.995);
-            }
-            if let Some(v) = map.get("distill_kl_coef") {
-                config.distill_kl_coef = v.as_f64().unwrap_or(0.1);
-            }
-            if let Some(v) = map.get("distill_warmup_steps") {
-                config.distill_warmup_steps = v.as_f64().unwrap_or(500.0).round() as usize;
-            }
-            if let Some(v) = map.get("worker_max_threads") {
-                config.worker_max_threads = v.as_f64().unwrap_or(0.0).round() as usize;
-            }
-            if let Some(v) = map.get("worker_reserve_cores") {
-                config.worker_reserve_cores = v.as_f64().unwrap_or(1.0).round() as usize;
-            }
-            if let Some(v) = map.get("worker_priority") {
-                config.worker_priority = v.as_str().unwrap_or("time_critical").to_string();
-            }
-            if let Some(v) = map.get("worker_stack_size_mb") {
-                config.worker_stack_size_mb = v.as_f64().unwrap_or(4.0).round() as usize;
-            }
-            if let Some(v) = map.get("f2p_sim_count") {
-                config.f2p_sim_count = v.as_f64().unwrap_or(0.0).round() as usize;
-            }
-            if let Some(v) = map.get("f2p_sim_count_prob") {
-                config.f2p_sim_count_prob = v.as_f64().unwrap_or(0.0).round() as usize;
-            }
-            if let Some(v) = map.get("f2p_sim_count_cost") {
-                config.f2p_sim_count_cost = v.as_f64().unwrap_or(0.0).round() as usize;
-            }
-            if let Some(v) = map.get("f2p_luck_mode") {
-                config.f2p_luck_mode = v.as_str().map(LuckMode::from_str).or(config.f2p_luck_mode);
-            }
-            if let Some(v) = map.get("online_train") {
-                config.online_train = v.as_bool().unwrap_or(false);
-            }
-            if let Some(v) = map.get("online_train_dqn") {
-                config.online_train_dqn = v.as_bool().unwrap_or(false);
-            }
-            if let Some(v) = map.get("online_train_neural") {
-                config.online_train_neural = v.as_bool().unwrap_or(false);
-            }
-            if let Some(v) = map.get("online_train_ppo") {
-                config.online_train_ppo = v.as_bool().unwrap_or(false);
-            }
-            if let Some(v) = map.get("train_interval_ms") {
-                config.train_interval_ms = v.as_f64().unwrap_or(50.0).round() as usize;
-            }
-            if let Some(v) = map.get("max_train_steps_per_tick") {
-                config.max_train_steps_per_tick = v.as_f64().unwrap_or(1.0).round() as usize;
-            }
-            if let Some(v) = map.get("language") {
-                config.language = v.as_str().map(|s| s.to_string());
-            }
-            if let Some(v) = map.get("model_dim") {
-                config.model_dim = v.as_f64().unwrap_or(32.0).round() as usize;
-            }
-            if let Some(v) = map.get("model_hidden_dim") {
-                config.model_hidden_dim = v.as_f64().unwrap_or(1024.0).round() as usize;
-            }
-            if let Some(v) = map.get("model_num_layers") {
-                config.model_num_layers = v.as_f64().unwrap_or(4.0).round() as usize;
-            }
-            if let Some(v) = map.get("model_num_heads") {
-                config.model_num_heads = v.as_f64().unwrap_or(8.0).round() as usize;
-            }
-            if let Some(v) = map.get("model_kv_lora_rank") {
-                config.model_kv_lora_rank = v.as_f64().unwrap_or(128.0).round() as usize;
-            }
-            if let Some(v) = map.get("model_qk_rope_dim") {
-                config.model_qk_rope_dim = v.as_f64().unwrap_or(64.0).round() as usize;
-            }
-            if let Some(v) = map.get("use_multi_stream") {
-                config.use_multi_stream = v.as_bool().unwrap_or(true);
-            }
-            if let Some(v) = map.get("multi_stream_factor") {
-                config.multi_stream_factor = v.as_f64().unwrap_or(2.0).round() as usize;
-            }
-            if let Some(v) = map.get("use_calibrated") {
-                config.use_calibrated = v.as_bool().unwrap_or(true);
-            }
-            if let Some(v) = map.get("calibrated_path") {
-                config.calibrated_path = v.as_str().unwrap_or("data/calibrated.json").to_string();
-            }
-            if let Some(v) = map.get("player_data_path") {
-                config.player_data_path = v.as_str().unwrap_or("data/player_data.json").to_string();
-            }
-            if let Some(JsonValue::Object(achf_map)) = map.get("achf") {
-                if let Some(v) = achf_map.get("enabled") {
-                    config.achf.enabled = v.as_bool().unwrap_or(false);
-                }
-                if let Some(v) = achf_map.get("mode") {
-                    config.achf.mode = v.as_str().unwrap_or("lite").to_string();
-                }
-                if let Some(v) = achf_map.get("candidate_mode") {
-                    config.achf.candidate_mode = v.as_str().unwrap_or("sparse").to_string();
-                }
-                if let Some(v) = achf_map.get("proj_mode") {
-                    config.achf.proj_mode = v.as_str().unwrap_or("sinkhorn").to_string();
-                }
-                if let Some(v) = achf_map.get("candidate_refresh_freq") {
-                    config.achf.candidate_refresh_freq = v.as_f64().unwrap_or(1.0).round() as usize;
-                }
-                if let Some(v) = achf_map
-                    .get("ortho_penalty_freq")
-                    .or_else(|| achf_map.get("proj_freq"))
+        let resolved_pools_path = resolve_relative_path(base_dir, &config.pools_path);
+        if !has_embedded_pools {
+            let (pool_contents, pool_document) = match fs::read_to_string(&resolved_pools_path) {
+                Ok(contents) => (contents, resolved_pools_path.display().to_string()),
+                Err(source)
+                    if source.kind() == io::ErrorKind::NotFound
+                        && (allow_embedded_pools || !pools_path_was_explicit) =>
                 {
-                    config.achf.ortho_penalty_freq = v.as_f64().unwrap_or(8.0).round() as usize;
+                    (EMBEDDED_POOLS.to_string(), "<embedded pools>".to_string())
                 }
-                if let Some(v) = achf_map.get("proj_steps") {
-                    config.achf.proj_steps = v.as_f64().unwrap_or(0.0).round() as usize;
+                Err(source) => {
+                    return Err(ConfigError::Io {
+                        path: resolved_pools_path,
+                        source,
+                    });
                 }
-                if let Some(v) = achf_map.get("lambda_ortho") {
-                    config.achf.lambda_ortho = v.as_f64().unwrap_or(0.0);
-                }
-                if let Some(v) = achf_map.get("gate_mode") {
-                    config.achf.gate_mode = v.as_str().unwrap_or("grad_ema").to_string();
-                }
-                if let Some(v) = achf_map.get("gate_momentum") {
-                    config.achf.gate_momentum = v.as_f64().unwrap_or(0.95);
-                }
-                if let Some(v) = achf_map.get("gate_beta") {
-                    config.achf.gate_beta = v.as_f64().unwrap_or(0.7);
-                }
-                if let Some(v) = achf_map.get("gate_alpha") {
-                    config.achf.gate_alpha = v.as_f64().unwrap_or(0.0);
-                }
-                if let Some(v) = achf_map.get("g_min") {
-                    config.achf.g_min = v.as_f64().unwrap_or(0.2);
-                }
-                if let Some(v) = achf_map.get("gate_warmup_steps") {
-                    config.achf.gate_warmup_steps = v.as_f64().unwrap_or(0.0).round() as usize;
-                }
-                if let Some(v) = achf_map.get("gate_transition_steps") {
-                    config.achf.gate_transition_steps = v.as_f64().unwrap_or(50.0).round() as usize;
-                }
-                if let Some(v) = achf_map.get("gate_k_clip") {
-                    config.achf.gate_k_clip = v.as_f64().unwrap_or(0.0);
-                }
-                if let Some(v) = achf_map.get("g_target_min") {
-                    config.achf.g_target_min = v.as_f64().unwrap_or(0.3);
-                }
-                if let Some(v) = achf_map.get("g_target_max") {
-                    config.achf.g_target_max = v.as_f64().unwrap_or(0.8);
-                }
-                if let Some(v) = achf_map.get("g_min_adapt_rate") {
-                    config.achf.g_min_adapt_rate = v.as_f64().unwrap_or(0.0);
-                }
-                if let Some(v) = achf_map.get("g_min_momentum") {
-                    config.achf.g_min_momentum = v.as_f64().unwrap_or(0.9);
-                }
-                if let Some(v) = achf_map.get("cache_min_rows") {
-                    config.achf.cache_min_rows = v.as_f64().unwrap_or(1.0).round() as usize;
-                }
-                if let Some(v) = achf_map.get("cache_min_nonzero_ratio") {
-                    config.achf.cache_min_nonzero_ratio = v.as_f64().unwrap_or(0.0);
-                }
-                if let Some(v) = achf_map.get("cache_min_reuse") {
-                    config.achf.cache_min_reuse = v.as_f64().unwrap_or(2.0).round() as usize;
-                }
-                if let Some(v) = achf_map.get("path_warmup_samples") {
-                    config.achf.path_warmup_samples = v.as_f64().unwrap_or(2.0).round() as usize;
-                }
-                if let Some(v) = achf_map.get("path_min_dwell") {
-                    config.achf.path_min_dwell = v.as_f64().unwrap_or(2.0).round() as usize;
-                }
-                if let Some(v) = achf_map.get("cache_sparsity_sample_rows") {
-                    config.achf.cache_sparsity_sample_rows =
-                        v.as_f64().unwrap_or(0.0).round() as usize;
-                }
-                if let Some(v) = achf_map.get("cache_cost_bias") {
-                    config.achf.cache_cost_bias = v.as_f64().unwrap_or(1.0);
-                }
-                if let Some(v) = achf_map.get("cache_adapt_rate") {
-                    config.achf.cache_adapt_rate = v.as_f64().unwrap_or(0.0);
-                }
-                if let Some(v) = achf_map.get("cache_bias_min") {
-                    config.achf.cache_bias_min = v.as_f64().unwrap_or(0.2);
-                }
-                if let Some(v) = achf_map.get("cache_bias_max") {
-                    config.achf.cache_bias_max = v.as_f64().unwrap_or(5.0);
-                }
-                if let Some(v) = achf_map.get("cache_latency_ema") {
-                    config.achf.cache_latency_ema = v.as_f64().unwrap_or(0.9);
-                }
-                if let Some(v) = achf_map.get("cache_latency_long_ema") {
-                    config.achf.cache_latency_long_ema = v.as_f64().unwrap_or(0.99);
-                }
-                if let Some(v) = achf_map.get("cache_adapt_blend") {
-                    config.achf.cache_adapt_blend = v.as_f64().unwrap_or(0.5);
-                }
-                if let Some(v) = achf_map.get("cache_latency_sample_every") {
-                    config.achf.cache_latency_sample_every =
-                        v.as_f64().unwrap_or(1.0).round() as u64;
-                }
-                if let Some(v) = achf_map.get("cache_log_interval_steps") {
-                    config.achf.cache_log_interval_steps =
-                        v.as_f64().unwrap_or(0.0).round() as usize;
-                }
-                if let Some(v) = achf_map.get("cache_log_per_layer") {
-                    config.achf.cache_log_per_layer = v.as_bool().unwrap_or(false);
-                }
-                if let Some(v) = achf_map.get("diagnostics_enabled") {
-                    config.achf.diagnostics_enabled = v.as_bool().unwrap_or(false);
-                }
-                if let Some(v) = achf_map.get("rank") {
-                    config.achf.rank = v.as_f64().unwrap_or(0.0).round() as usize;
-                }
-                if let Some(v) = achf_map.get("prune_threshold") {
-                    config.achf.prune_threshold = v.as_f64().unwrap_or(0.01);
-                }
-                if let Some(v) = achf_map.get("candidate_target_sparsity") {
-                    config.achf.candidate_target_sparsity = v.as_f64().unwrap_or(0.0);
-                }
-                if let Some(v) = achf_map.get("candidate_min_sparsity") {
-                    config.achf.candidate_min_sparsity = v.as_f64().unwrap_or(0.5);
-                }
-                if let Some(v) = achf_map.get("candidate_max_relative_error") {
-                    config.achf.candidate_max_relative_error = v.as_f64().unwrap_or(0.05);
-                }
-                if let Some(v) = achf_map.get("candidate_max_output_relative_error") {
-                    config.achf.candidate_max_output_relative_error = v.as_f64().unwrap_or(0.05);
-                }
-                if let Some(v) = achf_map.get("candidate_min_calibration_samples") {
-                    config.achf.candidate_min_calibration_samples =
-                        v.as_f64().unwrap_or(0.0).round() as usize;
-                }
-                if let Some(v) = achf_map.get("candidate_calibration_steps") {
-                    config.achf.candidate_calibration_steps =
-                        v.as_f64().unwrap_or(256.0).round() as usize;
-                }
-                if let Some(v) = achf_map.get("candidate_calibration_lr") {
-                    config.achf.candidate_calibration_lr = v.as_f64().unwrap_or(1e-3);
-                }
-                if let Some(v) = achf_map.get("candidate_calibration_max_samples") {
-                    config.achf.candidate_calibration_max_samples =
-                        v.as_f64().unwrap_or(256.0).round() as usize;
-                }
-                if let Some(v) = achf_map.get("candidate_train_from_scratch") {
-                    config.achf.candidate_train_from_scratch = v.as_bool().unwrap_or(false);
-                }
-                if let Some(v) = achf_map
-                    .get("candidate_weight_error_momentum")
-                    .or_else(|| achf_map.get("candidate_discrepancy_momentum"))
-                {
-                    config.achf.candidate_weight_error_momentum = v.as_f64().unwrap_or(0.9);
-                }
+            };
+            let mut pools_root = parse_json(&pool_contents, &pool_document)?;
+            let pools_object = root_object_mut(&mut pools_root, &pool_document)?;
+            remove_documentation_fields(pools_object);
+            prepare_localized_pool_entries(pools_object, language.as_deref());
+            let pools: PoolsDocument =
+                serde_json::from_value(pools_root).map_err(|source| ConfigError::Json {
+                    document: pool_document,
+                    source,
+                })?;
+            config.active_pool = pools.active_pool;
+            config.pools = pools.pools;
+        }
 
-                if let Some(v) = achf_map.get("apply_attn") {
-                    config.achf.apply_attn = v.as_bool().unwrap_or(false);
-                }
-                if let Some(v) = achf_map.get("apply_ffn") {
-                    config.achf.apply_ffn = v.as_bool().unwrap_or(true);
-                }
-                if let Some(v) = achf_map.get("apply_dqn") {
-                    config.achf.apply_dqn = v.as_bool().unwrap_or(false);
-                }
-                if let Some(v) = achf_map.get("infer_gate") {
-                    config.achf.infer_gate = v.as_str().unwrap_or("candidate").to_string();
-                }
-                if let Some(v) = achf_map.get("adaptive_inference") {
-                    config.achf.adaptive_inference = v.as_bool().unwrap_or(false);
-                }
+        config.pools_path = path_to_string(&resolved_pools_path);
+        config.calibrated_path =
+            path_to_string(&resolve_relative_path(base_dir, &config.calibrated_path));
+        config.player_data_path =
+            path_to_string(&resolve_relative_path(base_dir, &config.player_data_path));
+
+        let mut selection_errors = Vec::new();
+        if config.pools.is_empty() {
+            selection_errors.push("at least one pool must be configured".to_string());
+        } else if let Some(active_pool) = config.active_pool.clone() {
+            if !config.apply_pool(&active_pool) {
+                selection_errors.push(format!(
+                    "active_pool '{}' does not match any configured pool ID",
+                    active_pool
+                ));
             }
+        } else {
+            selection_errors.push("active_pool is required when pools are configured".to_string());
+        }
+        if !selection_errors.is_empty() {
+            return Err(ConfigError::Validation {
+                document: document.to_string(),
+                errors: selection_errors,
+            });
         }
 
-        // Pools live in a separate file (config.pools_path). For backward
-        // compatibility, if the main config still embeds a `pools` array we
-        // parse pools from there instead of loading the external file.
-        let pools_root: JsonValue = match &root {
-            JsonValue::Object(map) if map.contains_key("pools") => root.clone(),
-            _ => load_pools_root(&config.pools_path),
-        };
-        if let JsonValue::Object(ref pmap) = pools_root {
-            extract_pool_fields(&mut config, pmap);
-        }
+        config.validate_named(document)?;
+        Ok(config)
+    }
 
-        sanitize_pity_settings(
-            &mut config.soft_pity_start,
-            &mut config.small_pity_guarantee,
-            &mut config.big_pity_cumulative,
-            "root config",
-        );
-        sanitize_non_negative(&mut config.luck_action_cost, "luck_action_cost", 8.0);
-        sanitize_non_negative(&mut config.luck_budget_max, "luck_budget_max", 0.045);
-        sanitize_non_negative(&mut config.luck_budget_initial, "luck_budget_initial", 0.03);
-        sanitize_non_negative(
-            &mut config.luck_budget_recovery_per_pull,
-            "luck_budget_recovery_per_pull",
-            0.001,
-        );
-        sanitize_non_negative(
-            &mut config.luck_budget_negative_refund,
-            "luck_budget_negative_refund",
-            1.0,
-        );
-        if config.luck_budget_max > 0.0 && config.luck_budget_initial > config.luck_budget_max {
-            eprintln!(
-                "[Config Warning] luck_budget_initial ({}) exceeds luck_budget_max ({}), clamping",
-                config.luck_budget_initial, config.luck_budget_max
-            );
-            config.luck_budget_initial = config.luck_budget_max;
-        }
-        if config.policy_eval_episodes == 0 {
-            eprintln!("[Config Warning] policy_eval_episodes is 0, fallback to 1");
-            config.policy_eval_episodes = 1;
-        }
-        sanitize_achf_config(&mut config.achf);
-
-        // Sanitize model dimension settings
-        if config.model_dim == 0 {
-            eprintln!("[Config Warning] model_dim is 0, fallback to 32");
-            config.model_dim = 32;
-        }
-        if config.model_hidden_dim == 0 {
-            eprintln!("[Config Warning] model_hidden_dim is 0, fallback to 1024");
-            config.model_hidden_dim = 1024;
-        }
-        if config.model_num_layers == 0 {
-            eprintln!("[Config Warning] model_num_layers is 0, fallback to 4");
-            config.model_num_layers = 4;
-        }
-        if config.model_num_heads == 0 {
-            eprintln!("[Config Warning] model_num_heads is 0, fallback to 8");
-            config.model_num_heads = 8;
-        }
-        if config.model_dim % config.model_num_heads != 0 {
-            eprintln!(
-                "[Config Warning] model_dim ({}) not divisible by model_num_heads ({}), adjusting model_dim",
-                config.model_dim, config.model_num_heads
-            );
-            config.model_dim = (config.model_dim / config.model_num_heads) * config.model_num_heads;
-            if config.model_dim == 0 {
-                config.model_dim = config.model_num_heads;
-            }
-        }
-        if config.multi_stream_factor == 0 {
-            config.multi_stream_factor = 2;
-        }
-
-        if !config.pools.is_empty() {
-            if let Some(active) = config.active_pool.clone() {
-                if !config.apply_pool(&active) {
-                    let first = config.pools[0].id.clone();
-                    config.apply_pool(&first);
-                    config.active_pool = Some(first);
-                }
-            } else {
-                let first = config.pools[0].id.clone();
-                config.apply_pool(&first);
-                config.active_pool = Some(first);
-            }
-        }
-
-        if config.language.as_deref() == Some("en") {
-            if let JsonValue::Object(ref map) = pools_root {
-                if let Some(JsonValue::Array(pools_arr)) = map.get("pools") {
-                    for (i, pool_val) in pools_arr.iter().enumerate() {
-                        if let (JsonValue::Object(ref pm), Some(pool)) =
-                            (pool_val, config.pools.get_mut(i))
-                        {
-                            if let Some(s) = pm.get("name_en").and_then(|v| v.as_str()) {
-                                if !s.is_empty() {
-                                    pool.name = s.to_string();
-                                }
-                            }
-                            let swap = |field: &mut Vec<String>, key: &str| {
-                                if let Some(v) = pm.get(key) {
-                                    let en = json_to_string_vec(v);
-                                    if !en.is_empty() {
-                                        *field = en;
-                                    }
-                                }
-                            };
-                            swap(&mut pool.up_six, "up_six_en");
-                            swap(&mut pool.six_stars, "six_stars_en");
-                            swap(&mut pool.five_stars, "five_stars_en");
-                            swap(&mut pool.four_stars, "four_stars_en");
-                        }
-                    }
-                }
-                if let Some(active) = config.active_pool.clone() {
-                    config.apply_pool(&active);
-                }
-                if let Some(s) = map.get("pool_name_en").and_then(|v| v.as_str()) {
-                    if !s.is_empty() && config.active_pool.is_none() {
-                        config.pool_name = s.to_string();
-                    }
-                }
-            }
-        }
-
-        config
+    /// Validate a programmatically constructed configuration.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_named("<runtime configuration>")
     }
 
     /// Switch the active pool by ID, updating all pool-specific settings.
     pub fn apply_pool(&mut self, pool_id: &str) -> bool {
-        let pool = match self.pools.iter().find(|p| p.id == pool_id) {
-            Some(p) => p.clone(),
-            None => return false,
+        let Some(pool) = self.pools.iter().find(|pool| pool.id == pool_id).cloned() else {
+            return false;
         };
         self.pool_name = pool.name;
         self.up_six = pool.up_six;
@@ -1440,320 +810,386 @@ impl Config {
     }
 }
 
-/// Read and parse the external pools file (config.pools_path). Applies the
-/// same parent-directory fallback as the main config loader so it works from
-/// `target/**/exe` layouts. Returns `JsonValue::Null` if the file is missing
-/// or invalid (the caller then simply has no pools defined).
-fn load_pools_root(path: &str) -> JsonValue {
-    let mut file = match File::open(path) {
-        Ok(f) => Some(f),
-        Err(_) => {
-            let mut found = None;
-            for levels in [2, 3] {
-                if let Some(fallback) = fallback_parent_path(path, levels) {
-                    if let Ok(f) = File::open(&fallback) {
-                        println!(
-                            "[System] Pools file found in parent directory ({} levels up).",
-                            levels
-                        );
-                        found = Some(f);
-                        break;
-                    }
+fn parse_json(contents: &str, document: &str) -> Result<Value, ConfigError> {
+    serde_json::from_str(&strip_json_comments(contents)).map_err(|source| ConfigError::Json {
+        document: document.to_string(),
+        source,
+    })
+}
+
+fn root_object_mut<'a>(
+    root: &'a mut Value,
+    document: &str,
+) -> Result<&'a mut serde_json::Map<String, Value>, ConfigError> {
+    root.as_object_mut().ok_or_else(|| ConfigError::Validation {
+        document: document.to_string(),
+        errors: vec!["document root must be a JSON object".to_string()],
+    })
+}
+
+fn remove_documentation_fields(object: &mut serde_json::Map<String, Value>) {
+    object.retain(|key, _| !key.starts_with("_comment"));
+}
+
+fn prepare_localized_fields(object: &mut serde_json::Map<String, Value>, language: Option<&str>) {
+    localize_field(object, "pool_name", "pool_name_en", language);
+    localize_field(object, "up_six", "up_six_en", language);
+    localize_field(object, "six_stars", "six_stars_en", language);
+    localize_field(object, "five_stars", "five_stars_en", language);
+    localize_field(object, "four_stars", "four_stars_en", language);
+    prepare_localized_pool_entries(object, language);
+}
+
+fn prepare_localized_pool_entries(
+    object: &mut serde_json::Map<String, Value>,
+    language: Option<&str>,
+) {
+    let Some(Value::Array(pools)) = object.get_mut("pools") else {
+        return;
+    };
+    for pool in pools {
+        let Some(pool_object) = pool.as_object_mut() else {
+            continue;
+        };
+        localize_field(pool_object, "name", "name_en", language);
+        localize_field(pool_object, "up_six", "up_six_en", language);
+        localize_field(pool_object, "six_stars", "six_stars_en", language);
+        localize_field(pool_object, "five_stars", "five_stars_en", language);
+        localize_field(pool_object, "four_stars", "four_stars_en", language);
+    }
+}
+
+fn localize_field(
+    object: &mut serde_json::Map<String, Value>,
+    primary: &str,
+    english: &str,
+    language: Option<&str>,
+) {
+    if let Some(english_value) = object.remove(english) {
+        if language == Some("en") && localization_value_is_usable(&english_value) {
+            object.insert(primary.to_string(), english_value);
+        }
+    }
+}
+
+fn localization_value_is_usable(value: &Value) -> bool {
+    match value {
+        Value::String(value) => !value.is_empty(),
+        Value::Array(values) => !values.is_empty(),
+        _ => false,
+    }
+}
+
+fn resolve_relative_path(base_dir: &Path, configured: &str) -> PathBuf {
+    let path = Path::new(configured);
+    if path.is_absolute() {
+        normalize_path(path)
+    } else {
+        normalize_path(&base_dir.join(path))
+    }
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
                 }
             }
-            found
+            _ => normalized.push(component.as_os_str()),
         }
-    };
+    }
+    normalized
+}
 
-    let Some(ref mut f) = file else {
-        eprintln!(
-            "\x1b[33m[Warning]\x1b[0m Pools file '{}' not found; no pools loaded.",
-            path
+fn path_to_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+impl Config {
+    fn validate_named(&self, document: &str) -> Result<(), ConfigError> {
+        let mut errors = Vec::new();
+
+        validate_choice(
+            &mut errors,
+            "ppo_mode",
+            &self.ppo_mode,
+            &["auto", "fast", "balanced"],
         );
-        return JsonValue::Null;
-    };
+        validate_choice(
+            &mut errors,
+            "worker_priority",
+            &self.worker_priority,
+            &[
+                "highest",
+                "above_normal",
+                "normal",
+                "below_normal",
+                "lowest",
+                "idle",
+            ],
+        );
+        if let Some(language) = &self.language {
+            validate_choice(&mut errors, "language", language, &["zh", "en"]);
+        }
 
-    let mut contents = String::new();
-    if f.read_to_string(&mut contents).is_err() {
-        log::error!("Failed to read pools file '{}'", path);
-        return JsonValue::Null;
-    }
-    let stripped = strip_json_comments(&contents);
-    match serde_json::from_str(&stripped) {
-        Ok(value) => value,
-        Err(err) => {
-            eprintln!(
-                "\x1b[1;31m[Error]\x1b[0m Pools JSON parse error in '{}': {}",
-                path, err
+        if self.model_dim == 0 {
+            errors.push("model_dim must be greater than zero".to_string());
+        }
+        if self.model_hidden_dim == 0 {
+            errors.push("model_hidden_dim must be greater than zero".to_string());
+        }
+        if self.model_num_layers == 0 {
+            errors.push("model_num_layers must be greater than zero".to_string());
+        }
+        if self.model_num_heads == 0 {
+            errors.push("model_num_heads must be greater than zero".to_string());
+        } else if !self.model_hidden_dim.is_multiple_of(self.model_num_heads) {
+            errors.push("model_hidden_dim must be divisible by model_num_heads".to_string());
+        }
+        if self.model_kv_lora_rank == 0 {
+            errors.push("model_kv_lora_rank must be greater than zero".to_string());
+        }
+        if self.model_qk_rope_dim == 0 || !self.model_qk_rope_dim.is_multiple_of(2) {
+            errors.push("model_qk_rope_dim must be a positive even number".to_string());
+        }
+        if self.use_multi_stream && self.multi_stream_factor < 2 {
+            errors.push(
+                "multi_stream_factor must be at least 2 when use_multi_stream=true".to_string(),
             );
-            JsonValue::Null
         }
-    }
-}
+        if self.ppo_num_envs == 0 {
+            errors.push("ppo_num_envs must be greater than zero".to_string());
+        }
+        if self.policy_eval_episodes == 0 {
+            errors.push("policy_eval_episodes must be greater than zero".to_string());
+        }
+        if self.worker_stack_size_mb == 0 || self.worker_stack_size_mb > 512 {
+            errors.push("worker_stack_size_mb must be in 1..=512".to_string());
+        }
+        if self.online_train && self.train_interval_ms == 0 {
+            errors.push(
+                "train_interval_ms must be greater than zero for online training".to_string(),
+            );
+        }
+        if self.online_train && self.max_train_steps_per_tick == 0 {
+            errors.push(
+                "max_train_steps_per_tick must be greater than zero for online training"
+                    .to_string(),
+            );
+        }
 
-/// Populate the pool-related fields of `config` from a JSON object (either the
-/// external pools file root or, for backward compatibility, the main config
-/// root when it still embeds a `pools` array).
-fn extract_pool_fields(config: &mut Config, map: &serde_json::Map<String, JsonValue>) {
-    if let Some(v) = map.get("pool_name") {
-        config.pool_name = v.as_str().unwrap_or("").to_string();
-    }
-    if let Some(v) = map.get("up_six") {
-        config.up_six = json_to_string_vec(v);
-    }
-    if let Some(v) = map.get("up_rate") {
-        config.up_rate = v.as_f64().unwrap_or(0.5);
-    }
-    if let Some(v) = map.get("prob_6_base") {
-        config.prob_6_base = v.as_f64().unwrap_or(0.008);
-    }
-    if let Some(v) = map.get("prob_5_base") {
-        config.prob_5_base = v.as_f64().unwrap_or(0.08);
-    }
-    if let Some(v) = map.get("prob_4_base") {
-        config.prob_4_base = v.as_f64().unwrap_or(0.912);
-    }
-    if let Some(v) = map.get("soft_pity_start") {
-        config.soft_pity_start = v.as_f64().unwrap_or(65.0).round() as usize;
-    }
-    if let Some(v) = map.get("soft_pity_slope") {
-        config.soft_pity_slope = v.as_f64().unwrap_or(0.05);
-    }
-    if let Some(v) = map.get("small_pity_guarantee") {
-        config.small_pity_guarantee = v.as_f64().unwrap_or(80.0).round() as usize;
-    }
-    if let Some(v) = map.get("big_pity_cumulative") {
-        config.big_pity_cumulative = v.as_f64().unwrap_or(120.0).round() as usize;
-    }
-    if let Some(v) = map.get("up_pity_soft") {
-        config.up_pity_soft = v.as_f64().unwrap_or(0.0).round() as usize;
-    }
-    if let Some(v) = map.get("five_star_pity") {
-        config.five_star_pity = v.as_f64().unwrap_or(10.0).round() as usize;
-    }
-    if let Some(v) = map.get("always_5_star") {
-        config.always_5_star = v.as_bool().unwrap_or(false);
-    }
-    if let Some(v) = map.get("big_pity_requires_not_up") {
-        config.big_pity_requires_not_up = v.as_bool().unwrap_or(true);
-    }
-    if let Some(v) = map.get("six_stars") {
-        config.six_stars = json_to_string_vec(v);
-    }
-    if let Some(v) = map.get("five_stars") {
-        config.five_stars = json_to_string_vec(v);
-    }
-    if let Some(v) = map.get("four_stars") {
-        config.four_stars = json_to_string_vec(v);
-    }
-    if let Some(v) = map.get("active_pool") {
-        config.active_pool = v.as_str().map(|s| s.to_string());
-    }
-    if let Some(JsonValue::Array(pools)) = map.get("pools") {
-        config.pools = pools
-            .iter()
-            .filter_map(|v| match v {
-                JsonValue::Object(pool_map) => Some(parse_pool_config(pool_map)),
-                _ => None,
+        validate_non_negative(&mut errors, "luck_action_cost", self.luck_action_cost);
+        validate_non_negative(&mut errors, "luck_budget_max", self.luck_budget_max);
+        validate_non_negative(&mut errors, "luck_budget_initial", self.luck_budget_initial);
+        validate_non_negative(
+            &mut errors,
+            "luck_budget_recovery_per_pull",
+            self.luck_budget_recovery_per_pull,
+        );
+        validate_non_negative(
+            &mut errors,
+            "luck_budget_negative_refund",
+            self.luck_budget_negative_refund,
+        );
+        if self.luck_budget_initial > self.luck_budget_max {
+            errors.push("luck_budget_initial must be <= luck_budget_max".to_string());
+        }
+        if self.luck_budget_enabled && self.luck_budget_max <= 0.0 {
+            errors.push("luck_budget_max must be > 0 when luck budgeting is enabled".to_string());
+        }
+        validate_unit(&mut errors, "distill_ema_decay", self.distill_ema_decay);
+        if self.distill_ema_decay == 1.0 {
+            errors.push("distill_ema_decay must be less than 1".to_string());
+        }
+        validate_non_negative(&mut errors, "distill_kl_coef", self.distill_kl_coef);
+
+        if self.calibrated_path.trim().is_empty() {
+            errors.push("calibrated_path must not be empty".to_string());
+        }
+        if self.player_data_path.trim().is_empty() {
+            errors.push("player_data_path must not be empty".to_string());
+        }
+
+        validate_probability_model(
+            &mut errors,
+            "active pool",
+            self.up_rate,
+            self.prob_6_base,
+            self.prob_5_base,
+            self.prob_4_base,
+            self.soft_pity_start,
+            self.soft_pity_slope,
+            self.small_pity_guarantee,
+            self.big_pity_cumulative,
+            self.five_star_pity,
+            self.up_six.is_empty(),
+        );
+
+        let mut pool_ids = HashSet::new();
+        for (index, pool) in self.pools.iter().enumerate() {
+            let scope = if pool.id.is_empty() {
+                format!("pools[{index}]")
+            } else {
+                format!("pool '{}'", pool.id)
+            };
+            if pool.id.trim().is_empty() {
+                errors.push(format!("{scope}.id must not be empty"));
+            } else if !pool_ids.insert(pool.id.as_str()) {
+                errors.push(format!("duplicate pool ID '{}'", pool.id));
+            }
+            if pool.name.trim().is_empty() {
+                errors.push(format!("{scope}.name must not be empty"));
+            }
+            validate_choice(
+                &mut errors,
+                &format!("{scope}.pool_type"),
+                &pool.pool_type,
+                &["character_up", "weapon_up", "standard", "beginner"],
+            );
+            validate_probability_model(
+                &mut errors,
+                &scope,
+                pool.up_rate,
+                pool.prob_6_base,
+                pool.prob_5_base,
+                pool.prob_4_base,
+                pool.soft_pity_start,
+                pool.soft_pity_slope,
+                pool.small_pity_guarantee,
+                pool.big_pity_cumulative,
+                pool.five_star_pity,
+                pool.up_six.is_empty(),
+            );
+            let six_stars: HashSet<&str> = pool.six_stars.iter().map(String::as_str).collect();
+            for operator in &pool.up_six {
+                if !six_stars.contains(operator.as_str()) {
+                    errors.push(format!(
+                        "{scope}.up_six entry '{operator}' is missing from six_stars"
+                    ));
+                }
+            }
+        }
+
+        if let Some(active_pool) = &self.active_pool {
+            if !pool_ids.contains(active_pool.as_str()) {
+                errors.push(format!(
+                    "active_pool '{}' does not match any configured pool ID",
+                    active_pool
+                ));
+            }
+        } else {
+            errors.push("active_pool is required".to_string());
+        }
+
+        self.achf.validate(&mut errors);
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ConfigError::Validation {
+                document: document.to_string(),
+                errors,
             })
-            .collect();
-    }
-}
-
-fn parse_pool_config(pool_map: &serde_json::Map<String, JsonValue>) -> PoolConfig {
-    let mut pool = PoolConfig {
-        id: pool_map
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        name: pool_map
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Unknown")
-            .to_string(),
-        pool_type: pool_map
-            .get("pool_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string(),
-        up_six: pool_map
-            .get("up_six")
-            .map(json_to_string_vec)
-            .unwrap_or_default(),
-        up_rate: pool_map
-            .get("up_rate")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.5),
-        prob_6_base: pool_map
-            .get("prob_6_base")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.008),
-        prob_5_base: pool_map
-            .get("prob_5_base")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.08),
-        prob_4_base: pool_map
-            .get("prob_4_base")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.912),
-        soft_pity_start: pool_map
-            .get("soft_pity_start")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(65.0)
-            .round() as usize,
-        soft_pity_slope: pool_map
-            .get("soft_pity_slope")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.05),
-        small_pity_guarantee: pool_map
-            .get("small_pity_guarantee")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(80.0)
-            .round() as usize,
-        big_pity_cumulative: pool_map
-            .get("big_pity_cumulative")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(120.0)
-            .round() as usize,
-        up_pity_soft: pool_map
-            .get("up_pity_soft")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0)
-            .round() as usize,
-        five_star_pity: pool_map
-            .get("five_star_pity")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(10.0)
-            .round() as usize,
-        always_5_star: pool_map
-            .get("always_5_star")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-        big_pity_requires_not_up: pool_map
-            .get("big_pity_requires_not_up")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true),
-        six_stars: pool_map
-            .get("six_stars")
-            .map(json_to_string_vec)
-            .unwrap_or_default(),
-        five_stars: pool_map
-            .get("five_stars")
-            .map(json_to_string_vec)
-            .unwrap_or_default(),
-        four_stars: pool_map
-            .get("four_stars")
-            .map(json_to_string_vec)
-            .unwrap_or_default(),
-        is_archived: pool_map
-            .get("is_archived")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
-    };
-    if pool.up_rate <= 0.0 || pool.up_six.is_empty() {
-        pool.up_rate = 0.0;
-    }
-    let scope = if pool.id.is_empty() {
-        "pool <unknown>".to_string()
-    } else {
-        format!("pool '{}'", pool.id)
-    };
-    sanitize_pity_settings(
-        &mut pool.soft_pity_start,
-        &mut pool.small_pity_guarantee,
-        &mut pool.big_pity_cumulative,
-        &scope,
-    );
-    pool
-}
-
-fn warn_unknown_fields(map: &serde_json::Map<String, JsonValue>) {
-    let known: HashSet<&'static str> = [
-        "pool_name",
-        "up_six",
-        "up_rate",
-        "prob_6_base",
-        "prob_5_base",
-        "prob_4_base",
-        "soft_pity_start",
-        "small_pity_guarantee",
-        "big_pity_cumulative",
-        "up_pity_soft",
-        "five_star_pity",
-        "always_5_star",
-        "big_pity_requires_not_up",
-        "six_stars",
-        "five_stars",
-        "four_stars",
-        "pools",
-        "active_pool",
-        "pools_path",
-        "luck_mode",
-        "fast_init",
-        "ppo_mode",
-        "ppo_total_steps",
-        "ppo_steps_per_update",
-        "ppo_k_epochs",
-        "ppo_batch_size",
-        "ppo_context_len",
-        "ppo_num_envs",
-        "ppo_top_k",
-        "luck_action_cost",
-        "luck_budget_enabled",
-        "luck_budget_max",
-        "luck_budget_initial",
-        "luck_budget_recovery_per_pull",
-        "luck_budget_negative_refund",
-        "policy_eval_interval",
-        "policy_eval_episodes",
-        "policy_eval_seed",
-        "distill_enabled",
-        "distill_ema_decay",
-        "distill_kl_coef",
-        "distill_warmup_steps",
-        "device",
-        "worker_max_threads",
-        "worker_reserve_cores",
-        "worker_priority",
-        "worker_stack_size_mb",
-        "f2p_sim_count",
-        "f2p_sim_count_prob",
-        "f2p_sim_count_cost",
-        "f2p_luck_mode",
-        "online_train",
-        "online_train_dqn",
-        "online_train_neural",
-        "online_train_ppo",
-        "train_interval_ms",
-        "max_train_steps_per_tick",
-        "language",
-        "achf",
-        "soft_pity_slope",
-        "use_calibrated",
-        "calibrated_path",
-        "player_data_path",
-        "pool_name_en",
-        "up_six_en",
-        "six_stars_en",
-        "five_stars_en",
-        "four_stars_en",
-        "model_dim",
-        "model_hidden_dim",
-        "model_num_layers",
-        "model_num_heads",
-        "model_kv_lora_rank",
-        "model_qk_rope_dim",
-        "use_multi_stream",
-        "multi_stream_factor",
-    ]
-    .into_iter()
-    .collect();
-
-    for key in map.keys() {
-        if !known.contains(key.as_str()) {
-            eprintln!("[Config Warning] Unknown field: {}", key);
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_probability_model(
+    errors: &mut Vec<String>,
+    scope: &str,
+    up_rate: f64,
+    probability_six: f64,
+    probability_five: f64,
+    probability_four: f64,
+    soft_pity_start: usize,
+    soft_pity_slope: f64,
+    small_pity_guarantee: usize,
+    big_pity_cumulative: usize,
+    five_star_pity: usize,
+    up_list_is_empty: bool,
+) {
+    validate_unit(errors, &format!("{scope}.up_rate"), up_rate);
+    validate_unit(errors, &format!("{scope}.prob_6_base"), probability_six);
+    validate_unit(errors, &format!("{scope}.prob_5_base"), probability_five);
+    validate_unit(errors, &format!("{scope}.prob_4_base"), probability_four);
+    let probability_sum = probability_six + probability_five + probability_four;
+    if probability_sum.is_finite() && (probability_sum - 1.0).abs() > PROBABILITY_SUM_TOLERANCE {
+        errors.push(format!(
+            "{scope} base probabilities must sum to 1 (got {probability_sum:.17})"
+        ));
+    }
+    if up_list_is_empty && up_rate != 0.0 {
+        errors.push(format!("{scope}.up_rate must be 0 when up_six is empty"));
+    }
+    if !up_list_is_empty && up_rate <= 0.0 {
+        errors.push(format!(
+            "{scope}.up_rate must be > 0 when up_six is non-empty"
+        ));
+    }
+    if soft_pity_start == 0 {
+        errors.push(format!("{scope}.soft_pity_start must be greater than zero"));
+    }
+    if small_pity_guarantee == 0 || small_pity_guarantee > MAX_SMALL_PITY_GUARANTEE {
+        errors.push(format!(
+            "{scope}.small_pity_guarantee must be in 1..={MAX_SMALL_PITY_GUARANTEE}"
+        ));
+    }
+    if soft_pity_start > small_pity_guarantee {
+        errors.push(format!(
+            "{scope}.soft_pity_start must be <= small_pity_guarantee"
+        ));
+    }
+    if big_pity_cumulative > MAX_BIG_PITY_CUMULATIVE {
+        errors.push(format!(
+            "{scope}.big_pity_cumulative must be <= {MAX_BIG_PITY_CUMULATIVE}"
+        ));
+    }
+    if big_pity_cumulative > 0 && big_pity_cumulative < small_pity_guarantee {
+        errors.push(format!(
+            "{scope}.big_pity_cumulative must be 0 or >= small_pity_guarantee"
+        ));
+    }
+    if five_star_pity == 0 {
+        errors.push(format!("{scope}.five_star_pity must be greater than zero"));
+    }
+    validate_non_negative(errors, &format!("{scope}.soft_pity_slope"), soft_pity_slope);
+}
+
+fn validate_choice(errors: &mut Vec<String>, key: &str, value: &str, allowed: &[&str]) {
+    if !allowed.contains(&value) {
+        errors.push(format!(
+            "{key} has unsupported value '{value}'; expected one of: {}",
+            allowed.join(", ")
+        ));
+    }
+}
+
+fn validate_finite(errors: &mut Vec<String>, key: &str, value: f64) {
+    if !value.is_finite() {
+        errors.push(format!("{key} must be finite"));
+    }
+}
+
+fn validate_non_negative(errors: &mut Vec<String>, key: &str, value: f64) {
+    if !value.is_finite() || value < 0.0 {
+        errors.push(format!("{key} must be finite and >= 0"));
+    }
+}
+
+fn validate_positive(errors: &mut Vec<String>, key: &str, value: f64) {
+    if !value.is_finite() || value <= 0.0 {
+        errors.push(format!("{key} must be finite and > 0"));
+    }
+}
+
+fn validate_unit(errors: &mut Vec<String>, key: &str, value: f64) {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        errors.push(format!("{key} must be finite and in [0, 1]"));
     }
 }
 
@@ -1761,272 +1197,91 @@ fn warn_unknown_fields(map: &serde_json::Map<String, JsonValue>) {
 mod tests {
     use super::*;
 
-    fn parse_ok(input: &str) -> JsonValue {
-        let stripped = strip_json_comments(input);
-        serde_json::from_str(&stripped).unwrap()
+    #[test]
+    fn shipped_configuration_is_strictly_valid() {
+        let config = Config::try_load(DEFAULT_CONFIG_PATH).unwrap();
+        assert!(!config.pools.is_empty());
+        assert!(config.active_pool.is_some());
     }
 
     #[test]
-    fn parse_empty_object() {
-        let value = parse_ok("{}");
-        if let JsonValue::Object(map) = value {
-            assert!(map.is_empty());
-        } else {
-            panic!("Expected object");
-        }
+    fn default_keyword_uses_embedded_resources() {
+        let config = Config::try_load("default").unwrap();
+        assert!(!config.pools.is_empty());
     }
 
     #[test]
-    fn parse_nested_array() {
-        let value = parse_ok("[1, [2, 3], 4]");
-        if let JsonValue::Array(arr) = value {
-            assert_eq!(arr.len(), 3);
-        } else {
-            panic!("Expected array");
-        }
+    fn unknown_fields_are_rejected() {
+        let error = Config::try_from_json(r#"{"devcie":"cpu"}"#, ".").unwrap_err();
+        assert!(error.to_string().contains("unknown field `devcie`"));
     }
 
     #[test]
-    fn parse_unicode_escape() {
-        let value = parse_ok(r#""\u4e2d\u6587""#);
-        if let JsonValue::String(s) = value {
-            assert_eq!(s, "中文");
-        } else {
-            panic!("Expected string");
-        }
+    fn invalid_enum_values_are_rejected() {
+        let error = Config::try_from_json(r#"{"device":"gpu"}"#, ".").unwrap_err();
+        assert!(error.to_string().contains("unknown variant `gpu`"));
     }
 
     #[test]
-    fn parse_scientific_number() {
-        let value = parse_ok(r#"[1e-3, -2.5E+2]"#);
-        if let JsonValue::Array(arr) = value {
-            assert!((arr[0].as_f64().unwrap() - 0.001).abs() < 1e-12);
-            assert!((arr[1].as_f64().unwrap() + 250.0).abs() < 1e-9);
-        } else {
-            panic!("Expected array");
-        }
+    fn wrong_types_are_rejected() {
+        let error = Config::try_from_json(r#"{"model_dim":"32"}"#, ".").unwrap_err();
+        assert!(error.to_string().contains("invalid type"));
     }
 
     #[test]
-    fn parse_escape_sequences() {
-        let value = parse_ok(r#""line1\nline2\t\"""#);
-        if let JsonValue::String(s) = value {
-            assert_eq!(s, "line1\nline2\t\"");
-        } else {
-            panic!("Expected string");
-        }
+    fn documentation_fields_are_explicitly_ignored() {
+        let config = Config::try_from_json(
+            r#"{"_comment":{"device":"cpu/cuda/auto"},"_comment_extra":"docs"}"#,
+            ".",
+        )
+        .unwrap();
+        assert!(!config.pools.is_empty());
     }
 
     #[test]
-    fn default_model_uses_compact_dimensions() {
-        let config = Config::default();
-
-        assert_eq!(config.model_dim, 32);
-        assert_eq!(config.model_hidden_dim, 1024);
-        assert_eq!(config.model_num_layers, 4);
-        assert_eq!(config.model_num_heads, 8);
-        assert_eq!(config.model_kv_lora_rank, 128);
-        assert_eq!(config.model_qk_rope_dim, 64);
-        assert_eq!(config.multi_stream_factor, 2);
-        assert_eq!(config.achf.rank, 0);
-    }
-
-    #[test]
-    fn config_load_preserves_zero_achf_rank() {
-        let path =
-            std::env::temp_dir().join(format!("talos_xii_rank_zero_{}.json", std::process::id()));
-        std::fs::write(&path, r#"{"achf":{"rank":0}}"#).unwrap();
-        let config = Config::load(path.to_str().unwrap());
-        let _ = std::fs::remove_file(path);
-
-        assert_eq!(config.achf.rank, 0);
-    }
-
-    #[test]
-    fn sanitize_pity_clamps_large_small_guarantee() {
-        let mut soft = 50usize;
-        let mut small = usize::MAX;
-        let mut big = usize::MAX;
-        sanitize_pity_settings(&mut soft, &mut small, &mut big, "test");
-        assert_eq!(small, MAX_SMALL_PITY_GUARANTEE);
-        assert_eq!(big, MAX_BIG_PITY_CUMULATIVE);
-    }
-
-    #[test]
-    fn sanitize_pity_clamps_soft_to_small() {
-        let mut soft = 200usize;
-        let mut small = 80usize;
-        let mut big = 100usize;
-        sanitize_pity_settings(&mut soft, &mut small, &mut big, "test");
-        assert_eq!(soft, 80);
-        assert_eq!(small, 80);
-        assert_eq!(big, 100);
-    }
-
-    #[test]
-    fn sanitize_achf_clamps_numeric_bounds() {
-        let defaults = AchfConfig::default();
-        let mut achf = AchfConfig {
-            gate_momentum: 2.0,
-            gate_alpha: f64::NAN,
-            gate_beta: f64::INFINITY,
-            lambda_ortho: f64::NAN,
-            g_min: -0.1,
-            g_target_min: 1.5,
-            g_target_max: -0.4,
-            g_min_adapt_rate: -0.2,
-            g_min_momentum: f64::NAN,
-            gate_k_clip: -1.0,
-            cache_min_nonzero_ratio: 1.2,
-            cache_cost_bias: 0.0,
-            cache_adapt_rate: -0.3,
-            cache_bias_min: -1.0,
-            cache_bias_max: 0.1,
-            cache_latency_ema: -0.5,
-            cache_latency_long_ema: f64::INFINITY,
-            cache_adapt_blend: -0.8,
-            candidate_target_sparsity: 1.5,
-            candidate_max_output_relative_error: -0.5,
-            candidate_calibration_lr: 0.0,
-            ..Default::default()
-        };
-
-        sanitize_achf_config(&mut achf);
-
-        assert_eq!(achf.gate_momentum, 1.0);
-        assert_eq!(achf.gate_alpha, defaults.gate_alpha);
-        assert_eq!(achf.gate_beta, defaults.gate_beta);
-        assert_eq!(achf.lambda_ortho, defaults.lambda_ortho);
-        assert_eq!(achf.g_min, 0.0);
-        assert_eq!(achf.g_target_min, 1.0);
-        assert_eq!(achf.g_target_max, 1.0);
-        assert_eq!(achf.g_min_adapt_rate, 0.0);
-        assert_eq!(achf.g_min_momentum, defaults.g_min_momentum);
-        assert_eq!(achf.gate_k_clip, 0.0);
-        assert_eq!(achf.cache_min_nonzero_ratio, 1.0);
-        assert_eq!(achf.cache_cost_bias, defaults.cache_cost_bias);
-        assert_eq!(achf.cache_adapt_rate, 0.0);
-        assert_eq!(achf.cache_bias_min, defaults.cache_bias_min);
-        assert!(achf.cache_bias_max >= achf.cache_bias_min);
-        assert_eq!(achf.cache_latency_ema, 0.0);
-        assert_eq!(achf.cache_latency_long_ema, defaults.cache_latency_long_ema);
-        assert_eq!(achf.cache_adapt_blend, 0.0);
-        assert_eq!(achf.candidate_target_sparsity, 1.0);
-        assert_eq!(achf.candidate_max_output_relative_error, 0.0);
+    fn relative_paths_are_based_on_config_directory() {
+        let base = Path::new("custom/config");
+        let config = Config::try_from_json(
+            r#"{"calibrated_path":"models/calibrated.json","player_data_path":"players.json"}"#,
+            base,
+        )
+        .unwrap();
         assert_eq!(
-            achf.candidate_calibration_lr,
-            defaults.candidate_calibration_lr
+            Path::new(&config.calibrated_path),
+            Path::new("custom/config/models/calibrated.json")
+        );
+        assert_eq!(
+            Path::new(&config.player_data_path),
+            Path::new("custom/config/players.json")
         );
     }
 
     #[test]
-    fn sanitize_achf_canonicalizes_inference_mode() {
-        let mut full = AchfConfig {
-            mode: " FULL ".to_string(),
-            ..Default::default()
-        };
-        sanitize_achf_config(&mut full);
-        assert_eq!(full.mode, "full");
-        assert!(!full.adaptive_inference);
-        assert!(full.uses_adaptive_inference());
-
-        for mode in ["fixed_cached", "fixed_sparse", "fixed_dense", "plain_ema"] {
-            let mut config = AchfConfig {
-                mode: mode.to_string(),
-                ..Default::default()
-            };
-            sanitize_achf_config(&mut config);
-            assert_eq!(config.mode, mode);
-        }
-
-        let mut invalid = AchfConfig {
-            mode: "turbo".to_string(),
-            ..Default::default()
-        };
-        sanitize_achf_config(&mut invalid);
-        assert_eq!(invalid.mode, "lite");
-        assert!(!invalid.adaptive_inference);
-        assert!(!invalid.uses_adaptive_inference());
-
-        let mut legacy = AchfConfig {
-            mode: "lite".to_string(),
-            adaptive_inference: true,
-            ..Default::default()
-        };
-        sanitize_achf_config(&mut legacy);
-        assert_eq!(legacy.mode, "full");
-        assert!(!legacy.adaptive_inference);
-        assert!(legacy.uses_adaptive_inference());
+    fn invalid_achf_combinations_are_rejected() {
+        let error = Config::try_from_json(
+            r#"{"achf":{"proj_mode":"sinkhorn","lambda_ortho":0.1}}"#,
+            ".",
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("lambda_ortho cannot be combined"));
     }
 
     #[test]
-    fn sanitize_achf_separates_candidate_and_connection_constraints() {
-        let mut sparse = AchfConfig {
-            candidate_mode: "sparse".to_string(),
-            rank: 8,
-            ..Default::default()
-        };
-        sanitize_achf_config(&mut sparse);
-        assert_eq!(sparse.rank, 0);
-
-        let mut low_rank = AchfConfig {
-            candidate_mode: "low_rank".to_string(),
-            rank: 8,
-            prune_threshold: 0.5,
-            candidate_target_sparsity: 0.9,
-            ..Default::default()
-        };
-        sanitize_achf_config(&mut low_rank);
-        assert_eq!(low_rank.prune_threshold, 0.0);
-        assert_eq!(low_rank.candidate_target_sparsity, 0.0);
-
-        let mut target_sparse = AchfConfig {
-            candidate_mode: "sparse".to_string(),
-            prune_threshold: 0.5,
-            candidate_target_sparsity: 0.9,
-            ..Default::default()
-        };
-        sanitize_achf_config(&mut target_sparse);
-        assert_eq!(target_sparse.prune_threshold, 0.0);
-
-        let mut sparse_training = AchfConfig {
-            candidate_train_from_scratch: true,
-            candidate_min_calibration_samples: 64,
-            candidate_calibration_steps: 32,
-            ..Default::default()
-        };
-        sanitize_achf_config(&mut sparse_training);
-        assert_eq!(sparse_training.candidate_min_calibration_samples, 0);
-        assert_eq!(sparse_training.candidate_calibration_steps, 0);
-
-        let mut constrained_connection = AchfConfig {
-            proj_mode: "sinkhorn".to_string(),
-            lambda_ortho: 0.1,
-            ..Default::default()
-        };
-        sanitize_achf_config(&mut constrained_connection);
-        assert_eq!(constrained_connection.lambda_ortho, 0.0);
-    }
-
-    #[test]
-    fn config_load_migrates_legacy_achf_frequency_and_error_keys() {
-        let path = std::env::temp_dir().join(format!(
-            "talos_xii_achf_legacy_keys_{}.json",
-            std::process::id()
-        ));
-        std::fs::write(
-            &path,
-            r#"{"achf":{"proj_freq":3,"candidate_discrepancy_momentum":0.7,"path_warmup_samples":5,"path_min_dwell":7,"gate_transition_steps":23}}"#,
+    fn legacy_achf_field_aliases_are_parsed_without_silent_value_changes() {
+        let config = Config::try_from_json(
+            r#"{"achf":{"proj_freq":3,"candidate_discrepancy_momentum":0.7}}"#,
+            ".",
         )
         .unwrap();
-        let config = Config::load(path.to_str().unwrap());
-        let _ = std::fs::remove_file(path);
-
         assert_eq!(config.achf.ortho_penalty_freq, 3);
         assert_eq!(config.achf.candidate_weight_error_momentum, 0.7);
-        assert_eq!(config.achf.candidate_refresh_freq, 1);
-        assert_eq!(config.achf.path_warmup_samples, 5);
-        assert_eq!(config.achf.path_min_dwell, 7);
-        assert_eq!(config.achf.gate_transition_steps, 23);
+    }
+
+    #[test]
+    fn comments_inside_json_are_supported() {
+        let config = Config::try_from_json("{/* comment */\"device\":\"cpu\"}", ".").unwrap();
+        assert_eq!(config.device, ComputeDevice::Cpu);
     }
 }

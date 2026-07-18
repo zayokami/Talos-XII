@@ -1,5 +1,5 @@
 use crate::autograd::Tensor;
-use crate::config::{AchfConfig, Config};
+use crate::config::{AchfConfig, ComputeDevice, Config};
 use crate::env_net::EnvNet;
 use crate::gacha_env::{step_pull, GachaAction};
 use crate::neural::DIM;
@@ -7,6 +7,7 @@ use crate::nn::{Linear, Module};
 use crate::policy_eval::{evaluate_ppo_policy, format_policy_eval};
 use crate::rng::Rng;
 use crate::sim::{build_features_with_luck_budget, env_net_env, PpoExperience, PullState};
+use crate::training_error::TrainingError;
 use crate::training_metrics::{StepSnapshot, TrainingMetrics, TrainingMetricsSink};
 use crate::transformer::{KVCache, LuckTransformer};
 use crate::utils::{
@@ -143,6 +144,19 @@ pub struct ActorCritic {
 }
 
 impl ActorCritic {
+    pub fn uses_cuda(&self) -> bool {
+        #[cfg(cuda)]
+        {
+            self.parameters()
+                .first()
+                .is_some_and(|parameter| parameter.device == crate::autograd::Device::Cuda)
+        }
+        #[cfg(not(cuda))]
+        {
+            false
+        }
+    }
+
     pub fn new_with_config(config: &Config, seed: u64) -> Self {
         let backbone = LuckTransformer::new_with_config(config, seed);
         let actor_head = Linear::new(
@@ -236,6 +250,28 @@ impl ActorCritic {
         self.backbone.to_cuda();
         self.actor_head.to_cuda();
         self.critic_head.to_cuda();
+    }
+
+    #[cfg(cuda)]
+    pub fn try_to_cuda(&mut self) -> crate::cuda::error::CudaResult<()> {
+        use crate::autograd::Device;
+        use crate::cuda::error::CudaError;
+
+        crate::cuda::init()?;
+        let mut candidate = self.clone();
+        candidate.to_cuda();
+        if candidate
+            .parameters()
+            .iter()
+            .any(|parameter| parameter.device != Device::Cuda)
+        {
+            return Err(CudaError::InvalidInput {
+                op: "ActorCritic::try_to_cuda",
+                message: "one or more parameters failed to migrate to CUDA",
+            });
+        }
+        *self = candidate;
+        Ok(())
     }
 
     pub fn to_inference_bf16(&self) -> Self {
@@ -680,42 +716,52 @@ struct GpuAdam {
     beta2: f64,
     eps: f64,
     weight_decay: f64,
+    poisoned: bool,
 }
 
 #[cfg(cuda)]
 impl GpuAdam {
-    fn new(params: Vec<Tensor>, lr: f64) -> Option<Self> {
+    fn new(params: Vec<Tensor>, lr: f64) -> crate::cuda::error::CudaResult<Self> {
+        use crate::cuda::error::CudaError;
         use crate::cuda::memory::CudaBuffer;
         let mut m = Vec::with_capacity(params.len());
         let mut v = Vec::with_capacity(params.len());
         for p in &params {
             let len = p.cuda_storage_len();
             if p.device != crate::autograd::Device::Cuda {
-                return None;
+                return Err(CudaError::InvalidInput {
+                    op: "GpuAdam::new",
+                    message: "all parameters must reside on CUDA",
+                });
             }
             let (d_m, d_v) = match p.dtype {
                 crate::dtype::Dtype::F32 => {
-                    let dm = crate::cuda::memory::alloc::<f32>(len).ok()?;
-                    let dv = crate::cuda::memory::alloc::<f32>(len).ok()?;
+                    let dm = crate::cuda::memory::alloc::<f32>(len)?;
+                    let dv = crate::cuda::memory::alloc::<f32>(len)?;
                     let zeros = vec![0.0f32; len];
-                    crate::cuda::memory::copy_h2d(&dm, &zeros).ok()?;
-                    crate::cuda::memory::copy_h2d(&dv, &zeros).ok()?;
+                    crate::cuda::memory::copy_h2d(&dm, &zeros)?;
+                    crate::cuda::memory::copy_h2d(&dv, &zeros)?;
                     (CudaBuffer::F32(dm), CudaBuffer::F32(dv))
                 }
                 crate::dtype::Dtype::F64 => {
-                    let dm = crate::cuda::memory::alloc::<f64>(len).ok()?;
-                    let dv = crate::cuda::memory::alloc::<f64>(len).ok()?;
+                    let dm = crate::cuda::memory::alloc::<f64>(len)?;
+                    let dv = crate::cuda::memory::alloc::<f64>(len)?;
                     let zeros = vec![0.0f64; len];
-                    crate::cuda::memory::copy_h2d(&dm, &zeros).ok()?;
-                    crate::cuda::memory::copy_h2d(&dv, &zeros).ok()?;
+                    crate::cuda::memory::copy_h2d(&dm, &zeros)?;
+                    crate::cuda::memory::copy_h2d(&dv, &zeros)?;
                     (CudaBuffer::F64(dm), CudaBuffer::F64(dv))
                 }
-                _ => return None,
+                _ => {
+                    return Err(CudaError::InvalidInput {
+                        op: "GpuAdam::new",
+                        message: "only f32/f64 parameters are supported",
+                    });
+                }
             };
             m.push(std::sync::Arc::new(d_m));
             v.push(std::sync::Arc::new(d_v));
         }
-        Some(GpuAdam {
+        Ok(GpuAdam {
             params,
             m,
             v,
@@ -725,6 +771,7 @@ impl GpuAdam {
             beta2: 0.999,
             eps: 1e-8,
             weight_decay: 1e-4,
+            poisoned: false,
         })
     }
 
@@ -732,44 +779,51 @@ impl GpuAdam {
         self.lr = lr;
     }
 
-    fn step(&mut self) {
+    fn step(&mut self) -> crate::cuda::error::CudaResult<()> {
+        use crate::cuda::error::CudaError;
         use crate::cuda::memory::CudaBuffer;
+        if self.poisoned {
+            return Err(CudaError::InvalidInput {
+                op: "GpuAdam::step",
+                message: "optimizer is poisoned after a previous CUDA failure",
+            });
+        }
         self.t += 1;
         crate::cuda::record_optimizer_attempt();
-        if !crate::autograd::cuda_clip_gradients_in_place(&self.params, 1.0, 1e-6) {
+        if let Err(error) = crate::autograd::cuda_clip_gradients_in_place(&self.params, 1.0, 1e-6) {
+            self.poisoned = true;
             crate::cuda::record_optimizer_fallback();
-            return;
+            return Err(error);
         }
 
         let bias_correction1 = 1.0 - self.beta1.powi(self.t as i32);
         let bias_correction2 = 1.0 - self.beta2.powi(self.t as i32);
 
-        let mut all_ok = true;
         for (i, param) in self.params.iter().enumerate() {
             let len = param.cuda_storage_len();
             if len == 0 {
                 continue;
             }
             let d_params = match param.cuda_get_or_upload_buffer() {
-                Ok(buf) => buf,
-                Err(_) => {
+                Ok(buffer) => buffer,
+                Err((_, error)) => {
+                    self.poisoned = true;
                     crate::cuda::record_optimizer_fallback();
-                    all_ok = false;
-                    continue;
+                    return Err(error);
                 }
             };
             let d_grads = match param.cuda_grad_get_or_upload_buffer() {
-                Ok(buf) => buf,
-                Err(_) => {
+                Ok(buffer) => buffer,
+                Err((_, error)) => {
+                    self.poisoned = true;
                     crate::cuda::record_optimizer_fallback();
-                    all_ok = false;
-                    continue;
+                    return Err(error);
                 }
             };
             let d_m = self.m[i].clone();
             let d_v = self.v[i].clone();
 
-            let step_ok = match (param.dtype, &*d_params, &*d_grads, &*d_m, &*d_v) {
+            let step_result = match (param.dtype, &*d_params, &*d_grads, &*d_m, &*d_v) {
                 (
                     crate::dtype::Dtype::F32,
                     CudaBuffer::F32(p),
@@ -790,8 +844,7 @@ impl GpuAdam {
                     bias_correction1 as f32,
                     bias_correction2 as f32,
                     1.0,
-                )
-                .is_ok(),
+                ),
                 (
                     crate::dtype::Dtype::F64,
                     CudaBuffer::F64(p),
@@ -812,18 +865,20 @@ impl GpuAdam {
                     bias_correction1,
                     bias_correction2,
                     1.0,
-                )
-                .is_ok(),
-                _ => false,
+                ),
+                _ => Err(CudaError::InvalidInput {
+                    op: "GpuAdam::step",
+                    message: "parameter/gradient/moment dtype mismatch",
+                }),
             };
-            if !step_ok {
+            if let Err(error) = step_result {
+                self.poisoned = true;
                 crate::cuda::record_optimizer_fallback();
-                all_ok = false;
+                return Err(error);
             }
         }
-        if all_ok {
-            crate::cuda::record_optimizer_success();
-        }
+        crate::cuda::record_optimizer_success();
+        Ok(())
     }
 
     fn zero_grad(&self) {
@@ -888,16 +943,23 @@ enum Optimizer {
 }
 
 impl Optimizer {
-    fn new(params: Vec<Tensor>, lr: f64) -> Self {
+    fn new(params: Vec<Tensor>, lr: f64) -> Result<Self, String> {
         #[cfg(cuda)]
         {
-            GpuAdam::new(params.clone(), lr)
-                .map(Optimizer::Gpu)
-                .unwrap_or_else(|| Optimizer::Cpu(Adam::new(params, lr)))
+            if params
+                .iter()
+                .any(|parameter| parameter.device == crate::autograd::Device::Cuda)
+            {
+                GpuAdam::new(params, lr)
+                    .map(Optimizer::Gpu)
+                    .map_err(|error| error.to_string())
+            } else {
+                Ok(Optimizer::Cpu(Adam::new(params, lr)))
+            }
         }
         #[cfg(not(cuda))]
         {
-            Optimizer::Cpu(Adam::new(params, lr))
+            Ok(Optimizer::Cpu(Adam::new(params, lr)))
         }
     }
 
@@ -909,11 +971,14 @@ impl Optimizer {
         }
     }
 
-    fn step(&mut self) {
+    fn step(&mut self) -> Result<(), String> {
         match self {
-            Optimizer::Cpu(o) => o.step(),
+            Optimizer::Cpu(o) => {
+                o.step();
+                Ok(())
+            }
             #[cfg(cuda)]
-            Optimizer::Gpu(o) => o.step(),
+            Optimizer::Gpu(o) => o.step().map_err(|error| error.to_string()),
         }
     }
 
@@ -966,20 +1031,39 @@ struct PpoCudaUpdateCache {
 
 #[cfg(cuda)]
 impl PpoCudaUpdateCache {
-    fn ones_action_1(&mut self) -> Tensor {
+    fn ones_action_1(&mut self, step: usize) -> Result<Tensor, TrainingError> {
         if self.ones_action_1.is_none() {
             let ones = Tensor::new_f32(vec![1.0; ACTION_SPACE], vec![ACTION_SPACE, 1]);
-            let ones = match ones.to_cuda() {
-                Ok(t) => t,
-                Err(_) => ones,
-            };
+            let ones = ones.to_cuda().map_err(|error| {
+                TrainingError::new("PPO", "constant upload", step, error.to_string())
+            })?;
             self.ones_action_1 = Some(ones);
         }
-        self.ones_action_1
+        Ok(self
+            .ones_action_1
             .as_ref()
             .expect("ones_action_1 cache")
-            .clone()
+            .clone())
     }
+}
+
+fn ppo_tensor_on_device(
+    tensor: Tensor,
+    use_cuda: bool,
+    stage: &'static str,
+    step: usize,
+) -> Result<Tensor, TrainingError> {
+    #[cfg(cuda)]
+    {
+        if use_cuda {
+            return tensor
+                .to_cuda()
+                .map_err(|error| TrainingError::new("PPO", stage, step, error.to_string()));
+        }
+    }
+    #[cfg(not(cuda))]
+    let _ = (use_cuda, stage, step);
+    Ok(tensor)
 }
 
 /// PPO trainer with clipped surrogate objective and GAE.
@@ -999,6 +1083,7 @@ pub struct Ppo {
     achf_orthogonal_penalty_interval: usize,
     achf_calibration_states: Vec<(Vec<f64>, usize)>,
     achf_calibration_seen: usize,
+    use_cuda: bool,
     #[cfg(cuda)]
     cuda_update_cache: PpoCudaUpdateCache,
 }
@@ -1022,26 +1107,48 @@ impl Ppo {
 
     pub fn new(seed: u64, k_epochs: usize, batch_size: usize, config: &Config) -> Self {
         let policy = ActorCritic::new_with_config(config, seed);
-        let mut ppo = Self::from_policy(policy, k_epochs, batch_size);
+        let mut ppo = Self::from_policy_on_device(policy, k_epochs, batch_size, config.device);
         ppo.achf_orthogonal_penalty_interval =
             Self::achf_orthogonal_penalty_interval_from_config(&config.achf);
         ppo
     }
 
     pub fn from_policy(policy: ActorCritic, k_epochs: usize, batch_size: usize) -> Self {
+        Self::from_policy_on_device(policy, k_epochs, batch_size, ComputeDevice::Cpu)
+    }
+
+    pub fn from_policy_on_device(
+        policy: ActorCritic,
+        k_epochs: usize,
+        batch_size: usize,
+        device: ComputeDevice,
+    ) -> Self {
         #[cfg(cuda)]
-        let policy = {
-            let mut p = policy;
-            p.to_cuda();
-            p
+        let (policy, optimizer, use_cuda) = if device == ComputeDevice::Cuda {
+            let mut cuda_policy = policy.clone();
+            let cuda_backend = cuda_policy
+                .try_to_cuda()
+                .and_then(|()| GpuAdam::new(cuda_policy.parameters(), 0.0003));
+            match cuda_backend {
+                Ok(optimizer) => (cuda_policy, Optimizer::Gpu(optimizer), true),
+                Err(error) => {
+                    eprintln!(
+                        "[CUDA] PPO training backend initialization failed ({error}); using CPU before training starts"
+                    );
+                    let optimizer = Optimizer::Cpu(Adam::new(policy.parameters(), 0.0003));
+                    (policy, optimizer, false)
+                }
+            }
+        } else {
+            let optimizer = Optimizer::Cpu(Adam::new(policy.parameters(), 0.0003));
+            (policy, optimizer, false)
         };
-        let params = policy.parameters();
-        #[cfg(cuda)]
-        let optimizer = GpuAdam::new(params, 0.0003)
-            .map(Optimizer::Gpu)
-            .unwrap_or_else(|| Optimizer::Cpu(Adam::new(policy.parameters(), 0.0003)));
         #[cfg(not(cuda))]
-        let optimizer = Optimizer::Cpu(Adam::new(params, 0.0003));
+        let (policy, optimizer, use_cuda) = {
+            let _ = device;
+            let optimizer = Optimizer::Cpu(Adam::new(policy.parameters(), 0.0003));
+            (policy, optimizer, false)
+        };
         let safe_batch_size = batch_size.max(1);
         let achf_orthogonal_penalty_interval =
             Self::achf_orthogonal_penalty_interval_for_policy(&policy);
@@ -1070,6 +1177,7 @@ impl Ppo {
             achf_orthogonal_penalty_interval,
             achf_calibration_states: Vec::new(),
             achf_calibration_seen: 0,
+            use_cuda,
             #[cfg(cuda)]
             cuda_update_cache: PpoCudaUpdateCache {
                 ones_action_1: None,
@@ -1149,20 +1257,29 @@ impl Ppo {
         ema.refresh_achf_after_optimizer_step();
     }
 
-    fn achf_calibration_batch(corpus: &[(Vec<f64>, usize)], indices: &[usize]) -> Option<Tensor> {
+    fn achf_calibration_batch(
+        corpus: &[(Vec<f64>, usize)],
+        indices: &[usize],
+        use_cuda: bool,
+    ) -> Result<Option<Tensor>, TrainingError> {
         if indices.is_empty() {
-            return None;
+            return Ok(None);
         }
-        let max_sequence_length = indices
+        let Some(max_sequence_length) = indices
             .iter()
             .filter_map(|&index| corpus.get(index).map(|entry| entry.1))
-            .max()?
-            .max(1);
+            .max()
+        else {
+            return Ok(None);
+        };
+        let max_sequence_length = max_sequence_length.max(1);
         let mut batch_data = Vec::with_capacity(indices.len() * max_sequence_length * DIM);
         for &index in indices {
-            let (state, sequence_length) = corpus.get(index)?;
+            let Some((state, sequence_length)) = corpus.get(index) else {
+                return Ok(None);
+            };
             if *sequence_length == 0 || state.len() != sequence_length.saturating_mul(DIM) {
-                return None;
+                return Ok(None);
             }
             batch_data.extend_from_slice(state);
             if *sequence_length < max_sequence_length {
@@ -1175,11 +1292,17 @@ impl Ppo {
         let batch = Tensor::new_f32(batch_data, vec![indices.len(), max_sequence_length, DIM]);
         #[cfg(cuda)]
         {
-            Some(batch.to_cuda().unwrap_or(batch))
+            if use_cuda {
+                return batch.to_cuda().map(Some).map_err(|error| {
+                    TrainingError::new("PPO", "ACHF calibration upload", 0, error.to_string())
+                });
+            }
+            Ok(Some(batch))
         }
         #[cfg(not(cuda))]
         {
-            Some(batch)
+            let _ = use_cuda;
+            Ok(Some(batch))
         }
     }
 
@@ -1189,14 +1312,16 @@ impl Ppo {
         validation_indices: &[usize],
         batch_size: usize,
         step: usize,
-    ) {
+        use_cuda: bool,
+    ) -> Result<(), TrainingError> {
         policy.set_achf_candidate_calibration_validation();
         for chunk in validation_indices.chunks(batch_size.max(1)) {
-            if let Some(batch) = Self::achf_calibration_batch(corpus, chunk) {
+            if let Some(batch) = Self::achf_calibration_batch(corpus, chunk, use_cuda)? {
                 let _ = policy.forward_actor_critic_batch(&batch);
             }
         }
         policy.record_achf_candidate_calibration_checkpoint(step);
+        Ok(())
     }
 
     fn achf_candidate_calibration_target_met(
@@ -1215,9 +1340,9 @@ impl Ppo {
             })
     }
 
-    fn calibrate_achf_candidates(&mut self) {
+    fn calibrate_achf_candidates(&mut self) -> Result<(), TrainingError> {
         let Some(config) = self.policy.achf_config() else {
-            return;
+            return Ok(());
         };
         if !config.enabled
             || config.candidate_mode != "sparse"
@@ -1225,7 +1350,7 @@ impl Ppo {
             || config.candidate_calibration_steps == 0
             || config.candidate_calibration_max_samples == 0
         {
-            return;
+            return Ok(());
         }
         let corpus: Vec<(Vec<f64>, usize)> = self
             .achf_calibration_states
@@ -1237,11 +1362,11 @@ impl Ppo {
             .collect();
         if corpus.len() < 2 {
             eprintln!("[ACHF] Candidate calibration skipped: fewer than two valid rollout states");
-            return;
+            return Ok(());
         }
         let active_layers = self.policy.begin_achf_candidate_calibration();
         if active_layers == 0 {
-            return;
+            return Ok(());
         }
         let parameters = self.policy.achf_candidate_calibration_parameters();
         let parameter_masks = self.policy.achf_candidate_calibration_parameter_masks();
@@ -1250,7 +1375,8 @@ impl Ppo {
             parameter_masks.len(),
             "ACHF candidate calibration parameter/mask topology mismatch"
         );
-        let mut optimizer = Optimizer::new(parameters, config.candidate_calibration_lr);
+        let mut optimizer = Optimizer::new(parameters, config.candidate_calibration_lr)
+            .map_err(|error| TrainingError::new("PPO", "ACHF calibration setup", 0, error))?;
 
         let mut training_indices = Vec::new();
         let mut validation_indices = Vec::new();
@@ -1276,7 +1402,8 @@ impl Ppo {
             &validation_indices,
             self.batch_size,
             0,
-        );
+            self.use_cuda,
+        )?;
         let mut completed_steps = 0usize;
         for step in 1..=total_steps {
             let start = ((step - 1) * self.batch_size) % training_indices.len();
@@ -1286,7 +1413,8 @@ impl Ppo {
                 .collect();
             self.policy.set_achf_candidate_calibration_training();
             optimizer.zero_grad();
-            let Some(batch) = Self::achf_calibration_batch(&corpus, &batch_indices) else {
+            let Some(batch) = Self::achf_calibration_batch(&corpus, &batch_indices, self.use_cuda)?
+            else {
                 continue;
             };
             let _ = self.policy.forward_actor_critic_batch(&batch);
@@ -1294,7 +1422,9 @@ impl Ppo {
                 continue;
             };
             loss.backward();
-            optimizer.step();
+            optimizer
+                .step()
+                .map_err(|error| TrainingError::optimizer("PPO ACHF calibration", step, error))?;
             self.policy.enforce_achf_candidate_masks();
             completed_steps = step;
             if step.is_multiple_of(checkpoint_interval) || step == total_steps {
@@ -1304,7 +1434,8 @@ impl Ppo {
                     &validation_indices,
                     self.batch_size,
                     step,
-                );
+                    self.use_cuda,
+                )?;
                 if Self::achf_candidate_calibration_target_met(
                     &self.policy,
                     config.candidate_min_calibration_samples,
@@ -1321,7 +1452,8 @@ impl Ppo {
                 &validation_indices,
                 self.batch_size,
                 completed_steps,
-            );
+                self.use_cuda,
+            )?;
         }
         let masked_moment_max_abs = optimizer.masked_moment_max_abs(&parameter_masks);
         self.policy
@@ -1334,6 +1466,7 @@ impl Ppo {
             memory.eligible_candidate_layers,
             memory.candidate_layers,
         );
+        Ok(())
     }
 
     pub(crate) fn store_raw(&mut self, input: PpoStoreRawInput) {
@@ -1359,7 +1492,7 @@ impl Ppo {
         self.memory.values.push(value);
     }
 
-    pub fn update(&mut self, current_lr: f64) -> f64 {
+    pub fn update(&mut self, current_lr: f64) -> Result<f64, TrainingError> {
         self.update_with_progress(current_lr, |_, _, _, _| {})
     }
 
@@ -1388,12 +1521,16 @@ impl Ppo {
         }
     }
 
-    fn update_with_progress<F>(&mut self, current_lr: f64, mut on_batch: F) -> f64
+    fn update_with_progress<F>(
+        &mut self,
+        current_lr: f64,
+        mut on_batch: F,
+    ) -> Result<f64, TrainingError>
     where
         F: FnMut(usize, usize, usize, usize),
     {
         if self.memory.states_raw.is_empty() {
-            return 0.0;
+            return Ok(0.0);
         }
 
         // Update Learning Rate
@@ -1454,13 +1591,12 @@ impl Ppo {
         let target_kl = 0.015;
         let mut indices: Vec<usize> = (0..len).collect();
         let loss_sum_tensor = Tensor::zeros_f32(vec![1]);
-        #[cfg(cuda)]
-        let mut loss_sum_tensor = match loss_sum_tensor.to_cuda() {
-            Ok(t) => t,
-            Err(_) => loss_sum_tensor,
-        };
-        #[cfg(not(cuda))]
-        let mut loss_sum_tensor = loss_sum_tensor;
+        let mut loss_sum_tensor = ppo_tensor_on_device(
+            loss_sum_tensor,
+            self.use_cuda,
+            "loss accumulator upload",
+            self.optimizer_step_counter,
+        )?;
         let mut loss_count = 0usize;
         let planned_batches_per_epoch = len.div_ceil(self.batch_size);
         let planned_batches = self.k_epochs * planned_batches_per_epoch;
@@ -1486,18 +1622,24 @@ impl Ppo {
                     }
                 }
                 let batch_states = Tensor::new_f32(batch_data, vec![batch_len, max_seq_len, DIM]);
-                #[cfg(cuda)]
-                let batch_states = match batch_states.to_cuda() {
-                    Ok(t) => t,
-                    Err(_) => batch_states,
-                };
+                let batch_states = ppo_tensor_on_device(
+                    batch_states,
+                    self.use_cuda,
+                    "training batch upload",
+                    self.optimizer_step_counter,
+                )?;
                 let (batch_logits, batch_values) =
                     self.policy.forward_actor_critic_batch(&batch_states);
                 let batch_log_probs = batch_logits.log_softmax();
                 let batch_log_probs_copy = batch_log_probs.clone();
                 let batch_probs = batch_log_probs_copy.exp();
                 #[cfg(cuda)]
-                let ones_action_1 = self.cuda_update_cache.ones_action_1();
+                let ones_action_1 = if self.use_cuda {
+                    self.cuda_update_cache
+                        .ones_action_1(self.optimizer_step_counter)?
+                } else {
+                    Tensor::new_f32(vec![1.0; ACTION_SPACE], vec![ACTION_SPACE, 1])
+                };
                 #[cfg(not(cuda))]
                 let ones_action_1 = Tensor::new_f32(vec![1.0; ACTION_SPACE], vec![ACTION_SPACE, 1]);
                 let batch_entropy =
@@ -1519,13 +1661,12 @@ impl Ppo {
                 };
 
                 let mut distill_accum = Tensor::zeros_f32(vec![1]);
-                #[cfg(cuda)]
-                {
-                    distill_accum = match distill_accum.to_cuda() {
-                        Ok(t) => t,
-                        Err(_) => distill_accum,
-                    };
-                }
+                distill_accum = ppo_tensor_on_device(
+                    distill_accum,
+                    self.use_cuda,
+                    "distillation accumulator upload",
+                    self.optimizer_step_counter,
+                )?;
 
                 let mut action_mask_data = vec![0.0; batch_len * ACTION_SPACE];
                 let mut old_log_prob_data = Vec::with_capacity(batch_len);
@@ -1552,51 +1693,60 @@ impl Ppo {
                 let entropy_coef =
                     Tensor::new_f32(vec![ENTROPY_COEF; batch_len], vec![batch_len, 1]);
 
-                #[cfg(cuda)]
-                let action_mask = match action_mask.to_cuda() {
-                    Ok(t) => t,
-                    Err(_) => action_mask,
-                };
-                #[cfg(cuda)]
-                let old_log_prob_tensor = match old_log_prob_tensor.to_cuda() {
-                    Ok(t) => t,
-                    Err(_) => old_log_prob_tensor,
-                };
-                #[cfg(cuda)]
-                let advantage_tensor = match advantage_tensor.to_cuda() {
-                    Ok(t) => t,
-                    Err(_) => advantage_tensor,
-                };
-                #[cfg(cuda)]
-                let return_tensor = match return_tensor.to_cuda() {
-                    Ok(t) => t,
-                    Err(_) => return_tensor,
-                };
-                #[cfg(cuda)]
-                let one_batch = match one_batch.to_cuda() {
-                    Ok(t) => t,
-                    Err(_) => one_batch,
-                };
-                #[cfg(cuda)]
-                let clip_low = match clip_low.to_cuda() {
-                    Ok(t) => t,
-                    Err(_) => clip_low,
-                };
-                #[cfg(cuda)]
-                let clip_high = match clip_high.to_cuda() {
-                    Ok(t) => t,
-                    Err(_) => clip_high,
-                };
-                #[cfg(cuda)]
-                let value_coef = match value_coef.to_cuda() {
-                    Ok(t) => t,
-                    Err(_) => value_coef,
-                };
-                #[cfg(cuda)]
-                let entropy_coef = match entropy_coef.to_cuda() {
-                    Ok(t) => t,
-                    Err(_) => entropy_coef,
-                };
+                let action_mask = ppo_tensor_on_device(
+                    action_mask,
+                    self.use_cuda,
+                    "action mask upload",
+                    self.optimizer_step_counter,
+                )?;
+                let old_log_prob_tensor = ppo_tensor_on_device(
+                    old_log_prob_tensor,
+                    self.use_cuda,
+                    "old log-probability upload",
+                    self.optimizer_step_counter,
+                )?;
+                let advantage_tensor = ppo_tensor_on_device(
+                    advantage_tensor,
+                    self.use_cuda,
+                    "advantage upload",
+                    self.optimizer_step_counter,
+                )?;
+                let return_tensor = ppo_tensor_on_device(
+                    return_tensor,
+                    self.use_cuda,
+                    "return upload",
+                    self.optimizer_step_counter,
+                )?;
+                let one_batch = ppo_tensor_on_device(
+                    one_batch,
+                    self.use_cuda,
+                    "unit tensor upload",
+                    self.optimizer_step_counter,
+                )?;
+                let clip_low = ppo_tensor_on_device(
+                    clip_low,
+                    self.use_cuda,
+                    "clip lower-bound upload",
+                    self.optimizer_step_counter,
+                )?;
+                let clip_high = ppo_tensor_on_device(
+                    clip_high,
+                    self.use_cuda,
+                    "clip upper-bound upload",
+                    self.optimizer_step_counter,
+                )?;
+                let value_coef = ppo_tensor_on_device(
+                    value_coef,
+                    self.use_cuda,
+                    "value coefficient upload",
+                    self.optimizer_step_counter,
+                )?;
+                let entropy_coef = ppo_tensor_on_device(
+                    entropy_coef,
+                    self.use_cuda,
+                    "entropy coefficient upload",
+                    self.optimizer_step_counter,
+                )?;
 
                 let selected_log_probs =
                     (batch_log_probs.clone() * action_mask).matmul(&ones_action_1);
@@ -1627,20 +1777,22 @@ impl Ppo {
                 }
 
                 let batch_size_tensor = Tensor::new_f32(vec![inv_batch], vec![1]);
-                #[cfg(cuda)]
-                let batch_size_tensor = match batch_size_tensor.to_cuda() {
-                    Ok(t) => t,
-                    Err(_) => batch_size_tensor,
-                };
+                let batch_size_tensor = ppo_tensor_on_device(
+                    batch_size_tensor,
+                    self.use_cuda,
+                    "batch scale upload",
+                    self.optimizer_step_counter,
+                )?;
                 let mut final_loss = loss_elements.sum() * batch_size_tensor.clone();
                 // Add distillation loss after warmup: distill_coef * mean(kl_divs)
                 if teacher_batch_logits.is_some() {
                     let distill_coef_tensor = Tensor::new_f32(vec![self.distill_kl_coef], vec![1]);
-                    #[cfg(cuda)]
-                    let distill_coef_tensor = match distill_coef_tensor.to_cuda() {
-                        Ok(t) => t,
-                        Err(_) => distill_coef_tensor,
-                    };
+                    let distill_coef_tensor = ppo_tensor_on_device(
+                        distill_coef_tensor,
+                        self.use_cuda,
+                        "distillation coefficient upload",
+                        self.optimizer_step_counter,
+                    )?;
                     let distill_term = distill_accum * distill_coef_tensor * batch_size_tensor;
                     final_loss = final_loss + distill_term;
                 }
@@ -1656,7 +1808,9 @@ impl Ppo {
                 loss_count += 1;
                 final_loss.backward();
                 self.policy.update_achf_after_backward();
-                self.optimizer.step();
+                self.optimizer.step().map_err(|error| {
+                    TrainingError::optimizer("PPO", self.optimizer_step_counter + 1, error)
+                })?;
                 self.policy.refresh_achf_after_optimizer_step();
                 self.optimizer_step_counter += 1;
                 completed_batches += 1;
@@ -1691,9 +1845,9 @@ impl Ppo {
             }
         }
         if loss_count > 0 {
-            loss_sum_tensor.item() as f64 / loss_count as f64
+            Ok(loss_sum_tensor.item() as f64 / loss_count as f64)
         } else {
-            0.0
+            Ok(0.0)
         }
     }
 }
@@ -1979,7 +2133,11 @@ fn rollout_cuda_round(
 }
 
 /// Train a PPO agent with multi-environment rollouts.
-pub fn train_ppo(rng: &mut Rng, env_net: &EnvNet, config: &Config) -> ActorCritic {
+pub fn train_ppo(
+    rng: &mut Rng,
+    env_net: &EnvNet,
+    config: &Config,
+) -> Result<ActorCritic, TrainingError> {
     train_ppo_impl(rng, env_net, config, TrainingMetricsSink::noop())
 }
 
@@ -1988,7 +2146,7 @@ fn train_ppo_impl(
     env_net: &EnvNet,
     config: &Config,
     mut metrics: impl TrainingMetrics,
-) -> ActorCritic {
+) -> Result<ActorCritic, TrainingError> {
     println!("\n[PPO] Initializing PPO Training (Actor-Critic)...");
     let fast_mode = config.fast_init || config.ppo_mode == "fast";
     let total_steps = if config.ppo_total_steps > 0 {
@@ -2206,7 +2364,7 @@ fn train_ppo_impl(
                     last_heartbeat = Instant::now();
                 }
             },
-        );
+        )?;
         steps_done += collected;
 
         if config.achf.cache_log_interval_steps > 0
@@ -2263,9 +2421,9 @@ fn train_ppo_impl(
         }
     }
     pb.finish_with_message("PPO Training Complete.");
-    ppo.calibrate_achf_candidates();
+    ppo.calibrate_achf_candidates()?;
     ppo.policy.freeze_achf_for_inference();
-    ppo.policy
+    Ok(ppo.policy)
 }
 
 /// Train PPO with optional metrics collection for benchmarking.
@@ -2274,7 +2432,7 @@ pub fn train_ppo_with_metrics(
     env_net: &EnvNet,
     config: &Config,
     metrics_tx: Option<std::sync::mpsc::Sender<StepSnapshot>>,
-) -> ActorCritic {
+) -> Result<ActorCritic, TrainingError> {
     train_ppo_impl(rng, env_net, config, TrainingMetricsSink::from(metrics_tx))
 }
 
@@ -2287,16 +2445,26 @@ pub struct OnlinePpoTrainer {
 impl OnlinePpoTrainer {
     #[allow(dead_code)]
     pub fn new(seed: u64, k_epochs: usize, batch_size: usize, config: &Config) -> Self {
-        Self::from_policy(
+        Self::from_policy_on_device(
             ActorCritic::new_with_config(config, seed),
             k_epochs,
             batch_size,
+            config.device,
         )
     }
 
     pub fn from_policy(policy: ActorCritic, k_epochs: usize, batch_size: usize) -> Self {
+        Self::from_policy_on_device(policy, k_epochs, batch_size, ComputeDevice::Cpu)
+    }
+
+    pub fn from_policy_on_device(
+        policy: ActorCritic,
+        k_epochs: usize,
+        batch_size: usize,
+        device: ComputeDevice,
+    ) -> Self {
         Self {
-            ppo: Ppo::from_policy(policy, k_epochs, batch_size),
+            ppo: Ppo::from_policy_on_device(policy, k_epochs, batch_size, device),
             steps_done: 0,
         }
     }
@@ -2314,13 +2482,13 @@ impl OnlinePpoTrainer {
         });
     }
 
-    pub fn train_step(&mut self, current_lr: f64) -> bool {
+    pub fn train_step(&mut self, current_lr: f64) -> Result<bool, TrainingError> {
         if self.ppo.memory.states_raw.len() < self.ppo.batch_size {
-            return false;
+            return Ok(false);
         }
-        self.ppo.update(current_lr);
+        self.ppo.update(current_lr)?;
         self.steps_done += 1;
-        true
+        Ok(true)
     }
 
     pub fn sync_to(&self, shared: &std::sync::RwLock<ActorCritic>) {
@@ -2486,6 +2654,69 @@ mod tests {
         let got = trainer.ppo.policy.parameters()[0].data_f32().clone();
 
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn cpu_device_keeps_online_ppo_entirely_on_cpu() {
+        let policy = ActorCritic::new(42, &AchfConfig::default(), 16, 1);
+        let trainer = OnlinePpoTrainer::from_policy_on_device(policy, 1, 4, ComputeDevice::Cpu);
+
+        assert!(!trainer.ppo.use_cuda);
+        assert!(!trainer.ppo.policy.uses_cuda());
+    }
+
+    #[cfg(cuda)]
+    #[test]
+    fn ppo_gpu_adam_partial_failure_is_hard_and_poisons_optimizer() {
+        if !crate::cuda::is_available() {
+            return;
+        }
+        let first = Tensor::new_f32(vec![1.0], vec![1]);
+        let second = Tensor::new_f32(vec![2.0], vec![1]);
+        first.grad_write_f32()[0] = 0.25;
+        second.grad_write_f32()[0] = 0.25;
+        let first = first.to_cuda().expect("first CUDA upload should succeed");
+        let second = second.to_cuda().expect("second CUDA upload should succeed");
+        let mut optimizer =
+            GpuAdam::new(vec![first, second], 0.001).expect("GPU Adam should initialize");
+        let before = crate::cuda::runtime_stats();
+
+        crate::cuda::kernels::inject_adam_failure_after(1);
+        let failure = optimizer.step();
+        let after_failure = crate::cuda::runtime_stats();
+
+        assert!(failure.is_err(), "injected CUDA failure must be returned");
+        assert!(optimizer.poisoned);
+        assert!(
+            optimizer.params[0].data_to_f32_vec()[0] < 1.0,
+            "first parameter demonstrates that the failed step may be partial"
+        );
+        assert_eq!(
+            optimizer.params[1].data_to_f32_vec()[0],
+            2.0,
+            "second parameter must remain untouched at the injected failure"
+        );
+        assert_eq!(
+            after_failure.optimizer_attempts,
+            before.optimizer_attempts + 1
+        );
+        assert_eq!(
+            after_failure.optimizer_successes,
+            before.optimizer_successes
+        );
+        assert_eq!(
+            after_failure.optimizer_fallback_param,
+            before.optimizer_fallback_param + 1
+        );
+
+        let retry = optimizer.step();
+        assert!(matches!(
+            retry,
+            Err(crate::cuda::error::CudaError::InvalidInput {
+                message: "optimizer is poisoned after a previous CUDA failure",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2814,7 +3045,7 @@ mod tests {
             });
         }
 
-        let loss = ppo.update(0.0003);
+        let loss = ppo.update(0.0003).unwrap();
 
         assert!(loss.is_finite(), "PPO update loss should stay finite");
         assert!(
@@ -2914,7 +3145,7 @@ mod tests {
             })
             .collect();
 
-        ppo.calibrate_achf_candidates();
+        ppo.calibrate_achf_candidates().unwrap();
 
         let layer = ppo.policy.backbone.blocks[0].achf_ffn.as_ref().unwrap();
         assert_eq!(layer.weight.weight.data_to_f32_vec(), reference_before);
