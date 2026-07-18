@@ -21,8 +21,8 @@ def add_bias(x, bias):
 
 
 def sgd_step(param, lr):
-    updated = [v - lr * g for v, g in zip(param.to_list(), param.grad())]
-    return tx.tensor(updated, param.shape)
+    updated = [v - lr * g for v, g in zip(param.to_list(), param.grad.to_list())]
+    return tx.tensor(updated, param.shape, requires_grad=True)
 
 
 def forward(x, w1, b1, w2, b2):
@@ -32,10 +32,10 @@ def forward(x, w1, b1, w2, b2):
 
 
 def train(steps=400, lr=0.5):
-    w1 = tx.randn([2, 4], seed=11) * 0.5
-    b1 = tx.zeros([1, 4])
-    w2 = tx.randn([4, 1], seed=12) * 0.5
-    b2 = tx.zeros([1, 1])
+    w1 = (tx.randn([2, 4], seed=11) * 0.5).detach().requires_grad_()
+    b1 = tx.zeros([1, 4], requires_grad=True)
+    w2 = (tx.randn([4, 1], seed=12) * 0.5).detach().requires_grad_()
+    b2 = tx.zeros([1, 1], requires_grad=True)
 
     for step in range(steps):
         pred = forward(X, w1, b1, w2, b2)

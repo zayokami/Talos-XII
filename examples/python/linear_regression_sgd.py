@@ -26,8 +26,8 @@ def predict(x, w, b):
 
 
 def train(steps=150, lr=0.05):
-    w = tx.tensor([0.0], [1, 1])
-    b = tx.tensor([0.0], [1, 1])
+    w = tx.tensor([0.0], [1, 1], requires_grad=True)
+    b = tx.tensor([0.0], [1, 1], requires_grad=True)
 
     for step in range(steps):
         pred = predict(X, w, b)
@@ -35,11 +35,12 @@ def train(steps=150, lr=0.05):
         loss.backward()
         w_data = w.to_list()[0]
         b_data = b.to_list()[0]
-        gw = w.grad()[0]
-        gb = b.grad()[0]
+        gw = w.grad.to_list()[0]
+        gb = b.grad.to_list()[0]
 
-        w.fill_(w_data - lr * gw)
-        b.fill_(b_data - lr * gb)
+        with tx.no_grad():
+            w.fill_(w_data - lr * gw)
+            b.fill_(b_data - lr * gb)
         w.zero_grad()
         b.zero_grad()
 

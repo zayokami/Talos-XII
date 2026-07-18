@@ -96,6 +96,55 @@ pub(crate) fn cuda_grad_out_buffer(
     }
 }
 
+pub(crate) fn cuda_cached_grad_to_f64_vec(grad: &Storage) -> Option<Vec<f64>> {
+    use crate::cuda::memory::{copy_d2h, CudaBuffer};
+
+    let buffer = {
+        let map = cuda_grad_buffer_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.get(&grad.id()).cloned()?
+    };
+    assert_eq!(
+        buffer.len(),
+        grad.len(),
+        "CUDA gradient cache length does not match host storage"
+    );
+    assert_eq!(
+        buffer.dtype(),
+        grad.dtype(),
+        "CUDA gradient cache dtype does not match host storage"
+    );
+
+    let values = match &*buffer {
+        CudaBuffer::F32(device) => {
+            let mut host = vec![0.0f32; device.len()];
+            copy_d2h(&mut host, device)
+                .unwrap_or_else(|error| panic!("CUDA gradient materialization failed: {error}"));
+            host.into_iter().map(f64::from).collect()
+        }
+        CudaBuffer::F64(device) => {
+            let mut host = vec![0.0f64; device.len()];
+            copy_d2h(&mut host, device)
+                .unwrap_or_else(|error| panic!("CUDA gradient materialization failed: {error}"));
+            host
+        }
+        CudaBuffer::BF16(device) => {
+            let mut host = vec![crate::dtype::bf16::default(); device.len()];
+            copy_d2h(&mut host, device)
+                .unwrap_or_else(|error| panic!("CUDA gradient materialization failed: {error}"));
+            host.into_iter().map(crate::dtype::bf16::to_f64).collect()
+        }
+        CudaBuffer::I8(device) => {
+            let mut host = vec![0i8; device.len()];
+            copy_d2h(&mut host, device)
+                .unwrap_or_else(|error| panic!("CUDA gradient materialization failed: {error}"));
+            host.into_iter().map(f64::from).collect()
+        }
+    };
+    Some(values)
+}
+
 pub(super) fn cuda_sync_grad_to_host(tensor: &Tensor) -> bool {
     use crate::cuda::memory::{copy_d2h, CudaBuffer};
 

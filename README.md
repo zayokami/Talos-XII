@@ -140,6 +140,11 @@ maturin develop --release
 python -c "import talos_xii as tx; print(tx.ones([2]).to_list())"
 ```
 
+The Python frontend follows a versioned PyTorch eager-mode compatibility
+contract for its supported dense Tensor/autograd subset. See
+**[docs/PYTORCH_COMPATIBILITY.md](docs/PYTORCH_COMPATIBILITY.md)** for exact,
+partial, and unsupported behavior.
+
 The existing embedded interpreter remains available through
 `cargo run --features python -- python <script> -- <args>`. CPU wheels are the
 portable default. A CUDA Python build must be built on a CUDA 12 toolchain with
@@ -299,7 +304,6 @@ This software is provided "as is," without warranty of any kind, express or impl
 
 ---
 
----
 
 ## 系统要求
 
@@ -403,6 +407,10 @@ python -m pip install maturin
 maturin develop --release
 python -c "import talos_xii as tx; print(tx.ones([2]).to_list())"
 ```
+
+Python 前端针对已支持的稠密 Tensor/autograd 子集执行版本化的 PyTorch eager-mode
+行为契约。精确兼容、部分兼容与暂不支持的边界见
+**[docs/PYTORCH_COMPATIBILITY.md](docs/PYTORCH_COMPATIBILITY.md)**。
 
 原有嵌入式入口仍保留：
 `cargo run --features python -- python <script> -- <args>`。通用预编译 wheel

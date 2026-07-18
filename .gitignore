@@ -5,6 +5,7 @@ target/
 dist/
 **/__pycache__/
 *.whl
+bindings/python/python/talos_xii/_native.*
 
 # Remove Cargo.lock from gitignore if creating an executable, leave it for libraries
 # More information here https://doc.rust-lang.org/cargo/guide/cargo-guide-convention.html

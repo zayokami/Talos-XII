@@ -604,8 +604,8 @@ impl Tensor {
         }
     }
 
-    // Create a new leaf tensor with same data (copy)
-    pub fn item(&self) -> f32 {
+    /// Return the single tensor element without narrowing F64 values.
+    pub fn item(&self) -> f64 {
         assert_eq!(checked_shape_product(&self.shape, "item"), 1);
         #[cfg(cuda)]
         if self.device == Device::Cuda {
@@ -615,31 +615,31 @@ impl Tensor {
                     CudaBuffer::F32(b) if b.len() == 1 => {
                         let mut host = [0.0_f32; 1];
                         if crate::cuda::memory::copy_d2h(&mut host, b).is_ok() {
-                            return host[0];
+                            return host[0] as f64;
                         }
                     }
                     CudaBuffer::F64(b) if b.len() == 1 => {
                         let mut host = [0.0_f64; 1];
                         if crate::cuda::memory::copy_d2h(&mut host, b).is_ok() {
-                            return host[0] as f32;
+                            return host[0];
                         }
                     }
                     CudaBuffer::BF16(b) if b.len() == 1 => {
                         let mut host = [crate::dtype::bf16::default(); 1];
                         if crate::cuda::memory::copy_d2h(&mut host, b).is_ok() {
-                            return host[0].to_f32();
+                            return host[0].to_f64();
                         }
                     }
                     CudaBuffer::I8(b) if b.len() == 1 => {
                         let mut host = [0_i8; 1];
                         if crate::cuda::memory::copy_d2h(&mut host, b).is_ok() {
-                            return host[0] as f32;
+                            return host[0] as f64;
                         }
                     }
                     _ => {}
                 }
             }
         }
-        self.data_to_f32_vec()[0]
+        self.data_as_f64_vec()[0]
     }
 }

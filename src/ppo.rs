@@ -1824,7 +1824,7 @@ impl Ppo {
                 self.update_ema_teacher();
 
                 if completed_batches.is_multiple_of(KL_CHECK_INTERVAL) {
-                    let approx_kl = approx_kl_tensor.detach().item() as f64 / chunk.len() as f64;
+                    let approx_kl = approx_kl_tensor.detach().item() / chunk.len() as f64;
                     if approx_kl > target_kl * 1.5 {
                         early_stop = true;
                     }
@@ -1845,7 +1845,7 @@ impl Ppo {
             }
         }
         if loss_count > 0 {
-            Ok(loss_sum_tensor.item() as f64 / loss_count as f64)
+            Ok(loss_sum_tensor.item() / loss_count as f64)
         } else {
             Ok(0.0)
         }

@@ -46,13 +46,13 @@ def add_bias(x, bias):
 
 
 def sgd_step(param, lr):
-    updated = [v - lr * g for v, g in zip(param.to_list(), param.grad())]
-    return tx.tensor(updated, param.shape)
+    updated = [v - lr * g for v, g in zip(param.to_list(), param.grad.to_list())]
+    return tx.tensor(updated, param.shape, requires_grad=True)
 
 
 def train(steps=300, lr=0.2):
-    w = tx.randn([2, 3], seed=1) * 0.1
-    b = tx.zeros([1, 3])
+    w = (tx.randn([2, 3], seed=1) * 0.1).detach().requires_grad_()
+    b = tx.zeros([1, 3], requires_grad=True)
 
     for step in range(steps):
         logits = add_bias(FEATURES.matmul(w), b)

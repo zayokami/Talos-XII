@@ -25,9 +25,9 @@ mod unary_ops;
 pub(crate) use core::BackwardOp;
 pub use core::{Context, Device, GradWriteCompat, Tensor};
 #[cfg(cuda)]
-pub(crate) use cuda_bridge::cuda_grad_out_buffer;
-#[cfg(cuda)]
 use cuda_bridge::cuda_sync_grad_to_host;
+#[cfg(cuda)]
+pub(crate) use cuda_bridge::{cuda_cached_grad_to_f64_vec, cuda_grad_out_buffer};
 #[cfg(cuda)]
 pub(crate) use cuda_ops::cuda_clip_gradients_in_place;
 pub use guards::TensorReadGuard;

@@ -117,6 +117,10 @@ impl Storage {
 
     /// Convert storage data to Vec<f64>, regardless of original dtype.
     pub fn to_f64_vec(&self) -> Vec<f64> {
+        #[cfg(cuda)]
+        if let Some(values) = crate::autograd::cuda_cached_grad_to_f64_vec(self) {
+            return values;
+        }
         match self {
             Storage::F64(v) => v.read().unwrap().clone(),
             Storage::F32(v) => v.read().unwrap().iter().map(|&x| x as f64).collect(),
@@ -169,6 +173,10 @@ impl Storage {
 
     /// Convert storage data to Vec<f32>, regardless of original dtype.
     pub fn to_f32_vec(&self) -> Vec<f32> {
+        #[cfg(cuda)]
+        if let Some(values) = crate::autograd::cuda_cached_grad_to_f64_vec(self) {
+            return values.into_iter().map(|value| value as f32).collect();
+        }
         match self {
             Storage::F64(v) => v.read().unwrap().iter().map(|&x| x as f32).collect(),
             Storage::F32(v) => v.read().unwrap().iter().copied().collect(),
@@ -184,6 +192,11 @@ impl Storage {
     /// pressure. The buffer is cleared and refilled in place.
     pub fn to_f32_vec_into(&self, out: &mut Vec<f32>) {
         out.clear();
+        #[cfg(cuda)]
+        if let Some(values) = crate::autograd::cuda_cached_grad_to_f64_vec(self) {
+            out.extend(values.into_iter().map(|value| value as f32));
+            return;
+        }
         match self {
             Storage::F64(v) => {
                 let g = v.read().unwrap();

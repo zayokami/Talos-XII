@@ -100,14 +100,14 @@ import talos_xii as tx
 target = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
 
 x = tx.tensor([1.0, 2.0], [1, 2])
-w = tx.tensor([0.25, -0.5], [2, 1])
+w = tx.tensor([0.25, -0.5], [2, 1], requires_grad=True)
 y = x.matmul(w) + 0.1
 loss = y.mse_loss(tx.tensor([target], [1, 1]))
 loss.backward()
 
 print("prediction:", y.item())
 print("loss:", loss.item())
-print("grad_w:", w.grad())
+print("grad_w:", w.grad.tolist())
 ```
 
 Run it from the project root:
@@ -118,7 +118,7 @@ cargo run --features python -- python scripts/my_train.py -- 1.0
 
 The `talos_xii` package is the Python surface of the framework. Use `tx.tensor(...)` for your data, `tx.zeros/full/arange/eye/randn(...)` for common inputs, and normal Python operators like `x + 1.0`, `2.0 * x`, `x ** 2.0`, `x % 2.0`, and `abs(x)` for math. Tensor methods also cover common activation/special functions (`relu`, `gelu`, `relu6`, `elu`, `selu`, `softplus`, `softsign`, `sigmoid`, `tanh`, `sin`, `cos`, `acos`, `asin`, `atan`, `erf`, `erfc`, `sqrt`, `rsqrt`, `log1p`, `expm1`) plus `concat`, `split`, `strided_slice`, `l2_normalize`, `group_norm`, `instance_norm`, `batch_norm2d`, `avg_pool2d`, `max_pool2d`, `pooling`, `conv2d`, `conv2d_transpose`, `depthwise_conv2d`, `conv3d`, and `gemm`/`matmul`.
 
-Operator names with explicit `*Grad` or `*Backprop*` are handled through autograd: call `loss.backward()` and then read `tensor.grad()`. `SoftmaxV2`/`LogSoftmaxV2` map to `softmax(dim)` and `log_softmax(dim)`. `Conv2DCompress` is currently a compatibility alias for the standard `conv2d` math path; Talos-XII does not yet store a separate compressed convolution weight format.
+Operator names with explicit Grad or Backprop variants are handled through autograd: create trainable leaves with requires_grad=True, call loss.backward(), and then read the Tensor-valued tensor.grad property. SoftmaxV2 and LogSoftmaxV2 map to softmax(dim) and log_softmax(dim). Conv2DCompress is currently a compatibility alias for the standard conv2d math path; Talos-XII does not yet store a separate compressed convolution weight format.
 
 No NumPy or PyTorch installation is required for Talos-XII tensor/autograd scripts. The optional bridge links against a local Python runtime supported by PyO3. Scripts are arbitrary Python code and are not sandboxed: they run with the same OS permissions as the Talos-XII process, can read/write files, read environment variables, import local modules, start child processes, perform network access, and terminate the process. Run only scripts you trust. The Python tensor constructors and shape-producing bridge APIs enforce per-tensor allocation guards, and exporting tensors to Python lists has a separate size guard.
 Most tensor methods are also available as `tx.*` functional calls with the same names, so you can choose whichever style reads better in a script. Arithmetic is aligned too: `x.add(y)` / `tx.add(x, y)` match `x + y`, with the same pattern for `sub`, `mul`, `div`, and `neg`.
@@ -270,14 +270,14 @@ import talos_xii as tx
 target = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
 
 x = tx.tensor([1.0, 2.0], [1, 2])
-w = tx.tensor([0.25, -0.5], [2, 1])
+w = tx.tensor([0.25, -0.5], [2, 1], requires_grad=True)
 y = x.matmul(w) + 0.1
 loss = y.mse_loss(tx.tensor([target], [1, 1]))
 loss.backward()
 
 print("prediction:", y.item())
 print("loss:", loss.item())
-print("grad_w:", w.grad())
+print("grad_w:", w.grad.tolist())
 ```
 
 在项目根目录运行：
@@ -288,7 +288,7 @@ cargo run --features python -- python scripts/my_train.py -- 1.0
 
 `talos_xii` 是框架的 Python API。用 `tx.tensor(...)` 放入数据，用 `tx.zeros/full/arange/eye/randn(...)` 创建常见输入，也可以直接写 `x + 1.0`、`2.0 * x`、`x ** 2.0`、`x % 2.0`、`abs(x)` 这类普通 Python 数学表达式。Tensor 方法也覆盖常见激活/特殊函数（`relu`、`gelu`、`relu6`、`elu`、`selu`、`softplus`、`softsign`、`sigmoid`、`tanh`、`sin`、`cos`、`acos`、`asin`、`atan`、`erf`、`erfc`、`sqrt`、`rsqrt`、`log1p`、`expm1`），以及 `concat`、`split`、`strided_slice`、`l2_normalize`、`group_norm`、`instance_norm`、`batch_norm2d`、`avg_pool2d`、`max_pool2d`、`pooling`、`conv2d`、`conv2d_transpose`、`depthwise_conv2d`、`conv3d`、`gemm`/`matmul`。
 
-带 `*Grad` 或 `*Backprop*` 的算子通过 autograd 覆盖：调用 `loss.backward()` 后读取 `tensor.grad()`。`SoftmaxV2`/`LogSoftmaxV2` 对应 `softmax(dim)` 和 `log_softmax(dim)`。`Conv2DCompress` 目前是标准 `conv2d` 数学路径的兼容别名；Talos-XII 还没有单独的压缩卷积权重存储格式。
+带 Grad 或 Backprop 变体的算子通过 autograd 覆盖：用 requires_grad=True 创建可训练叶 Tensor，调用 loss.backward()，然后读取 Tensor 类型的 tensor.grad 属性。SoftmaxV2 和 LogSoftmaxV2 对应 softmax(dim) 与 log_softmax(dim)。Conv2DCompress 目前是标准 conv2d 数学路径的兼容别名；Talos-XII 还没有单独的压缩卷积权重存储格式。
 
 编写 Talos-XII 张量/autograd 脚本不需要安装 NumPy 或 PyTorch。这个可选桥接会链接本机 PyO3 支持的 Python 运行时。脚本是任意 Python 代码，且不提供沙箱隔离：脚本会以 Talos-XII 进程相同的系统权限运行，可以读写文件、读取环境变量、导入本地模块、启动子进程、访问网络，也可以直接终止进程。请只运行可信脚本。Python Tensor 构造函数和会产生新 shape 的桥接 API 都加了单 Tensor 分配保护，导出到 Python list 也有单独的大小保护。
 大多数 Tensor 方法也提供同名 `tx.*` functional 调用，例如 `x.relu()` 和 `tx.relu(x)` 都可以用，脚本里按可读性选择即可。算术 API 也保持一致：`x.add(y)` / `tx.add(x, y)` 等价于 `x + y`，`sub`、`mul`、`div`、`neg` 也是同一套规则。

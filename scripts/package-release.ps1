@@ -53,6 +53,7 @@ Copy-Item -LiteralPath (Join-Path $RepositoryRoot "data/config.json") -Destinati
 Copy-Item -LiteralPath (Join-Path $RepositoryRoot "data/pools.json") -Destination (Join-Path $StagingDirectory "config/pools.example.json")
 Copy-Item -LiteralPath (Join-Path $RepositoryRoot "docs/USAGE.md") -Destination (Join-Path $StagingDirectory "docs")
 Copy-Item -LiteralPath (Join-Path $RepositoryRoot "docs/REQUIREMENTS.md") -Destination (Join-Path $StagingDirectory "docs")
+Copy-Item -LiteralPath (Join-Path $RepositoryRoot "docs/PYTORCH_COMPATIBILITY.md") -Destination (Join-Path $StagingDirectory "docs")
 
 if ($ArchiveFormat -eq "auto") {
     $ArchiveFormat = if ($IsWindows) { "zip" } else { "tar.gz" }

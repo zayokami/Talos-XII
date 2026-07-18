@@ -90,8 +90,9 @@ jobs:
         shell: pwsh
         run: |
           $wheel = (Get-ChildItem -LiteralPath dist -Filter *.whl).FullName
-          python -m pip install $wheel
+          python -m pip install pytest $wheel
           python -c "import talos_xii as tx; assert tx.ones([2]).to_list() == [1.0, 1.0]"
+          python -m pytest bindings/python/tests/test_tensor_contract.py
       - uses: actions/upload-artifact@v4
         with:
           name: python-${{ runner.os }}-${{ runner.arch }}

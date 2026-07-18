@@ -46,7 +46,12 @@ fn release_packaging_contains_runtime_contract_files() {
         "data/config.json",
         "data/pools.json",
         "docs/REQUIREMENTS.md",
+        "docs/PYTORCH_COMPATIBILITY.md",
         "docs/USAGE.md",
+        "bindings/python/python/talos_xii/__init__.pyi",
+        "bindings/python/python/talos_xii/py.typed",
+        "bindings/python/tests/test_tensor_contract.py",
+        "bindings/python/tests/test_torch_differential.py",
         "scripts/package-release.ps1",
     ] {
         assert!(repo_path(relative).is_file(), "missing {relative}");

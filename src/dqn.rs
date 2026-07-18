@@ -2760,7 +2760,7 @@ fn train_dqn_impl(
 
         if metrics.is_enabled() && step % snapshot_every == 0 {
             if let Some(loss) = pending_train_loss.take() {
-                last_train_loss = loss.item() as f64;
+                last_train_loss = loss.item();
             }
             let avg_r = if recent_rewards.is_empty() {
                 0.0

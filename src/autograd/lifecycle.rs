@@ -9,6 +9,31 @@ use std::sync::Arc;
 
 impl Tensor {
     pub fn backward(&self) {
+        self.backward_with_gradient(None)
+            .expect("legacy backward seed must match the tensor shape");
+    }
+
+    /// Run reverse-mode autograd with an optional explicit output gradient.
+    ///
+    /// Passing `None` preserves the historical Talos-XII behavior and seeds
+    /// every output element with one. Python bindings enforce PyTorch's stricter
+    /// scalar-only implicit seed before calling this method.
+    pub fn backward_with_gradient(&self, gradient: Option<&Tensor>) -> Result<(), String> {
+        if let Some(gradient) = gradient {
+            if gradient.shape != self.shape {
+                return Err(format!(
+                    "gradient shape {:?} does not match output shape {:?}",
+                    gradient.shape, self.shape
+                ));
+            }
+            if gradient.device != self.device {
+                return Err(format!(
+                    "gradient device {:?} does not match output device {:?}",
+                    gradient.device, self.device
+                ));
+            }
+        }
+
         // Topological sort — iterative DFS post-order to avoid stack overflow
         // on deep computation graphs (e.g. multi-layer transformers).
         let mut visited = std::collections::HashSet::new();
@@ -31,29 +56,25 @@ impl Tensor {
             }
         }
 
-        // Seed gradient of this tensor to 1.0
+        // Intermediate gradients are traversal scratch space and must not leak
+        // into a repeated backward pass. Leaf gradients intentionally remain
+        // untouched so repeated calls accumulate like PyTorch.
+        for tensor in &topo {
+            if tensor._ctx.is_some() {
+                tensor.zero_grad();
+            }
+        }
+
+        // Seed the output gradient. The host storage is authoritative here;
+        // CUDA backward lazily uploads it on first use.
         #[cfg(cuda)]
         if self.device == Device::Cuda {
             self.cuda_grad_remove_cached_buffer();
         }
-        self.grad.fill_f64(1.0);
-        #[cfg(cuda)]
-        if self.device == Device::Cuda {
-            if let Some(d_grad) = self.cuda_grad_zero_buffer() {
-                if !d_grad.is_empty() {
-                    match &*d_grad {
-                        crate::cuda::memory::CudaBuffer::BF16(_) => {}
-                        crate::cuda::memory::CudaBuffer::I8(_) => {}
-                        crate::cuda::memory::CudaBuffer::F32(buf) => {
-                            let _ = crate::cuda::kernels::fill_f32(buf, 1.0);
-                        }
-                        crate::cuda::memory::CudaBuffer::F64(buf) => {
-                            let _ = crate::cuda::kernels::fill(buf, 1.0);
-                        }
-                    }
-                }
-            }
-        }
+        let seed = gradient
+            .map(Tensor::data_as_f64_vec)
+            .unwrap_or_else(|| vec![1.0; self.numel()]);
+        self.accumulate_external_gradient(&seed);
 
         // Backprop
         for t in topo.iter().rev() {
@@ -63,6 +84,7 @@ impl Tensor {
                 (ctx.backward_op)(&t.grad, &ctx.parents);
             }
         }
+        Ok(())
     }
 
     // Explicitly clear the graph history to free memory
@@ -82,6 +104,17 @@ impl Tensor {
                 let _ = d_grad;
             }
         }
+    }
+
+    /// Accumulate an externally produced gradient while keeping CUDA caches
+    /// coherent. This is used by language bindings for identity-like transfer
+    /// and dtype-conversion nodes.
+    pub fn accumulate_external_gradient(&self, gradient: &[f64]) {
+        #[cfg(cuda)]
+        if self.device == Device::Cuda {
+            self.cuda_grad_remove_cached_buffer();
+        }
+        self.grad.accumulate_f64_slice(gradient);
     }
 
     /// Copy tensor data to CUDA GPU and keep host data lazy until materialized.

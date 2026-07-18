@@ -326,7 +326,7 @@ fn test_extra_unary_binary_and_loss_ops() {
 
     let loss_input = Tensor::new(vec![1.0, -2.0, 3.0], vec![3]);
     let loss = loss_input.l2_loss();
-    assert!((loss.item() as f64 - 7.0).abs() < 1e-9);
+    assert!((loss.item() - 7.0).abs() < 1e-9);
     loss.backward();
     assert_eq!(loss_input.grad_to_f64_vec(), vec![1.0, -2.0, 3.0]);
 }
@@ -371,7 +371,7 @@ fn test_pooling_and_extended_conv_shapes() {
     let x = Tensor::new(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2]);
     let avg = x.avg_pool2d(2, 1, 0, false);
     assert_eq!(avg.shape, vec![1, 1, 1, 1]);
-    assert!((avg.item() as f64 - 2.5).abs() < 1e-9);
+    assert!((avg.item() - 2.5).abs() < 1e-9);
 
     let trans_weight = Tensor::new(vec![1.0], vec![1, 1, 1, 1]);
     let transposed = x.conv2d_transpose(&trans_weight, 1, 0);
@@ -529,6 +529,26 @@ fn test_cuda_div_backward_matches_cpu() {
         assert!((a_cpu_grad[i] - a_cuda_grad[i]).abs() < 1e-5);
         assert!((b_cpu_grad[i] - b_cuda_grad[i]).abs() < 1e-5);
     }
+}
+
+#[cfg(cuda)]
+#[test]
+fn test_cuda_broadcast_backward_materializes_cached_gradient() {
+    if crate::cuda::init().is_err() {
+        return;
+    }
+
+    let matrix = Tensor::new_f32(vec![1.0; 6], vec![2, 3])
+        .to_cuda()
+        .expect("CUDA matrix upload");
+    let bias = Tensor::new_f32(vec![0.5, 1.0, 1.5], vec![3])
+        .to_cuda()
+        .expect("CUDA bias upload");
+    let expanded_bias = bias.broadcast(vec![2, 3]);
+
+    (&matrix + &expanded_bias).sum().backward();
+
+    assert_eq!(bias.grad_to_f64_vec(), vec![2.0, 2.0, 2.0]);
 }
 
 #[cfg(cuda)]
@@ -984,4 +1004,38 @@ fn test_f32_backward_elementwise() {
     // d(ab)/db = a
     assert!((b_grad[0] - 2.0).abs() < 1e-4);
     assert!((b_grad[1] - 3.0).abs() < 1e-4);
+}
+
+#[test]
+fn test_backward_with_explicit_gradient_seed() {
+    let input = Tensor::new_f32(vec![1.0, 2.0], vec![2]);
+    let output = &input * &input;
+    let gradient = Tensor::new_f32(vec![0.5, 2.0], vec![2]);
+
+    output.backward_with_gradient(Some(&gradient)).unwrap();
+
+    let actual = input.grad_to_f32_vec();
+    assert!((actual[0] - 1.0).abs() < 1e-6);
+    assert!((actual[1] - 8.0).abs() < 1e-6);
+}
+
+#[test]
+fn test_repeated_backward_resets_intermediate_gradients() {
+    let input = Tensor::new_f32(vec![2.0], vec![1]);
+    let squared = &input * &input;
+    let loss = squared.sum();
+
+    loss.backward();
+    loss.backward();
+
+    let actual = input.grad_to_f32_vec();
+    assert!((actual[0] - 8.0).abs() < 1e-6);
+}
+
+#[test]
+fn test_f64_item_preserves_precision() {
+    let value = 1.123_456_789_012_345_f64;
+    let tensor = Tensor::new(vec![value], Vec::new());
+
+    assert_eq!(tensor.item(), value);
 }

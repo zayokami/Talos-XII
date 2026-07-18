@@ -237,8 +237,13 @@ jobs:
           args: --release --locked --out dist
       - name: Smoke-test wheel
         run: |
-          python -m pip install dist/*.whl
+          python -m pip install pytest dist/*.whl
           python -c "import talos_xii as tx; assert tx.__version__; assert tx.ones([2]).to_list() == [1.0, 1.0]"
+          python -m pytest bindings/python/tests/test_tensor_contract.py
+      - name: PyTorch 2.10 differential contract
+        run: |
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu "torch>=2.10,<2.11"
+          python -m pytest bindings/python/tests/test_torch_differential.py
 
   # ─────────────────────────────────────────────────
   #  CUDA compile: toolkit validation without a GPU
@@ -256,6 +261,7 @@ jobs:
         with:
           key: cuda12-compile
       - run: cargo test --locked --features cuda --no-run
+      - run: cargo check --manifest-path bindings/python/Cargo.toml --locked --features cuda
 
   # ─────────────────────────────────────────────────
   #  CUDA runtime: opt-in self-hosted GPU validation
@@ -266,6 +272,18 @@ jobs:
     runs-on: [self-hosted, talos-cuda]
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo run --locked --features cuda -- doctor --json
       - run: cargo test --locked --features cuda gpu_adam -- --test-threads=1
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --locked --features cuda --out dist
+      - name: CUDA Python contract
+        run: |
+          python -m pip install pytest
+          python -c "import glob, subprocess, sys; wheels = glob.glob('dist/*.whl'); assert len(wheels) == 1, wheels; subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--force-reinstall', wheels[0]])"
+          python -m pytest bindings/python/tests/test_cuda_tensor_contract.py

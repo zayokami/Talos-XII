@@ -17,6 +17,7 @@ include = [
     "data/config.json",
     "data/pools.json",
     "docs/REQUIREMENTS.md",
+    "docs/PYTORCH_COMPATIBILITY.md",
     "docs/USAGE.md",
     "examples/**",
     "bindings/python/Cargo.toml",
