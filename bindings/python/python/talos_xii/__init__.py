@@ -4,7 +4,7 @@ from contextlib import ContextDecorator as _ContextDecorator
 from functools import wraps as _wraps
 import os as _os
 from pathlib import Path as _Path
-from threading import local as _local
+from threading import Lock as _Lock, local as _local
 
 
 _dll_directories = []
@@ -108,6 +108,41 @@ class _CudaNamespace:
 
 
 cuda = _CudaNamespace()
+
+
+_seed_lock = _Lock()
+_seed_state = 42
+
+
+def manual_seed(seed: int) -> int:
+    """Set the deterministic seed used by Python neural-network initializers."""
+
+    global _seed_state
+    value = int(seed) & ((1 << 64) - 1)
+    with _seed_lock:
+        _seed_state = value
+    return value
+
+
+def initial_seed() -> int:
+    """Return the current Python initializer seed state."""
+
+    with _seed_lock:
+        return _seed_state
+
+
+def _next_seed() -> int:
+    global _seed_state
+    with _seed_lock:
+        _seed_state = (_seed_state * 6364136223846793005 + 1442695040888963407) & (
+            (1 << 64) - 1
+        )
+        return _seed_state
+
+
+from . import nn as nn
+from . import optim as optim
+from .serialization import load, save
 
 
 __all__ = [name for name in globals() if not name.startswith("_")]

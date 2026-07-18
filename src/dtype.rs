@@ -323,6 +323,36 @@ impl Storage {
         }
     }
 
+    /// Replace storage contents from f64 values, converting to the native dtype.
+    pub fn copy_from_f64_slice(&self, values: &[f64]) -> Result<(), String> {
+        if self.len() != values.len() {
+            return Err(format!(
+                "storage length {} does not match source length {}",
+                self.len(),
+                values.len()
+            ));
+        }
+        match self {
+            Storage::F64(storage) => storage.write().unwrap().copy_from_slice(values),
+            Storage::F32(storage) => {
+                for (destination, &source) in storage.write().unwrap().iter_mut().zip(values) {
+                    *destination = source as f32;
+                }
+            }
+            Storage::BF16(storage) => {
+                for (destination, &source) in storage.write().unwrap().iter_mut().zip(values) {
+                    *destination = bf16::from_f64(source);
+                }
+            }
+            Storage::I8(storage) => {
+                for (destination, &source) in storage.write().unwrap().iter_mut().zip(values) {
+                    *destination = source as i8;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Zero all elements.
     pub fn zero(&self) {
         match self {

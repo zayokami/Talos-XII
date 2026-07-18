@@ -1199,6 +1199,42 @@ extern "C" {
         d_grad_out: *mut c_int,
         d_input_grad: *mut c_int,
     ) -> c_int;
+    #[link_name = "sqrt_f64"]
+    pub fn cuda_sqrt(
+        h_in: *const f64,
+        h_out: *mut f64,
+        size: c_int,
+        d_in: *mut c_int,
+        d_out: *mut c_int,
+    ) -> c_int;
+    #[link_name = "sqrt_f32"]
+    pub fn cuda_sqrt_f32(
+        h_in: *const f32,
+        h_out: *mut f32,
+        size: c_int,
+        d_in: *mut c_int,
+        d_out: *mut c_int,
+    ) -> c_int;
+    #[link_name = "sqrt_backward_f64"]
+    pub fn cuda_sqrt_backward(
+        h_sqrt_out: *const f64,
+        h_grad_out: *const f64,
+        h_input_grad: *mut f64,
+        size: c_int,
+        d_sqrt_out: *mut c_int,
+        d_grad_out: *mut c_int,
+        d_input_grad: *mut c_int,
+    ) -> c_int;
+    #[link_name = "sqrt_backward_f32"]
+    pub fn cuda_sqrt_backward_f32(
+        h_sqrt_out: *const f32,
+        h_grad_out: *const f32,
+        h_input_grad: *mut f32,
+        size: c_int,
+        d_sqrt_out: *mut c_int,
+        d_grad_out: *mut c_int,
+        d_input_grad: *mut c_int,
+    ) -> c_int;
     #[link_name = "weighted_mse_loss_f64"]
     pub fn cuda_weighted_mse_loss(
         h_pred: *const f64,

@@ -3,17 +3,6 @@ use crate::dtype::{Dtype, Storage};
 use rayon::prelude::*;
 use std::sync::Arc;
 
-/// Minimum element count for which dispatching an element-wise op to the GPU
-/// pays off when neither operand is already resident in GPU memory.
-///
-/// A cold element-wise GPU op costs operand H2D uploads plus a kernel launch
-/// (tens of microseconds fixed overhead), while the SIMD CPU path processes
-/// a few thousand elements in ~1-2us. Resident operands skip this gate so
-/// chains of GPU ops stay on-device. Threshold chosen alongside
-/// `CUDA_MATMUL_MIN_OPS` in `matmul.rs` (see measurement notes there).
-#[cfg(cuda)]
-const CUDA_ELEMWISE_MIN_ELEMS: usize = 4096;
-
 #[cfg(cuda)]
 #[derive(Clone, Copy)]
 enum CudaBinaryOp {
@@ -327,6 +316,119 @@ impl Tensor {
     }
 
     #[cfg(cuda)]
+    pub(crate) fn sqrt_cuda(&self) -> Option<Tensor> {
+        use crate::cuda::memory::{alloc_pooled, CudaBuffer};
+
+        if self.device != Device::Cuda || !matches!(self.dtype, Dtype::F32 | Dtype::F64) {
+            return None;
+        }
+        let len = self.numel();
+        let d_in = self.cuda_get_or_upload_buffer().ok()?;
+        let d_out = match self.dtype {
+            Dtype::F32 => CudaBuffer::F32(alloc_pooled::<f32>(len).ok()?),
+            Dtype::F64 => CudaBuffer::F64(alloc_pooled::<f64>(len).ok()?),
+            _ => return None,
+        };
+        let d_out = Arc::new(d_out);
+        let ok = match (&*d_in, &*d_out, self.dtype) {
+            (CudaBuffer::F32(input), CudaBuffer::F32(out), Dtype::F32) => {
+                crate::cuda::kernels::sqrt_f32(input, out, len).is_ok()
+            }
+            (CudaBuffer::F64(input), CudaBuffer::F64(out), Dtype::F64) => {
+                crate::cuda::kernels::sqrt(input, out, len).is_ok()
+            }
+            _ => false,
+        };
+        if !ok {
+            return None;
+        }
+
+        let dtype = self.dtype;
+        let d_out_for_backward = d_out.clone();
+        let out = Tensor {
+            data: Tensor::empty_storage(dtype),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(dtype)),
+            shape: self.shape.clone(),
+            device: Device::Cuda,
+            dtype,
+            _ctx: Some(Arc::new(Context {
+                parents: vec![self.clone()],
+                backward_op: Box::new(move |grad_out, parents| {
+                    let input = &parents[0];
+                    if input.device == Device::Cuda {
+                        if let Some(d_grad_tmp) = cuda_grad_out_buffer(grad_out) {
+                            if let Some(d_input_grad) = input.cuda_grad_ensure_buffer() {
+                                let ok = match (
+                                    &*d_out_for_backward,
+                                    &*d_grad_tmp,
+                                    &*d_input_grad,
+                                    dtype,
+                                ) {
+                                    (
+                                        CudaBuffer::F32(sqrt_out),
+                                        CudaBuffer::F32(gt),
+                                        CudaBuffer::F32(ig),
+                                        Dtype::F32,
+                                    ) => crate::cuda::kernels::sqrt_backward_f32(
+                                        sqrt_out,
+                                        gt,
+                                        ig,
+                                        sqrt_out.len(),
+                                    )
+                                    .is_ok(),
+                                    (
+                                        CudaBuffer::F64(sqrt_out),
+                                        CudaBuffer::F64(gt),
+                                        CudaBuffer::F64(ig),
+                                        Dtype::F64,
+                                    ) => crate::cuda::kernels::sqrt_backward(
+                                        sqrt_out,
+                                        gt,
+                                        ig,
+                                        sqrt_out.len(),
+                                    )
+                                    .is_ok(),
+                                    _ => false,
+                                };
+                                if ok {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+
+                    let grad_out_f64 = grad_out.to_f64_vec();
+                    let sqrt_cache: Vec<f64> = match &*d_out_for_backward {
+                        CudaBuffer::F32(buffer) => {
+                            let mut host = vec![0.0f32; buffer.len()];
+                            if crate::cuda::memory::copy_d2h(&mut host, buffer).is_err() {
+                                return;
+                            }
+                            host.into_iter().map(|value| value as f64).collect()
+                        }
+                        CudaBuffer::F64(buffer) => {
+                            let mut host = vec![0.0f64; buffer.len()];
+                            if crate::cuda::memory::copy_d2h(&mut host, buffer).is_err() {
+                                return;
+                            }
+                            host
+                        }
+                        CudaBuffer::BF16(_) | CudaBuffer::I8(_) => return,
+                    };
+                    let mut input_grad = input.grad_write_compat();
+                    for index in 0..input_grad.len() {
+                        if sqrt_cache[index] > 0.0 {
+                            input_grad[index] += grad_out_f64[index] * 0.5 / sqrt_cache[index];
+                        }
+                    }
+                }),
+            })),
+        };
+        out.cuda_set_cached_buffer(d_out);
+        Some(out)
+    }
+
+    #[cfg(cuda)]
     pub(crate) fn sum_cuda(&self, scale: f64) -> Option<Tensor> {
         use crate::cuda::memory::{alloc_pooled, CudaBuffer};
 
@@ -515,13 +617,6 @@ impl Tensor {
             return None;
         }
         let len = self.numel();
-        // Small host-only workloads are faster on the CPU SIMD path.
-        if len < CUDA_ELEMWISE_MIN_ELEMS
-            && self.cuda_cached_buffer().is_none()
-            && !self.data.is_empty()
-        {
-            return None;
-        }
         let d_in = self.cuda_get_or_upload_buffer().ok()?;
         let d_out = match self.dtype {
             Dtype::F32 => CudaBuffer::F32(alloc_pooled::<f32>(len).ok()?),
@@ -2025,16 +2120,6 @@ impl Tensor {
             return None;
         }
         let len = self.numel();
-        // Small workloads whose operands live only on the host are faster on
-        // the CPU SIMD path; returning None routes the caller there.
-        if len < CUDA_ELEMWISE_MIN_ELEMS
-            && self.cuda_cached_buffer().is_none()
-            && rhs.cuda_cached_buffer().is_none()
-            && !self.data.is_empty()
-            && !rhs.data.is_empty()
-        {
-            return None;
-        }
         let d_a = self.cuda_get_or_upload_buffer().ok()?;
         let d_b = rhs.cuda_get_or_upload_buffer().ok()?;
         let d_out = match out_dtype {

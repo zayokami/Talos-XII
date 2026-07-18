@@ -232,6 +232,57 @@ impl Tensor {
         self
     }
 
+    /// Copy tensor values in place while preserving this tensor's identity.
+    pub fn copy_data_from(&mut self, source: &Tensor) -> Result<&mut Self, String> {
+        if self.shape != source.shape {
+            return Err(format!(
+                "source shape {:?} does not match destination shape {:?}",
+                source.shape, self.shape
+            ));
+        }
+
+        #[cfg(cuda)]
+        if self.device == Device::Cuda
+            && source.device == Device::Cuda
+            && self.dtype == source.dtype
+        {
+            use crate::cuda::memory::{copy_d2d, CudaBuffer};
+
+            let destination = self.cuda_get_or_upload_buffer().map_err(|(stage, error)| {
+                format!("CUDA copy_ destination {stage} failed: {error}")
+            })?;
+            let source = source
+                .cuda_get_or_upload_buffer()
+                .map_err(|(stage, error)| format!("CUDA copy_ source {stage} failed: {error}"))?;
+            match (&*destination, &*source) {
+                (CudaBuffer::F64(destination), CudaBuffer::F64(source)) => {
+                    copy_d2d(destination, source)
+                }
+                (CudaBuffer::F32(destination), CudaBuffer::F32(source)) => {
+                    copy_d2d(destination, source)
+                }
+                (CudaBuffer::BF16(destination), CudaBuffer::BF16(source)) => {
+                    copy_d2d(destination, source)
+                }
+                (CudaBuffer::I8(destination), CudaBuffer::I8(source)) => {
+                    copy_d2d(destination, source)
+                }
+                _ => unreachable!("copy_ dtype equality was checked before CUDA dispatch"),
+            }
+            .map_err(|error| format!("CUDA copy_ D2D failed: {error}"))?;
+            self.cuda_clear_host_data_preserve_cache();
+            return Ok(self);
+        }
+
+        let values = source.data_as_f64_vec();
+        #[cfg(cuda)]
+        self.cuda_materialize();
+        self.data.copy_from_f64_slice(&values)?;
+        #[cfg(cuda)]
+        self.cuda_remove_cached_buffer();
+        Ok(self)
+    }
+
     // -------------------------------------------------------------------------
     // Dtype-aware lock access helpers
     // -------------------------------------------------------------------------

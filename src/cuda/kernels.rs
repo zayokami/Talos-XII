@@ -1640,6 +1640,82 @@ pub fn exp_backward(
 }
 
 #[cfg(cuda)]
+pub fn sqrt(input: &DevicePtr<f64>, out: &DevicePtr<f64>, size: usize) -> CudaResult<()> {
+    crate::cuda::init()?;
+    validate_len("cuda::kernels::sqrt(input)", input.len(), size)?;
+    validate_len("cuda::kernels::sqrt(out)", out.len(), size)?;
+    let size_i32 = to_i32_len("cuda::kernels::sqrt(size)", size)?;
+    if size == 0 {
+        return Ok(());
+    }
+    let status = unsafe {
+        crate::cuda::bindings::cuda_sqrt(
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            size_i32,
+            input.as_raw() as *mut std::os::raw::c_int,
+            out.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::sqrt",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn sqrt_backward(
+    sqrt_out: &DevicePtr<f64>,
+    grad_out: &DevicePtr<f64>,
+    input_grad: &DevicePtr<f64>,
+    size: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    validate_len(
+        "cuda::kernels::sqrt_backward(sqrt_out)",
+        sqrt_out.len(),
+        size,
+    )?;
+    validate_len(
+        "cuda::kernels::sqrt_backward(grad_out)",
+        grad_out.len(),
+        size,
+    )?;
+    validate_len(
+        "cuda::kernels::sqrt_backward(input_grad)",
+        input_grad.len(),
+        size,
+    )?;
+    let size_i32 = to_i32_len("cuda::kernels::sqrt_backward(size)", size)?;
+    if size == 0 {
+        return Ok(());
+    }
+    let status = unsafe {
+        crate::cuda::bindings::cuda_sqrt_backward(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            size_i32,
+            sqrt_out.as_raw() as *mut std::os::raw::c_int,
+            grad_out.as_raw() as *mut std::os::raw::c_int,
+            input_grad.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::sqrt_backward",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
 pub fn weighted_mse_loss(
     pred: &DevicePtr<f64>,
     target: &DevicePtr<f64>,
@@ -4140,6 +4216,82 @@ pub fn exp_backward_f32(
     } else {
         Err(CudaError::Runtime {
             op: "cuda::kernels::exp_backward_f32",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn sqrt_f32(input: &DevicePtr<f32>, out: &DevicePtr<f32>, size: usize) -> CudaResult<()> {
+    crate::cuda::init()?;
+    validate_len("cuda::kernels::sqrt_f32(input)", input.len(), size)?;
+    validate_len("cuda::kernels::sqrt_f32(out)", out.len(), size)?;
+    let size_i32 = to_i32_len("cuda::kernels::sqrt_f32(size)", size)?;
+    if size == 0 {
+        return Ok(());
+    }
+    let status = unsafe {
+        crate::cuda::bindings::cuda_sqrt_f32(
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            size_i32,
+            input.as_raw() as *mut std::os::raw::c_int,
+            out.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::sqrt_f32",
+            code: status as u32,
+        })
+    }
+}
+
+#[cfg(cuda)]
+pub fn sqrt_backward_f32(
+    sqrt_out: &DevicePtr<f32>,
+    grad_out: &DevicePtr<f32>,
+    input_grad: &DevicePtr<f32>,
+    size: usize,
+) -> CudaResult<()> {
+    crate::cuda::init()?;
+    validate_len(
+        "cuda::kernels::sqrt_backward_f32(sqrt_out)",
+        sqrt_out.len(),
+        size,
+    )?;
+    validate_len(
+        "cuda::kernels::sqrt_backward_f32(grad_out)",
+        grad_out.len(),
+        size,
+    )?;
+    validate_len(
+        "cuda::kernels::sqrt_backward_f32(input_grad)",
+        input_grad.len(),
+        size,
+    )?;
+    let size_i32 = to_i32_len("cuda::kernels::sqrt_backward_f32(size)", size)?;
+    if size == 0 {
+        return Ok(());
+    }
+    let status = unsafe {
+        crate::cuda::bindings::cuda_sqrt_backward_f32(
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            size_i32,
+            sqrt_out.as_raw() as *mut std::os::raw::c_int,
+            grad_out.as_raw() as *mut std::os::raw::c_int,
+            input_grad.as_raw() as *mut std::os::raw::c_int,
+        )
+    };
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(CudaError::Runtime {
+            op: "cuda::kernels::sqrt_backward_f32",
             code: status as u32,
         })
     }

@@ -12,6 +12,7 @@ and it does not import or embed PyTorch at runtime.
   CUDA backend.
 - Differential tests: bindings/python/tests/test_torch_differential.py.
 - Framework-owned tests: bindings/python/tests/test_tensor_contract.py.
+- Module/optimizer tests: bindings/python/tests/test_nn_training.py.
 
 The baseline is versioned deliberately. A future PyTorch release does not
 silently redefine Talos-XII behavior; the compatibility matrix and differential
@@ -40,6 +41,19 @@ The following behavior is treated as stable and release-blocking:
   back to CPU.
 - Typed Python exceptions at validated API boundaries. Unsupported behavior is
   reported as NotImplementedError instead of being approximated silently.
+- Python framework primitives: Parameter, Module, Linear, Sequential,
+  ModuleList, common activations, Flatten, LayerNorm, RMSNorm, and MSELoss.
+  Parameter registration, recursive traversal, train/eval propagation,
+  persistent buffers, identity-preserving module device/dtype conversion, and
+  strict state-dictionary loading are release-blocking behavior.
+- SGD (momentum, dampening, Nesterov, weight decay, maximize), Adam, and AdamW,
+  including optimizer state dictionaries. Their supported update rules are
+  checked differentially against PyTorch 2.10.x.
+- Versioned, pickle-free save/load for Tensor trees, module state dictionaries,
+  and optimizer state. Loading never executes checkpoint-provided Python code.
+- CUDA Python training covers scalar arithmetic, square, F32/F64 sqrt forward
+  and backward, Linear training, in-place parameter updates, and SGD/Adam/AdamW
+  CPU-to-GPU numerical agreement.
 
 ## Deliberate extensions and legacy APIs
 
@@ -63,6 +77,12 @@ The following behavior is treated as stable and release-blocking:
   implemented. Talos-XII materializes contiguous results.
 - Higher-order gradients (create_graph=True), forward-mode AD, hooks, anomaly
   detection, and custom Python autograd functions are not implemented.
+- The Python module catalog is intentionally small. Convolution modules,
+  recurrent modules, attention modules, schedulers, multiple optimizer
+  parameter groups, hooks, and distributed wrappers are not implemented yet.
+- Linear currently follows the documented 1-D/2-D matmul subset; arbitrary
+  leading batch dimensions are not yet accepted. LayerNorm and RMSNorm accept
+  one normalized trailing dimension rather than a normalized-shape tuple.
 - CUDA currently exposes the framework's production single-device backend, not
   PyTorch streams, events, graphs, peer access, or distributed collectives.
 - PyTorch pickle/checkpoint binary compatibility is not claimed.
@@ -72,6 +92,7 @@ The following behavior is treated as stable and release-blocking:
 Build and install the wheel, then run:
 
     python -m pytest bindings/python/tests/test_tensor_contract.py
+    python -m pytest bindings/python/tests/test_nn_training.py
     python -m pytest bindings/python/tests/test_torch_differential.py
     python -m pytest bindings/python/tests/test_cuda_tensor_contract.py
 

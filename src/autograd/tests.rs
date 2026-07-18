@@ -920,6 +920,21 @@ fn test_f32_reshape_broadcast_transpose() {
 }
 
 #[test]
+fn test_f32_transposed_weight_matmul_backward() {
+    let input = Tensor::with_dtype(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], Dtype::F32);
+    let weight = Tensor::with_dtype(vec![3.0, 4.0], vec![1, 2], Dtype::F32);
+    let transposed = weight.transpose(0, 1);
+
+    assert_eq!(transposed.data.dtype(), Dtype::F32);
+    assert_eq!(transposed.grad.dtype(), Dtype::F32);
+
+    input.matmul(&transposed).sum().backward();
+
+    assert_eq!(input.grad_to_f64_vec(), vec![3.0, 4.0, 3.0, 4.0]);
+    assert_eq!(weight.grad_to_f64_vec(), vec![4.0, 6.0]);
+}
+
+#[test]
 fn test_f32_gelu_exp_log() {
     let a = Tensor::with_dtype(vec![0.0, 1.0, 2.0], vec![3], Dtype::F32);
 

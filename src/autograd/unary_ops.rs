@@ -534,6 +534,11 @@ impl Tensor {
     }
 
     pub fn sqrt(&self) -> Tensor {
+        #[cfg(cuda)]
+        if let Some(out) = self.sqrt_cuda() {
+            return out;
+        }
+
         if self.dtype == Dtype::F64 {
             let self_data = self.data_as_f64_vec();
             let len = self_data.len();

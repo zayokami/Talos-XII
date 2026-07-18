@@ -76,6 +76,18 @@ maturin develop --release
 python -c "import talos_xii as tx; print(tx.__version__)"
 ```
 
+The installable package also provides the PyTorch-style `tx.nn`, `tx.optim`,
+and safe checkpoint APIs. It has no runtime dependency on PyTorch or NumPy:
+
+```bash
+python examples/python/nn_training.py cpu 120 model.txckpt
+python examples/python/nn_training.py cuda 120 model-cuda.txckpt
+```
+
+The CUDA command requires a CUDA-enabled wheel and fails explicitly when the
+runtime is unavailable. `Module.cuda()` and dtype conversion preserve Parameter
+object identity, so existing optimizer references remain valid.
+
 Enable the embedded PyO3 bridge to run a Python script inside the Talos-XII process:
 
 ```bash
@@ -245,6 +257,18 @@ python -m pip install maturin
 maturin develop --release
 python -c "import talos_xii as tx; print(tx.__version__)"
 ```
+
+可安装包还提供 PyTorch 风格的 `tx.nn`、`tx.optim` 与安全 checkpoint API，
+运行时不依赖 PyTorch 或 NumPy：
+
+```bash
+python examples/python/nn_training.py cpu 120 model.txckpt
+python examples/python/nn_training.py cuda 120 model-cuda.txckpt
+```
+
+CUDA 命令要求安装 CUDA 版 wheel；运行时不可用会直接报错，不会静默回退。
+`Module.cuda()` 与 dtype 转换保持 Parameter 对象身份，因此已有 optimizer
+引用仍然有效。
 
 启用可选 PyO3 桥接后，可在 Talos-XII 进程内执行 Python 脚本：
 

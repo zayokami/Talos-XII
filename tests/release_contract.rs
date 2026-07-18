@@ -57,3 +57,13 @@ fn release_packaging_contains_runtime_contract_files() {
         assert!(repo_path(relative).is_file(), "missing {relative}");
     }
 }
+
+#[test]
+fn cargo_package_globs_exclude_generated_python_artifacts() {
+    let manifest = std::fs::read_to_string(repo_path("Cargo.toml")).unwrap();
+
+    assert!(manifest.contains(r#""/examples/**/*.py""#));
+    assert!(manifest.contains(r#""/bindings/python/python/**/*.pyi""#));
+    assert!(!manifest.contains(r#""/examples/**""#));
+    assert!(!manifest.contains(r#""/bindings/python/python/**""#));
+}

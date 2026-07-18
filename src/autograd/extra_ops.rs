@@ -374,6 +374,12 @@ impl Tensor {
     }
 
     pub fn square(&self) -> Tensor {
+        #[cfg(cuda)]
+        if self.device == Device::Cuda {
+            if let Some(out) = self.mul_cuda(self) {
+                return out;
+            }
+        }
         self.unary_autograd(|x| x * x, |x, _| 2.0 * x)
     }
 

@@ -531,8 +531,8 @@ impl Tensor {
         let cap_rank = rank;
 
         Tensor {
-            data: Storage::F64(Arc::new(RwLock::new(new_data))),
-            grad: Storage::zeros(len, Tensor::grad_dtype_for(Dtype::F64)),
+            data: Storage::from_f64_vec(new_data, self.dtype),
+            grad: Storage::zeros(len, Tensor::grad_dtype_for(self.dtype)),
             shape: new_shape,
             device: self.device,
             dtype: self.dtype,

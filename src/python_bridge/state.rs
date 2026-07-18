@@ -17,6 +17,7 @@ struct VersionDependency {
 
 pub(super) struct PythonAutogradState {
     requires_grad: AtomicBool,
+    is_parameter: AtomicBool,
     is_leaf: bool,
     retain_grad: AtomicBool,
     grad_ready: AtomicBool,
@@ -60,6 +61,7 @@ impl PythonAutogradState {
     pub(super) fn leaf(tensor: &Tensor, requires_grad: bool) -> Arc<Self> {
         let state = Arc::new(Self {
             requires_grad: AtomicBool::new(requires_grad),
+            is_parameter: AtomicBool::new(false),
             is_leaf: true,
             retain_grad: AtomicBool::new(false),
             grad_ready: AtomicBool::new(false),
@@ -110,6 +112,7 @@ impl PythonAutogradState {
 
         let state = Arc::new(Self {
             requires_grad: AtomicBool::new(requires_grad),
+            is_parameter: AtomicBool::new(false),
             is_leaf: !requires_grad,
             retain_grad: AtomicBool::new(false),
             grad_ready: AtomicBool::new(false),
@@ -129,6 +132,7 @@ impl PythonAutogradState {
     ) -> Arc<Self> {
         let state = Arc::new(Self {
             requires_grad: AtomicBool::new(requires_grad),
+            is_parameter: AtomicBool::new(false),
             is_leaf,
             retain_grad: AtomicBool::new(false),
             grad_ready: AtomicBool::new(false),
@@ -153,6 +157,14 @@ impl PythonAutogradState {
         if !value {
             self.grad_ready.store(false, Ordering::Release);
         }
+    }
+
+    pub(super) fn is_parameter(&self) -> bool {
+        self.is_parameter.load(Ordering::Acquire)
+    }
+
+    pub(super) fn set_parameter(&self, value: bool) {
+        self.is_parameter.store(value, Ordering::Release);
     }
 
     pub(super) fn is_leaf(&self) -> bool {
@@ -189,6 +201,10 @@ impl PythonAutogradState {
 
     pub(super) fn increment_version(&self) {
         self.version.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(super) fn rebind(self: &Arc<Self>, tensor: &Tensor) {
+        register(tensor, self);
     }
 
     pub(super) fn check_versions(&self) -> Result<(), String> {

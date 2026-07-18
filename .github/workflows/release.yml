@@ -92,7 +92,8 @@ jobs:
           $wheel = (Get-ChildItem -LiteralPath dist -Filter *.whl).FullName
           python -m pip install pytest $wheel
           python -c "import talos_xii as tx; assert tx.ones([2]).to_list() == [1.0, 1.0]"
-          python -m pytest bindings/python/tests/test_tensor_contract.py
+          python -c "import pathlib, talos_xii as tx; root = pathlib.Path(tx.__file__).parent; required = ['py.typed', '__init__.pyi', 'nn/__init__.pyi', 'nn/functional.pyi', 'optim/__init__.pyi', 'serialization.pyi']; missing = [name for name in required if not (root / name).is_file()]; assert not missing, missing"
+          python -m pytest bindings/python/tests/test_tensor_contract.py bindings/python/tests/test_nn_training.py
       - uses: actions/upload-artifact@v4
         with:
           name: python-${{ runner.os }}-${{ runner.arch }}
@@ -106,16 +107,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install build dependencies
-        run: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y curl build-essential pkg-config libfontconfig1-dev libfreetype6-dev
+        run: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y curl build-essential pkg-config libfontconfig1-dev libfreetype6-dev python3 python3-pip
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-cuda12-linux
       - run: cargo build --release --locked --features cuda
+      - name: Build and smoke-test CUDA Python wheel
+        run: |
+          python3 -m pip install "maturin>=1.8,<2.0"
+          python3 -m maturin build --release --locked --features cuda --compatibility linux --out dist-python-cuda
+          python3 -m pip install --force-reinstall dist-python-cuda/*.whl
+          python3 -c "import talos_xii as tx; assert tx.__version__ == '0.8.0'; assert tx.nn.Linear(2, 1)(tx.ones([1, 2])).shape == (1, 1)"
       - uses: actions/upload-artifact@v4
         with:
           name: cuda12-linux-binary
           path: target/release/talos_xii
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cuda12-linux-python
+          path: dist-python-cuda/*.whl
           if-no-files-found: error
 
   cuda-linux:
@@ -156,8 +168,11 @@ jobs:
       - name: Build aggregate checksums
         shell: bash
         run: |
-          find artifacts -maxdepth 1 -type f ! -name '*.sha256' ! -name 'SHA256SUMS' -print0 \
-            | sort -z | xargs -0 sha256sum > artifacts/SHA256SUMS
+          cd artifacts
+          find . -maxdepth 1 -type f ! -name '*.sha256' ! -name 'SHA256SUMS' -print0 \
+            | sort -z | while IFS= read -r -d '' file; do sha256sum "$file" > "${file#./}.sha256"; done
+          find . -maxdepth 1 -type f ! -name '*.sha256' ! -name 'SHA256SUMS' -print0 \
+            | sort -z | xargs -0 sha256sum > SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true

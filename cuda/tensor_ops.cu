@@ -504,6 +504,31 @@ __global__ void exp_backward_kernel(
 }
 
 template<typename T>
+__global__ void sqrt_kernel(
+    const T* __restrict__ input,
+    T* __restrict__ output,
+    int size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        output[idx] = sqrt(input[idx]);
+    }
+}
+
+template<typename T>
+__global__ void sqrt_backward_kernel(
+    const T* __restrict__ sqrt_out,
+    const T* __restrict__ grad_out,
+    T* __restrict__ input_grad,
+    int size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size && sqrt_out[idx] > T(0.0)) {
+        input_grad[idx] += grad_out[idx] * T(0.5) / sqrt_out[idx];
+    }
+}
+
+template<typename T>
 __global__ void weighted_mse_loss_kernel(
     const T* __restrict__ pred,
     const T* __restrict__ target,
@@ -1351,6 +1376,44 @@ extern "C" int exp_backward_f32(const float* h_exp_out, const float* h_grad_out,
     dim3 block(TENSOR_OP_BLOCK);
     dim3 grid((size + TENSOR_OP_BLOCK - 1) / TENSOR_OP_BLOCK);
     exp_backward_kernel<float><<<grid, block>>>(dev_exp_out, dev_grad_out, dev_input_grad, size);
+    return (int)cudaPeekAtLastError();
+}
+
+extern "C" int sqrt_f64(const double* h_in, double* h_out, int size, int* d_in, int* d_out) {
+    const double* dev_in = (const double*)d_in;
+    double* dev_out = (double*)d_out;
+    dim3 block(TENSOR_OP_BLOCK);
+    dim3 grid((size + TENSOR_OP_BLOCK - 1) / TENSOR_OP_BLOCK);
+    sqrt_kernel<double><<<grid, block>>>(dev_in, dev_out, size);
+    return (int)cudaPeekAtLastError();
+}
+
+extern "C" int sqrt_f32(const float* h_in, float* h_out, int size, int* d_in, int* d_out) {
+    const float* dev_in = (const float*)d_in;
+    float* dev_out = (float*)d_out;
+    dim3 block(TENSOR_OP_BLOCK);
+    dim3 grid((size + TENSOR_OP_BLOCK - 1) / TENSOR_OP_BLOCK);
+    sqrt_kernel<float><<<grid, block>>>(dev_in, dev_out, size);
+    return (int)cudaPeekAtLastError();
+}
+
+extern "C" int sqrt_backward_f64(const double* h_sqrt_out, const double* h_grad_out, double* h_input_grad, int size, int* d_sqrt_out, int* d_grad_out, int* d_input_grad) {
+    const double* dev_sqrt_out = (const double*)d_sqrt_out;
+    const double* dev_grad_out = (const double*)d_grad_out;
+    double* dev_input_grad = (double*)d_input_grad;
+    dim3 block(TENSOR_OP_BLOCK);
+    dim3 grid((size + TENSOR_OP_BLOCK - 1) / TENSOR_OP_BLOCK);
+    sqrt_backward_kernel<double><<<grid, block>>>(dev_sqrt_out, dev_grad_out, dev_input_grad, size);
+    return (int)cudaPeekAtLastError();
+}
+
+extern "C" int sqrt_backward_f32(const float* h_sqrt_out, const float* h_grad_out, float* h_input_grad, int size, int* d_sqrt_out, int* d_grad_out, int* d_input_grad) {
+    const float* dev_sqrt_out = (const float*)d_sqrt_out;
+    const float* dev_grad_out = (const float*)d_grad_out;
+    float* dev_input_grad = (float*)d_input_grad;
+    dim3 block(TENSOR_OP_BLOCK);
+    dim3 grid((size + TENSOR_OP_BLOCK - 1) / TENSOR_OP_BLOCK);
+    sqrt_backward_kernel<float><<<grid, block>>>(dev_sqrt_out, dev_grad_out, dev_input_grad, size);
     return (int)cudaPeekAtLastError();
 }
 

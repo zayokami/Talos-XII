@@ -340,6 +340,15 @@ impl PyTensor {
     }
 
     #[getter]
+    fn _is_parameter(&self) -> bool {
+        self.state.is_parameter()
+    }
+
+    fn _set_parameter(&self, value: bool) {
+        self.state.set_parameter(value);
+    }
+
+    #[getter]
     fn grad_fn(&self) -> Option<&'static str> {
         if self.state.requires_grad() && !self.state.is_leaf() {
             Some("TalosBackward")
@@ -479,6 +488,62 @@ impl PyTensor {
         self.clone_tensor()
     }
 
+    fn copy_<'py>(
+        mut self_: PyRefMut<'py, Self>,
+        source: &PyTensor,
+    ) -> PyResult<PyRefMut<'py, Self>> {
+        if GRAD_ENABLED.with(Cell::get) && self_.state.requires_grad() {
+            let message = if self_.state.is_leaf() {
+                "a leaf Tensor that requires grad is being used in an in-place operation"
+            } else {
+                "in-place mutation of a Tensor tracked by autograd is not implemented; use no_grad() for parameter updates"
+            };
+            return Err(PyRuntimeError::new_err(message));
+        }
+        self_
+            .inner
+            .copy_data_from(&source.inner)
+            .map_err(PyRuntimeError::new_err)?;
+        self_.state.increment_version();
+        Ok(self_)
+    }
+
+    fn _replace_data_(&mut self, source: &PyTensor) -> PyResult<()> {
+        if self.inner.shape != source.inner.shape {
+            return Err(PyRuntimeError::new_err(format!(
+                "source shape {:?} does not match destination shape {:?}",
+                source.inner.shape, self.inner.shape
+            )));
+        }
+        if GRAD_ENABLED.with(Cell::get) && self.state.requires_grad() {
+            return Err(PyRuntimeError::new_err(
+                "a leaf Tensor that requires grad is being used in an in-place operation",
+            ));
+        }
+        if source.inner.dtype == Dtype::I8 && self.state.requires_grad() {
+            return Err(PyRuntimeError::new_err(
+                "only floating point tensors can require gradients",
+            ));
+        }
+
+        let existing_grad = self
+            .state
+            .grad_ready()
+            .then(|| self.inner.grad_to_f64_vec());
+        let mut replacement = source.inner.clone();
+        replacement.clear_graph();
+        if let Some(existing_grad) = existing_grad {
+            replacement
+                .grad
+                .copy_from_f64_slice(&existing_grad)
+                .map_err(PyRuntimeError::new_err)?;
+        }
+        self.inner = replacement;
+        self.state.increment_version();
+        self.state.rebind(&self.inner);
+        Ok(())
+    }
+
     fn fill_(&mut self, value: f64) -> PyResult<()> {
         if GRAD_ENABLED.with(Cell::get) && self.state.requires_grad() {
             let message = if self.state.is_leaf() {
@@ -581,7 +646,8 @@ impl PyTensor {
         match tensor_operand(rhs)? {
             TensorOperand::Tensor(rhs) => broadcast_binary(self, &rhs, |lhs, rhs| lhs + rhs),
             TensorOperand::Scalar(rhs) => {
-                wrap_tensor_op(|| &self.inner + &self.scalar_tensor_like(rhs))
+                let scalar = self.scalar_tensor_like(rhs)?;
+                wrap_tensor_op(|| &self.inner + &scalar)
             }
         }
     }
@@ -590,7 +656,8 @@ impl PyTensor {
         match tensor_operand(rhs)? {
             TensorOperand::Tensor(rhs) => broadcast_binary(self, &rhs, |lhs, rhs| lhs - rhs),
             TensorOperand::Scalar(rhs) => {
-                wrap_tensor_op(|| &self.inner - &self.scalar_tensor_like(rhs))
+                let scalar = self.scalar_tensor_like(rhs)?;
+                wrap_tensor_op(|| &self.inner - &scalar)
             }
         }
     }
@@ -599,7 +666,8 @@ impl PyTensor {
         match tensor_operand(rhs)? {
             TensorOperand::Tensor(rhs) => broadcast_binary(self, &rhs, |lhs, rhs| lhs * rhs),
             TensorOperand::Scalar(rhs) => {
-                wrap_tensor_op(|| &self.inner * &self.scalar_tensor_like(rhs))
+                let scalar = self.scalar_tensor_like(rhs)?;
+                wrap_tensor_op(|| &self.inner * &scalar)
             }
         }
     }
@@ -608,7 +676,8 @@ impl PyTensor {
         match tensor_operand(rhs)? {
             TensorOperand::Tensor(rhs) => broadcast_binary(self, &rhs, |lhs, rhs| lhs / rhs),
             TensorOperand::Scalar(rhs) => {
-                wrap_tensor_op(|| &self.inner / &self.scalar_tensor_like(rhs))
+                let scalar = self.scalar_tensor_like(rhs)?;
+                wrap_tensor_op(|| &self.inner / &scalar)
             }
         }
     }
@@ -1141,7 +1210,8 @@ impl PyTensor {
         match tensor_operand(lhs)? {
             TensorOperand::Tensor(lhs) => broadcast_binary(&lhs, self, |lhs, rhs| lhs + rhs),
             TensorOperand::Scalar(lhs) => {
-                wrap_tensor_op(|| &self.scalar_tensor_like(lhs) + &self.inner)
+                let scalar = self.scalar_tensor_like(lhs)?;
+                wrap_tensor_op(|| &scalar + &self.inner)
             }
         }
     }
@@ -1154,7 +1224,8 @@ impl PyTensor {
         match tensor_operand(lhs)? {
             TensorOperand::Tensor(lhs) => broadcast_binary(&lhs, self, |lhs, rhs| lhs - rhs),
             TensorOperand::Scalar(lhs) => {
-                wrap_tensor_op(|| &self.scalar_tensor_like(lhs) - &self.inner)
+                let scalar = self.scalar_tensor_like(lhs)?;
+                wrap_tensor_op(|| &scalar - &self.inner)
             }
         }
     }
@@ -1167,7 +1238,8 @@ impl PyTensor {
         match tensor_operand(lhs)? {
             TensorOperand::Tensor(lhs) => broadcast_binary(&lhs, self, |lhs, rhs| lhs * rhs),
             TensorOperand::Scalar(lhs) => {
-                wrap_tensor_op(|| &self.scalar_tensor_like(lhs) * &self.inner)
+                let scalar = self.scalar_tensor_like(lhs)?;
+                wrap_tensor_op(|| &scalar * &self.inner)
             }
         }
     }
@@ -1180,7 +1252,8 @@ impl PyTensor {
         match tensor_operand(lhs)? {
             TensorOperand::Tensor(lhs) => broadcast_binary(&lhs, self, |lhs, rhs| lhs / rhs),
             TensorOperand::Scalar(lhs) => {
-                wrap_tensor_op(|| &self.scalar_tensor_like(lhs) / &self.inner)
+                let scalar = self.scalar_tensor_like(lhs)?;
+                wrap_tensor_op(|| &scalar / &self.inner)
             }
         }
     }
@@ -1197,7 +1270,8 @@ impl PyTensor {
         match tensor_operand(rhs)? {
             TensorOperand::Tensor(rhs) => self.modulo(&rhs),
             TensorOperand::Scalar(rhs) => {
-                wrap_tensor_op(|| self.inner.modulo(&self.scalar_tensor_like(rhs)))
+                let scalar = self.scalar_tensor_like(rhs)?;
+                wrap_tensor_op(|| self.inner.modulo(&scalar))
             }
         }
     }
@@ -1206,7 +1280,8 @@ impl PyTensor {
         match tensor_operand(lhs)? {
             TensorOperand::Tensor(lhs) => lhs.modulo(self),
             TensorOperand::Scalar(lhs) => {
-                wrap_tensor_op(|| self.scalar_tensor_like(lhs).modulo(&self.inner))
+                let scalar = self.scalar_tensor_like(lhs)?;
+                wrap_tensor_op(|| scalar.modulo(&self.inner))
             }
         }
     }
@@ -1282,12 +1357,19 @@ impl PyTensor {
         Self { inner, state }
     }
 
-    fn scalar_tensor_like(&self, value: f64) -> AutoTensor {
-        AutoTensor::with_dtype(
+    fn scalar_tensor_like(&self, value: f64) -> PyResult<AutoTensor> {
+        let scalar = AutoTensor::with_dtype(
             vec![value; self.inner.numel()],
             self.inner.shape.clone(),
             self.inner.dtype,
-        )
+        );
+        #[cfg(cuda)]
+        if self.inner.device == Device::Cuda {
+            return scalar.to_cuda().map_err(|error| {
+                PyRuntimeError::new_err(format!("CUDA scalar transfer failed: {error}"))
+            });
+        }
+        Ok(scalar)
     }
 
     fn set_requires_grad_value(&self, value: bool) -> PyResult<()> {

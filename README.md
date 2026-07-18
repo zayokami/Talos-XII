@@ -140,6 +140,23 @@ maturin develop --release
 python -c "import talos_xii as tx; print(tx.ones([2]).to_list())"
 ```
 
+The installable package includes a PyTorch-style training layer without a
+PyTorch or NumPy runtime dependency:
+
+```python
+import talos_xii as tx
+
+tx.manual_seed(23)
+model = tx.nn.Sequential(tx.nn.Linear(2, 8), tx.nn.ReLU(), tx.nn.Linear(8, 1))
+optimizer = tx.optim.AdamW(model.parameters(), lr=1e-3)
+
+optimizer.zero_grad()
+loss = model(tx.ones([4, 2])).square().mean()
+loss.backward()
+optimizer.step()
+tx.save(model, "model.txckpt")
+```
+
 The Python frontend follows a versioned PyTorch eager-mode compatibility
 contract for its supported dense Tensor/autograd subset. See
 **[docs/PYTORCH_COMPATIBILITY.md](docs/PYTORCH_COMPATIBILITY.md)** for exact,
@@ -149,7 +166,8 @@ The existing embedded interpreter remains available through
 `cargo run --features python -- python <script> -- <args>`. CPU wheels are the
 portable default. A CUDA Python build must be built on a CUDA 12 toolchain with
 `maturin build --release --features cuda`; NVIDIA runtime libraries are not
-bundled into the wheel.
+bundled into the wheel. Tagged releases also provide a Linux CUDA 12 wheel with
+the `linux_x86_64` platform tag; select that artifact explicitly for CUDA use.
 
 Tagged releases produce Windows ZIP, Linux/macOS `tar.gz`, a Linux CUDA 12
 archive, abi3 wheels, per-artifact `.sha256` files, and an aggregate
@@ -408,6 +426,22 @@ maturin develop --release
 python -c "import talos_xii as tx; print(tx.ones([2]).to_list())"
 ```
 
+可安装包包含 PyTorch 风格的训练层，运行时不依赖 PyTorch 或 NumPy：
+
+```python
+import talos_xii as tx
+
+tx.manual_seed(23)
+model = tx.nn.Sequential(tx.nn.Linear(2, 8), tx.nn.ReLU(), tx.nn.Linear(8, 1))
+optimizer = tx.optim.AdamW(model.parameters(), lr=1e-3)
+
+optimizer.zero_grad()
+loss = model(tx.ones([4, 2])).square().mean()
+loss.backward()
+optimizer.step()
+tx.save(model, "model.txckpt")
+```
+
 Python 前端针对已支持的稠密 Tensor/autograd 子集执行版本化的 PyTorch eager-mode
 行为契约。精确兼容、部分兼容与暂不支持的边界见
 **[docs/PYTORCH_COMPATIBILITY.md](docs/PYTORCH_COMPATIBILITY.md)**。
@@ -416,6 +450,8 @@ Python 前端针对已支持的稠密 Tensor/autograd 子集执行版本化的 P
 `cargo run --features python -- python <script> -- <args>`。通用预编译 wheel
 默认是 CPU 版；CUDA Python 包必须在 CUDA 12 工具链上执行
 `maturin build --release --features cuda`，wheel 不捆绑 NVIDIA 运行库。
+带 tag 的发布还会提供 `linux_x86_64` 平台标签的 Linux CUDA 12 wheel；
+CUDA 用户必须明确选择该制品。
 
 版本标签发布会生成 Windows ZIP、Linux/macOS `tar.gz`、Linux CUDA 12 包、
 abi3 wheel、每个制品的 `.sha256` 与汇总 `SHA256SUMS`。原生包包含二进制、
